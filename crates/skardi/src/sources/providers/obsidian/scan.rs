@@ -236,7 +236,13 @@ impl VaultScan {
                 }
             };
             let text = String::from_utf8_lossy(&bytes);
-            notes.push(parse_note(&entry.rel_key, entry.size, entry.modified, &text, &index));
+            notes.push(parse_note(
+                &entry.rel_key,
+                entry.size,
+                entry.modified,
+                &text,
+                &index,
+            ));
         }
 
         // Wholesale-failure guard (spec §Failure Modes): policy skips are not
@@ -276,8 +282,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     fn fixture_root() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("src/sources/providers/obsidian/fixtures/vault")
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/sources/providers/obsidian/fixtures/vault")
     }
 
     fn defaults() -> ScanOptions {
@@ -303,7 +308,14 @@ mod tests {
         run_scan(root.to_string_lossy().into_owned(), opts).await
     }
 
-    type LinkSummary<'a> = (Option<&'a str>, &'a str, &'a str, &'a str, &'a str, Option<u32>);
+    type LinkSummary<'a> = (
+        Option<&'a str>,
+        &'a str,
+        &'a str,
+        &'a str,
+        &'a str,
+        Option<u32>,
+    );
     fn summarize(links: &[LinkRow]) -> Vec<LinkSummary<'_>> {
         links
             .iter()
@@ -359,18 +371,27 @@ mod tests {
         assert_eq!(home.size_bytes, meta.len() as i64);
         assert!(home.modified_ms > 0);
 
-        let design = notes.iter().find(|n| n.path == "Projects/Design.md").unwrap();
+        let design = notes
+            .iter()
+            .find(|n| n.path == "Projects/Design.md")
+            .unwrap();
         assert_eq!(design.name, "Design");
         assert_eq!(design.folder, "Projects");
         assert_eq!(design.aliases, None);
 
-        let bad = notes.iter().find(|n| n.path == "Bad Frontmatter.md").unwrap();
+        let bad = notes
+            .iter()
+            .find(|n| n.path == "Bad Frontmatter.md")
+            .unwrap();
         assert_eq!(bad.frontmatter_json, None);
         assert!(bad.frontmatter_error.is_some());
         assert!(bad.body.starts_with("Body survives"));
         assert_eq!(bad.aliases, None);
 
-        let plain = notes.iter().find(|n| n.path == "No Frontmatter.md").unwrap();
+        let plain = notes
+            .iter()
+            .find(|n| n.path == "No Frontmatter.md")
+            .unwrap();
         assert_eq!(plain.frontmatter_json, None);
         assert_eq!(plain.frontmatter_error, None);
         assert!(plain.body.contains("\n---\n"));
@@ -394,19 +415,89 @@ mod tests {
         assert_eq!(
             summarize(&home.links),
             vec![
-                (Some("Projects/Design.md"), "Projects/Design", "wikilink", "exact", "frontmatter", None),
-                (Some("Projects/Design.md"), "Projects/Design", "wikilink", "exact", "body", Some(9)),
-                (Some("Projects/Design.md"), "Design", "wikilink", "name", "body", Some(9)),
-                (None, "https://skardi.ai", "external", "external", "body", Some(16)),
-                (None, "https://example.com", "external", "external", "body", Some(16)),
-                (None, "mailto:hello@example.com", "external", "external", "body", Some(16)),
-                (Some("attachments/diagram.png"), "diagram.png", "embed", "name", "body", Some(17)),
-                (Some("attachments/diagram.png"), "attachments/diagram.png", "embed", "exact", "body", Some(17)),
-                (Some("Meeting.md"), "Meeting", "wikilink", "name", "body", Some(18)),
+                (
+                    Some("Projects/Design.md"),
+                    "Projects/Design",
+                    "wikilink",
+                    "exact",
+                    "frontmatter",
+                    None
+                ),
+                (
+                    Some("Projects/Design.md"),
+                    "Projects/Design",
+                    "wikilink",
+                    "exact",
+                    "body",
+                    Some(9)
+                ),
+                (
+                    Some("Projects/Design.md"),
+                    "Design",
+                    "wikilink",
+                    "name",
+                    "body",
+                    Some(9)
+                ),
+                (
+                    None,
+                    "https://skardi.ai",
+                    "external",
+                    "external",
+                    "body",
+                    Some(16)
+                ),
+                (
+                    None,
+                    "https://example.com",
+                    "external",
+                    "external",
+                    "body",
+                    Some(16)
+                ),
+                (
+                    None,
+                    "mailto:hello@example.com",
+                    "external",
+                    "external",
+                    "body",
+                    Some(16)
+                ),
+                (
+                    Some("attachments/diagram.png"),
+                    "diagram.png",
+                    "embed",
+                    "name",
+                    "body",
+                    Some(17)
+                ),
+                (
+                    Some("attachments/diagram.png"),
+                    "attachments/diagram.png",
+                    "embed",
+                    "exact",
+                    "body",
+                    Some(17)
+                ),
+                (
+                    Some("Meeting.md"),
+                    "Meeting",
+                    "wikilink",
+                    "name",
+                    "body",
+                    Some(18)
+                ),
                 (Some("Home.md"), "", "wikilink", "exact", "body", Some(18)),
                 (None, "Notes", "wikilink", "ambiguous", "body", Some(19)),
                 (None, "Nowhere", "wikilink", "missing", "body", Some(19)),
-                (None, "missing/thing.md", "markdown", "missing", "body", Some(19)),
+                (
+                    None,
+                    "missing/thing.md",
+                    "markdown",
+                    "missing",
+                    "body",
+                    Some(19)
+                ),
             ]
         );
         assert_eq!(home.links[2].heading.as_deref(), Some("Goals"));
@@ -421,22 +512,81 @@ mod tests {
         assert_eq!(
             summarize(&by_path("Meeting.md").links),
             vec![
-                (Some("People/Alice.md"), "People/Alice", "wikilink", "exact", "frontmatter", None),
-                (Some("People/Bob.md"), "People/Bob", "wikilink", "exact", "frontmatter", None),
-                (Some("Rooms/B12.md"), "Rooms/B12", "wikilink", "exact", "frontmatter", None),
+                (
+                    Some("People/Alice.md"),
+                    "People/Alice",
+                    "wikilink",
+                    "exact",
+                    "frontmatter",
+                    None
+                ),
+                (
+                    Some("People/Bob.md"),
+                    "People/Bob",
+                    "wikilink",
+                    "exact",
+                    "frontmatter",
+                    None
+                ),
+                (
+                    Some("Rooms/B12.md"),
+                    "Rooms/B12",
+                    "wikilink",
+                    "exact",
+                    "frontmatter",
+                    None
+                ),
             ]
         );
-        assert_eq!(by_path("Meeting.md").links[1].display_text.as_deref(), Some("Bob"));
+        assert_eq!(
+            by_path("Meeting.md").links[1].display_text.as_deref(),
+            Some("Bob")
+        );
 
         assert_eq!(
             summarize(&by_path("Projects/Design.md").links),
             vec![
                 (Some("Home.md"), "Home", "wikilink", "name", "body", Some(9)),
-                (Some("Projects/Notes.md"), "Notes.md", "markdown", "exact", "body", Some(9)),
-                (Some("Meeting.md"), "../Meeting.md", "markdown", "exact", "body", Some(9)),
-                (Some("Projects/Notes.md"), "./Notes", "wikilink", "exact", "body", Some(10)),
-                (Some("Home.md"), "../Home", "wikilink", "exact", "body", Some(10)),
-                (Some("Home.md"), "Home.md", "markdown", "name", "body", Some(10)),
+                (
+                    Some("Projects/Notes.md"),
+                    "Notes.md",
+                    "markdown",
+                    "exact",
+                    "body",
+                    Some(9)
+                ),
+                (
+                    Some("Meeting.md"),
+                    "../Meeting.md",
+                    "markdown",
+                    "exact",
+                    "body",
+                    Some(9)
+                ),
+                (
+                    Some("Projects/Notes.md"),
+                    "./Notes",
+                    "wikilink",
+                    "exact",
+                    "body",
+                    Some(10)
+                ),
+                (
+                    Some("Home.md"),
+                    "../Home",
+                    "wikilink",
+                    "exact",
+                    "body",
+                    Some(10)
+                ),
+                (
+                    Some("Home.md"),
+                    "Home.md",
+                    "markdown",
+                    "name",
+                    "body",
+                    Some(10)
+                ),
             ]
         );
 
@@ -450,8 +600,22 @@ mod tests {
         assert_eq!(
             summarize(&by_path("People/Bob.md").links),
             vec![
-                (Some("People/Alice.md"), "Alice", "wikilink", "name", "body", Some(1)),
-                (Some("Rooms/B12.md"), "B12", "wikilink", "name", "body", Some(1)),
+                (
+                    Some("People/Alice.md"),
+                    "Alice",
+                    "wikilink",
+                    "name",
+                    "body",
+                    Some(1)
+                ),
+                (
+                    Some("Rooms/B12.md"),
+                    "B12",
+                    "wikilink",
+                    "name",
+                    "body",
+                    Some(1)
+                ),
             ]
         );
         assert_eq!(
@@ -479,7 +643,13 @@ mod tests {
             .collect();
         assert_eq!(
             orphans,
-            vec!["Archive/Notes.md", "Bad Frontmatter.md", "CJK.md", "Large.md", "No Frontmatter.md"]
+            vec![
+                "Archive/Notes.md",
+                "Bad Frontmatter.md",
+                "CJK.md",
+                "Large.md",
+                "No Frontmatter.md"
+            ]
         );
     }
 
@@ -488,7 +658,11 @@ mod tests {
         let notes = scan(&fixture_root(), defaults()).await.unwrap();
         let mut rows: Vec<(&str, &str, &str)> = notes
             .iter()
-            .flat_map(|n| n.tags.iter().map(move |t| (n.path.as_str(), t.tag.as_str(), t.source.as_str())))
+            .flat_map(|n| {
+                n.tags
+                    .iter()
+                    .map(move |t| (n.path.as_str(), t.tag.as_str(), t.source.as_str()))
+            })
             .collect();
         // Notes are already path-ordered and tags (tag, source)-ordered per
         // note, so this sort must be a no-op.
@@ -525,14 +699,18 @@ mod tests {
 
     #[tokio::test]
     async fn missing_root_is_an_error_naming_it() {
-        let err = scan(Path::new("/no/such/vault/root"), defaults()).await.unwrap_err();
+        let err = scan(Path::new("/no/such/vault/root"), defaults())
+            .await
+            .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("/no/such/vault/root"), "{msg}");
     }
 
     #[tokio::test]
     async fn size_cap_skips_large_notes_before_reading() {
-        let large = std::fs::metadata(fixture_root().join("Large.md")).unwrap().len();
+        let large = std::fs::metadata(fixture_root().join("Large.md"))
+            .unwrap()
+            .len();
         assert!(large > 2048, "fixture Large.md must exceed the test cap");
         let opts = ScanOptions::new(vec![".obsidian/**".into(), ".trash/**".into()], 2048).unwrap();
         let notes = scan(&fixture_root(), opts).await.unwrap();
@@ -617,8 +795,14 @@ mod tests {
         let err = scan(dir.path(), defaults()).await.unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("every note read under"), "{msg}");
-        assert!(msg.contains(&dir.path().to_string_lossy().into_owned()), "{msg}");
-        assert!(msg.contains("Archive/Notes.md"), "first failure named: {msg}");
+        assert!(
+            msg.contains(&dir.path().to_string_lossy().into_owned()),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("Archive/Notes.md"),
+            "first failure named: {msg}"
+        );
         assert!(msg.contains("12 attempted"), "{msg}");
         restore_readable(dir.path());
     }
@@ -647,7 +831,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         copy_dir(&fixture_root(), dir.path());
         std::fs::remove_file(dir.path().join("CJK.md")).unwrap();
-        std::os::unix::fs::symlink(outside.path().join("secret.md"), dir.path().join("CJK.md")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret.md"), dir.path().join("CJK.md"))
+            .unwrap();
         let notes = scan(dir.path(), defaults()).await.unwrap();
         assert_eq!(notes.len(), 11);
         assert!(notes.iter().all(|n| n.path != "CJK.md"));
@@ -675,7 +860,11 @@ mod tests {
         assert_eq!(note.links[0].line, Some(5));
         assert_eq!(note.links[0].resolution, Resolution::Name);
         // Body duplicates collapse; (tag, source) order.
-        let tags: Vec<(&str, &str)> = note.tags.iter().map(|t| (t.tag.as_str(), t.source.as_str())).collect();
+        let tags: Vec<(&str, &str)> = note
+            .tags
+            .iter()
+            .map(|t| (t.tag.as_str(), t.source.as_str()))
+            .collect();
         assert_eq!(tags, vec![("a", "body"), ("t", "frontmatter")]);
     }
 }

@@ -212,7 +212,8 @@ pub fn extract(body: &str, body_first_line: u32) -> Extracted {
     let to_file_line = |offset: usize| lines.line_of(offset) + body_first_line - 1;
 
     let mut options = Options::empty();
-    options.insert(Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS);
+    options
+        .insert(Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS);
 
     let mut code_ranges: Vec<Range<usize>> = Vec::new();
     let mut found: Vec<(usize, RawLink)> = Vec::new();
@@ -318,7 +319,10 @@ mod tests {
         assert_eq!(links("[[Note]]"), vec![wl("Note")]);
         assert_eq!(
             links("[[Note|Shown]]"),
-            vec![RawLink { display_text: Some("Shown".into()), ..wl("Note") }]
+            vec![RawLink {
+                display_text: Some("Shown".into()),
+                ..wl("Note")
+            }]
         );
         assert_eq!(
             links("[[Note#Some Heading|Shown]]"),
@@ -330,18 +334,30 @@ mod tests {
         );
         assert_eq!(
             links("[[Meeting#^abc123]]"),
-            vec![RawLink { block_id: Some("abc123".into()), ..wl("Meeting") }]
+            vec![RawLink {
+                block_id: Some("abc123".into()),
+                ..wl("Meeting")
+            }]
         );
         assert_eq!(
             links("![[attachments/diagram.png]]"),
-            vec![RawLink { embed: true, ..wl("attachments/diagram.png") }]
+            vec![RawLink {
+                embed: true,
+                ..wl("attachments/diagram.png")
+            }]
         );
-        assert_eq!(links("[[ Folder/Some Note ]]"), vec![wl("Folder/Some Note")]);
+        assert_eq!(
+            links("[[ Folder/Some Note ]]"),
+            vec![wl("Folder/Some Note")]
+        );
         assert_eq!(links("[[笔记]]"), vec![wl("笔记")]);
         assert_eq!(links("[[A]][[B]]"), vec![wl("A"), wl("B")]);
         assert_eq!(
             links("[[#Goals]]"),
-            vec![RawLink { heading: Some("Goals".into()), ..wl("") }]
+            vec![RawLink {
+                heading: Some("Goals".into()),
+                ..wl("")
+            }]
         );
         // An empty display part is NULL, not "".
         assert_eq!(links("[[Note|]]"), vec![wl("Note")]);
@@ -361,18 +377,30 @@ mod tests {
             display_text: Some("t".into()),
             line: Some(1),
         };
-        assert_eq!(links("[t](Projects/Design.md)"), vec![md("Projects/Design.md")]);
+        assert_eq!(
+            links("[t](Projects/Design.md)"),
+            vec![md("Projects/Design.md")]
+        );
         assert_eq!(
             links("![t](attachments/diagram.png)"),
-            vec![RawLink { embed: true, ..md("attachments/diagram.png") }]
+            vec![RawLink {
+                embed: true,
+                ..md("attachments/diagram.png")
+            }]
         );
         assert_eq!(
             links("[t](Note.md#Some%20Heading)"),
-            vec![RawLink { heading: Some("Some Heading".into()), ..md("Note.md") }]
+            vec![RawLink {
+                heading: Some("Some Heading".into()),
+                ..md("Note.md")
+            }]
         );
         assert_eq!(
             links("[t](Note.md#^blk)"),
-            vec![RawLink { block_id: Some("blk".into()), ..md("Note.md") }]
+            vec![RawLink {
+                block_id: Some("blk".into()),
+                ..md("Note.md")
+            }]
         );
         // Split at the literal `#` first, decode second: `%23` stays in the name.
         assert_eq!(links("[t](foo%23bar.md)"), vec![md("foo#bar.md")]);
@@ -381,7 +409,10 @@ mod tests {
         // Same-note link: empty path, heading kept.
         assert_eq!(
             links("[t](#Goals)"),
-            vec![RawLink { heading: Some("Goals".into()), ..md("") }]
+            vec![RawLink {
+                heading: Some("Goals".into()),
+                ..md("")
+            }]
         );
         // Inline code inside the link text is part of the display text.
         assert_eq!(
@@ -434,7 +465,10 @@ mod tests {
         assert_eq!(tags("#标签"), vec![("标签".into(), 1)]);
         assert_eq!(tags("#y2026"), vec![("y2026".into(), 1)]);
         // Trailing punctuation is not part of the tag.
-        assert_eq!(tags("see #alpha, then #beta."), vec![("alpha".into(), 1), ("beta".into(), 1)]);
+        assert_eq!(
+            tags("see #alpha, then #beta."),
+            vec![("alpha".into(), 1), ("beta".into(), 1)]
+        );
         // Rejected forms.
         assert!(tags("C#").is_empty());
         assert!(tags("https://x/#anchor").is_empty());

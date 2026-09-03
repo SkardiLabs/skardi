@@ -54,13 +54,14 @@ impl ScanOptions {
                 match key.as_str() {
                     "exclude_globs" => exclude = value.to_string(),
                     "max_file_bytes" => {
-                        max_file_bytes = value
-                            .parse::<u64>()
-                            .ok()
-                            .filter(|n| *n > 0)
-                            .ok_or_else(|| OptionsError::InvalidMaxFileBytes {
-                                value: value.to_string(),
-                            })?;
+                        max_file_bytes =
+                            value
+                                .parse::<u64>()
+                                .ok()
+                                .filter(|n| *n > 0)
+                                .ok_or_else(|| OptionsError::InvalidMaxFileBytes {
+                                    value: value.to_string(),
+                                })?;
                     }
                     other => {
                         return Err(OptionsError::UnknownKey {
@@ -160,12 +161,17 @@ mod tests {
     #[test]
     fn max_file_bytes_parses_and_rejects_garbage() {
         let m = map(&[("max_file_bytes", " 2048 ")]);
-        assert_eq!(ScanOptions::from_map(Some(&m)).unwrap().max_file_bytes, 2048);
+        assert_eq!(
+            ScanOptions::from_map(Some(&m)).unwrap().max_file_bytes,
+            2048
+        );
         for bad in ["0", "-1", "abc", "1.5", ""] {
             let m = map(&[("max_file_bytes", bad)]);
             assert_eq!(
                 ScanOptions::from_map(Some(&m)).unwrap_err(),
-                OptionsError::InvalidMaxFileBytes { value: bad.trim().to_string() },
+                OptionsError::InvalidMaxFileBytes {
+                    value: bad.trim().to_string()
+                },
                 "value {bad:?}"
             );
         }
@@ -173,10 +179,16 @@ mod tests {
 
     #[test]
     fn unknown_key_is_rejected_and_the_first_sorted_key_is_named() {
-        let m = map(&[("zeta", "1"), ("exclude_glob", "x"), ("max_file_bytes", "1")]);
+        let m = map(&[
+            ("zeta", "1"),
+            ("exclude_glob", "x"),
+            ("max_file_bytes", "1"),
+        ]);
         assert_eq!(
             ScanOptions::from_map(Some(&m)).unwrap_err(),
-            OptionsError::UnknownKey { key: "exclude_glob".to_string() }
+            OptionsError::UnknownKey {
+                key: "exclude_glob".to_string()
+            }
         );
     }
 

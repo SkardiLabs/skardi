@@ -144,7 +144,9 @@ impl Index {
     /// then the vault root for paths with a `/`, then the name index for
     /// bare names (Obsidian "Shortest path").
     fn resolve_markdown(&self, from_path: &str, target: &str) -> (Option<String>, Resolution) {
-        if let Some(path) = normalize(folder_of(from_path), target).and_then(|p| self.lookup_exact(&p)) {
+        if let Some(path) =
+            normalize(folder_of(from_path), target).and_then(|p| self.lookup_exact(&p))
+        {
             return (Some(path), Resolution::Exact);
         }
         if target.contains('/') {
@@ -187,7 +189,9 @@ impl Index {
 
 /// Parent folder of a relative path (`""` at the root).
 fn folder_of(path: &str) -> &str {
-    path.rsplit_once('/').map(|(folder, _)| folder).unwrap_or("")
+    path.rsplit_once('/')
+        .map(|(folder, _)| folder)
+        .unwrap_or("")
 }
 
 /// Join `folder` and `target`, collapsing `.`/`..` and empty segments.
@@ -268,70 +272,161 @@ mod tests {
     #[test]
     fn wikilink_rows() {
         assert_eq!(r("Home.md", &wiki("")), ok("Home.md", Resolution::Exact)); // [[#Heading]]
-        assert_eq!(r("Projects/Design.md", &wiki("./Notes")), ok("Projects/Notes.md", Resolution::Exact));
-        assert_eq!(r("Projects/Design.md", &wiki("../Home")), ok("Home.md", Resolution::Exact));
-        assert_eq!(r("Projects/Design.md", &wiki("../../Home")), (None, Resolution::Missing));
-        assert_eq!(r("Projects/Design.md", &wiki("./Nope")), (None, Resolution::Missing));
-        assert_eq!(r("Home.md", &wiki("Projects/Design")), ok("Projects/Design.md", Resolution::Exact));
-        assert_eq!(r("Home.md", &wiki("projects/DESIGN.MD")), ok("Projects/Design.md", Resolution::Exact));
-        assert_eq!(r("Home.md", &wiki("Projects/Nope")), (None, Resolution::Missing));
-        assert_eq!(r("Home.md", &wiki("Design")), ok("Projects/Design.md", Resolution::Name));
-        assert_eq!(r("Home.md", &wiki("design.MD")), ok("Projects/Design.md", Resolution::Name));
+        assert_eq!(
+            r("Projects/Design.md", &wiki("./Notes")),
+            ok("Projects/Notes.md", Resolution::Exact)
+        );
+        assert_eq!(
+            r("Projects/Design.md", &wiki("../Home")),
+            ok("Home.md", Resolution::Exact)
+        );
+        assert_eq!(
+            r("Projects/Design.md", &wiki("../../Home")),
+            (None, Resolution::Missing)
+        );
+        assert_eq!(
+            r("Projects/Design.md", &wiki("./Nope")),
+            (None, Resolution::Missing)
+        );
+        assert_eq!(
+            r("Home.md", &wiki("Projects/Design")),
+            ok("Projects/Design.md", Resolution::Exact)
+        );
+        assert_eq!(
+            r("Home.md", &wiki("projects/DESIGN.MD")),
+            ok("Projects/Design.md", Resolution::Exact)
+        );
+        assert_eq!(
+            r("Home.md", &wiki("Projects/Nope")),
+            (None, Resolution::Missing)
+        );
+        assert_eq!(
+            r("Home.md", &wiki("Design")),
+            ok("Projects/Design.md", Resolution::Name)
+        );
+        assert_eq!(
+            r("Home.md", &wiki("design.MD")),
+            ok("Projects/Design.md", Resolution::Name)
+        );
         // A bare root-level note is `name` (spec table); with its extension
         // written it is a vault path, hence `exact`.
-        assert_eq!(r("Meeting.md", &wiki("Home")), ok("Home.md", Resolution::Name));
-        assert_eq!(r("Meeting.md", &wiki("Home.md")), ok("Home.md", Resolution::Exact));
+        assert_eq!(
+            r("Meeting.md", &wiki("Home")),
+            ok("Home.md", Resolution::Name)
+        );
+        assert_eq!(
+            r("Meeting.md", &wiki("Home.md")),
+            ok("Home.md", Resolution::Exact)
+        );
         assert_eq!(r("Home.md", &wiki("Notes")), (None, Resolution::Ambiguous));
         assert_eq!(r("Home.md", &wiki("Nowhere")), (None, Resolution::Missing));
         // Aliases never resolve.
         assert_eq!(r("Home.md", &wiki("Start")), (None, Resolution::Missing));
         // Attachments match by full file name.
-        assert_eq!(r("Home.md", &wiki("diagram.png")), ok("attachments/diagram.png", Resolution::Name));
+        assert_eq!(
+            r("Home.md", &wiki("diagram.png")),
+            ok("attachments/diagram.png", Resolution::Name)
+        );
         // A dotted title that is a root-level file is exact; elsewhere it
         // falls through to the name index (plan deviation (a)).
-        assert_eq!(r("Home.md", &wiki("Note v2.1")), ok("Note v2.1.md", Resolution::Exact));
+        assert_eq!(
+            r("Home.md", &wiki("Note v2.1")),
+            ok("Note v2.1.md", Resolution::Exact)
+        );
         let nested = Index::build(&["Sub/Note v2.1.md"]);
         let res = nested.resolve("Home.md", &wiki("Note v2.1"));
-        assert_eq!((res.to_path, res.resolution), ok("Sub/Note v2.1.md", Resolution::Name));
+        assert_eq!(
+            (res.to_path, res.resolution),
+            ok("Sub/Note v2.1.md", Resolution::Name)
+        );
         // A colon with a space after it is not a URL scheme.
-        assert_eq!(r("Home.md", &wiki("Note: subtitle")), (None, Resolution::Missing));
+        assert_eq!(
+            r("Home.md", &wiki("Note: subtitle")),
+            (None, Resolution::Missing)
+        );
     }
 
     #[test]
     fn markdown_rows() {
         assert_eq!(r("Home.md", &md("")), ok("Home.md", Resolution::Exact)); // [t](#Heading)
         // Sibling first, even though a same-named note exists elsewhere.
-        assert_eq!(r("Projects/Design.md", &md("Notes.md")), ok("Projects/Notes.md", Resolution::Exact));
-        assert_eq!(r("Projects/Design.md", &md("Notes")), ok("Projects/Notes.md", Resolution::Exact));
-        assert_eq!(r("Projects/Design.md", &md("../Meeting.md")), ok("Meeting.md", Resolution::Exact));
-        assert_eq!(r("Projects/Design.md", &md("../../Meeting.md")), (None, Resolution::Missing));
+        assert_eq!(
+            r("Projects/Design.md", &md("Notes.md")),
+            ok("Projects/Notes.md", Resolution::Exact)
+        );
+        assert_eq!(
+            r("Projects/Design.md", &md("Notes")),
+            ok("Projects/Notes.md", Resolution::Exact)
+        );
+        assert_eq!(
+            r("Projects/Design.md", &md("../Meeting.md")),
+            ok("Meeting.md", Resolution::Exact)
+        );
+        assert_eq!(
+            r("Projects/Design.md", &md("../../Meeting.md")),
+            (None, Resolution::Missing)
+        );
         // Vault path second.
-        assert_eq!(r("Home.md", &md("Projects/Notes.md")), ok("Projects/Notes.md", Resolution::Exact));
-        assert_eq!(r("Projects/Design.md", &md("People/Alice.md")), ok("People/Alice.md", Resolution::Exact));
-        assert_eq!(r("Home.md", &md("missing/thing.md")), (None, Resolution::Missing));
+        assert_eq!(
+            r("Home.md", &md("Projects/Notes.md")),
+            ok("Projects/Notes.md", Resolution::Exact)
+        );
+        assert_eq!(
+            r("Projects/Design.md", &md("People/Alice.md")),
+            ok("People/Alice.md", Resolution::Exact)
+        );
+        assert_eq!(
+            r("Home.md", &md("missing/thing.md")),
+            (None, Resolution::Missing)
+        );
         // Bare name not a sibling: unique → name, repeated → ambiguous.
-        assert_eq!(r("Projects/Design.md", &md("Home.md")), ok("Home.md", Resolution::Name));
+        assert_eq!(
+            r("Projects/Design.md", &md("Home.md")),
+            ok("Home.md", Resolution::Name)
+        );
         assert_eq!(r("Home.md", &md("Notes.md")), (None, Resolution::Ambiguous));
         assert_eq!(r("Home.md", &md("nothing.md")), (None, Resolution::Missing));
         // The decoded `%23` file name is looked up literally.
-        assert_eq!(r("Home.md", &md("foo#bar.md")), ok("foo#bar.md", Resolution::Exact));
+        assert_eq!(
+            r("Home.md", &md("foo#bar.md")),
+            ok("foo#bar.md", Resolution::Exact)
+        );
     }
 
     #[test]
     fn kinds_and_externals() {
         let i = idx();
-        assert_eq!(i.resolve("Home.md", &wiki("Design")).kind, LinkKind::Wikilink);
         assert_eq!(
-            i.resolve("Home.md", &raw(LinkSyntax::Wikilink, true, "diagram.png")).kind,
+            i.resolve("Home.md", &wiki("Design")).kind,
+            LinkKind::Wikilink
+        );
+        assert_eq!(
+            i.resolve("Home.md", &raw(LinkSyntax::Wikilink, true, "diagram.png"))
+                .kind,
             LinkKind::Embed
         );
-        assert_eq!(i.resolve("Home.md", &md("Meeting.md")).kind, LinkKind::Markdown);
         assert_eq!(
-            i.resolve("Home.md", &raw(LinkSyntax::Markdown, true, "attachments/diagram.png")).kind,
+            i.resolve("Home.md", &md("Meeting.md")).kind,
+            LinkKind::Markdown
+        );
+        assert_eq!(
+            i.resolve(
+                "Home.md",
+                &raw(LinkSyntax::Markdown, true, "attachments/diagram.png")
+            )
+            .kind,
             LinkKind::Embed
         );
-        for target in ["https://example.com", "mailto:a@b.c", "obsidian://open?vault=x"] {
-            for syntax in [LinkSyntax::Wikilink, LinkSyntax::Markdown, LinkSyntax::Autolink] {
+        for target in [
+            "https://example.com",
+            "mailto:a@b.c",
+            "obsidian://open?vault=x",
+        ] {
+            for syntax in [
+                LinkSyntax::Wikilink,
+                LinkSyntax::Markdown,
+                LinkSyntax::Autolink,
+            ] {
                 let res = i.resolve("Home.md", &raw(syntax, false, target));
                 assert_eq!(res.to_path, None, "{target}");
                 assert_eq!(res.kind, LinkKind::External);
@@ -340,7 +435,11 @@ mod tests {
         }
         // An external image is still `external`, not `embed`.
         assert_eq!(
-            i.resolve("Home.md", &raw(LinkSyntax::Markdown, true, "https://x/i.png")).kind,
+            i.resolve(
+                "Home.md",
+                &raw(LinkSyntax::Markdown, true, "https://x/i.png")
+            )
+            .kind,
             LinkKind::External
         );
     }
@@ -360,8 +459,14 @@ mod tests {
 
     #[test]
     fn normalize_collapses_dots_and_refuses_to_climb_out() {
-        assert_eq!(normalize("Projects", "Notes.md"), Some("Projects/Notes.md".into()));
-        assert_eq!(normalize("Projects", "./Notes.md"), Some("Projects/Notes.md".into()));
+        assert_eq!(
+            normalize("Projects", "Notes.md"),
+            Some("Projects/Notes.md".into())
+        );
+        assert_eq!(
+            normalize("Projects", "./Notes.md"),
+            Some("Projects/Notes.md".into())
+        );
         assert_eq!(normalize("Projects", "../Home.md"), Some("Home.md".into()));
         assert_eq!(normalize("A/B", "../../x"), Some("x".into()));
         assert_eq!(normalize("A", "../../x"), None);

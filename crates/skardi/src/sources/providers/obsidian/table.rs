@@ -204,7 +204,12 @@ impl DisplayAs for ObsidianScanExec {
                 self.limit
             ),
             DisplayFormatType::TreeRender => {
-                write!(f, "ObsidianScanExec({}: {})", self.kind.table_name(), self.root)
+                write!(
+                    f,
+                    "ObsidianScanExec({}: {})",
+                    self.kind.table_name(),
+                    self.root
+                )
             }
         }
     }
@@ -344,7 +349,9 @@ fn notes_column(idx: usize, rows: &[ParsedNote]) -> ArrayRef {
             }
             Arc::new(builder.finish())
         }
-        7 => Arc::new(Int64Array::from_iter_values(rows.iter().map(|n| n.size_bytes))),
+        7 => Arc::new(Int64Array::from_iter_values(
+            rows.iter().map(|n| n.size_bytes),
+        )),
         8 => Arc::new(
             TimestampMillisecondArray::from_iter_values(rows.iter().map(|n| n.modified_ms))
                 .with_timezone("UTC"),
@@ -556,13 +563,28 @@ mod tests {
             .join("src/sources/providers/obsidian/fixtures/vault")
             .to_string_lossy()
             .into_owned();
-        let opts = ScanOptions::from_map(None).map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let opts =
+            ScanOptions::from_map(None).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let ctx = SessionContext::new();
-        ctx.register_table("notes", Arc::new(ObsidianTable::new(TableKind::Notes, root, opts)))?;
-        let batches = ctx.sql("SELECT count(*) FROM notes").await?.collect().await?;
-        assert_eq!(batches[0].column(0).as_primitive::<Int64Type>().value(0), 12);
+        ctx.register_table(
+            "notes",
+            Arc::new(ObsidianTable::new(TableKind::Notes, root, opts)),
+        )?;
+        let batches = ctx
+            .sql("SELECT count(*) FROM notes")
+            .await?
+            .collect()
+            .await?;
+        assert_eq!(
+            batches[0].column(0).as_primitive::<Int64Type>().value(0),
+            12
+        );
 
-        let plan = ctx.sql("EXPLAIN SELECT path FROM notes LIMIT 2").await?.collect().await?;
+        let plan = ctx
+            .sql("EXPLAIN SELECT path FROM notes LIMIT 2")
+            .await?
+            .collect()
+            .await?;
         let text = arrow::util::pretty::pretty_format_batches(&plan)?.to_string();
         assert!(text.contains("ObsidianScanExec"), "{text}");
         Ok(())

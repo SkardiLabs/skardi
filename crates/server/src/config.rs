@@ -3639,7 +3639,10 @@ spec:
             .await
             .unwrap_err();
         let msg = format!("{err:?}");
-        assert!(msg.contains("`obsidian` feature"), "unexpected error: {msg}");
+        assert!(
+            msg.contains("`obsidian` feature"),
+            "unexpected error: {msg}"
+        );
     }
 
     /// Registration through the server's own entry point, then a query
@@ -3648,12 +3651,7 @@ spec:
     #[cfg(feature = "obsidian")]
     #[tokio::test]
     async fn test_register_obsidian_source_and_query_notes() {
-        let source = obsidian_source(
-            "vault",
-            OBSIDIAN_FIXTURE_VAULT,
-            None,
-            AccessMode::ReadOnly,
-        );
+        let source = obsidian_source("vault", OBSIDIAN_FIXTURE_VAULT, None, AccessMode::ReadOnly);
         let mut session_ctx = SessionContext::new();
         register_data_sources(&mut session_ctx, &[source])
             .await
@@ -3684,12 +3682,7 @@ spec:
     #[cfg(feature = "obsidian")]
     #[tokio::test]
     async fn test_register_obsidian_read_write_fails() {
-        let source = obsidian_source(
-            "vault",
-            OBSIDIAN_FIXTURE_VAULT,
-            None,
-            AccessMode::ReadWrite,
-        );
+        let source = obsidian_source("vault", OBSIDIAN_FIXTURE_VAULT, None, AccessMode::ReadWrite);
         let mut session_ctx = SessionContext::new();
         let err = register_data_sources(&mut session_ctx, &[source])
             .await
