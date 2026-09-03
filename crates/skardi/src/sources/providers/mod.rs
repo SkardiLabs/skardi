@@ -16,6 +16,8 @@ pub mod lance;
 pub mod mongo;
 pub mod mysql;
 pub mod mysql_wire;
+#[cfg(feature = "obsidian")]
+pub mod obsidian;
 pub mod open_connector;
 pub mod redis;
 // Config/error types compile unconditionally (plain serde/thiserror, no
