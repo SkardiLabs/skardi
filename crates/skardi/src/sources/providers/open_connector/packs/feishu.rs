@@ -154,6 +154,8 @@ mod tests {
             include_str!("fixtures/feishu/contracts/list_chat_members.json")
         } else if path.ends_with("feishu.list_document_blocks") {
             include_str!("fixtures/feishu/contracts/list_document_blocks.json")
+        } else if path.ends_with("feishu.get_document_content") {
+            include_str!("fixtures/feishu/contracts/get_document_content.json")
         } else if path.ends_with("feishu.list_tasks") {
             include_str!("fixtures/feishu/contracts/list_tasks.json")
         } else if path.ends_with("feishu.list_wiki_spaces") {
@@ -510,6 +512,10 @@ mod tests {
                 include_str!("fixtures/feishu/contracts/list_document_blocks.json"),
             ),
             (
+                "document_content",
+                include_str!("fixtures/feishu/contracts/get_document_content.json"),
+            ),
+            (
                 "tasks",
                 include_str!("fixtures/feishu/contracts/list_tasks.json"),
             ),
@@ -574,6 +580,25 @@ mod tests {
                 "every {short} column is expected to be uncovered (loose item schema)"
             );
         }
+
+        // `document_content` is the exception, and the reason is worth
+        // stating: it is the only feishu action whose output schema DECLARES
+        // its fields (`documentId`, `content`, additionalProperties: false)
+        // rather than handing back a loose object. So its columns sit INSIDE
+        // the fingerprint gate — an upstream rename fails registration
+        // instead of surfacing as a null column at scan time. It is also the
+        // pack's first `row_shape: object` table; the two facts are related,
+        // since a "read one thing" action has a payload worth declaring.
+        let content = table("document_content");
+        assert!(
+            fingerprint_uncovered_columns(
+                include_str!("fixtures/feishu/contracts/get_document_content.json"),
+                content.row_path,
+                content.fields,
+            )
+            .is_empty(),
+            "document_content's columns are covered by its strict contract"
+        );
     }
 
     // ── Integration: the pack against a mock gateway, end to end. ───────
@@ -586,7 +611,7 @@ mod tests {
             "resource: { containerId: oc_root }"
         } else if tables.contains("chat_members") {
             "resource: { chatId: oc_root }"
-        } else if tables.contains("document_blocks") {
+        } else if tables.contains("document_blocks") || tables.contains("document_content") {
             "resource: { documentId: docx_root }"
         } else if tables.contains("wiki_nodes") {
             "resource: { spaceId: sp_root }"
@@ -677,6 +702,75 @@ bindings:
                 "ordering pin: {input}"
             );
         }
+    }
+
+    /// The pack's first `row_shape: object` table, end to end: one document
+    /// becomes ONE row carrying its whole text.
+    ///
+    /// Why the table exists beside `document_blocks` is the interesting part.
+    /// That one is structurally complete and textually empty — a block's
+    /// payload sits under a key named by its own `block_type`, which no fixed
+    /// relational mapping can address — so a corpus built from it would be
+    /// block ids with empty bodies. Feishu's raw-content action answers with
+    /// the assembled text instead, as the response object itself rather than
+    /// a one-element list, and before `row_shape` existed that shape could
+    /// not be expressed as a pack table at all.
+    ///
+    /// The fixture is a redacted 2026-09-03 capture through the pinned
+    /// gateway against a real document.
+    #[tokio::test]
+    async fn document_content_reads_one_document_as_a_single_row() {
+        let content = include_str!("fixtures/feishu/document_content.json");
+        let gateway = MockGateway::start(move |req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                return feishu_discovery(&req.path);
+            }
+            if req.method == "POST" && req.path == "/v1/actions/feishu.get_document_content" {
+                let body: Value = serde_json::from_str(&req.body).unwrap_or_default();
+                // The binding's coordinate reaches the action, and a cursor
+                // does not: a single-object table declares no pagination, so
+                // a pageToken here would mean the scan asked for page two of
+                // a document's text.
+                assert_eq!(body["input"]["documentId"], Value::from("docx_root"));
+                assert!(
+                    body["input"].get("pageToken").is_none(),
+                    "a single-row table must not paginate: {}",
+                    req.body
+                );
+                return MockResponse::ok(&envelope_ok(content));
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+        let (_gateway, ctx) = setup_with_gateway(
+            gateway,
+            "SKARDI_TEST_OC_FEISHU_DOC_CONTENT",
+            "document_content",
+        )
+        .await;
+
+        let batches = collect(
+            &ctx,
+            "SELECT document_id, content FROM saas.ws.document_content",
+        )
+        .await;
+        assert_eq!(
+            column_values(&batches, "document_id"),
+            vec!["docx_measure_0001"]
+        );
+        let text = column_values(&batches, "content");
+        assert_eq!(text.len(), 1, "one document is one row");
+        assert!(
+            text[0].contains("the pipeline worked end to end"),
+            "the document's text reaches the row verbatim"
+        );
+        assert!(
+            text[0].contains('\n'),
+            "multi-block text arrives newline-joined, not collapsed"
+        );
     }
 
     #[tokio::test]

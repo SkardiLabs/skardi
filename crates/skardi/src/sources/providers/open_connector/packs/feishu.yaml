@@ -119,6 +119,38 @@ tables:
       # message resource documents it, typed utf8 like every other id.
       - { name: upper_message_id, path: upper_message_id, type: utf8, nullable: true }
 
+  # One row per DOCUMENT, not per block: the whole docx as plain text.
+  #
+  # `document_blocks` below is the structural view, and it deliberately
+  # exposes no text — a block's payload lives under a key named BY its
+  # block_type (`page`, `text`, `heading1`, ...), which a fixed relational
+  # mapping cannot address. That makes it useless as a corpus on its own,
+  # so this table exists beside it: Feishu's raw-content endpoint returns
+  # the assembled text of every block in one call, which is exactly the
+  # shape an OKF document row wants.
+  #
+  # This is the pack format's first `row_shape: object` table. The action
+  # answers with the row itself (`{documentId, content}`) rather than a
+  # list, so `row_path: "$"` names the envelope and the loader refuses any
+  # pagination beside it — there is no second page of a document's text.
+  # Live-captured 2026-09-03 through the pinned build against a real
+  # document; the fixture is that capture with the id replaced.
+  document_content:
+    action: feishu.get_document_content
+    row_path: "$"
+    row_shape: object
+    fingerprint: 08734aacc5852526417d49b121b8dc171cca52d961432cca342bb16b23cc8b1c
+    pagination:
+      strategy: single_page
+    resources:
+      required: [documentId]
+    columns:
+      - { name: document_id, path: documentId, type: utf8, nullable: false }
+      # Never null: the action substitutes an empty string for a document
+      # with no text, so an empty corpus row is a real empty document
+      # rather than a fetch that half-failed.
+      - { name: content, path: content, type: utf8, nullable: false }
+
   document_blocks:
     action: feishu.list_document_blocks
     row_path: "$.items"

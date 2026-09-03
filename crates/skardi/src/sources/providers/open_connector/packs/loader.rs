@@ -43,7 +43,7 @@ use crate::sources::providers::open_connector::pagination::{
 };
 use crate::sources::providers::open_connector::row_path::RowPath;
 use crate::sources::providers::open_connector::source_pack::{
-    FixedValue, SourcePack, SourcePackTable,
+    FixedValue, RowShape, SourcePack, SourcePackTable,
 };
 
 /// Parse an embedded pack asset, memoized in `cell`.
@@ -141,6 +141,7 @@ fn convert_table(
         id,
         action_id,
         row_path: leak_str(doc.row_path),
+        row_shape: doc.row_shape.into(),
         fields: leak_slice(fields),
         pagination,
         required_resources: leak_str_slice(doc.resources.required),
@@ -171,6 +172,18 @@ fn validate_table(table: &SourcePackTable) -> Result<(), String> {
         .pagination
         .validate()
         .map_err(|e| format!("{id}: {e}"))?;
+    // A single-object table reads ONE thing: there is no second page to ask
+    // for, and no cursor in an object that is itself the row. Declaring both
+    // would mean the scan requests page 2 of a document's text — refuse the
+    // combination at load rather than discover it as an infinite scan or a
+    // provider error nobody can attribute.
+    if table.row_shape == RowShape::Object
+        && !matches!(table.pagination, PaginationStrategy::SinglePage { .. })
+    {
+        return Err(format!(
+            "{id}: `row_shape: object` reads a single row and cannot paginate;              declare `strategy: single_page`"
+        ));
+    }
     RowConverter::new(table.fields).map_err(|e| format!("{id}: {e}"))?;
 
     let mut columns = std::collections::HashSet::new();
@@ -561,11 +574,34 @@ enum KindTag {
     Pack,
 }
 
+/// What `row_path` resolves to. Defaults to `array`, which is what every
+/// list endpoint is and what every pack table declared before single-object
+/// rows existed — so an omitted key keeps its old meaning exactly.
+#[derive(Deserialize, Default)]
+enum RowShapeDoc {
+    #[serde(rename = "array")]
+    #[default]
+    Array,
+    #[serde(rename = "object")]
+    Object,
+}
+
+impl From<RowShapeDoc> for RowShape {
+    fn from(doc: RowShapeDoc) -> Self {
+        match doc {
+            RowShapeDoc::Array => RowShape::Array,
+            RowShapeDoc::Object => RowShape::Object,
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TableDoc {
     action: String,
     row_path: String,
+    #[serde(default)]
+    row_shape: RowShapeDoc,
     #[serde(default)]
     fingerprint: Option<String>,
     pagination: PaginationDoc,

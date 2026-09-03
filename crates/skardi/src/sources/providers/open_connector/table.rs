@@ -156,6 +156,7 @@ impl TableProvider for OpenConnectorTableProvider {
             ScanTarget::from_pack_table(self.table, self.source_pack_version),
             Arc::clone(&self.converter),
             self.row_path.clone(),
+            self.table.row_shape,
             self.resource.clone(),
             translated.inputs,
             projection.cloned(),
@@ -195,6 +196,7 @@ mod tests {
             id: "test.t",
             action_id: "test.action",
             row_path: "$.items",
+            row_shape: super::super::source_pack::RowShape::Array,
             fields: &[FieldMapping {
                 name: "id",
                 path: "id",
