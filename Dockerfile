@@ -50,6 +50,11 @@ COPY --from=builder /app/target/release/skardi-server /usr/local/bin/skardi-serv
 # empty (no-op) for builds without the `documents` feature.
 COPY --from=builder /pdfium-lib/ /usr/local/bin/
 
+# The `documents` feature's non-PDF path (Office/ODF/images) shells out to
+# LibreOffice/ImageMagick. Those are deliberately not installed here — they add
+# hundreds of MB to every image — so document support is PDF-only out of the
+# box; derive an image to add them (see docs/documents.md).
+
 EXPOSE 8080
 
 ENTRYPOINT ["skardi-server"]

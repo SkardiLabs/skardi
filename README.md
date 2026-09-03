@@ -282,6 +282,14 @@ LLM extraction, documents, RSS). For anything in between, build locally with
 The fastest cloud path is the
 [Sealos](https://sealos.io/products/app-store/skardi/) template.
 
+The full image's `documents` support is **PDF-only**: it ships PDFium, but not
+the LibreOffice/ImageMagick converters that Office/ODF/image inputs need, and
+OCR is HTTP-only (`ocr_server_url`) in every build. For a non-PDF corpus,
+derive an image that installs those tools —
+`FROM ghcr.io/skardilabs/skardi/skardi-server-full:latest` plus
+`apt-get install -y libreoffice imagemagick`. See
+[docs/documents.md](docs/documents.md).
+
 </details>
 
 <details>
