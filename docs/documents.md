@@ -129,6 +129,20 @@ result OCR is performed via an **HTTP OCR engine**: set `ocr_server_url`.
   only when `ocr_server_url` is configured. With no engine, parsing proceeds on
   native text (logged), no error.
 
+**The published full image carries no converters.**
+`skardi-server-full` is the only pre-built image with the `documents` feature,
+and it ships PDFium (so PDF parsing and `render_page_images` work out of the
+box) but installs neither LibreOffice nor ImageMagick — non-PDF inputs
+therefore fail to parse: in a mixed corpus each one is skipped with a warning,
+and an all-non-PDF corpus trips the wholesale-failure guard and errors the
+scan. Derive an image to add the converters:
+
+```dockerfile
+FROM ghcr.io/skardilabs/skardi/skardi-server-full:latest
+RUN apt-get update && apt-get install -y libreoffice imagemagick \
+    && rm -rf /var/lib/apt/lists/*
+```
+
 **Preflight at registration:** problems surface when the source is registered,
 not mid-scan. `ocr: on` with no `ocr_server_url` fails with a clear, actionable
 error. Non-PDF globs without LibreOffice produce a warning (PDF-only corpora

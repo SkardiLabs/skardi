@@ -315,13 +315,24 @@ infrastructure layer. See [docs/rss.md](docs/rss.md).
 docker run --rm -p 8080:8080 \
   -v /path/to/ctx.yaml:/config/ctx.yaml \
   -v /path/to/pipelines:/config/pipelines \
-  ghcr.io/skardilabs/skardi/skardi-server:latest \
+  ghcr.io/skardilabs/skardi/skardi-server-lite:latest \
   --ctx /config/ctx.yaml --pipeline /config/pipelines --port 8080
 ```
 
-Use the `skardi-server-rag` tag for the embedding + chunk UDFs, or build locally
-with `docker build -t skardi .` (`--build-arg FEATURES=rag`). The fastest cloud
-path is the [Sealos](https://sealos.io/products/app-store/skardi/) template.
+Two images are published per release: `skardi-server-lite` (default build —
+chunking only) and `skardi-server-full` (every stable feature: RAG/embedding,
+LLM extraction, documents, RSS). For anything in between, build locally with
+`docker build -t skardi --build-arg FEATURES=<flags> .` (e.g. `FEATURES=rag`).
+The fastest cloud path is the
+[Sealos](https://sealos.io/products/app-store/skardi/) template.
+
+The full image's `documents` support is **PDF-only**: it ships PDFium, but not
+the LibreOffice/ImageMagick converters that Office/ODF/image inputs need, and
+OCR is HTTP-only (`ocr_server_url`) in every build. For a non-PDF corpus,
+derive an image that installs those tools —
+`FROM ghcr.io/skardilabs/skardi/skardi-server-full:latest` plus
+`apt-get install -y libreoffice imagemagick`. See
+[docs/documents.md](docs/documents.md).
 
 </details>
 
