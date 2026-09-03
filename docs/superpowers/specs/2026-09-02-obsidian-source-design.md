@@ -1,8 +1,8 @@
 # Obsidian Vault Source Design
 
-**Status:** Draft for review
+**Status:** Implemented (plan: docs/superpowers/plans/2026-09-03-obsidian-source.md, branch feature/obsidian-source)
 **Date:** 2026-09-02
-**Branch:** `feature/obsidian-source-design`
+**Branch:** `feature/obsidian-source`
 
 ## Summary
 
@@ -403,3 +403,21 @@ README.md                                         # source list entry
 - `kind = 'external'` already ships; bare-URL detection could join it.
 - Block-level rows (headings, callouts) if chunking pipelines want structure finer than a note.
 - Live S3 verification as an opt-in integration test, mirroring `documents_s3_live`.
+
+## Implementation notes (2026-09)
+
+Deviations from this spec that were settled during implementation, each
+covered by a test:
+
+- **Bare wikilink names containing `.`** (`[[Note.md]]`, `[[Note v2.1]]`)
+  try a root-level exact path first and fall back to the name lookup. The
+  spec's pure name rule made `[[Note.md]]` `missing` while Obsidian opens it.
+- **URL-scheme detection** uses `^[A-Za-z][A-Za-z0-9+.-]*:\S` (RFC 3986
+  scheme grammar) instead of a fixed scheme list, so `obsidian://`,
+  `zotero://`, `mailto:` all classify as `external`.
+- **Scan entry point** is an async `run_scan(root, opts)` wrapper around the
+  synchronous `VaultScan::run` on `spawn_blocking`; `ObsidianScanExec` awaits
+  it inside a one-item stream. No blocking on a Tokio worker.
+- **Autolinks** (`<https://…>`) carry `display_text = NULL` rather than
+  repeating the URL, so `display_text IS NOT NULL` means "the author wrote
+  text".
