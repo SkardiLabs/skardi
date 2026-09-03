@@ -126,11 +126,14 @@ pipelines should still check proxy read timeouts (nginx's
 proxy counts any bytes as liveness).
 
 **Audit grouping.** A legacy-protocol session (2025-11-25 and earlier)
-groups its queries and pipeline runs in the query-audit ledger under the
-transport's `Mcp-Session-Id`. Stateless-protocol requests (2026-07-28 and
-later) are attributed per-request with a minted UUID — that protocol
-revision removed the conversation-level handle, so there is nothing durable
-to group by.
+groups its pipeline runs — and the queries that carry `purpose` — in the
+query-audit ledger under the transport's `Mcp-Session-Id`. Stateless-protocol
+requests (2026-07-28 and later) are attributed per-request with a minted
+UUID — that protocol revision removed the conversation-level handle, so
+there is nothing durable to group by. On either protocol the id reaches a
+`query` audit row only inside `ai_context`, which is omitted when `purpose`
+is absent: a purpose-less query is recorded with no session id at all.
+Pipeline runs always carry the id, via `X-Skardi-Session-Id`.
 
 ---
 
@@ -163,10 +166,12 @@ schema as the standard `description` keyword, so the model no longer has
 to guess semantics from the parameter name alone.
 
 Every pipeline call carries a session id as `X-Skardi-Session-Id` — the
-same id `query` sends in `ai_context.session_id` — so an MCP session's
-pipeline runs and ad-hoc queries group together in the query audit ledger.
-On the stdio bridge that id is one UUID per MCP connection; on `/mcp` see
-audit grouping under [Remote (streamable HTTP)](#remote-streamable-http).
+same id `query` sends in `ai_context.session_id` when `purpose` is given —
+so an MCP session's pipeline runs and purposeful ad-hoc queries group
+together in the query audit ledger. A query without `purpose` sends no
+`ai_context` and is audited without a session id, so it stands outside the
+group. On the stdio bridge the id is one UUID per MCP connection; on `/mcp`
+see audit grouping under [Remote (streamable HTTP)](#remote-streamable-http).
 
 ### `query`
 
@@ -176,7 +181,7 @@ Ad-hoc SQL against the federated engine — the MCP face of `POST /query`.
 |---|---|---|
 | `sql` | string, **required** | One statement. DML only on `access_mode: read_write` sources; DDL is always rejected. |
 | `max_rows` | integer, optional | Result row cap; server default 1000. |
-| `purpose` | string, optional | One line on why you are running this query. Sent as `ai_context: {purpose, session_id}` and recorded in the server's query audit log; the `session_id` is the same per-connection (bridge) or per-session/per-request (`/mcp`) id pipeline calls carry, so related calls group together in the ledger. Omitted entirely when not provided. |
+| `purpose` | string, optional | One line on why you are running this query. Sent as `ai_context: {purpose, session_id}` and recorded in the server's query audit log; the `session_id` is the same per-connection (bridge) or per-session/per-request (`/mcp`) id pipeline calls carry, so related calls group together in the ledger. Omitted entirely when not provided — a query without `purpose` is audited without a session id and does not group with the session's other calls. |
 
 ### `list_data_sources`
 
