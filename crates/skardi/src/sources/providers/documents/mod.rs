@@ -4,10 +4,6 @@
 //! into queryable `(file, page)` rows via the pure-Rust `liteparse` crate.
 //! Everything here is behind the `documents` Cargo feature.
 
-// `pub(crate)` rather than private: `llm_extract`'s image fetch reuses
-// [`blob::BlobStore`] to read `s3://` `image_ref`s, so that S3 client
-// construction and the env-only credential contract live in exactly one place.
-pub(crate) mod blob;
 mod parse;
 mod table;
 

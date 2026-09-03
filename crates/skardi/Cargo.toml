@@ -29,6 +29,10 @@ chunking = ["dep:text-splitter"]
 rag = ["embedding", "chunking"]
 # documents source connector: parse a folder of files into queryable (file, page) rows.
 documents = ["dep:liteparse", "dep:glob", "dep:object_store"]
+# obsidian source connector: an Obsidian vault (local dir or s3:// prefix) as
+# `notes` / `links` / `tags` catalog tables. Shares `providers/blob.rs` with
+# `documents` (hence glob + object_store); pulldown-cmark walks note bodies.
+obsidian = ["dep:glob", "dep:object_store", "dep:pulldown-cmark"]
 # rss source connector: RSS/Atom/JSON-Feed subscriptions as queryable tables.
 # reqwest/gzip: the fetcher decodes gzip-compressed feed responses itself
 # (the response-size cap is measured on the decoded stream), which needs the
@@ -146,16 +150,21 @@ redis = { version = "1.0.0-rc.2", default-features = false, features = ["cluster
 liteparse = { version = "2.4.0", default-features = false, optional = true }
 # Stable fingerprints for Open Connector contracts and document IDs.
 blake3 = "1"
-# include_globs matching for the documents connector.
+# include_globs (documents) / exclude_globs (obsidian) matching.
 glob = { version = "0.3", optional = true }
+# CommonMark event stream for the obsidian connector (code ranges, links,
+# images). `default-features = false` drops the getopts/html bits; the 0.13.4
+# resolution is already in Cargo.lock via text-splitter.
+pulldown-cmark = { version = "0.13", default-features = false, optional = true }
 # Label lookup + transcoding for the rss sanitation ladder's re-encode rung.
 encoding_rs = { version = "0.8", optional = true }
 # Deterministic HTML→Markdown for rss item content.
 htmd = { version = "0.5.5", optional = true }
 # RSS 0.9x/1.0/2.0, Atom, and JSON Feed parsing into one model.
 feed-rs = { version = "2.4", optional = true }
-# object-store (S3/GCS/Azure) backend for the documents connector's source `path`
-# and `image_store`. Only the `aws` scheme is wired in v1 (see blob.rs).
+# object-store (S3/GCS/Azure) backend for the documents connector's source
+# `path` and `image_store`, and the obsidian connector's vault `path`. Only
+# the `aws` scheme is wired in v1 (see blob.rs).
 object_store = { workspace = true, optional = true }
 secrecy = "0.10"
 pgvector = { version = "0.4", features = ["sqlx"] }
@@ -170,6 +179,10 @@ uuid = { workspace = true }
 # register_all also installs ->/->>/? operator rewrites session-wide, so
 # it must not hide behind graph::register_graph_udtfs).
 datafusion-functions-json = "0.52"
+
+[target.'cfg(unix)'.dependencies]
+# `O_NOFOLLOW` for blob.rs's no-follow read (already in the tree via tokio).
+libc = "0.2"
 
 [dev-dependencies]
 tokio-test = "0.4"

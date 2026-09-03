@@ -1,3 +1,9 @@
+// Shared local-vs-object-store I/O for the `documents` and `obsidian`
+// connectors. `pub(crate)`: `llm_extract`'s image fetch also reads `s3://`
+// refs through it so S3 client construction and the env-only credential
+// contract live in exactly one place.
+#[cfg(any(feature = "documents", feature = "obsidian"))]
+pub(crate) mod blob;
 pub mod clickhouse;
 #[cfg(feature = "documents")]
 pub mod documents;

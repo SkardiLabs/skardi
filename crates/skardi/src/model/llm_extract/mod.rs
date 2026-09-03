@@ -651,9 +651,9 @@ fn fetch_image_with_policy(
     // branch such a ref would fall through to `std::fs::read("s3://…")` and fail
     // with a misleading "No such file or directory".
     if kind == RefKind::S3 {
-        #[cfg(feature = "documents")]
+        #[cfg(any(feature = "documents", feature = "obsidian"))]
         {
-            use crate::sources::providers::documents::blob::BlobStore;
+            use crate::sources::providers::blob::{BlobStore, ReadOptions};
 
             let handle = tokio::runtime::Handle::current();
             let bytes = tokio::task::block_in_place(|| {
@@ -661,7 +661,14 @@ fn fetch_image_with_policy(
                     // Build the store inside this runtime: the underlying reqwest
                     // client must not outlive / cross runtimes (see blob.rs).
                     let (store, loc) = BlobStore::resolve(image_ref)?;
-                    store.get(&loc).await
+                    store
+                        .get(
+                            &loc,
+                            ReadOptions {
+                                follow_symlinks: true,
+                            },
+                        )
+                        .await
                 })
             })
             .with_context(|| format!("reading s3 image_ref '{image_ref}'"))?;
@@ -670,11 +677,11 @@ fn fetch_image_with_policy(
                 mime: mime_from_path(image_ref),
             });
         }
-        #[cfg(not(feature = "documents"))]
+        #[cfg(not(any(feature = "documents", feature = "obsidian")))]
         {
             return Err(anyhow::anyhow!(
-                "cannot fetch image_ref '{image_ref}': s3:// refs require the `documents` \
-                 Cargo feature (which provides the S3 client). Rebuild with \
+                "cannot fetch image_ref '{image_ref}': s3:// refs require the `documents` or \
+                 `obsidian` Cargo feature (either provides the S3 client). Rebuild with \
                  --features documents, or use a local image_store."
             ));
         }
