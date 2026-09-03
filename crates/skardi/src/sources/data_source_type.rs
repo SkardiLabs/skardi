@@ -20,6 +20,8 @@ pub enum DataSourceType {
     Documents,
     Dynamodb,
     Rss,
+    /// Obsidian vault exposed as `notes` / `links` / `tags` (read-only, catalog-level).
+    Obsidian,
     Graph,
     // Explicit rename: the `lowercase` rule would produce `openconnector`,
     // but the public YAML spelling (and the design spec) is `open_connector`.
@@ -45,6 +47,7 @@ impl DataSourceType {
             Self::Documents => "documents",
             Self::Dynamodb => "dynamodb",
             Self::Rss => "rss",
+            Self::Obsidian => "obsidian",
             Self::Graph => "graph",
             Self::OpenConnector => "open_connector",
         }
@@ -87,6 +90,23 @@ mod tests {
         let t: DataSourceType = serde_yaml::from_str("rss").unwrap();
         assert_eq!(t, DataSourceType::Rss);
         assert_eq!(t.as_str(), "rss");
+    }
+
+    #[test]
+    fn obsidian_variant_roundtrips() {
+        let t: DataSourceType = serde_yaml::from_str("obsidian").unwrap();
+        assert_eq!(t, DataSourceType::Obsidian);
+        assert_eq!(t.as_str(), "obsidian");
+    }
+
+    /// The JSON spelling is load-bearing too: `/data_source` serialises the
+    /// type, so pin both directions rather than only the YAML config path.
+    #[test]
+    fn obsidian_roundtrips_as_lowercase_json_string() {
+        let json = serde_json::to_string(&DataSourceType::Obsidian).unwrap();
+        assert_eq!(json, "\"obsidian\"");
+        let back: DataSourceType = serde_json::from_str("\"obsidian\"").unwrap();
+        assert_eq!(back, DataSourceType::Obsidian);
     }
 
     #[test]

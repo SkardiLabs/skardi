@@ -13,6 +13,8 @@ use skardi::sources::providers::influxdb::register_influxdb_tables;
 use skardi::sources::providers::lance::register_lance_table;
 use skardi::sources::providers::mongo::register_mongo_tables;
 use skardi::sources::providers::mysql::register_mysql_tables;
+#[cfg(feature = "obsidian")]
+use skardi::sources::providers::obsidian::register_obsidian_tables;
 use skardi::sources::providers::open_connector::{
     OpenConnectorConfig, register_open_connector_tables,
 };
@@ -865,6 +867,10 @@ const CATALOG_SUPPORTED_SOURCES: &[DataSourceType] = &[
     // pair `main.feeds`/`main.items`, so per-table `options` must be rejected
     // by the same guard.
     DataSourceType::Rss,
+    // Obsidian is catalog-only too: one vault is one catalog exposing the
+    // fixed trio `main.notes`/`main.links`/`main.tags`, so per-table
+    // `options` must be rejected by the same guard.
+    DataSourceType::Obsidian,
     // Graph is catalog-only as well: one source is one catalog exposing the
     // declared views as `main.<view>`, with per-table `options` rejected by
     // the same guard.
@@ -2038,6 +2044,53 @@ async fn register_data_source_for_pass(
                     name: source.name.clone(),
                     error: "rss data source type requires the `rss` feature to be enabled at \
                             build time"
+                        .to_string(),
+                }
+                .into());
+            }
+        }
+        DataSourceType::Obsidian => {
+            #[cfg(feature = "obsidian")]
+            {
+                tracing::info!(
+                    "Registering Obsidian source: {} at {:?} (hierarchy_level: {:?})",
+                    source.name,
+                    source.path,
+                    source.hierarchy_level
+                );
+
+                let path_str = source
+                    .path
+                    .to_str()
+                    .ok_or_else(|| ConfigError::NonUtf8Path {
+                        name: source.name.clone(),
+                        path: source.path.clone(),
+                    })?;
+
+                // Catalog-only and read-only are re-checked inside the
+                // provider, which is the single enforcement point shared by
+                // this arm and the embedder-facing entry point — the same
+                // arrangement as the RSS arm above.
+                register_obsidian_tables(
+                    session_ctx,
+                    &source.name,
+                    path_str,
+                    source.options.as_ref(),
+                    source.access_mode.is_read_write(),
+                    source.hierarchy_level,
+                )
+                .await
+                .map_err(|e| ConfigError::DataSourceRegistrationFailed {
+                    name: source.name.clone(),
+                    error: format!("{e:#}"),
+                })?;
+            }
+            #[cfg(not(feature = "obsidian"))]
+            {
+                return Err(ConfigError::DataSourceRegistrationFailed {
+                    name: source.name.clone(),
+                    error: "obsidian data source type requires the `obsidian` feature to be \
+                            enabled at build time"
                         .to_string(),
                 }
                 .into());
@@ -3247,6 +3300,100 @@ feeds:
         );
     }
 
+    /// An Obsidian source: catalog-level, read-only, `path` is the vault
+    /// root. No typed config block — the vault is entirely described by
+    /// `path` plus the flat `options` map.
+    fn obsidian_source(
+        name: &str,
+        path: &str,
+        options: Option<HashMap<String, String>>,
+        access_mode: AccessMode,
+    ) -> DataSource {
+        DataSource {
+            name: name.to_string(),
+            source_type: DataSourceType::Obsidian,
+            path: PathBuf::from(path),
+            // Deliberately absent, like RSS: a vault has no connection
+            // string, so `Obsidian` must not be in the
+            // connection-string-required arm of `validate_data_sources`.
+            connection_string: None,
+            schema: None,
+            options,
+            hierarchy_level: HierarchyLevel::Catalog,
+            access_mode,
+            enable_cache: false,
+            description: None,
+            open_connector: None,
+            rss: None,
+            graph: None,
+        }
+    }
+
+    #[test]
+    fn validate_accepts_obsidian_source() {
+        // Pins the omission above: no `connection_string`, and validation
+        // must still accept it.
+        let source = obsidian_source("vault", "/tmp/vault", None, AccessMode::ReadOnly);
+        validate_data_sources(&[source]).expect("valid obsidian source");
+    }
+
+    #[test]
+    fn validate_rejects_obsidian_reserved_catalog_names() {
+        // `Obsidian` joins CATALOG_SUPPORTED_SOURCES, so a vault named after
+        // a built-in catalog must be refused before `register_catalog` can
+        // replace it.
+        for reserved in ["datafusion", "information_schema"] {
+            let source = obsidian_source(reserved, "/tmp/vault", None, AccessMode::ReadOnly);
+            let err = validate_data_sources(&[source]).unwrap_err();
+            let config_err = err.downcast_ref::<ConfigError>().unwrap();
+            assert!(
+                matches!(
+                    config_err,
+                    ConfigError::ReservedCatalogSourceName { name } if name == reserved
+                ),
+                "got {config_err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_obsidian_catalog_table_option() {
+        // The vault's tables are fixed (`main.notes` / `main.links` /
+        // `main.tags`), so a flat `table` option must fail rather than be
+        // silently ignored.
+        let options = HashMap::from([("table".to_string(), "notes".to_string())]);
+        let source = obsidian_source("vault", "/tmp/vault", Some(options), AccessMode::ReadOnly);
+
+        let err = validate_data_sources(&[source]).unwrap_err();
+        let config_err = err.downcast_ref::<ConfigError>().unwrap();
+        assert!(
+            matches!(
+                config_err,
+                ConfigError::CatalogModeConflictingOptions { name, option }
+                    if name == "vault" && option == "table"
+            ),
+            "got {config_err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_obsidian_read_write() {
+        // The Obsidian provider is read-only, so `Obsidian` is absent from
+        // WRITABLE_SOURCE_TYPES and the generic access_mode gate rejects
+        // read_write — as with rss, there is no obsidian-specific check.
+        let source = obsidian_source("vault", "/tmp/vault", None, AccessMode::ReadWrite);
+        let err = validate_data_sources(&[source]).unwrap_err();
+        let config_err = err.downcast_ref::<ConfigError>().unwrap();
+        assert!(
+            matches!(
+                config_err,
+                ConfigError::UnsupportedWriteMode { name, source_type }
+                    if name == "vault" && *source_type == DataSourceType::Obsidian
+            ),
+            "got {config_err}"
+        );
+    }
+
     /// A minimal valid `graph:` block with one view. The URL points at a
     /// closed port — validation is pure (no network I/O), so it passes
     /// here; reachability is registration's concern.
@@ -3469,6 +3616,86 @@ spec:
         assert_eq!(col(0), "https://feeds.example.invalid/f.xml");
         assert_eq!(col(1), "https://feeds.example.invalid/f.xml");
         assert_eq!(col(2), "never");
+    }
+
+    /// The checked-in vault the registration tests below read. Relative to
+    /// `crates/server`, so it resolves the same in every CI checkout.
+    #[cfg(feature = "obsidian")]
+    const OBSIDIAN_FIXTURE_VAULT: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../skardi/src/sources/providers/obsidian/fixtures/vault"
+    );
+
+    /// A `type: obsidian` source in a build without the `obsidian` feature
+    /// must fail at registration with a message naming the feature — the
+    /// config parses fine (nothing in the block is feature-gated), so the
+    /// failure is a build-capability error, not a serde one.
+    #[cfg(not(feature = "obsidian"))]
+    #[tokio::test]
+    async fn test_register_obsidian_source_without_feature_names_the_feature() {
+        let source = obsidian_source("vault", "/tmp/vault", None, AccessMode::ReadOnly);
+        let mut session_ctx = SessionContext::new();
+        let err = register_data_sources(&mut session_ctx, &[source])
+            .await
+            .unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("`obsidian` feature"), "unexpected error: {msg}");
+    }
+
+    /// Registration through the server's own entry point, then a query
+    /// against the catalog it registered. Zero network: the fixture vault is
+    /// a local directory.
+    #[cfg(feature = "obsidian")]
+    #[tokio::test]
+    async fn test_register_obsidian_source_and_query_notes() {
+        let source = obsidian_source(
+            "vault",
+            OBSIDIAN_FIXTURE_VAULT,
+            None,
+            AccessMode::ReadOnly,
+        );
+        let mut session_ctx = SessionContext::new();
+        register_data_sources(&mut session_ctx, &[source])
+            .await
+            .expect("obsidian source should register");
+
+        let batches = session_ctx
+            .sql("SELECT count(*) FROM vault.main.notes")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let count = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap()
+            .value(0);
+        // 12 `.md` files under the fixture vault; `.obsidian/` and `.trash/`
+        // are excluded by the provider.
+        assert_eq!(count, 12);
+    }
+
+    /// `access_mode: read_write` never reaches the tables: the provider is
+    /// the single enforcement point, so registration fails even though this
+    /// path skips `validate_data_sources` (which would reject it earlier via
+    /// WRITABLE_SOURCE_TYPES).
+    #[cfg(feature = "obsidian")]
+    #[tokio::test]
+    async fn test_register_obsidian_read_write_fails() {
+        let source = obsidian_source(
+            "vault",
+            OBSIDIAN_FIXTURE_VAULT,
+            None,
+            AccessMode::ReadWrite,
+        );
+        let mut session_ctx = SessionContext::new();
+        let err = register_data_sources(&mut session_ctx, &[source])
+            .await
+            .unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("read-only"), "unexpected error: {msg}");
     }
 
     #[test]

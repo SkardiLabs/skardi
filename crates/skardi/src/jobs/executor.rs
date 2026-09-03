@@ -376,6 +376,9 @@ impl JobExecutor {
             Some(DataSourceType::Rss) => Err(JobSubmitError::Internal(anyhow::anyhow!(
                 "rss sources are read-only and cannot be used as a job destination"
             ))),
+            Some(DataSourceType::Obsidian) => Err(JobSubmitError::Internal(anyhow::anyhow!(
+                "obsidian sources are read-only and cannot be used as a job destination"
+            ))),
             Some(DataSourceType::Graph) => Err(JobSubmitError::Internal(anyhow::anyhow!(
                 "graph sources are read-only and cannot be used as a job destination"
             ))),
