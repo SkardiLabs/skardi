@@ -421,3 +421,7 @@ covered by a test:
 - **Autolinks** (`<https://…>`) carry `display_text = NULL` rather than
   repeating the URL, so `display_text IS NOT NULL` means "the author wrote
   text".
+- **Email autolinks** (`<me@example.com>`) get `mailto:` restored on their
+  target. pulldown-cmark reports the bare address and prepends the scheme only
+  when rendering HTML; without it the target carries no scheme and would
+  resolve as a note name instead of `external`.
