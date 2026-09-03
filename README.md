@@ -110,8 +110,9 @@ spec:
 ```
 
 **4 — The agent has a new tool.** One definition, every binding — shell, REST,
-and MCP — so the same promoted pipeline works in Claude Code, Cursor, your own
-loop, or any HTTP host, with no wrapper code to maintain.
+and MCP over both transports (local stdio and remote streamable HTTP) — so the
+same promoted pipeline works in Claude Code, Cursor, your own loop, claude.ai,
+or any HTTP host, with no wrapper code to maintain.
 
 ```bash
 # shell verb — any agent with a Bash tool, no MCP config
@@ -119,9 +120,17 @@ skardi run weekly-churn -p window='7 days'
 # same pipeline, served as REST
 curl -X POST localhost:8080/weekly-churn/execute \
   -H 'Content-Type: application/json' -d '{"window": "7 days"}'
-# same pipeline as an MCP tool — hosts without a shell (Claude Desktop, …)
+# same pipeline as an MCP tool — hosts that spawn a local process (Claude Desktop, …)
 skardi mcp
+# … and as remote MCP — hosts that only take a URL (claude.ai, hosted agents):
+# the server above already serves http://localhost:8080/mcp. With auth enabled
+# every request carries a Bearer token; a public hostname is declared with
+# --mcp-allowed-host api.example.com (loopback is always allowed).
 ```
+
+Both MCP bindings — the local `skardi mcp` bridge and the server's `/mcp`
+endpoint — project the same tool surface; [docs/mcp.md](docs/mcp.md) covers
+host setup, auth, the host allowlist, and reverse proxies for both.
 
 Promoting queries into pipelines is only the simplest form of **Act**. The same ledger supports
 acting on *intentions*: when every weekday morning ends with the same GitHub +
