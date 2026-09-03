@@ -99,6 +99,29 @@ spec:
     let mut pipelines: HashMap<String, StandardPipeline> = HashMap::new();
     pipelines.insert(pipeline.name().to_string(), pipeline);
 
+    // A pipeline literally named `mcp`: its REST route is `/mcp/execute`,
+    // one path segment below the MCP mount — the worst-case name for the
+    // exact-mount regression test below.
+    let mcp_yaml_path = tmp.path().join("mcp.yaml");
+    let mut f = std::fs::File::create(&mcp_yaml_path).unwrap();
+    f.write_all(
+        br#"
+kind: pipeline
+metadata:
+  name: "mcp"
+  version: "1.0.0"
+  description: "Deliberately named after the MCP mount point"
+spec:
+  query: |
+    SELECT COUNT(*) AS n FROM products WHERE price <= {max_price}
+"#,
+    )
+    .unwrap();
+    let mcp_pipeline = StandardPipeline::load_from_file(&mcp_yaml_path, Arc::clone(&ctx))
+        .await
+        .unwrap();
+    pipelines.insert(mcp_pipeline.name().to_string(), mcp_pipeline);
+
     let engine = Arc::new(skardi::engine::datafusion::DataFusionEngine::new_with_arc(
         Arc::clone(&ctx),
     ));
@@ -365,6 +388,29 @@ async fn anonymous_initialize_is_a_transport_401() {
         .await
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+}
+
+/// Regression: the MCP service is mounted at exactly `/mcp`, so a pipeline
+/// literally named `mcp` keeps its REST surface at `/mcp/execute`. A prefix
+/// mount (`nest_service`) would shadow that route from every URL-borne
+/// caller — REST, the CLI, and the stdio bridge alike.
+#[tokio::test]
+async fn pipeline_named_mcp_is_not_shadowed_by_the_mount() {
+    let (state, _tmp) = make_app_state(AuthLayer::None, None).await;
+    let addr = serve(state).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/mcp/execute"))
+        .header("content-type", "application/json")
+        .body(json!({"max_price": 1000.0}).to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_slice(&resp.bytes().await.unwrap()).unwrap();
+    assert_eq!(body["success"], json!(true), "{body}");
+    // Three products at or under 1000: Sony 199, Samsung 599, Apple 999.
+    assert_eq!(body["data"][0]["n"], json!(3), "{body}");
 }
 
 /// rmcp's stateless client is the Discover lifecycle: no `initialize`

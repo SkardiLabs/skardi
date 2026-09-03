@@ -15,15 +15,17 @@ use crate::server::AppState;
 use gate::SessionGate;
 use handler::McpHandler;
 
-/// Nest the gated MCP service at `/mcp`. `rest` is deliberately the
+/// Mount the gated MCP service at exactly `/mcp`. `rest` is deliberately the
 /// pre-middleware router: transport middleware (CORS today) applies exactly
 /// once, to the inbound `/mcp` request — capturing the post-middleware
 /// router would run it a second time on every synthetic dispatch. Dispatch
 /// only ever targets REST paths, so no recursion into `/mcp` is possible.
 ///
-/// Known, accepted shadow: the nest hides REST's `/:name/execute` from
-/// every URL-borne caller for a pipeline literally named `mcp`; only `/mcp`
-/// itself still reaches it, via this pre-nest capture.
+/// The mount is `route_service` (exact path), not `nest_service` (prefix):
+/// streamable HTTP is a single-endpoint protocol (rmcp dispatches on method
+/// alone — POST/GET/DELETE against one URL), and a prefix mount would shadow
+/// REST's `/:name/execute` for a pipeline literally named `mcp` from every
+/// URL-borne caller — REST, the CLI, and the stdio bridge alike.
 pub(crate) fn attach(rest: Router, state: AppState) -> Router {
     let allowed_hosts = allowed_hosts(&state);
     let handler_rest = rest.clone();
@@ -43,7 +45,12 @@ pub(crate) fn attach(rest: Router, state: AppState) -> Router {
         // CSRF-shaped surface for Origin to guard).
         StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts),
     );
-    rest.nest_service("/mcp", SessionGate::new(service, state))
+    let gate = SessionGate::new(service, state);
+    // `/mcp/` is registered too: the prefix mount used to accept it, and a
+    // host configured with a trailing slash should not 404. Only these two
+    // exact paths — nothing deeper — so `/mcp/execute` stays REST's.
+    rest.route_service("/mcp", gate.clone())
+        .route_service("/mcp/", gate)
 }
 
 /// Additive host allowlist: the loopback trio is always allowed (rmcp's
@@ -229,6 +236,25 @@ mod tests {
             &[("authorization", auth.as_str())],
         )
         .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// The mount is exact, but a trailing slash still reaches the service —
+    /// the prefix mount accepted `/mcp/`, and a host URL configured that way
+    /// should not 404. Nothing deeper is claimed: `/mcp/execute` is REST's,
+    /// covered end-to-end in `tests/mcp_http.rs`.
+    #[tokio::test]
+    async fn trailing_slash_also_reaches_the_mcp_service() {
+        let state = make_state(AuthLayer::None, vec![]);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/mcp/")
+            .header("host", "127.0.0.1")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .body(Body::from(initialize_body()))
+            .unwrap();
+        let resp = configure_routes(state).oneshot(request).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
 

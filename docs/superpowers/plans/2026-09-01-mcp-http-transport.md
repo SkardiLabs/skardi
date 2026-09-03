@@ -814,7 +814,13 @@ pub(crate) fn attach(rest: Router, state: AppState) -> Router {
             ..Default::default()
         },
     );
-    rest.nest_service("/mcp", SessionGate::new(service, state))
+    // Exact mount, not `nest_service`: streamable HTTP is a single-endpoint
+    // protocol, and a prefix mount would shadow REST's `/:name/execute` for
+    // a pipeline literally named `mcp`. `/mcp/` is kept for hosts configured
+    // with a trailing slash.
+    let gate = SessionGate::new(service, state);
+    rest.route_service("/mcp", gate.clone())
+        .route_service("/mcp/", gate)
 }
 
 /// Additive host allowlist: the loopback trio is always allowed (rmcp's
