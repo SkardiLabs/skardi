@@ -434,10 +434,8 @@ mod tests {
             "SELECT arrow_typeof(modified_at) FROM vault.main.notes LIMIT 1",
         )
         .await;
-        assert_eq!(
-            strings(&b, 0)[0].as_deref(),
-            Some("Timestamp(Millisecond, Some(\"UTC\"))")
-        );
+        // DataFusion's own rendering of the type, not Arrow's Debug form.
+        assert_eq!(strings(&b, 0)[0].as_deref(), Some("Timestamp(ms, \"UTC\")"));
     }
 
     #[tokio::test]
