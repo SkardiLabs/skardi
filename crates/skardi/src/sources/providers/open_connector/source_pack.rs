@@ -58,6 +58,32 @@ impl FixedValue {
     }
 }
 
+/// What a table's row path resolves to.
+///
+/// Two upstream shapes, and the difference is a table's declaration rather
+/// than something the scan infers from the payload:
+///
+/// - [`RowShape::Array`] — a list endpoint. The overwhelming default.
+/// - [`RowShape::Object`] — a "read one thing" endpoint, where the response
+///   object IS the row. A document's plain text, a file's content, a single
+///   record fetched by id: these carry their payload as fields, not as a
+///   one-element list, and before this existed they could not be expressed
+///   as a pack table at all.
+///
+/// Sniffing the shape per response was rejected: a mistyped path that landed
+/// on an object would become a silent one-row table instead of the loud
+/// `RowPathNotArray` the array contract exists to raise. A declaration makes
+/// the wrong shape fail on the FIRST scan with a message naming both what it
+/// found and what the table asked for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RowShape {
+    /// The path resolves to an array; each element is a row.
+    #[default]
+    Array,
+    /// The path resolves to one object, which is the single row.
+    Object,
+}
+
 /// One stable table definition inside a source pack.
 #[derive(Debug, Clone, Copy)]
 pub struct SourcePackTable {
@@ -65,8 +91,11 @@ pub struct SourcePackTable {
     pub id: &'static str,
     /// Open Connector action backing the table (read-only by construction).
     pub action_id: &'static str,
-    /// Fixed row path of the row array in the action response.
+    /// Fixed row path of the rows in the action response.
     pub row_path: &'static str,
+    /// Whether [`Self::row_path`] resolves to an array of rows or to a single
+    /// row object. Declared, never sniffed — see [`RowShape`].
+    pub row_shape: RowShape,
     /// Fixed Arrow schema and field mappings.
     pub fields: &'static [FieldMapping],
     /// Pagination strategy.
@@ -862,6 +891,7 @@ mod tests {
             id,
             action_id: "t.action",
             row_path: "$.items",
+            row_shape: RowShape::Array,
             fields: &[],
             pagination: PaginationStrategy::SinglePage {
                 next_cursor_path: None,

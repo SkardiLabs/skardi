@@ -55,7 +55,7 @@ use super::json_to_arrow::RowConverter;
 use super::pagination::PaginationStrategy;
 use super::raw_schema::derive_raw_columns;
 use super::row_path::RowPath;
-use super::source_pack::SourcePackRegistry;
+use super::source_pack::{RowShape, SourcePackRegistry};
 use super::table::OpenConnectorTableProvider;
 use crate::sources::providers::udtf_args::strict_string_arg;
 
@@ -425,6 +425,12 @@ impl TableProvider for RawScanProvider {
             self.target.clone(),
             Arc::clone(&self.converter),
             self.row_path.clone(),
+            // A raw `open_connector_scan` has no pack table to declare a
+            // shape, and its whole contract is "the caller names an action
+            // and a row path". Arrays only: a UDTF that silently accepted a
+            // single object would be inferring the shape, which is the thing
+            // `RowShape` exists to prevent.
+            RowShape::Array,
             self.input.clone(),
             Vec::new(),
             projection.cloned(),

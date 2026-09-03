@@ -33,7 +33,7 @@ use super::error::OpenConnectorError;
 use super::json_to_arrow::RowConverter;
 use super::pagination::{CursorContinuation, Pagination, PaginationStrategy};
 use super::row_path::RowPath;
-use super::source_pack::{FixedValue, SourcePackTable};
+use super::source_pack::{FixedValue, RowShape, SourcePackTable};
 
 /// The scanned collection's identity and pagination contract — the shape
 /// shared by YAML-bound source-pack tables and `open_connector_scan` raw
@@ -89,6 +89,7 @@ pub struct OpenConnectorExec {
     target: ScanTarget,
     converter: Arc<RowConverter>,
     row_path: RowPath,
+    row_shape: RowShape,
     resource: Value,
     filter_inputs: Vec<(String, Value)>,
     projection: Option<Vec<usize>>,
@@ -125,6 +126,7 @@ impl OpenConnectorExec {
         target: ScanTarget,
         converter: Arc<RowConverter>,
         row_path: RowPath,
+        row_shape: RowShape,
         resource: Value,
         filter_inputs: Vec<(String, Value)>,
         projection: Option<Vec<usize>>,
@@ -153,6 +155,7 @@ impl OpenConnectorExec {
             target,
             converter,
             row_path,
+            row_shape,
             resource,
             filter_inputs,
             projection,
@@ -274,6 +277,7 @@ struct ScanState {
     target: ScanTarget,
     converter: Arc<RowConverter>,
     row_path: RowPath,
+    row_shape: RowShape,
     resource: Value,
     filter_inputs: Vec<(String, Value)>,
     projection: Option<Vec<usize>>,
@@ -361,6 +365,7 @@ impl ScanState {
             target: exec.target.clone(),
             converter: exec.converter.clone(),
             row_path: exec.row_path.clone(),
+            row_shape: exec.row_shape,
             resource: exec.resource.clone(),
             filter_inputs: exec.filter_inputs.clone(),
             projection: exec.projection.clone(),
@@ -541,7 +546,10 @@ impl ScanState {
                 code,
             });
         }
-        let rows = self.row_path.rows(&envelope, page)?;
+        let rows = match self.row_shape {
+            RowShape::Array => self.row_path.rows(&envelope, page)?,
+            RowShape::Object => self.row_path.single_row(&envelope, page)?,
+        };
         let batch = self.converter.convert(rows, page)?;
         // Conversion is synchronous, so it cannot be preempted by Tokio; do
         // not emit its result if it consumed the remaining scan budget.
@@ -659,6 +667,7 @@ mod tests {
             ScanTarget::from_pack_table(table, source_pack_version),
             Arc::new(RowConverter::new(table.fields).expect("converter")),
             RowPath::parse(table.row_path).expect("row path"),
+            table.row_shape,
             json!({}),
             vec![],
             None,
@@ -713,6 +722,7 @@ mod tests {
             id: "split.entries",
             action_id: "split.list",
             row_path: "$.entries",
+            row_shape: RowShape::Array,
             fields: &[FieldMapping {
                 name: "id",
                 path: "id",
@@ -784,6 +794,7 @@ mod tests {
             ScanTarget::from_pack_table(table, 1),
             Arc::new(RowConverter::new(table.fields).expect("converter")),
             RowPath::parse(table.row_path).expect("row path"),
+            table.row_shape,
             json!({"path": "/docs"}),
             vec![],
             None,

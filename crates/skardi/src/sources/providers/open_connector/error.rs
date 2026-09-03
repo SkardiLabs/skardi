@@ -463,6 +463,21 @@ pub enum OpenConnectorError {
         found: String,
     },
 
+    /// A single-object table's row path resolved to something that is not an
+    /// object. Distinct from [`Self::RowPathNotArray`] on purpose: the two
+    /// name opposite expectations, and one message covering both would leave
+    /// a reader unable to tell a table whose upstream started returning a
+    /// list from one whose declared shape is simply wrong.
+    #[error(
+        "Open Connector row path '{path}' on page {page} resolved to {found}, expected a single \
+         row object (this table declares `row_shape: object`)"
+    )]
+    RowPathNotObjectRow {
+        path: String,
+        page: usize,
+        found: String,
+    },
+
     /// A row could not be converted to the table's fixed Arrow schema. The
     /// `found` carries the JSON *kind* only — never the value itself, which
     /// may contain sensitive data.
