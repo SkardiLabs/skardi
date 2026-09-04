@@ -1,6 +1,6 @@
 //! Physical execution plan for SQLite FTS5 full-text search.
 
-use arrow::array::{ArrayRef, RecordBatch};
+use arrow::array::{ArrayRef, RecordBatch, RecordBatchOptions, new_empty_array};
 use arrow::datatypes::{DataType, SchemaRef};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -16,6 +16,7 @@ use std::fmt;
 use std::sync::Arc;
 use tokio_rusqlite::Connection;
 
+use super::fts_query::websearch_to_fts5;
 use super::{quote_sqlite_ident, sqlite_values_to_arrow};
 
 /// Physical execution plan that runs a SQLite FTS5 full-text search query using
@@ -35,6 +36,12 @@ use super::{quote_sqlite_ident, sqlite_values_to_arrow};
 /// Note: FTS5's `rank` is equivalent to `bm25(table)` and is negative (more
 /// negative = better match). We negate it so `_score` is positive and higher
 /// means more relevant, consistent with `pg_fts`.
+///
+/// `query` is what the user typed, not an FTS5 expression: it is translated by
+/// [`websearch_to_fts5`] on the way in, so the same parameter means the same
+/// thing here as it does in `pg_fts` behind `websearch_to_tsquery`. Text with
+/// nothing to search for returns no rows without reaching SQLite, because FTS5
+/// rejects an empty match string as a syntax error.
 #[derive(Debug, Clone)]
 pub struct SqliteFtsExec {
     conn: Arc<Connection>,
@@ -42,7 +49,9 @@ pub struct SqliteFtsExec {
     table_name: String,
     /// Name of the text column to search.
     text_col: String,
-    /// The user's search query string.
+    /// The user's search text, verbatim — translated to an FTS5 expression at
+    /// execution time rather than stored translated, so `EXPLAIN` output and
+    /// error messages keep showing what was actually asked.
     query: String,
     /// Maximum number of results to return.
     limit: usize,
@@ -141,12 +150,31 @@ impl SqliteFtsExec {
 
     /// Execute the query and return all rows as a single `RecordBatch`.
     async fn run(&self) -> DFResult<RecordBatch> {
+        let schema = self.schema.clone();
+
+        // No searchable term — an empty or punctuation-only question. FTS5
+        // treats an empty match string as a syntax error, so answer it here
+        // instead of letting a blank question come back as an execution
+        // failure (or, worse, as arbitrary rows).
+        let Some(match_expr) = websearch_to_fts5(&self.query) else {
+            tracing::debug!("sqlite_fts: query has no searchable term; returning no rows");
+            return RecordBatch::try_new_with_options(
+                schema.clone(),
+                schema
+                    .fields()
+                    .iter()
+                    .map(|f| new_empty_array(f.data_type()))
+                    .collect(),
+                &RecordBatchOptions::new().with_row_count(Some(0)),
+            )
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None));
+        };
+
         let sql = self.build_query();
         tracing::debug!("sqlite_fts SQL: {}", sql);
 
         let conn = Arc::clone(&self.conn);
-        let schema = self.schema.clone();
-        let query = self.query.clone();
+        let query = match_expr;
         let num_cols = schema.fields().len();
         let field_types: Vec<DataType> = schema
             .fields()

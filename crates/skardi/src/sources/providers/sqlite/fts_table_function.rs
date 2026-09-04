@@ -434,7 +434,9 @@ mod tests {
                    ('Database Systems', 'Overview of relational database management systems and SQL', 'database'),
                    ('Deep Learning', 'Advanced neural network architectures for machine learning', 'ai'),
                    ('Web Development', 'Modern web frameworks and frontend technologies', 'web'),
-                   ('Natural Language Processing', 'NLP techniques for text analysis and machine learning applications', 'ai');",
+                   ('Natural Language Processing', 'NLP techniques for text analysis and machine learning applications', 'ai'),
+                   ('Gateway Modes', 'The gateway runs in read-only mode and it doesn''t write anything back', 'ops'),
+                   ('Retry Policy', 'note: the retry policy is described in the ops runbook', 'ops');",
             )?;
             Ok(())
         })
@@ -728,6 +730,116 @@ mod tests {
             total_rows(&batches),
             0,
             "deleted article must not appear in FTS results"
+        );
+    }
+
+    // ─── The parameter is user text, not an FTS5 expression ──────────────
+    // Every query in this block returned an execution error before
+    // `websearch_to_fts5` sat in front of FTS5 (SkardiLabs/skardi-skills#39):
+    // FTS5 read the apostrophe as a string delimiter, the colon as a column
+    // filter, and the hyphen as a term boundary. These are the questions a
+    // person types into a search box, so they have to answer.
+
+    /// A hyphenated technical term is the vocabulary a technical corpus is
+    /// made of. It has to find the row, not merely avoid erroring.
+    #[tokio::test]
+    #[ignore]
+    async fn test_fts_hyphenated_term_finds_the_row() {
+        let mut ctx = SessionContext::new();
+        let (_reg, _db) = register_ci_fts(&mut ctx).await;
+
+        let batches = query_all(
+            &ctx,
+            "SELECT title FROM sqlite_fts('articles_fts', 'body', 'read-only mode', 10)",
+        )
+        .await;
+
+        let titles = batches[0]
+            .column_by_name("title")
+            .expect("title column")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("title is Utf8");
+        assert_eq!(total_rows(&batches), 1, "expected the read-only row");
+        assert_eq!(titles.value(0), "Gateway Modes");
+    }
+
+    /// The apostrophe matters most: a natural English question hits it before
+    /// a hyphenated term does.
+    #[tokio::test]
+    #[ignore]
+    async fn test_fts_apostrophe_finds_the_row() {
+        let mut ctx = SessionContext::new();
+        let (_reg, _db) = register_ci_fts(&mut ctx).await;
+
+        // Doubled for the SQL string literal; FTS5 sees `doesn't write`.
+        let batches = query_all(
+            &ctx,
+            "SELECT title FROM sqlite_fts('articles_fts', 'body', 'doesn''t write', 10)",
+        )
+        .await;
+        assert_eq!(total_rows(&batches), 1, "expected the read-only row");
+    }
+
+    /// A colon used to be read as a column filter and reported as
+    /// `no such column: note`.
+    #[tokio::test]
+    #[ignore]
+    async fn test_fts_colon_is_literal_text_not_a_column_filter() {
+        let mut ctx = SessionContext::new();
+        let (_reg, _db) = register_ci_fts(&mut ctx).await;
+
+        let batches = query_all(
+            &ctx,
+            "SELECT title FROM sqlite_fts('articles_fts', 'body', 'note: retry policy', 10)",
+        )
+        .await;
+        assert_eq!(total_rows(&batches), 1, "expected the retry-policy row");
+    }
+
+    /// A blank question is answerable without asking FTS5, which rejects an
+    /// empty match string outright. Zero rows is the honest answer; the
+    /// alternative that used to be possible — rows for a question nobody
+    /// asked — is worse than an error.
+    #[tokio::test]
+    #[ignore]
+    async fn test_fts_query_with_nothing_to_search_for_returns_no_rows() {
+        let mut ctx = SessionContext::new();
+        let (_reg, _db) = register_ci_fts(&mut ctx).await;
+
+        for query in ["", "   ", "---"] {
+            let batches = query_all(
+                &ctx,
+                &format!("SELECT title FROM sqlite_fts('articles_fts', 'body', '{query}', 10)"),
+            )
+            .await;
+            assert_eq!(total_rows(&batches), 0, "query {query:?}");
+        }
+    }
+
+    /// `websearch_to_tsquery`'s two operators, honoured on this backend too.
+    #[tokio::test]
+    #[ignore]
+    async fn test_fts_or_and_exclusion_operators() {
+        let mut ctx = SessionContext::new();
+        let (_reg, _db) = register_ci_fts(&mut ctx).await;
+
+        let both = query_all(
+            &ctx,
+            "SELECT title FROM sqlite_fts('articles_fts', 'body', 'gateway or runbook', 10)",
+        )
+        .await;
+        assert_eq!(total_rows(&both), 2, "or should reach both ops articles");
+
+        let excluded = query_all(
+            &ctx,
+            "SELECT title FROM sqlite_fts('articles_fts', 'body', 'gateway or runbook -policy', 10)",
+        )
+        .await;
+        assert_eq!(
+            total_rows(&excluded),
+            1,
+            "-policy should drop the runbook row"
         );
     }
 }
