@@ -90,7 +90,8 @@ Every schema carries the metadata key `skardi.obsidian.surface_version`
 
 - **Files:** every `*.md` under the root, minus `exclude_globs`
   (case-insensitive, `**` crosses folders), minus files over `max_file_bytes`,
-  minus symlinks (never followed, never read — see Security). Bytes that are
+  minus symlinks and special files such as FIFOs (never followed, never read —
+  see Security). Bytes that are
   not valid UTF-8 are decoded lossily (U+FFFD), never an error. A note skipped
   for size, or unreadable mid-scan, is still in the listing and so still a
   valid link *target*: `links.to_path` can name a path with no `notes` row.
@@ -162,7 +163,8 @@ rows.
 | Invalid UTF-8 | Row kept; lossy decode. |
 | Note larger than `max_file_bytes` | Skipped before it is read (the size comes from the listing); `warn` with path and size. The one case that drops a row. |
 | Symlinked file or directory inside the vault | Skipped at listing time; `warn` with path. |
-| Listed file replaced by a symlink before it is read | Open refused (`O_NOFOLLOW`); counted as a read failure. |
+| Listed file, or a directory above it, replaced by a symlink before the read | Open refused (`O_NOFOLLOW` on every component beneath the root); counted as a read failure. |
+| A `.md` that is not a regular file (FIFO, socket, device) | Skipped at listing time; if it appears after listing, the open is non-blocking and refused as a read failure. Never stalls the query. |
 | Some notes unreadable mid-scan | Skipped with a `warn` naming path and cause; the rest are returned. |
 | Every attempted read fails (permissions, S3 `List` without `Get`, expired credentials) | The query fails naming the root, the attempted count and the first failure — never an empty result. Size-cap and symlink skips are not attempts. |
 | No `.md` listed (empty vault, everything excluded or oversized) | Three empty tables; no error. |
@@ -174,16 +176,17 @@ Errors name paths, never note contents.
 ## Security
 
 - Symlinks under the root are never followed. Listing skips them, and each
-  read opens the file with `O_NOFOLLOW`, so a *file* swapped for a symlink
-  between listing and reading is refused rather than followed. `O_NOFOLLOW`
-  guards the final path component only: a *directory* on the path swapped for
-  a symlink after listing would still be traversed — the residual window on
-  Unix.
+  read walks from the root down to the file, opening every component relative
+  to its parent with `O_NOFOLLOW`, so a *file* or a *directory* swapped for a
+  symlink between listing and reading is refused rather than followed.
+- Only regular files are read. The final open is non-blocking and the handle
+  is type-checked, so a FIFO or device named `note.md` is refused instead of
+  stalling the query.
 - The vault root itself may be a symlink. It is operator configuration, not
   vault content, so registration follows it.
 - On non-Unix targets the no-follow open is approximated by a `symlink_metadata`
-  check before the read, which leaves a small race window. Run on Unix if that
-  matters.
+  check on every component before the read, which leaves a small race window.
+  Run on Unix if that matters.
 - Nothing is written, ever. `access_mode: read_write` is a startup error.
 
 ## Example queries

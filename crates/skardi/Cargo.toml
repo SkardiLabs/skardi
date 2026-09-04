@@ -183,9 +183,9 @@ uuid = { workspace = true }
 datafusion-functions-json = "0.52"
 
 [target.'cfg(unix)'.dependencies]
-# `O_NOFOLLOW` for blob.rs's no-follow read (already in the tree via tokio);
-# optional, enabled by the two features that compile blob.rs, so a
-# featureless build declares nothing new.
+# `openat` + `O_NOFOLLOW` for blob.rs's per-component no-follow read (already
+# in the tree via tokio); optional, enabled by the two features that compile
+# blob.rs, so a featureless build declares nothing new.
 libc = { version = "0.2", optional = true }
 
 [dev-dependencies]

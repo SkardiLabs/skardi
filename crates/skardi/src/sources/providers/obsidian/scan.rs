@@ -218,12 +218,9 @@ impl VaultScan {
                 continue;
             }
             attempted += 1;
-            let bytes = match handle.block_on(store.get(
-                &entry.loc,
-                ReadOptions {
-                    follow_symlinks: false,
-                },
-            )) {
+            let bytes = match handle
+                .block_on(store.get(&entry.loc, ReadOptions::NoSymlinksBeneath(&prefix)))
+            {
                 Ok(bytes) => bytes,
                 Err(e) => {
                     let cause = format!("{e:#}");

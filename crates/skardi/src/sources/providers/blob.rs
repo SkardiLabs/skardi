@@ -9,12 +9,13 @@
 //!
 //! Symlinks: `documents` follows them (its historical behavior); `obsidian`
 //! refuses them at listing time ([`ListOptions::follow_symlinks`]) *and* at
-//! read time ([`ReadOptions::follow_symlinks`], `O_NOFOLLOW` on unix) because a
-//! symlink inside a vault pointing outside it would otherwise let `path:
-//! ~/vault` read arbitrary files, and a file can be swapped for a symlink
+//! read time ([`ReadOptions::NoSymlinksBeneath`]: every path component below
+//! the root is opened with `O_NOFOLLOW` on unix) because a symlink inside a
+//! vault pointing outside it would otherwise let `path: ~/vault` read
+//! arbitrary files, and a file or a directory can be swapped for a symlink
 //! between the two calls.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -71,12 +72,20 @@ pub struct ListOptions {
     pub follow_symlinks: bool,
 }
 
-/// How [`BlobStore::get`] opens a local file.
+/// How [`BlobStore::get`] opens a local file. Ignored for S3, which has no
+/// symlinks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ReadOptions {
-    /// Local only: `true` is `std::fs::read`; `false` opens with `O_NOFOLLOW`
-    /// (unix) and refuses anything that is not a regular file. Ignored for S3.
-    pub follow_symlinks: bool,
+pub enum ReadOptions<'a> {
+    /// `std::fs::read`: symlinks anywhere on the path are followed.
+    FollowSymlinks,
+    /// Refuse every symlink between the listed prefix and the file. The
+    /// prefix (the vault root) is operator configuration and is opened
+    /// normally, symlink or not; each component beneath it is then opened
+    /// relative to its parent with `O_NOFOLLOW` (unix), so a directory *or*
+    /// a file swapped for a symlink after listing is refused. The final open
+    /// is non-blocking and the handle must be a regular file: a FIFO named
+    /// `note.md` would otherwise stall the scan waiting for a writer.
+    NoSymlinksBeneath(&'a Loc),
 }
 
 /// One listed object/file.
@@ -154,12 +163,20 @@ impl BlobStore {
     }
 
     /// Fetch the full bytes of one object/file.
-    pub async fn get(&self, loc: &Loc, opts: ReadOptions) -> Result<Vec<u8>> {
+    pub async fn get(&self, loc: &Loc, opts: ReadOptions<'_>) -> Result<Vec<u8>> {
         match (self, loc) {
-            (BlobStore::Local, Loc::Local(path)) if opts.follow_symlinks => {
-                std::fs::read(path).with_context(|| format!("reading {}", path.display()))
-            }
-            (BlobStore::Local, Loc::Local(path)) => read_local_no_follow(path),
+            (BlobStore::Local, Loc::Local(path)) => match opts {
+                ReadOptions::FollowSymlinks => {
+                    std::fs::read(path).with_context(|| format!("reading {}", path.display()))
+                }
+                ReadOptions::NoSymlinksBeneath(Loc::Local(root)) => {
+                    read_local_no_follow(root, path)
+                }
+                ReadOptions::NoSymlinksBeneath(Loc::S3 { .. }) => anyhow::bail!(
+                    "blob: NoSymlinksBeneath needs a local root for {}",
+                    path.display()
+                ),
+            },
             (BlobStore::Remote(store), Loc::S3 { key, .. }) => {
                 let res = store
                     .get(&OsPath::from(key.as_str()))
@@ -258,13 +275,19 @@ fn list_local(root: &Path, opts: ListOptions) -> Result<Vec<BlobEntry>> {
             if !opts.follow_symlinks {
                 // `DirEntry::file_type` does not follow links, so this sees
                 // the symlink itself, whether it points at a file or a dir.
-                // Fail closed: an entry that cannot be typed (unlinked between
-                // readdir and stat) is skipped rather than handed to `is_dir`
-                // below, which does follow.
+                // Only directories and regular files go on: a FIFO, socket or
+                // device named `x.md` is not a note, and a blocking open on it
+                // would stall the whole scan. Fail closed: an entry that cannot
+                // be typed (unlinked between readdir and stat) is skipped
+                // rather than handed to `is_dir` below, which does follow.
                 match entry.file_type() {
-                    Ok(kind) if !kind.is_symlink() => {}
-                    Ok(_) => {
+                    Ok(kind) if kind.is_dir() || kind.is_file() => {}
+                    Ok(kind) if kind.is_symlink() => {
                         tracing::warn!(path = %path.display(), "blob: skipping symlink");
+                        continue;
+                    }
+                    Ok(_) => {
+                        tracing::warn!(path = %path.display(), "blob: skipping special file (not a regular file or directory)");
                         continue;
                     }
                     Err(e) => {
@@ -307,57 +330,134 @@ fn list_local(root: &Path, opts: ListOptions) -> Result<Vec<BlobEntry>> {
     Ok(out)
 }
 
-/// Read a local file refusing to follow a symlink at the final path component.
-/// Unix: `O_NOFOLLOW` makes the open itself fail with `ELOOP` on a symlink,
-/// then the opened handle is checked to be a regular file (a FIFO or device
-/// would otherwise block or misbehave). This closes the listing→read race for
-/// the final path component only: a directory above it swapped for a symlink
-/// after listing is still followed (`O_NOFOLLOW` does not cover intermediate
-/// components); `docs/obsidian.md` records that residual window.
+/// Read `path`, which the listing found beneath `root`, without following a
+/// symlink at any component below the root.
+///
+/// Unix: the root is opened normally (it is operator configuration and may
+/// itself be a symlink), then every component of the relative remainder is
+/// opened with `openat(parent_fd, name, O_NOFOLLOW | …)`: directories with
+/// `O_DIRECTORY`, the file with `O_NONBLOCK`. A symlink at any level fails its
+/// open with `ELOOP` instead of being traversed, so the listing→read race is
+/// closed for the whole path, not just its last component. The non-blocking
+/// final open cannot stall on a FIFO waiting for a writer; the handle is then
+/// `fstat`ed and anything but a regular file is refused (`O_NONBLOCK` is inert
+/// on a regular file).
 #[cfg(unix)]
-fn read_local_no_follow(path: &Path) -> Result<Vec<u8>> {
+fn read_local_no_follow(root: &Path, path: &Path) -> Result<Vec<u8>> {
+    use std::ffi::CString;
+    use std::fs::File;
     use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::OpenOptionsExt;
 
-    let mut file = std::fs::OpenOptions::new()
+    let rel = path
+        .strip_prefix(root)
+        .with_context(|| format!("blob: {} is not beneath {}", path.display(), root.display()))?;
+    let root_dir = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-        .with_context(|| {
-            format!(
-                "blob: opening {} without following symlinks",
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(root)
+        .with_context(|| format!("blob: opening root directory {}", root.display()))?;
+    let mut dir = OwnedFd::from(root_dir);
+    let mut file: Option<File> = None;
+    let mut components = rel.components().peekable();
+    while let Some(component) = components.next() {
+        let Component::Normal(name) = component else {
+            anyhow::bail!(
+                "blob: refusing path component {component:?} in {}",
                 path.display()
-            )
-        })?;
+            );
+        };
+        let c_name = CString::new(name.as_bytes())
+            .with_context(|| format!("blob: NUL byte in {}", path.display()))?;
+        let last = components.peek().is_none();
+        let flags = libc::O_RDONLY
+            | libc::O_NOFOLLOW
+            | libc::O_CLOEXEC
+            | if last {
+                libc::O_NONBLOCK
+            } else {
+                libc::O_DIRECTORY
+            };
+        // SAFETY: `dir` is an open directory descriptor owned by this frame
+        // and `c_name` is a NUL-terminated string that outlives the call;
+        // `openat` reads both and writes nothing into our memory.
+        let fd = unsafe { libc::openat(dir.as_raw_fd(), c_name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error()).with_context(|| {
+                format!(
+                    "blob: opening {} without following symlinks (component {})",
+                    path.display(),
+                    name.to_string_lossy()
+                )
+            });
+        }
+        // SAFETY: `fd` was just returned by a successful `openat` and nothing
+        // else owns it; `OwnedFd` closes it exactly once.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        if last {
+            file = Some(File::from(fd));
+        } else {
+            dir = fd;
+        }
+    }
+    let mut file = file.ok_or_else(|| {
+        anyhow::anyhow!("blob: {} is the root itself, not a file", path.display())
+    })?;
     let meta = file
         .metadata()
         .with_context(|| format!("blob: stat {}", path.display()))?;
     if !meta.file_type().is_file() {
         anyhow::bail!("blob: {} is not a regular file", path.display());
     }
-    let mut buf = Vec::new();
+    let mut buf = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
     file.read_to_end(&mut buf)
         .with_context(|| format!("reading {}", path.display()))?;
     Ok(buf)
 }
 
-/// Non-unix fallback: check `symlink_metadata` before reading. There is a
-/// residual time-of-check/time-of-use window between the check and the read;
+/// Non-unix fallback: `symlink_metadata` on every component beneath `root`,
+/// then a regular-file check, before reading. There is a residual
+/// time-of-check/time-of-use window between the checks and the read;
 /// documented in `docs/obsidian.md`.
 #[cfg(not(unix))]
-fn read_local_no_follow(path: &Path) -> Result<Vec<u8>> {
-    let meta = std::fs::symlink_metadata(path)
-        .with_context(|| format!("blob: stat {} without following symlinks", path.display()))?;
-    if meta.file_type().is_symlink() {
-        anyhow::bail!(
-            "blob: opening {} without following symlinks: is a symlink",
-            path.display()
-        );
+fn read_local_no_follow(root: &Path, path: &Path) -> Result<Vec<u8>> {
+    let rel = path
+        .strip_prefix(root)
+        .with_context(|| format!("blob: {} is not beneath {}", path.display(), root.display()))?;
+    if rel.as_os_str().is_empty() {
+        anyhow::bail!("blob: {} is the root itself, not a file", path.display());
     }
+    let mut current = root.to_path_buf();
+    for component in rel.components() {
+        let Component::Normal(name) = component else {
+            anyhow::bail!(
+                "blob: refusing path component {component:?} in {}",
+                path.display()
+            );
+        };
+        current.push(name);
+        let meta = std::fs::symlink_metadata(&current).with_context(|| {
+            format!(
+                "blob: stat {} without following symlinks",
+                current.display()
+            )
+        })?;
+        if meta.file_type().is_symlink() {
+            anyhow::bail!(
+                "blob: opening {} without following symlinks: {} is a symlink",
+                path.display(),
+                current.display()
+            );
+        }
+    }
+    let meta = std::fs::symlink_metadata(&current)
+        .with_context(|| format!("blob: stat {}", path.display()))?;
     if !meta.file_type().is_file() {
         anyhow::bail!("blob: {} is not a regular file", path.display());
     }
-    std::fs::read(path).with_context(|| format!("reading {}", path.display()))
+    std::fs::read(&current).with_context(|| format!("reading {}", path.display()))
 }
 
 /// List objects under an S3 prefix. Recursive uses a flat `list`; non-recursive
@@ -527,12 +627,7 @@ mod tests {
         let top = listed.iter().find(|e| e.rel_key == "top.pdf").unwrap();
         assert_eq!(
             store
-                .get(
-                    &top.loc,
-                    ReadOptions {
-                        follow_symlinks: true
-                    }
-                )
+                .get(&top.loc, ReadOptions::FollowSymlinks)
                 .await
                 .unwrap(),
             b"TOP"
@@ -640,14 +735,9 @@ mod tests {
             key: "corpus/a.pdf".into(),
         };
         assert_eq!(
-            blob.get(
-                &src,
-                ReadOptions {
-                    follow_symlinks: false
-                }
-            )
-            .await
-            .unwrap(),
+            blob.get(&src, ReadOptions::NoSymlinksBeneath(&src))
+                .await
+                .unwrap(),
             b"HELLO"
         );
 
@@ -660,14 +750,7 @@ mod tests {
             };
             blob.put(&dst, b"\x89PNGcrop").await.unwrap();
             assert_eq!(
-                blob.get(
-                    &dst,
-                    ReadOptions {
-                        follow_symlinks: false
-                    }
-                )
-                .await
-                .unwrap(),
+                blob.get(&dst, ReadOptions::FollowSymlinks).await.unwrap(),
                 b"\x89PNGcrop"
             );
         }
@@ -759,9 +842,42 @@ mod tests {
         let err = BlobStore::Local
             .get(
                 &loc,
-                ReadOptions {
-                    follow_symlinks: false,
-                },
+                ReadOptions::NoSymlinksBeneath(&Loc::Local(dir.path().to_path_buf())),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("without following symlinks"),
+            "unexpected: {err:#}"
+        );
+        assert_eq!(
+            BlobStore::Local
+                .get(&loc, ReadOptions::FollowSymlinks)
+                .await
+                .unwrap(),
+            b"S"
+        );
+    }
+
+    /// A directory on the path swapped for a symlink after listing is refused
+    /// too: `O_NOFOLLOW` applies to every component beneath the root, not just
+    /// the file. The root itself may be a symlink.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_get_refuses_symlinked_directory_beneath_root() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("note.md"), b"S").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("real")).unwrap();
+        std::fs::write(dir.path().join("real/note.md"), b"R").unwrap();
+        // As if `real/` had been listed and then replaced by a link outside.
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("linkdir")).unwrap();
+        let root = Loc::Local(dir.path().to_path_buf());
+
+        let err = BlobStore::Local
+            .get(
+                &Loc::Local(dir.path().join("linkdir/note.md")),
+                ReadOptions::NoSymlinksBeneath(&root),
             )
             .await
             .unwrap_err();
@@ -772,15 +888,97 @@ mod tests {
         assert_eq!(
             BlobStore::Local
                 .get(
-                    &loc,
-                    ReadOptions {
-                        follow_symlinks: true
-                    }
+                    &Loc::Local(dir.path().join("real/note.md")),
+                    ReadOptions::NoSymlinksBeneath(&root)
                 )
                 .await
                 .unwrap(),
-            b"S"
+            b"R"
         );
+
+        // The root is operator configuration: a symlinked root is followed,
+        // and the walk below it is just as strict.
+        let holder = tempfile::tempdir().unwrap();
+        let root_link = holder.path().join("vault");
+        std::os::unix::fs::symlink(dir.path(), &root_link).unwrap();
+        let linked_root = Loc::Local(root_link.clone());
+        assert_eq!(
+            BlobStore::Local
+                .get(
+                    &Loc::Local(root_link.join("real/note.md")),
+                    ReadOptions::NoSymlinksBeneath(&linked_root)
+                )
+                .await
+                .unwrap(),
+            b"R"
+        );
+        let err = BlobStore::Local
+            .get(
+                &Loc::Local(root_link.join("linkdir/note.md")),
+                ReadOptions::NoSymlinksBeneath(&linked_root),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("without following symlinks"),
+            "unexpected: {err:#}"
+        );
+
+        // A path outside the root is refused before anything is opened.
+        let err = BlobStore::Local
+            .get(
+                &Loc::Local(outside.path().join("note.md")),
+                ReadOptions::NoSymlinksBeneath(&root),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("is not beneath"),
+            "unexpected: {err:#}"
+        );
+    }
+
+    /// A FIFO named like a note is skipped by the strict listing and, if it
+    /// shows up after listing, refused by a non-blocking open instead of
+    /// stalling the scan until a writer appears. The read runs on its own
+    /// thread with a deadline so a regression fails instead of hanging CI.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_fifo_is_skipped_and_never_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("real.md"), b"R").unwrap();
+        let fifo = dir.path().join("pipe.md");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(status.success(), "mkfifo failed: {status}");
+        let root = Loc::Local(dir.path().to_path_buf());
+
+        let strict = BlobStore::Local
+            .list(
+                &root,
+                ListOptions {
+                    recursive: true,
+                    follow_symlinks: false,
+                },
+            )
+            .await
+            .unwrap();
+        let rels: Vec<&str> = strict.iter().map(|e| e.rel_key.as_str()).collect();
+        assert_eq!(rels, vec!["real.md"]);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let root_path = dir.path().to_path_buf();
+        std::thread::spawn(move || {
+            let outcome = read_local_no_follow(&root_path, &fifo).map_err(|e| format!("{e:#}"));
+            let _ = tx.send(outcome);
+        });
+        let outcome = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("opening a FIFO must not block");
+        let msg = outcome.unwrap_err();
+        assert!(msg.contains("is not a regular file"), "{msg}");
     }
 
     #[tokio::test]

@@ -443,3 +443,15 @@ covered by a test:
 - **Fixture:** `People/Bob.md` links only `[[Alice]]`, making `Rooms/B12.md`
   reachable solely through `Meeting.md`'s frontmatter — the frontmatter-only
   inbound note the Testing Strategy asks for. The link total is 27.
+- **Read-time symlink guard covers every component.** `ReadOptions` became an
+  enum — `FollowSymlinks` (what `documents` passes) and
+  `NoSymlinksBeneath(&Loc)`, which carries the listed root — because
+  `O_NOFOLLOW` guards only the last component of a path. The unix arm opens
+  the root normally (operator configuration, may be a symlink), then `openat`s
+  each component beneath it with `O_NOFOLLOW`: `O_DIRECTORY` for directories,
+  `O_NONBLOCK` for the file, so a directory swapped for a symlink after
+  listing fails with `ELOOP` too. The non-blocking final open plus an `fstat`
+  regular-file check means a FIFO named `note.md` is refused instead of
+  stalling the scan; the strict listing also skips anything that is not a
+  regular file or directory. Non-unix keeps the `symlink_metadata`
+  approximation, now per component.
