@@ -425,3 +425,21 @@ covered by a test:
   target. pulldown-cmark reports the bare address and prepends the scheme only
   when rendering HTML; without it the target carries no scheme and would
   resolve as a note name instead of `external`.
+- **Tags inside comments and math** are not masked: `%%…%%`, `<!-- … -->`
+  and `$…$` can yield `tags` rows. Only code is excluded, as Parsing Rules
+  say; recorded so the gap is a decision rather than an oversight.
+- **`[[Note:subtitle]]`** (no space after the colon) is `external` under the
+  scheme grammar above; `[[Note: subtitle]]` is a note name. Tested.
+- **A leading `/` in a Markdown link** is the vault root only; the linking
+  note's folder is never tried (matches the docs' "root-relative" row).
+- **`aliases` with nothing usable** (`""`, `[]`, `[7]`) is NULL, not an empty
+  list — one shape for "no aliases".
+- **Frontmatter tags** follow the body grammar's digit rule (`2026` dropped,
+  `y2026` kept) and lose exactly one leading `#`.
+- **Declared output ordering.** `ObsidianScanExec` declares `notes` by
+  `path`, `links` by `from_path`, `tags` by `(path, tag, source)` whenever the
+  projection keeps those leading columns, so an `ORDER BY` on them plans no
+  sort. Emission type is `Final`: one batch after the whole scan.
+- **Fixture:** `People/Bob.md` links only `[[Alice]]`, making `Rooms/B12.md`
+  reachable solely through `Meeting.md`'s frontmatter — the frontmatter-only
+  inbound note the Testing Strategy asks for. The link total is 27.
