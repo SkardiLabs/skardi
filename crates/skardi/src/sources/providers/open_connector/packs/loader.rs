@@ -43,7 +43,7 @@ use crate::sources::providers::open_connector::pagination::{
 };
 use crate::sources::providers::open_connector::row_path::RowPath;
 use crate::sources::providers::open_connector::source_pack::{
-    FixedValue, SourcePack, SourcePackTable,
+    FixedValue, RowShape, SourcePack, SourcePackTable,
 };
 
 /// Parse an embedded pack asset, memoized in `cell`.
@@ -141,6 +141,7 @@ fn convert_table(
         id,
         action_id,
         row_path: leak_str(doc.row_path),
+        row_shape: doc.row_shape.into(),
         fields: leak_slice(fields),
         pagination,
         required_resources: leak_str_slice(doc.resources.required),
@@ -163,7 +164,26 @@ fn validate_table(table: &SourcePackTable) -> Result<(), String> {
     let id = table.id;
     // Structural pieces the engine parses lazily elsewhere fail HERE so a
     // generated asset gets one complete diagnostic pass.
-    RowPath::parse(table.row_path).map_err(|e| format!("{id}: {e}"))?;
+    // Two shapes, two contracts. Array tables keep the strict path parser;
+    // object tables get the root-only one, so `$` never becomes valid for a
+    // table that is supposed to locate a row array.
+    match table.row_shape {
+        RowShape::Array => {
+            RowPath::parse(table.row_path).map_err(|e| format!("{id}: {e}"))?;
+        }
+        RowShape::Object => {
+            RowPath::parse_object_root(table.row_path).map_err(|e| format!("{id}: {e}"))?;
+            // An object row IS the whole response, so there is nothing for a
+            // second request to return. Any multi-page strategy here is a
+            // declaration error that would otherwise re-fetch the same row
+            // until a page limit stopped it.
+            if !matches!(table.pagination, PaginationStrategy::SinglePage { .. }) {
+                return Err(format!(
+                    "{id}: row_shape 'object' requires pagination strategy 'single_page'"
+                ));
+            }
+        }
+    }
     if let Some(path) = table.error_path {
         RowPath::parse(path).map_err(|e| format!("{id}: {e}"))?;
     }
@@ -566,6 +586,10 @@ enum KindTag {
 struct TableDoc {
     action: String,
     row_path: String,
+    /// Response shape. Omitted means `array`, so every pack written before
+    /// object rows existed keeps its exact behaviour.
+    #[serde(default)]
+    row_shape: RowShapeDoc,
     #[serde(default)]
     fingerprint: Option<String>,
     pagination: PaginationDoc,
@@ -578,6 +602,23 @@ struct TableDoc {
     columns: Vec<ColumnDoc>,
     #[serde(default)]
     filters: Vec<FilterDoc>,
+}
+
+#[derive(Deserialize, Default, Clone, Copy)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+enum RowShapeDoc {
+    #[default]
+    Array,
+    Object,
+}
+
+impl From<RowShapeDoc> for RowShape {
+    fn from(doc: RowShapeDoc) -> Self {
+        match doc {
+            RowShapeDoc::Array => Self::Array,
+            RowShapeDoc::Object => Self::Object,
+        }
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -990,6 +1031,120 @@ tables:
         )
         .unwrap_err();
         assert!(err.contains("total_page_path"), "{err}");
+    }
+
+    #[test]
+    fn row_shape_defaults_to_array_for_every_existing_pack() {
+        // The zero-behaviour-change invariant: a pack that says nothing
+        // about shape must load exactly as it did before object rows.
+        let pack = parse_pack(
+            r#"
+kind: pack
+pack: demo
+version: 1
+tables:
+  items:
+    action: demo.list
+    row_path: "$.items"
+    pagination: { strategy: single_page }
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }
+"#,
+        )
+        .expect("a pack without row_shape still parses");
+        assert_eq!(pack.tables[0].row_shape, RowShape::Array);
+    }
+
+    #[test]
+    fn object_row_shape_parses_with_root_path_and_single_page() {
+        let pack = parse_pack(
+            r#"
+kind: pack
+pack: demo
+version: 1
+tables:
+  document_content:
+    action: demo.get_document_content
+    row_path: "$"
+    row_shape: object
+    pagination: { strategy: single_page }
+    columns:
+      - { name: content, path: content, type: utf8, nullable: true }
+"#,
+        )
+        .expect("object rows at the root with single_page are valid");
+        assert_eq!(pack.tables[0].row_shape, RowShape::Object);
+        assert_eq!(pack.tables[0].row_path, "$");
+    }
+
+    #[test]
+    fn object_row_shape_requires_single_page() {
+        // An object row IS the whole response: a second page could only
+        // re-fetch the same row.
+        let err = parse_pack(
+            r#"
+kind: pack
+pack: demo
+version: 1
+tables:
+  document_content:
+    action: demo.get_document_content
+    row_path: "$"
+    row_shape: object
+    pagination:
+      strategy: cursor
+      cursor_input: pageToken
+      next_cursor_path: "$.pageToken"
+      page_size_input: pageSize
+      page_size: 100
+    columns:
+      - { name: content, path: content, type: utf8, nullable: true }
+"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("single_page"), "{err}");
+    }
+
+    #[test]
+    fn object_row_shape_rejects_a_non_root_path() {
+        let err = parse_pack(
+            r#"
+kind: pack
+pack: demo
+version: 1
+tables:
+  document_content:
+    action: demo.get_document_content
+    row_path: "$.document"
+    row_shape: object
+    pagination: { strategy: single_page }
+    columns:
+      - { name: content, path: content, type: utf8, nullable: true }
+"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("'$'"), "{err}");
+    }
+
+    #[test]
+    fn array_row_shape_still_rejects_the_root_path() {
+        // The array contract is unchanged: `$` remains invalid there.
+        let err = parse_pack(
+            r#"
+kind: pack
+pack: demo
+version: 1
+tables:
+  items:
+    action: demo.list
+    row_path: "$"
+    pagination: { strategy: single_page }
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }
+"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("row path"), "{err}");
     }
 
     #[test]

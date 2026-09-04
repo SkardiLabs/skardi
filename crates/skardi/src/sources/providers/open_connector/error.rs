@@ -452,6 +452,18 @@ pub enum OpenConnectorError {
         found: String,
     },
 
+    /// A raw-action scan asked for the object row shape. Object rows are a
+    /// pack-declared contract (`row_shape: object`) whose response shape is
+    /// pinned by a fingerprint; an ad-hoc action has no such gate, and
+    /// deriving a row schema from the response ROOT rather than a row array
+    /// is a different inference rule that has not been designed. Deferred
+    /// deliberately, with this error, rather than guessed at.
+    #[error(
+        "Open Connector raw-action scans do not support object rows: '$' selects the response root, \
+         which only pack tables may declare via 'row_shape: object'. Use a row path locating a row array."
+    )]
+    ObjectRowsUnsupportedForRawAction,
+
     /// The row path resolved to a non-array value; relational rows must be an
     /// array of objects.
     #[error(
