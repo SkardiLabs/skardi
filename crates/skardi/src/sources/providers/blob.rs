@@ -21,7 +21,9 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use object_store::path::Path as OsPath;
-use object_store::{Attribute, Attributes, ObjectMeta, ObjectStore, PutOptions, PutPayload};
+#[cfg(feature = "documents")]
+use object_store::{Attribute, Attributes, PutOptions, PutPayload};
+use object_store::{ObjectMeta, ObjectStore};
 
 /// A parsed source/target location: either a local path or an S3 object.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,6 +107,7 @@ fn normalize_prefix(key: &str) -> String {
 
 /// The `Content-Type` to stamp on a written object, inferred from its key's
 /// extension. Returns `None` when unknown (the store then applies its default).
+#[cfg(feature = "documents")]
 fn content_type_for_key(key: &str) -> Option<&'static str> {
     let ext = Path::new(key)
         .extension()
@@ -120,7 +123,8 @@ fn content_type_for_key(key: &str) -> Option<&'static str> {
     }
 }
 
-/// Local-vs-object-store I/O backend for the documents connector.
+/// Local-vs-object-store I/O backend shared by the `documents` and `obsidian`
+/// sources.
 #[derive(Clone)]
 pub enum BlobStore {
     Local,
@@ -171,7 +175,10 @@ impl BlobStore {
         }
     }
 
-    /// Write bytes to one object/file (image crops / page renders).
+    /// Write bytes to one object/file (image crops / page renders). Only
+    /// `documents` writes; `obsidian` is read-only by contract, so the writer
+    /// (and its object_store attribute imports) stay behind that feature.
+    #[cfg(feature = "documents")]
     pub async fn put(&self, loc: &Loc, bytes: &[u8]) -> Result<()> {
         match (self, loc) {
             (BlobStore::Local, Loc::Local(path)) => {
@@ -206,7 +213,7 @@ impl BlobStore {
 
     /// Build the backend + parsed location for a URI. For S3 this constructs the
     /// `object_store` client **on the calling thread's runtime** (call from the
-    /// documents parse thread) to avoid reqwest connection-pool cross-runtime
+    /// source's blocking scan/parse thread) to avoid reqwest connection-pool cross-runtime
     /// hazards; credentials/region come from the environment.
     pub fn resolve(uri: &str) -> Result<(BlobStore, Loc)> {
         let loc = Loc::parse(uri)?;
@@ -251,10 +258,19 @@ fn list_local(root: &Path, opts: ListOptions) -> Result<Vec<BlobEntry>> {
             if !opts.follow_symlinks {
                 // `DirEntry::file_type` does not follow links, so this sees
                 // the symlink itself, whether it points at a file or a dir.
-                let is_symlink = entry.file_type().map(|t| t.is_symlink()).unwrap_or(false);
-                if is_symlink {
-                    tracing::warn!(path = %path.display(), "blob: skipping symlink");
-                    continue;
+                // Fail closed: an entry that cannot be typed (unlinked between
+                // readdir and stat) is skipped rather than handed to `is_dir`
+                // below, which does follow.
+                match entry.file_type() {
+                    Ok(kind) if !kind.is_symlink() => {}
+                    Ok(_) => {
+                        tracing::warn!(path = %path.display(), "blob: skipping symlink");
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(path = %path.display(), error = %e, "blob: cannot type entry, skipping");
+                        continue;
+                    }
                 }
             }
             if path.is_dir() {
@@ -294,7 +310,10 @@ fn list_local(root: &Path, opts: ListOptions) -> Result<Vec<BlobEntry>> {
 /// Read a local file refusing to follow a symlink at the final path component.
 /// Unix: `O_NOFOLLOW` makes the open itself fail with `ELOOP` on a symlink,
 /// then the opened handle is checked to be a regular file (a FIFO or device
-/// would otherwise block or misbehave). This closes the listing→read race.
+/// would otherwise block or misbehave). This closes the listing→read race for
+/// the final path component only: a directory above it swapped for a symlink
+/// after listing is still followed (`O_NOFOLLOW` does not cover intermediate
+/// components); `docs/obsidian.md` records that residual window.
 #[cfg(unix)]
 fn read_local_no_follow(path: &Path) -> Result<Vec<u8>> {
     use std::io::Read;
@@ -401,6 +420,7 @@ fn push_remote_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use object_store::PutPayload;
 
     #[test]
     fn loc_parse_detects_local_and_s3() {
@@ -454,6 +474,7 @@ mod tests {
         assert_eq!(normalize_prefix("/"), "");
     }
 
+    #[cfg(feature = "documents")]
     #[test]
     fn content_type_inferred_from_extension() {
         assert_eq!(content_type_for_key("x/y_0.png"), Some("image/png"));
@@ -517,13 +538,16 @@ mod tests {
             b"TOP"
         );
 
-        // put creates parent dirs and writes bytes.
-        let out = Loc::Local(dir.path().join("crops/a_0.png"));
-        store.put(&out, b"\x89PNG").await.unwrap();
-        assert_eq!(
-            std::fs::read(dir.path().join("crops/a_0.png")).unwrap(),
-            b"\x89PNG"
-        );
+        // put creates parent dirs and writes bytes (documents-only writer).
+        #[cfg(feature = "documents")]
+        {
+            let out = Loc::Local(dir.path().join("crops/a_0.png"));
+            store.put(&out, b"\x89PNG").await.unwrap();
+            assert_eq!(
+                std::fs::read(dir.path().join("crops/a_0.png")).unwrap(),
+                b"\x89PNG"
+            );
+        }
     }
 
     #[tokio::test]
@@ -627,22 +651,26 @@ mod tests {
             b"HELLO"
         );
 
-        let dst = Loc::S3 {
-            bucket: "bk".into(),
-            key: "crops/a.pdf_img0.png".into(),
-        };
-        blob.put(&dst, b"\x89PNGcrop").await.unwrap();
-        assert_eq!(
-            blob.get(
-                &dst,
-                ReadOptions {
-                    follow_symlinks: false
-                }
-            )
-            .await
-            .unwrap(),
-            b"\x89PNGcrop"
-        );
+        // The writer is documents-only.
+        #[cfg(feature = "documents")]
+        {
+            let dst = Loc::S3 {
+                bucket: "bk".into(),
+                key: "crops/a.pdf_img0.png".into(),
+            };
+            blob.put(&dst, b"\x89PNGcrop").await.unwrap();
+            assert_eq!(
+                blob.get(
+                    &dst,
+                    ReadOptions {
+                        follow_symlinks: false
+                    }
+                )
+                .await
+                .unwrap(),
+                b"\x89PNGcrop"
+            );
+        }
     }
 
     #[test]

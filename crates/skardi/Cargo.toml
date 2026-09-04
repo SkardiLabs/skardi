@@ -28,11 +28,11 @@ chunking = ["dep:text-splitter"]
 # RAG umbrella: chunk → embed → write loop in one feature.
 rag = ["embedding", "chunking"]
 # documents source connector: parse a folder of files into queryable (file, page) rows.
-documents = ["dep:liteparse", "dep:glob", "dep:object_store"]
+documents = ["dep:liteparse", "dep:glob", "dep:object_store", "dep:libc"]
 # obsidian source connector: an Obsidian vault (local dir or s3:// prefix) as
 # `notes` / `links` / `tags` catalog tables. Shares `providers/blob.rs` with
 # `documents` (hence glob + object_store); pulldown-cmark walks note bodies.
-obsidian = ["dep:glob", "dep:object_store", "dep:pulldown-cmark"]
+obsidian = ["dep:glob", "dep:object_store", "dep:pulldown-cmark", "dep:libc"]
 # rss source connector: RSS/Atom/JSON-Feed subscriptions as queryable tables.
 # reqwest/gzip: the fetcher decodes gzip-compressed feed responses itself
 # (the response-size cap is measured on the decoded stream), which needs the
@@ -86,13 +86,15 @@ tracing = { workspace = true }
 # pipeline
 log = { workspace = true }
 regex = { workspace = true }
-# preserve_order is LOAD-BEARING for TWO consumers: json_pack's
+# preserve_order is LOAD-BEARING for THREE consumers: json_pack's
 # argument-order-is-object-order contract (and the etl golden bundles'
-# byte determinism), and the graph module's declared-columns JSON — whose
+# byte determinism); the graph module's declared-columns JSON — whose
 # object order IS the positional binding to the Cypher RETURN clause
 # (trimming this feature would silently re-sort declared columns
-# lexicographically and mis-map same-typed columns). Without the explicit
-# feature it held only through transitive unification (bson enables it).
+# lexicographically and mis-map same-typed columns); and the obsidian
+# source's `frontmatter_json` and frontmatter-link rows, which follow YAML
+# document order and whose tests pin it. Without the explicit feature it
+# held only through transitive unification (bson enables it).
 serde_json = { workspace = true, features = ["preserve_order"] }
 serde_yaml = { workspace = true }
 # model
@@ -181,8 +183,10 @@ uuid = { workspace = true }
 datafusion-functions-json = "0.52"
 
 [target.'cfg(unix)'.dependencies]
-# `O_NOFOLLOW` for blob.rs's no-follow read (already in the tree via tokio).
-libc = "0.2"
+# `O_NOFOLLOW` for blob.rs's no-follow read (already in the tree via tokio);
+# optional, enabled by the two features that compile blob.rs, so a
+# featureless build declares nothing new.
+libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
 tokio-test = "0.4"
