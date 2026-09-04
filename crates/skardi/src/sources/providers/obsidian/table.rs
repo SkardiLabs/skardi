@@ -446,10 +446,13 @@ mod tests {
     use crate::sources::providers::obsidian::scan::parse_note;
     use arrow::array::{Array, AsArray};
     use arrow::datatypes::Int64Type;
+    use chrono::{DateTime, Utc};
     use datafusion::prelude::SessionContext;
+    use std::path::Path;
+    use std::time::UNIX_EPOCH;
 
-    fn epoch() -> chrono::DateTime<chrono::Utc> {
-        chrono::DateTime::<chrono::Utc>::from(std::time::UNIX_EPOCH)
+    fn epoch() -> DateTime<Utc> {
+        DateTime::<Utc>::from(UNIX_EPOCH)
     }
 
     fn two_notes() -> Vec<ParsedNote> {
@@ -610,7 +613,7 @@ mod tests {
 
     #[tokio::test]
     async fn table_is_queryable_through_datafusion() -> datafusion::common::Result<()> {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("src/sources/providers/obsidian/fixtures/vault")
             .to_string_lossy()
             .into_owned();

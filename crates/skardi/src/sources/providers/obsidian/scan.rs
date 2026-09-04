@@ -4,6 +4,7 @@
 //! `BlobStore` futures with `Handle::current().block_on`, and resolves the
 //! store inside the same task so an S3 client never crosses runtimes.
 
+use std::path::Path;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -129,7 +130,7 @@ pub fn parse_note(
     tags.sort();
 
     let file_name = path.rsplit('/').next().unwrap_or(path);
-    let name = std::path::Path::new(file_name)
+    let name = Path::new(file_name)
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| file_name.to_string());
