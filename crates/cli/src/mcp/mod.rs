@@ -4,7 +4,6 @@
 //! JSON-RPC channel, so nothing on this path may print to it.
 
 mod bridge;
-mod projection;
 
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
@@ -12,6 +11,11 @@ use rmcp::transport::stdio;
 use crate::client::ApiClient;
 
 pub async fn run(client: ApiClient) -> anyhow::Result<()> {
+    // mcp-core's projection warnings go through `tracing`; without a
+    // subscriber they would vanish. stderr, because stdout is the protocol.
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .try_init();
     let service = bridge::McpBridge::new(client)
         .serve(stdio())
         .await

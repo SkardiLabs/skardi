@@ -35,6 +35,7 @@ fn args(jobs_path: PathBuf, jobs_db: PathBuf, audit_db: PathBuf) -> CliArgs {
         port: 8080,
         query_audit_db: Some(audit_db),
         query_audit_retention_days: None,
+        mcp_allowed_hosts: vec![],
     }
 }
 

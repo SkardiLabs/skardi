@@ -21,8 +21,9 @@ use rmcp::service::{RequestContext, RoleServer};
 use serde_json::Value;
 use uuid::Uuid;
 
+use skardi_mcp_core::projection;
+
 use crate::client::{ApiClient, ApiError, encode_component};
-use crate::mcp::projection;
 
 const INSTRUCTIONS: &str = "Skardi is a federated SQL data plane: operator-defined \
 pipelines plus an ad-hoc SQL engine over the configured data sources. Prefer the \

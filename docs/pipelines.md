@@ -15,8 +15,10 @@ One pipeline YAML drives every agent-facing surface:
 - **Shell** — `skardi run <name> --param=…` from the CLI today.
 - **Claude skills** — auto-generated Markdown under `.claude/skills/` (v1.1
   roadmap).
-- **MCP tools** — same YAML projected to MCP tools for non-Claude hosts via
-  `skardi mcp` — see [mcp.md](mcp.md).
+- **MCP tools** — same YAML projected to MCP tools, over two transports:
+  the `skardi mcp` stdio bridge for hosts that spawn a local binary, and
+  the server's `/mcp` streamable-HTTP endpoint for hosts that can't — see
+  [mcp.md](mcp.md).
 
 This page covers the pipeline YAML shape, parameter inference, invocation,
 and response format. For the HTTP binding and shared concerns (context
@@ -52,8 +54,10 @@ spec:
 ```
 
 The loader is strict — a file without `kind: pipeline` at the root is
-rejected at startup, and a pipeline file under a `--jobs` directory is
-silently skipped.
+rejected at startup, and so is one with an empty `metadata.name` (the name
+is the `<name>` segment of `POST /<name>/execute`, so an empty one could
+never be called); a pipeline file under a `--jobs` directory is silently
+skipped.
 
 ### Parameter placeholders
 
@@ -88,7 +92,7 @@ comes from the SQL, and every key under `spec.parameters` must name a
 load, and so does a blank description. Text is trimmed on load, so block
 scalars (`>`) publish without their trailing newline. Each description is published as the standard `description` keyword
 inside that parameter's `json_schema` in the enriched `GET /pipelines`
-inventory, which `skardi mcp` projects verbatim into MCP tool input
+inventory, which both MCP bindings project verbatim into MCP tool input
 schemas — the sentence written here is exactly what a model reads before
 filling the parameter.
 

@@ -55,6 +55,7 @@ fn args_with_ctx(ctx_path: std::path::PathBuf) -> CliArgs {
         port: 8080,
         query_audit_db: None,
         query_audit_retention_days: None,
+        mcp_allowed_hosts: vec![],
     }
 }
 

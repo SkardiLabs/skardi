@@ -114,6 +114,19 @@ pub struct CliArgs {
         help = "Prune /query audit records older than N days (default: keep forever)"
     )]
     pub query_audit_retention_days: Option<u32>,
+
+    /// Extra `Host` header values `/mcp` accepts, appended to the
+    /// always-allowed loopback trio (localhost / 127.0.0.1 / ::1). rmcp's
+    /// loopback-only default is a DNS-rebinding defense; a remote deployment
+    /// declares its public hostnames here — deliberately no allow-any escape
+    /// hatch. An entry with a port matches that port exactly; without one it
+    /// matches any port. Repeatable.
+    #[arg(
+        long = "mcp-allowed-host",
+        help = "Allow this Host header value on /mcp, in addition to loopback \
+                (repeatable; host or host:port)"
+    )]
+    pub mcp_allowed_hosts: Vec<String>,
 }
 
 /// Main server configuration containing pipelines and data sources
@@ -706,6 +719,17 @@ fn extract_pipeline_sql(path: &Path) -> Result<(String, String)> {
 
     let pipeline: MinimalPipeline = serde_yaml::from_str(&content)
         .with_context(|| format!("Failed to parse pipeline YAML: {:?}", path))?;
+
+    // The name is the URL segment of `/<name>/execute` (and the identity every
+    // MCP binding dispatches on), so an empty one is unreachable everywhere.
+    // Reject it here, before SQL validation and the full load.
+    if pipeline.metadata.name.trim().is_empty() {
+        anyhow::bail!(
+            "Pipeline {:?} has an empty metadata.name; every pipeline needs a \
+             non-empty name — it is the URL segment of /<name>/execute",
+            path
+        );
+    }
 
     Ok((pipeline.metadata.name, pipeline.spec.query))
 }
@@ -2339,6 +2363,7 @@ spec:
             port: 8080,
             query_audit_db: None,
             query_audit_retention_days: None,
+            mcp_allowed_hosts: vec![],
         };
 
         let config = load_server_config(args).await.unwrap();
@@ -2366,6 +2391,7 @@ spec:
             port: 3000,
             query_audit_db: None,
             query_audit_retention_days: None,
+            mcp_allowed_hosts: vec![],
         };
 
         let config = load_server_config(args).await.unwrap();
@@ -2422,6 +2448,7 @@ spec:
             port: 3000,
             query_audit_db: None,
             query_audit_retention_days: None,
+            mcp_allowed_hosts: vec![],
         };
 
         let config = load_server_config(args).await.unwrap();
@@ -2452,6 +2479,7 @@ spec:
             port: 8080,
             query_audit_db: None,
             query_audit_retention_days: None,
+            mcp_allowed_hosts: vec![],
         };
 
         let result = load_server_config(args).await;
@@ -2467,6 +2495,48 @@ spec:
         );
     }
 
+    /// An empty `metadata.name` is unreachable on every surface — it is the
+    /// `:name` segment of `/:name/execute`, which cannot bind an empty string,
+    /// and both MCP bindings dispatch on the same path — so the loader rejects
+    /// it up front instead of advertising a tool that can only 404.
+    #[tokio::test]
+    async fn test_load_server_config_rejects_empty_pipeline_name() {
+        let temp_dir = TempDir::new().unwrap();
+        let pipeline_path = temp_dir.path().join("unnamed.yaml");
+        fs::write(
+            &pipeline_path,
+            r#"
+kind: pipeline
+metadata:
+  name: ""
+  version: "1.0.0"
+spec:
+  query: "SELECT 1"
+"#,
+        )
+        .unwrap();
+
+        let args = CliArgs {
+            pipeline_path: Some(pipeline_path),
+            jobs_path: None,
+            jobs_db_path: None,
+            ctx_file: None,
+            semantics_path: None,
+            port: 8080,
+            query_audit_db: None,
+            query_audit_retention_days: None,
+            mcp_allowed_hosts: vec![],
+        };
+
+        let error = load_server_config(args).await.unwrap_err();
+        let error_string = format!("{:?}", error);
+        assert!(
+            error_string.contains("empty metadata.name"),
+            "Expected the empty-name rejection, got: {}",
+            error_string
+        );
+    }
+
     #[tokio::test]
     async fn test_load_server_config_no_pipelines() {
         let args = CliArgs {
@@ -2478,6 +2548,7 @@ spec:
             port: 8080,
             query_audit_db: None,
             query_audit_retention_days: None,
+            mcp_allowed_hosts: vec![],
         };
 
         let config = load_server_config(args).await.unwrap();
@@ -2735,6 +2806,30 @@ spec:
         assert!(args.pipeline_path.is_none());
         assert_eq!(args.ctx_file, None);
         assert_eq!(args.port, 8080); // default value
+    }
+
+    #[test]
+    fn mcp_allowed_host_is_repeatable_and_defaults_empty() {
+        use clap::Parser;
+
+        let args = CliArgs::try_parse_from([
+            "skardi-server",
+            "--mcp-allowed-host",
+            "api.example.com",
+            "--mcp-allowed-host",
+            "skardi.internal:8443",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.mcp_allowed_hosts,
+            vec![
+                "api.example.com".to_string(),
+                "skardi.internal:8443".to_string()
+            ]
+        );
+
+        let args = CliArgs::try_parse_from(["skardi-server"]).unwrap();
+        assert!(args.mcp_allowed_hosts.is_empty());
     }
 
     #[test]
