@@ -149,9 +149,11 @@ milliseconds; for an `s3://` root every query is one `LIST` plus one `GET`
 per note — budget the egress accordingly.
 
 Notes larger than `max_file_bytes` are skipped with a `warn` log naming the
-path. A vault where *every* read fails (permissions, a mounted drive that went
-away) fails the query with the first cause instead of silently returning zero
-rows.
+path. The cap is enforced twice: on the listed size, and again on the open
+file or object, so a note that grows between the two is refused rather than
+buffered whole. A vault where *every* read fails (permissions, a mounted drive
+that went away) fails the query with the first cause instead of silently
+returning zero rows.
 
 ## Failure modes
 
@@ -162,6 +164,7 @@ rows.
 | Malformed or non-mapping frontmatter | Row kept; `frontmatter_json` NULL; `frontmatter_error` set. |
 | Invalid UTF-8 | Row kept; lossy decode. |
 | Note larger than `max_file_bytes` | Skipped before it is read (the size comes from the listing); `warn` with path and size. The one case that drops a row. |
+| Note that grows past `max_file_bytes` after listing | The read stops one byte past the cap; skipped with a `warn`, counted as a policy skip, not a read failure. |
 | Symlinked file or directory inside the vault | Skipped at listing time; `warn` with path. |
 | Listed file, or a directory above it, replaced by a symlink before the read | Open refused (`O_NOFOLLOW` on every component beneath the root); counted as a read failure. |
 | A `.md` that is not a regular file (FIFO, socket, device) | Skipped at listing time; if it appears after listing, the open is non-blocking and refused as a read failure. Never stalls the query. |

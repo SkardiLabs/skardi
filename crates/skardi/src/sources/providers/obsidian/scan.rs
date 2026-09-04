@@ -14,7 +14,9 @@ use super::config::ScanOptions;
 use super::frontmatter;
 use super::markdown::{self, RawLink};
 use super::resolve::{Index, LinkKind, Resolution};
-use crate::sources::providers::blob::{BlobEntry, BlobStore, ListOptions, ReadOptions};
+use crate::sources::providers::blob::{
+    BlobEntry, BlobStore, ListOptions, ReadOptions, SizeCapExceeded,
+};
 
 /// Where a link or tag was found (`links.source`, `tags.source`). `Body`
 /// sorts before `Frontmatter`, which is the `tags` row order.
@@ -218,10 +220,25 @@ impl VaultScan {
                 continue;
             }
             attempted += 1;
-            let bytes = match handle
-                .block_on(store.get(&entry.loc, ReadOptions::NoSymlinksBeneath(&prefix)))
-            {
+            let bytes = match handle.block_on(store.get(
+                &entry.loc,
+                ReadOptions::no_symlinks_beneath(&prefix).with_max_bytes(opts.max_file_bytes),
+            )) {
                 Ok(bytes) => bytes,
+                Err(e) if e.downcast_ref::<SizeCapExceeded>().is_some() => {
+                    // The note grew past the cap between listing and read.
+                    // Same policy as the listing-time skip, so it is a skip and
+                    // not an attempt: an oversized-only vault stays empty
+                    // rather than tripping the wholesale-failure guard.
+                    tracing::warn!(
+                        path = %entry.rel_key,
+                        max_file_bytes = opts.max_file_bytes,
+                        "obsidian: skipping note that grew past max_file_bytes after listing"
+                    );
+                    attempted -= 1;
+                    skipped += 1;
+                    continue;
+                }
                 Err(e) => {
                     let cause = format!("{e:#}");
                     tracing::warn!(path = %entry.rel_key, error = %cause, "obsidian: skipping unreadable note");

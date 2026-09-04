@@ -9,7 +9,7 @@
 //!
 //! Symlinks: `documents` follows them (its historical behavior); `obsidian`
 //! refuses them at listing time ([`ListOptions::follow_symlinks`]) *and* at
-//! read time ([`ReadOptions::NoSymlinksBeneath`]: every path component below
+//! read time ([`Symlinks::NoneBeneath`]: every path component below
 //! the root is opened with `O_NOFOLLOW` on unix) because a symlink inside a
 //! vault pointing outside it would otherwise let `path: ~/vault` read
 //! arbitrary files, and a file or a directory can be swapped for a symlink
@@ -72,12 +72,12 @@ pub struct ListOptions {
     pub follow_symlinks: bool,
 }
 
-/// How [`BlobStore::get`] opens a local file. Ignored for S3, which has no
-/// symlinks.
+/// Which symlinks [`BlobStore::get`] tolerates on a local path. Ignored for
+/// S3, which has no symlinks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReadOptions<'a> {
+pub enum Symlinks<'a> {
     /// `std::fs::read`: symlinks anywhere on the path are followed.
-    FollowSymlinks,
+    Follow,
     /// Refuse every symlink between the listed prefix and the file. The
     /// prefix (the vault root) is operator configuration and is opened
     /// normally, symlink or not; each component beneath it is then opened
@@ -85,8 +85,68 @@ pub enum ReadOptions<'a> {
     /// a file swapped for a symlink after listing is refused. The final open
     /// is non-blocking and the handle must be a regular file: a FIFO named
     /// `note.md` would otherwise stall the scan waiting for a writer.
-    NoSymlinksBeneath(&'a Loc),
+    NoneBeneath(&'a Loc),
 }
+
+/// How [`BlobStore::get`] reads one object/file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadOptions<'a> {
+    pub symlinks: Symlinks<'a>,
+    /// Refuse to buffer more than this many bytes. The listing's `size` is a
+    /// snapshot: a file or object that grows or is replaced between `list`
+    /// and `get` would otherwise be read in full, whatever a caller's
+    /// listing-time cap said. With a cap set the read stops at
+    /// `max_bytes + 1` observed bytes and fails with [`SizeCapExceeded`],
+    /// which callers can tell apart from an I/O error.
+    pub max_bytes: Option<u64>,
+}
+
+impl<'a> ReadOptions<'a> {
+    /// Follow symlinks, no cap: what `documents` has always done.
+    pub fn follow() -> Self {
+        ReadOptions {
+            symlinks: Symlinks::Follow,
+            max_bytes: None,
+        }
+    }
+
+    /// Refuse symlinks anywhere under `root` (see [`Symlinks::NoneBeneath`]).
+    pub fn no_symlinks_beneath(root: &'a Loc) -> Self {
+        ReadOptions {
+            symlinks: Symlinks::NoneBeneath(root),
+            max_bytes: None,
+        }
+    }
+
+    /// Stop reading past `max_bytes` bytes.
+    pub fn with_max_bytes(mut self, max_bytes: u64) -> Self {
+        self.max_bytes = Some(max_bytes);
+        self
+    }
+}
+
+/// A read hit [`ReadOptions::max_bytes`]. Its own type because a caller that
+/// enforces a size policy at listing time needs to classify this as the same
+/// policy skip, not as an unreadable file: `err.downcast_ref::<SizeCapExceeded>()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SizeCapExceeded {
+    /// The file path or object key that was too large.
+    pub target: String,
+    /// The cap that was exceeded.
+    pub max_bytes: u64,
+}
+
+impl std::fmt::Display for SizeCapExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "blob: {} exceeds max_bytes ({}); it grew or was replaced after listing",
+            self.target, self.max_bytes
+        )
+    }
+}
+
+impl std::error::Error for SizeCapExceeded {}
 
 /// One listed object/file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,18 +222,21 @@ impl BlobStore {
         }
     }
 
-    /// Fetch the full bytes of one object/file.
+    /// Fetch the full bytes of one object/file, subject to
+    /// [`ReadOptions::max_bytes`].
     pub async fn get(&self, loc: &Loc, opts: ReadOptions<'_>) -> Result<Vec<u8>> {
         match (self, loc) {
-            (BlobStore::Local, Loc::Local(path)) => match opts {
-                ReadOptions::FollowSymlinks => {
-                    std::fs::read(path).with_context(|| format!("reading {}", path.display()))
+            (BlobStore::Local, Loc::Local(path)) => match opts.symlinks {
+                Symlinks::Follow => {
+                    let file = std::fs::File::open(path)
+                        .with_context(|| format!("reading {}", path.display()))?;
+                    read_capped(file, opts.max_bytes, &path.display().to_string())
                 }
-                ReadOptions::NoSymlinksBeneath(Loc::Local(root)) => {
-                    read_local_no_follow(root, path)
+                Symlinks::NoneBeneath(Loc::Local(root)) => {
+                    read_local_no_follow(root, path, opts.max_bytes)
                 }
-                ReadOptions::NoSymlinksBeneath(Loc::S3 { .. }) => anyhow::bail!(
-                    "blob: NoSymlinksBeneath needs a local root for {}",
+                Symlinks::NoneBeneath(Loc::S3 { .. }) => anyhow::bail!(
+                    "blob: NoneBeneath needs a local root for {}",
                     path.display()
                 ),
             },
@@ -182,11 +245,37 @@ impl BlobStore {
                     .get(&OsPath::from(key.as_str()))
                     .await
                     .with_context(|| format!("s3 get {key}"))?;
-                let bytes = res
-                    .bytes()
-                    .await
-                    .with_context(|| format!("s3 read body {key}"))?;
-                Ok(bytes.to_vec())
+                // The listing's size is a snapshot; this one comes with the
+                // body, so an object that grew since is refused before the
+                // first chunk is buffered.
+                if let Some(max) = opts.max_bytes {
+                    if res.meta.size > max {
+                        return Err(SizeCapExceeded {
+                            target: key.clone(),
+                            max_bytes: max,
+                        }
+                        .into());
+                    }
+                }
+                let mut buf: Vec<u8> = Vec::new();
+                let mut stream = res.into_stream();
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk.with_context(|| format!("s3 read body {key}"))?;
+                    // A store that streams more than it advertised (or an
+                    // object replaced mid-transfer) is cut off here: dropping
+                    // the stream aborts the transfer.
+                    if let Some(max) = opts.max_bytes {
+                        if buf.len() as u64 + chunk.len() as u64 > max {
+                            return Err(SizeCapExceeded {
+                                target: key.clone(),
+                                max_bytes: max,
+                            }
+                            .into());
+                        }
+                    }
+                    buf.extend_from_slice(&chunk);
+                }
+                Ok(buf)
             }
             _ => anyhow::bail!("blob: BlobStore/Loc backend mismatch in get()"),
         }
@@ -330,6 +419,35 @@ fn list_local(root: &Path, opts: ListOptions) -> Result<Vec<BlobEntry>> {
     Ok(out)
 }
 
+/// Read an already-opened file, refusing to buffer more than `max_bytes`.
+/// Reads one byte past the cap so growth after the `fstat` is caught too, and
+/// the allocation is bounded by the cap rather than by the claimed length.
+fn read_capped(file: std::fs::File, max_bytes: Option<u64>, target: &str) -> Result<Vec<u8>> {
+    use std::io::Read;
+
+    let Some(max) = max_bytes else {
+        let mut buf = Vec::new();
+        let mut file = file;
+        file.read_to_end(&mut buf)
+            .with_context(|| format!("reading {target}"))?;
+        return Ok(buf);
+    };
+    let ceiling = max.saturating_add(1);
+    let hint = file.metadata().map(|m| m.len().min(ceiling)).unwrap_or(0);
+    let mut buf = Vec::with_capacity(usize::try_from(hint).unwrap_or(0));
+    file.take(ceiling)
+        .read_to_end(&mut buf)
+        .with_context(|| format!("reading {target}"))?;
+    if buf.len() as u64 > max {
+        return Err(SizeCapExceeded {
+            target: target.to_string(),
+            max_bytes: max,
+        }
+        .into());
+    }
+    Ok(buf)
+}
+
 /// Read `path`, which the listing found beneath `root`, without following a
 /// symlink at any component below the root.
 ///
@@ -343,10 +461,9 @@ fn list_local(root: &Path, opts: ListOptions) -> Result<Vec<BlobEntry>> {
 /// `fstat`ed and anything but a regular file is refused (`O_NONBLOCK` is inert
 /// on a regular file).
 #[cfg(unix)]
-fn read_local_no_follow(root: &Path, path: &Path) -> Result<Vec<u8>> {
+fn read_local_no_follow(root: &Path, path: &Path, max_bytes: Option<u64>) -> Result<Vec<u8>> {
     use std::ffi::CString;
     use std::fs::File;
-    use std::io::Read;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::OpenOptionsExt;
@@ -402,7 +519,7 @@ fn read_local_no_follow(root: &Path, path: &Path) -> Result<Vec<u8>> {
             dir = fd;
         }
     }
-    let mut file = file.ok_or_else(|| {
+    let file = file.ok_or_else(|| {
         anyhow::anyhow!("blob: {} is the root itself, not a file", path.display())
     })?;
     let meta = file
@@ -411,10 +528,19 @@ fn read_local_no_follow(root: &Path, path: &Path) -> Result<Vec<u8>> {
     if !meta.file_type().is_file() {
         anyhow::bail!("blob: {} is not a regular file", path.display());
     }
-    let mut buf = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
-    file.read_to_end(&mut buf)
-        .with_context(|| format!("reading {}", path.display()))?;
-    Ok(buf)
+    // `fstat` on the very handle being read: a file that grew since the
+    // listing is refused without reading it, and `read_capped` still stops one
+    // byte past the cap in case it grows now.
+    if let Some(max) = max_bytes {
+        if meta.len() > max {
+            return Err(SizeCapExceeded {
+                target: path.display().to_string(),
+                max_bytes: max,
+            }
+            .into());
+        }
+    }
+    read_capped(file, max_bytes, &path.display().to_string())
 }
 
 /// Non-unix fallback: `symlink_metadata` on every component beneath `root`,
@@ -422,7 +548,7 @@ fn read_local_no_follow(root: &Path, path: &Path) -> Result<Vec<u8>> {
 /// time-of-check/time-of-use window between the checks and the read;
 /// documented in `docs/obsidian.md`.
 #[cfg(not(unix))]
-fn read_local_no_follow(root: &Path, path: &Path) -> Result<Vec<u8>> {
+fn read_local_no_follow(root: &Path, path: &Path, max_bytes: Option<u64>) -> Result<Vec<u8>> {
     let rel = path
         .strip_prefix(root)
         .with_context(|| format!("blob: {} is not beneath {}", path.display(), root.display()))?;
@@ -457,7 +583,9 @@ fn read_local_no_follow(root: &Path, path: &Path) -> Result<Vec<u8>> {
     if !meta.file_type().is_file() {
         anyhow::bail!("blob: {} is not a regular file", path.display());
     }
-    std::fs::read(&current).with_context(|| format!("reading {}", path.display()))
+    let file =
+        std::fs::File::open(&current).with_context(|| format!("reading {}", path.display()))?;
+    read_capped(file, max_bytes, &path.display().to_string())
 }
 
 /// List objects under an S3 prefix. Recursive uses a flat `list`; non-recursive
@@ -626,10 +754,7 @@ mod tests {
         // get returns the file bytes.
         let top = listed.iter().find(|e| e.rel_key == "top.pdf").unwrap();
         assert_eq!(
-            store
-                .get(&top.loc, ReadOptions::FollowSymlinks)
-                .await
-                .unwrap(),
+            store.get(&top.loc, ReadOptions::follow()).await.unwrap(),
             b"TOP"
         );
 
@@ -735,7 +860,7 @@ mod tests {
             key: "corpus/a.pdf".into(),
         };
         assert_eq!(
-            blob.get(&src, ReadOptions::NoSymlinksBeneath(&src))
+            blob.get(&src, ReadOptions::no_symlinks_beneath(&src))
                 .await
                 .unwrap(),
             b"HELLO"
@@ -750,7 +875,7 @@ mod tests {
             };
             blob.put(&dst, b"\x89PNGcrop").await.unwrap();
             assert_eq!(
-                blob.get(&dst, ReadOptions::FollowSymlinks).await.unwrap(),
+                blob.get(&dst, ReadOptions::follow()).await.unwrap(),
                 b"\x89PNGcrop"
             );
         }
@@ -842,7 +967,7 @@ mod tests {
         let err = BlobStore::Local
             .get(
                 &loc,
-                ReadOptions::NoSymlinksBeneath(&Loc::Local(dir.path().to_path_buf())),
+                ReadOptions::no_symlinks_beneath(&Loc::Local(dir.path().to_path_buf())),
             )
             .await
             .unwrap_err();
@@ -852,7 +977,7 @@ mod tests {
         );
         assert_eq!(
             BlobStore::Local
-                .get(&loc, ReadOptions::FollowSymlinks)
+                .get(&loc, ReadOptions::follow())
                 .await
                 .unwrap(),
             b"S"
@@ -877,7 +1002,7 @@ mod tests {
         let err = BlobStore::Local
             .get(
                 &Loc::Local(dir.path().join("linkdir/note.md")),
-                ReadOptions::NoSymlinksBeneath(&root),
+                ReadOptions::no_symlinks_beneath(&root),
             )
             .await
             .unwrap_err();
@@ -889,7 +1014,7 @@ mod tests {
             BlobStore::Local
                 .get(
                     &Loc::Local(dir.path().join("real/note.md")),
-                    ReadOptions::NoSymlinksBeneath(&root)
+                    ReadOptions::no_symlinks_beneath(&root)
                 )
                 .await
                 .unwrap(),
@@ -906,7 +1031,7 @@ mod tests {
             BlobStore::Local
                 .get(
                     &Loc::Local(root_link.join("real/note.md")),
-                    ReadOptions::NoSymlinksBeneath(&linked_root)
+                    ReadOptions::no_symlinks_beneath(&linked_root)
                 )
                 .await
                 .unwrap(),
@@ -915,7 +1040,7 @@ mod tests {
         let err = BlobStore::Local
             .get(
                 &Loc::Local(root_link.join("linkdir/note.md")),
-                ReadOptions::NoSymlinksBeneath(&linked_root),
+                ReadOptions::no_symlinks_beneath(&linked_root),
             )
             .await
             .unwrap_err();
@@ -928,7 +1053,7 @@ mod tests {
         let err = BlobStore::Local
             .get(
                 &Loc::Local(outside.path().join("note.md")),
-                ReadOptions::NoSymlinksBeneath(&root),
+                ReadOptions::no_symlinks_beneath(&root),
             )
             .await
             .unwrap_err();
@@ -971,7 +1096,8 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let root_path = dir.path().to_path_buf();
         std::thread::spawn(move || {
-            let outcome = read_local_no_follow(&root_path, &fifo).map_err(|e| format!("{e:#}"));
+            let outcome =
+                read_local_no_follow(&root_path, &fifo, None).map_err(|e| format!("{e:#}"));
             let _ = tx.send(outcome);
         });
         let outcome = rx
@@ -979,6 +1105,86 @@ mod tests {
             .expect("opening a FIFO must not block");
         let msg = outcome.unwrap_err();
         assert!(msg.contains("is not a regular file"), "{msg}");
+    }
+
+    /// The listing's size is a snapshot: a note that grows before the read is
+    /// refused by the cap instead of being buffered whole, and the error is a
+    /// `SizeCapExceeded` so the caller can treat it as its own policy skip.
+    #[tokio::test]
+    async fn local_get_enforces_max_bytes_after_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, vec![b'x'; 8]).unwrap();
+        let root = Loc::Local(dir.path().to_path_buf());
+        let loc = Loc::Local(path.clone());
+
+        // At the cap, and one byte over it.
+        assert_eq!(
+            BlobStore::Local
+                .get(
+                    &loc,
+                    ReadOptions::no_symlinks_beneath(&root).with_max_bytes(8)
+                )
+                .await
+                .unwrap()
+                .len(),
+            8
+        );
+        let err = BlobStore::Local
+            .get(
+                &loc,
+                ReadOptions::no_symlinks_beneath(&root).with_max_bytes(7),
+            )
+            .await
+            .unwrap_err();
+        let cap = err
+            .downcast_ref::<SizeCapExceeded>()
+            .unwrap_or_else(|| panic!("not a cap error: {err:#}"));
+        assert_eq!(cap.max_bytes, 7);
+        assert!(cap.target.contains("note.md"), "{}", cap.target);
+
+        // The follow-symlinks reader honors the cap too, and no cap reads all.
+        assert!(
+            BlobStore::Local
+                .get(&loc, ReadOptions::follow().with_max_bytes(7))
+                .await
+                .unwrap_err()
+                .downcast_ref::<SizeCapExceeded>()
+                .is_some()
+        );
+        assert_eq!(
+            BlobStore::Local
+                .get(&loc, ReadOptions::follow())
+                .await
+                .unwrap()
+                .len(),
+            8
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_get_enforces_max_bytes() {
+        let store = seed_inmemory(&[("corpus/a.md", b"0123456789")]).await;
+        let blob = BlobStore::Remote(store);
+        let loc = Loc::S3 {
+            bucket: "bk".into(),
+            key: "corpus/a.md".into(),
+        };
+        assert_eq!(
+            blob.get(&loc, ReadOptions::follow().with_max_bytes(10))
+                .await
+                .unwrap()
+                .len(),
+            10
+        );
+        let err = blob
+            .get(&loc, ReadOptions::follow().with_max_bytes(9))
+            .await
+            .unwrap_err();
+        let cap = err
+            .downcast_ref::<SizeCapExceeded>()
+            .unwrap_or_else(|| panic!("not a cap error: {err:#}"));
+        assert_eq!((cap.target.as_str(), cap.max_bytes), ("corpus/a.md", 9u64));
     }
 
     #[tokio::test]

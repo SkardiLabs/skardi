@@ -631,7 +631,7 @@ fn parse_source_blocking(root: &str, opts: &ParseOptions) -> Result<Vec<ParsedPa
         ..
     } in entries
     {
-        let bytes = match runtime.block_on(read_store.get(&loc, ReadOptions::FollowSymlinks)) {
+        let bytes = match runtime.block_on(read_store.get(&loc, ReadOptions::follow())) {
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!("documents: fetch failed for {}: {:#}", rel_path, e);

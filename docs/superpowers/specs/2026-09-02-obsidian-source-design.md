@@ -443,9 +443,19 @@ covered by a test:
 - **Fixture:** `People/Bob.md` links only `[[Alice]]`, making `Rooms/B12.md`
   reachable solely through `Meeting.md`'s frontmatter — the frontmatter-only
   inbound note the Testing Strategy asks for. The link total is 27.
-- **Read-time symlink guard covers every component.** `ReadOptions` became an
-  enum — `FollowSymlinks` (what `documents` passes) and
-  `NoSymlinksBeneath(&Loc)`, which carries the listed root — because
+- **`max_file_bytes` is enforced at read time as well.** The listing's `size`
+  is a snapshot, so a note that grows or is replaced before its `get` would
+  otherwise be buffered in full. `ReadOptions` therefore became a struct —
+  `{ symlinks, max_bytes }` — and the reader stops at `max_bytes + 1` observed
+  bytes: locally an `fstat` on the open handle plus a `take`-bounded read, on
+  S3 a size check against the body's own `ObjectMeta` plus a per-chunk running
+  total over `into_stream()`, which aborts the transfer instead of collecting
+  the whole response. The failure is a typed `SizeCapExceeded`, so the scan
+  classifies it as the same policy skip as the listing-time cap (a skip, not
+  an attempt) rather than as an unreadable note.
+- **Read-time symlink guard covers every component.** The policy is
+  `ReadOptions::symlinks` — `Symlinks::Follow` (what `documents` passes) or
+  `Symlinks::NoneBeneath(&Loc)`, which carries the listed root — because
   `O_NOFOLLOW` guards only the last component of a path. The unix arm opens
   the root normally (operator configuration, may be a symlink), then `openat`s
   each component beneath it with `O_NOFOLLOW`: `O_DIRECTORY` for directories,

@@ -661,7 +661,7 @@ fn fetch_image_with_policy(
                     // Build the store inside this runtime: the underlying reqwest
                     // client must not outlive / cross runtimes (see blob.rs).
                     let (store, loc) = BlobStore::resolve(image_ref)?;
-                    store.get(&loc, ReadOptions::FollowSymlinks).await
+                    store.get(&loc, ReadOptions::follow()).await
                 })
             })
             .with_context(|| format!("reading s3 image_ref '{image_ref}'"))?;
