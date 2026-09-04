@@ -466,12 +466,28 @@ WHERE category = 'ai'
 ORDER BY _score DESC
 ```
 
-FTS5 query syntax supports:
-- Plain terms (AND'd by default): `machine learning`
-- Quoted phrases: `"neural network"`
-- NOT operator: `learning NOT database`
-- OR operator: `machine OR database`
-- Prefix queries: `mach*`
+**Web-search-style queries** — `query` is search text, not an FTS5 expression.
+It is parsed the same way `pg_fts` parses its own `query` argument (PostgreSQL's
+`websearch_to_tsquery`), so the two backends answer the same question the same
+way:
+
+| Syntax | Meaning | Example |
+|---|---|---|
+| `foo bar` | AND (both terms required) | `machine learning` |
+| `"foo bar"` | Exact phrase | `"neural network"` |
+| `foo or bar` | OR (either term) | `machine or database` |
+| `-foo` | NOT (exclude term) | `learning -database` |
+
+Everything else is literal text. Apostrophes, colons and hyphens are ordinary
+characters — `what's the retry policy`, `note: check the gateway` and
+`read-only mode` are all searched for as written, and no input can turn a
+question into a query error. Text with nothing to search for (empty, blank, or
+pure punctuation) returns no rows.
+
+Because the parameter is search text, FTS5's own operator syntax is not
+reachable through it: `mach*` prefix queries, `NEAR()`, `column : term` filters
+and the uppercase `AND` / `OR` / `NOT` keywords are searched for literally
+rather than executed. Use the `or` and `-` forms above instead.
 
 ### Write
 
