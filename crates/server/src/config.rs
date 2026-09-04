@@ -720,6 +720,17 @@ fn extract_pipeline_sql(path: &Path) -> Result<(String, String)> {
     let pipeline: MinimalPipeline = serde_yaml::from_str(&content)
         .with_context(|| format!("Failed to parse pipeline YAML: {:?}", path))?;
 
+    // The name is the URL segment of `/<name>/execute` (and the identity every
+    // MCP binding dispatches on), so an empty one is unreachable everywhere.
+    // Reject it here, before SQL validation and the full load.
+    if pipeline.metadata.name.trim().is_empty() {
+        anyhow::bail!(
+            "Pipeline {:?} has an empty metadata.name; every pipeline needs a \
+             non-empty name — it is the URL segment of /<name>/execute",
+            path
+        );
+    }
+
     Ok((pipeline.metadata.name, pipeline.spec.query))
 }
 
@@ -2480,6 +2491,48 @@ spec:
         assert!(
             error_string.contains("Pipeline file not found"),
             "Expected error to contain 'Pipeline file not found', got: {}",
+            error_string
+        );
+    }
+
+    /// An empty `metadata.name` is unreachable on every surface — it is the
+    /// `:name` segment of `/:name/execute`, which cannot bind an empty string,
+    /// and both MCP bindings dispatch on the same path — so the loader rejects
+    /// it up front instead of advertising a tool that can only 404.
+    #[tokio::test]
+    async fn test_load_server_config_rejects_empty_pipeline_name() {
+        let temp_dir = TempDir::new().unwrap();
+        let pipeline_path = temp_dir.path().join("unnamed.yaml");
+        fs::write(
+            &pipeline_path,
+            r#"
+kind: pipeline
+metadata:
+  name: ""
+  version: "1.0.0"
+spec:
+  query: "SELECT 1"
+"#,
+        )
+        .unwrap();
+
+        let args = CliArgs {
+            pipeline_path: Some(pipeline_path),
+            jobs_path: None,
+            jobs_db_path: None,
+            ctx_file: None,
+            semantics_path: None,
+            port: 8080,
+            query_audit_db: None,
+            query_audit_retention_days: None,
+            mcp_allowed_hosts: vec![],
+        };
+
+        let error = load_server_config(args).await.unwrap_err();
+        let error_string = format!("{:?}", error);
+        assert!(
+            error_string.contains("empty metadata.name"),
+            "Expected the empty-name rejection, got: {}",
             error_string
         );
     }

@@ -54,8 +54,10 @@ spec:
 ```
 
 The loader is strict — a file without `kind: pipeline` at the root is
-rejected at startup, and a pipeline file under a `--jobs` directory is
-silently skipped.
+rejected at startup, and so is one with an empty `metadata.name` (the name
+is the `<name>` segment of `POST /<name>/execute`, so an empty one could
+never be called); a pipeline file under a `--jobs` directory is silently
+skipped.
 
 ### Parameter placeholders
 
