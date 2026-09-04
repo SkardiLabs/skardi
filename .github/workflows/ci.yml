@@ -230,6 +230,15 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Check the package for errors
         run: cargo check --all
+      - name: Check single-feature builds
+        # `documents` and `obsidian` share providers/blob.rs and each must
+        # build on its own (obsidian spec acceptance). Neither `cargo check
+        # --all` nor `--all-features` compiles either shape, so a symbol only
+        # one of them uses would rot unnoticed. Checking the server pulls the
+        # library in with exactly that one feature.
+        run: |
+          cargo check -p skardi-server --features documents
+          cargo check -p skardi-server --features obsidian
       - name: Execute rust tests
         run: cargo llvm-cov --no-report nextest --all-features
       - name: Execute doc tests

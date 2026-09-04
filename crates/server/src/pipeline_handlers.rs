@@ -531,7 +531,10 @@ pub async fn get_data_sources(
             | DataSourceType::Lance
             | DataSourceType::Sqlite
             | DataSourceType::Iceberg
-            | DataSourceType::Documents => Some(data_source.path.to_string_lossy().to_string()),
+            | DataSourceType::Documents
+            // Obsidian's `path` is the vault root (local dir or `s3://` prefix),
+            // so it reports like the other path-based sources.
+            | DataSourceType::Obsidian => Some(data_source.path.to_string_lossy().to_string()),
             DataSourceType::Postgres
             | DataSourceType::Mysql
             | DataSourceType::Mongo

@@ -1,8 +1,8 @@
 # Obsidian Vault Source Design
 
-**Status:** Draft for review
+**Status:** Implemented (plan: docs/superpowers/plans/2026-09-03-obsidian-source.md, branch feature/obsidian-source)
 **Date:** 2026-09-02
-**Branch:** `feature/obsidian-source-design`
+**Branch:** `feature/obsidian-source`
 
 ## Summary
 
@@ -403,3 +403,70 @@ README.md                                         # source list entry
 - `kind = 'external'` already ships; bare-URL detection could join it.
 - Block-level rows (headings, callouts) if chunking pipelines want structure finer than a note.
 - Live S3 verification as an opt-in integration test, mirroring `documents_s3_live`.
+
+## Implementation notes (2026-09)
+
+Deviations from this spec that were settled during implementation, each
+covered by a test:
+
+- **Bare wikilink names containing `.`** (`[[Note.md]]`, `[[Note v2.1]]`)
+  try a root-level exact path first and fall back to the name lookup. The
+  spec's pure name rule made `[[Note.md]]` `missing` while Obsidian opens it.
+- **URL-scheme detection** uses `^[A-Za-z][A-Za-z0-9+.-]*:\S` (RFC 3986
+  scheme grammar) instead of a fixed scheme list, so `obsidian://`,
+  `zotero://`, `mailto:` all classify as `external`.
+- **Scan entry point** is an async `run_scan(root, opts)` wrapper around the
+  synchronous `VaultScan::run` on `spawn_blocking`; `ObsidianScanExec` awaits
+  it inside a one-item stream. No blocking on a Tokio worker.
+- **Autolinks** (`<https://…>`) carry `display_text = NULL` rather than
+  repeating the URL, so `display_text IS NOT NULL` means "the author wrote
+  text".
+- **Email autolinks** (`<me@example.com>`) get `mailto:` restored on their
+  target. pulldown-cmark reports the bare address and prepends the scheme only
+  when rendering HTML; without it the target carries no scheme and would
+  resolve as a note name instead of `external`.
+- **Tags inside comments and math** are not masked: `%%…%%`, `<!-- … -->`
+  and `$…$` can yield `tags` rows. Only code is excluded, as Parsing Rules
+  say; recorded so the gap is a decision rather than an oversight.
+- **`[[Note:subtitle]]`** (no space after the colon) is `external` under the
+  scheme grammar above; `[[Note: subtitle]]` is a note name. Tested.
+- **A leading `/` in a Markdown link** is the vault root only; the linking
+  note's folder is never tried (matches the docs' "root-relative" row).
+- **`aliases` with nothing usable** (`""`, `[]`, `[7]`) is NULL, not an empty
+  list — one shape for "no aliases".
+- **Frontmatter tags** follow the body grammar's digit rule (`2026` dropped,
+  `y2026` kept) and lose exactly one leading `#`.
+- **Declared output ordering.** `ObsidianScanExec` declares `notes` by
+  `path`, `links` by `from_path`, `tags` by `(path, tag, source)` whenever the
+  projection keeps those leading columns, so an `ORDER BY` on them plans no
+  sort. Emission type is `Final`: one batch after the whole scan.
+- **Fixture:** `People/Bob.md` links only `[[Alice]]`, making `Rooms/B12.md`
+  reachable solely through `Meeting.md`'s frontmatter — the frontmatter-only
+  inbound note the Testing Strategy asks for. The link total is 27.
+- **`max_file_bytes` is enforced at read time as well.** The listing's `size`
+  is a snapshot, so a note that grows or is replaced before its `get` would
+  otherwise be buffered in full. `ReadOptions` therefore became a struct —
+  `{ symlinks, max_bytes }` — and the reader stops at `max_bytes + 1` observed
+  bytes: locally an `fstat` on the open handle plus a `take`-bounded read, on
+  S3 a size check against the body's own `ObjectMeta` plus a per-chunk running
+  total over `into_stream()`, which aborts the transfer instead of collecting
+  the whole response. The failure is a typed `SizeCapExceeded`, so the scan
+  classifies it as the same policy skip as the listing-time cap (a skip, not
+  an attempt) rather than as an unreadable note.
+- **Read-time symlink guard covers every component.** The policy is
+  `ReadOptions::symlinks` — `Symlinks::Follow` (what `documents` passes) or
+  `Symlinks::NoneBeneath(&Loc)`, which carries the listed root — because
+  `O_NOFOLLOW` guards only the last component of a path. The unix arm opens
+  the root normally (operator configuration, may be a symlink), then `openat`s
+  each component beneath it with `O_NOFOLLOW`: `O_DIRECTORY` for directories,
+  `O_NONBLOCK` for the file, so a directory swapped for a symlink after
+  listing fails with `ELOOP` too. The non-blocking final open plus an `fstat`
+  regular-file check means a FIFO named `note.md` is refused instead of
+  stalling the scan; the strict listing also skips anything that is not a
+  regular file or directory. Non-unix keeps the `symlink_metadata`
+  approximation, now per component.
+- **The connector's public API is `register_obsidian_tables` alone.** The six
+  submodules are private, as `documents`' `parse`/`table` are: nothing outside
+  the crate uses the scanner, parsers or resolver, and keeping them off the
+  public API leaves their signatures free to change without a breaking
+  release. The registration function carries the module's one doc example.
