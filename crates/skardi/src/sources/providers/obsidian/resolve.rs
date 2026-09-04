@@ -74,7 +74,15 @@ impl Index {
         let mut index = Index::default();
         for path in paths {
             let path = path.as_ref();
-            index.by_path.insert(path.to_lowercase(), path.to_string());
+            if let Some(previous) = index.by_path.insert(path.to_lowercase(), path.to_string()) {
+                // Case-sensitive filesystems can hold both; the listing is
+                // sorted, so "last wins" is deterministic but still arbitrary.
+                tracing::debug!(
+                    kept = %path,
+                    dropped = %previous,
+                    "obsidian: two files differ only by case; the later one resolves"
+                );
+            }
             let file_name = path.rsplit('/').next().unwrap_or(path);
             let name = strip_md(file_name).unwrap_or(file_name);
             index
@@ -140,10 +148,14 @@ impl Index {
         self.lookup_name(target)
     }
 
-    /// Note-relative first (CommonMark / Obsidian "Relative path to file"),
+    /// A leading `/` is the vault root and nothing else. Otherwise
+    /// note-relative first (CommonMark / Obsidian "Relative path to file"),
     /// then the vault root for paths with a `/`, then the name index for
     /// bare names (Obsidian "Shortest path").
     fn resolve_markdown(&self, from_path: &str, target: &str) -> (Option<String>, Resolution) {
+        if let Some(rooted) = target.strip_prefix('/') {
+            return self.exact_or_missing(normalize("", rooted));
+        }
         if let Some(path) =
             normalize(folder_of(from_path), target).and_then(|p| self.lookup_exact(&p))
         {
@@ -232,6 +244,7 @@ mod tests {
     const PATHS: &[&str] = &[
         "Home.md",
         "Meeting.md",
+        "Notes.md",
         "Projects/Design.md",
         "Projects/Notes.md",
         "Archive/Notes.md",
@@ -349,7 +362,8 @@ mod tests {
     #[test]
     fn markdown_rows() {
         assert_eq!(r("Home.md", &md("")), ok("Home.md", Resolution::Exact)); // [t](#Heading)
-        // Sibling first, even though a same-named note exists elsewhere.
+        // Sibling first, even though `Notes.md` also exists at the root and in
+        // `Archive/` (spec: "even when a root-level other.md also exists").
         assert_eq!(
             r("Projects/Design.md", &md("Notes.md")),
             ok("Projects/Notes.md", Resolution::Exact)
@@ -379,12 +393,38 @@ mod tests {
             r("Home.md", &md("missing/thing.md")),
             (None, Resolution::Missing)
         );
+        // A leading `/` is root-only: from `Projects/`, `/Notes.md` is the
+        // root note, never the sibling, and a missing root path stays missing
+        // even when a sibling of that name exists.
+        assert_eq!(
+            r("Projects/Design.md", &md("/Notes.md")),
+            ok("Notes.md", Resolution::Exact)
+        );
+        assert_eq!(
+            r("Projects/Design.md", &md("/Home.md")),
+            ok("Home.md", Resolution::Exact)
+        );
+        assert_eq!(
+            r("Projects/Design.md", &md("/Design.md")),
+            (None, Resolution::Missing)
+        );
+        assert_eq!(
+            r("Home.md", &md("/Projects/Notes")),
+            ok("Projects/Notes.md", Resolution::Exact)
+        );
         // Bare name not a sibling: unique → name, repeated → ambiguous.
         assert_eq!(
             r("Projects/Design.md", &md("Home.md")),
             ok("Home.md", Resolution::Name)
         );
-        assert_eq!(r("Home.md", &md("Notes.md")), (None, Resolution::Ambiguous));
+        // From the root, `Notes.md` is the root note itself (exact path).
+        assert_eq!(
+            r("Home.md", &md("Notes.md")),
+            ok("Notes.md", Resolution::Exact)
+        );
+        let dup = Index::build(&["A/Dup.md", "B/Dup.md"]);
+        let res = dup.resolve("Home.md", &md("Dup.md"));
+        assert_eq!((res.to_path, res.resolution), (None, Resolution::Ambiguous));
         assert_eq!(r("Home.md", &md("nothing.md")), (None, Resolution::Missing));
         // The decoded `%23` file name is looked up literally.
         assert_eq!(

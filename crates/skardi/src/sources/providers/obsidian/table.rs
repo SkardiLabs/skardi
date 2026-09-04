@@ -13,13 +13,15 @@ use arrow::array::{
     ArrayRef, Int32Array, Int64Array, ListBuilder, RecordBatch, RecordBatchOptions, StringArray,
     StringBuilder, TimestampMillisecondArray,
 };
+use arrow::compute::SortOptions;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::datasource::TableType;
 use datafusion::error::DataFusionError;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_expr::expressions::Column;
+use datafusion::physical_expr::{EquivalenceProperties, PhysicalSortExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
@@ -163,9 +165,13 @@ impl TableProvider for ObsidianTable {
             .unwrap_or_else(|| (0..full.fields().len()).collect());
         let projected_schema = Arc::new(full.project(&projection)?);
         let properties = PlanProperties::new(
-            EquivalenceProperties::new(projected_schema.clone()),
+            EquivalenceProperties::new_with_orderings(
+                projected_schema.clone(),
+                declared_ordering(self.kind, &projected_schema),
+            ),
             Partitioning::UnknownPartitioning(1),
-            EmissionType::Both,
+            // One batch after the whole scan; nothing is emitted incrementally.
+            EmissionType::Final,
             Boundedness::Bounded,
         );
         Ok(Arc::new(ObsidianScanExec {
@@ -239,7 +245,7 @@ impl ExecutionPlan for ObsidianScanExec {
     fn with_new_children(
         self: Arc<Self>,
         _children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+    ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
         Ok(self)
     }
 
@@ -247,7 +253,7 @@ impl ExecutionPlan for ObsidianScanExec {
         &self,
         _partition: usize,
         _context: Arc<TaskContext>,
-    ) -> datafusion::error::Result<SendableRecordBatchStream> {
+    ) -> datafusion::common::Result<SendableRecordBatchStream> {
         let schema = self.schema();
         let kind = self.kind;
         let root = self.root.clone();
@@ -270,9 +276,60 @@ impl ExecutionPlan for ObsidianScanExec {
     }
 }
 
+/// The order [`build_batch`] emits rows in, as far as the projection keeps the
+/// leading columns: `notes` by `path`; `links` by `from_path` (within a note
+/// frontmatter links precede body links by line, which is not a column order,
+/// so only that prefix is declared); `tags` by `(path, tag, source)`. Declaring
+/// it lets the planner drop an `ORDER BY` on these columns instead of sorting
+/// again. Empty when the leading column is projected away.
+fn declared_ordering(kind: TableKind, projected: &Schema) -> Vec<Vec<PhysicalSortExpr>> {
+    let columns: &[&str] = match kind {
+        TableKind::Notes => &["path"],
+        TableKind::Links => &["from_path"],
+        TableKind::Tags => &["path", "tag", "source"],
+    };
+    let mut ordering = Vec::new();
+    for name in columns {
+        let Ok(idx) = projected.index_of(name) else {
+            break;
+        };
+        ordering.push(PhysicalSortExpr::new(
+            Arc::new(Column::new(name, idx)),
+            SortOptions {
+                descending: false,
+                nulls_first: false,
+            },
+        ));
+    }
+    if ordering.is_empty() {
+        Vec::new()
+    } else {
+        vec![ordering]
+    }
+}
+
+/// Materialize `projection` through `column`, which yields `None` for an index
+/// outside the table's schema. `Schema::project` already rejected such an
+/// index in `scan`, so this is an internal error, not a panic.
+fn columns(
+    projection: &[usize],
+    column: impl Fn(usize) -> Option<ArrayRef>,
+) -> datafusion::common::Result<Vec<ArrayRef>> {
+    projection
+        .iter()
+        .map(|&i| {
+            column(i).ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "obsidian: projection index {i} is outside the table schema"
+                ))
+            })
+        })
+        .collect()
+}
+
 /// Project + limit the parsed notes into one batch of `kind`. An empty
 /// projection (`count(*)`) still carries the row count.
-pub fn build_batch(
+pub(crate) fn build_batch(
     kind: TableKind,
     notes: &[ParsedNote],
     projected_schema: &SchemaRef,
@@ -282,10 +339,7 @@ pub fn build_batch(
     let (row_count, arrays) = match kind {
         TableKind::Notes => {
             let rows = truncate(notes, limit);
-            (
-                rows.len(),
-                projection.iter().map(|&i| notes_column(i, rows)).collect(),
-            )
+            (rows.len(), columns(projection, |i| notes_column(i, rows))?)
         }
         TableKind::Links => {
             let all: Vec<(&str, &LinkRow)> = notes
@@ -293,10 +347,7 @@ pub fn build_batch(
                 .flat_map(|n| n.links.iter().map(move |l| (n.path.as_str(), l)))
                 .collect();
             let rows = truncate(&all, limit);
-            (
-                rows.len(),
-                projection.iter().map(|&i| links_column(i, rows)).collect(),
-            )
+            (rows.len(), columns(projection, |i| links_column(i, rows))?)
         }
         TableKind::Tags => {
             let all: Vec<(&str, &TagRow)> = notes
@@ -304,10 +355,7 @@ pub fn build_batch(
                 .flat_map(|n| n.tags.iter().map(move |t| (n.path.as_str(), t)))
                 .collect();
             let rows = truncate(&all, limit);
-            (
-                rows.len(),
-                projection.iter().map(|&i| tags_column(i, rows)).collect(),
-            )
+            (rows.len(), columns(projection, |i| tags_column(i, rows))?)
         }
     };
     let options = RecordBatchOptions::new().with_row_count(Some(row_count));
@@ -326,8 +374,8 @@ fn utf8<'a>(values: impl Iterator<Item = Option<&'a str>>) -> ArrayRef {
     Arc::new(StringArray::from_iter(values))
 }
 
-fn notes_column(idx: usize, rows: &[ParsedNote]) -> ArrayRef {
-    match idx {
+fn notes_column(idx: usize, rows: &[ParsedNote]) -> Option<ArrayRef> {
+    let array: ArrayRef = match idx {
         0 => utf8(rows.iter().map(|n| Some(n.path.as_str()))),
         1 => utf8(rows.iter().map(|n| Some(n.name.as_str()))),
         2 => utf8(rows.iter().map(|n| Some(n.folder.as_str()))),
@@ -356,12 +404,13 @@ fn notes_column(idx: usize, rows: &[ParsedNote]) -> ArrayRef {
             TimestampMillisecondArray::from_iter_values(rows.iter().map(|n| n.modified_ms))
                 .with_timezone("UTC"),
         ),
-        other => unreachable!("notes schema has 9 columns, got index {other}"),
-    }
+        _ => return None,
+    };
+    Some(array)
 }
 
-fn links_column(idx: usize, rows: &[(&str, &LinkRow)]) -> ArrayRef {
-    match idx {
+fn links_column(idx: usize, rows: &[(&str, &LinkRow)]) -> Option<ArrayRef> {
+    let array: ArrayRef = match idx {
         0 => utf8(rows.iter().map(|(from, _)| Some(*from))),
         1 => utf8(rows.iter().map(|(_, l)| l.to_path.as_deref())),
         2 => utf8(rows.iter().map(|(_, l)| Some(l.target.as_str()))),
@@ -375,17 +424,19 @@ fn links_column(idx: usize, rows: &[(&str, &LinkRow)]) -> ArrayRef {
             rows.iter()
                 .map(|(_, l)| l.line.and_then(|line| i32::try_from(line).ok())),
         )),
-        other => unreachable!("links schema has 10 columns, got index {other}"),
-    }
+        _ => return None,
+    };
+    Some(array)
 }
 
-fn tags_column(idx: usize, rows: &[(&str, &TagRow)]) -> ArrayRef {
-    match idx {
+fn tags_column(idx: usize, rows: &[(&str, &TagRow)]) -> Option<ArrayRef> {
+    let array: ArrayRef = match idx {
         0 => utf8(rows.iter().map(|(path, _)| Some(*path))),
         1 => utf8(rows.iter().map(|(_, t)| Some(t.tag.as_str()))),
         2 => utf8(rows.iter().map(|(_, t)| Some(t.source.as_str()))),
-        other => unreachable!("tags schema has 3 columns, got index {other}"),
-    }
+        _ => return None,
+    };
+    Some(array)
 }
 
 #[cfg(test)]
@@ -558,7 +609,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn table_is_queryable_through_datafusion() -> datafusion::error::Result<()> {
+    async fn table_is_queryable_through_datafusion() -> datafusion::common::Result<()> {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("src/sources/providers/obsidian/fixtures/vault")
             .to_string_lossy()

@@ -409,7 +409,7 @@ mod tests {
     async fn fixture_links_match_the_oracle() {
         let notes = scan(&fixture_root(), defaults()).await.unwrap();
         let by_path = |p: &str| notes.iter().find(|n| n.path == p).unwrap();
-        assert_eq!(notes.iter().map(|n| n.links.len()).sum::<usize>(), 28);
+        assert_eq!(notes.iter().map(|n| n.links.len()).sum::<usize>(), 27);
 
         let home = by_path("Home.md");
         assert_eq!(
@@ -597,26 +597,19 @@ mod tests {
                 (None, "Start", "wikilink", "missing", "body", Some(1)),
             ]
         );
+        // Bob links Alice only: `Rooms/B12.md` must stay reachable solely
+        // through Meeting.md's frontmatter (the spec's frontmatter-only
+        // inbound note), so the graph checks below depend on that extraction.
         assert_eq!(
             summarize(&by_path("People/Bob.md").links),
-            vec![
-                (
-                    Some("People/Alice.md"),
-                    "Alice",
-                    "wikilink",
-                    "name",
-                    "body",
-                    Some(1)
-                ),
-                (
-                    Some("Rooms/B12.md"),
-                    "B12",
-                    "wikilink",
-                    "name",
-                    "body",
-                    Some(1)
-                ),
-            ]
+            vec![(
+                Some("People/Alice.md"),
+                "Alice",
+                "wikilink",
+                "name",
+                "body",
+                Some(1)
+            )]
         );
         assert_eq!(
             summarize(&by_path("CJK.md").links),
@@ -631,6 +624,13 @@ mod tests {
             .filter(|l| l.to_path.as_deref() == Some("Home.md"))
             .count();
         assert_eq!(in_degree_home, 6);
+        let in_degree_b12 = notes
+            .iter()
+            .flat_map(|n| n.links.iter())
+            .filter(|l| l.to_path.as_deref() == Some("Rooms/B12.md"))
+            .map(|l| l.source)
+            .collect::<Vec<_>>();
+        assert_eq!(in_degree_b12, vec![Source::Frontmatter]);
         let linked: std::collections::HashSet<&str> = notes
             .iter()
             .flat_map(|n| n.links.iter())
@@ -725,6 +725,27 @@ mod tests {
         let opts = ScanOptions::new(vec![], 2048).unwrap();
         let notes = scan(dir.path(), opts).await.unwrap();
         assert!(notes.is_empty());
+    }
+
+    /// Spec acceptance: an over-cap note is never *read*, proven with a `get`
+    /// that would fail if reached. Were the read attempted it would be the
+    /// only attempt, fail, and trip the wholesale-failure guard; the skip
+    /// happens on the listing's size, so the scan is empty and `Ok`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn oversized_note_is_never_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = dir.path().join("Big.md");
+        std::fs::write(&big, vec![b'x'; 4096]).unwrap();
+        if !make_unreadable(&big) {
+            eprintln!("skipping: running as root, chmod 000 does not deny reads");
+            restore_readable(dir.path());
+            return;
+        }
+        let opts = ScanOptions::new(vec![], 2048).unwrap();
+        let notes = scan(dir.path(), opts).await.unwrap();
+        assert!(notes.is_empty());
+        restore_readable(dir.path());
     }
 
     #[tokio::test]

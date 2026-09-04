@@ -1,1 +1,1 @@
-Bob works with [[Alice]] in [[B12]].
+Bob works with [[Alice]].

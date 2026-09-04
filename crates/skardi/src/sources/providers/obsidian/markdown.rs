@@ -198,11 +198,21 @@ fn raw_link_from_markdown(open: OpenLink) -> RawLink {
 
 /// Copy of `body` with every byte inside `ranges` replaced by a space.
 /// Multi-byte characters become one space per byte, so offsets are preserved
-/// and the result is valid UTF-8.
+/// and the result is valid UTF-8. Ranges may overlap or arrive unsorted: they
+/// are sorted once and swept with a single cursor, so a long note with many
+/// code spans costs O(n log n) rather than O(n × spans).
 fn mask_ranges(body: &str, ranges: &[Range<usize>]) -> String {
+    let mut sorted: Vec<Range<usize>> = ranges.to_vec();
+    sorted.sort_by_key(|r| (r.start, r.end));
+    let mut pending = sorted.into_iter().peekable();
+    // Bytes below this offset are inside some range already passed.
+    let mut masked_until = 0usize;
     let mut out = String::with_capacity(body.len());
     for (idx, ch) in body.char_indices() {
-        if ranges.iter().any(|r| r.contains(&idx)) {
+        while let Some(range) = pending.next_if(|r| r.start <= idx) {
+            masked_until = masked_until.max(range.end);
+        }
+        if idx < masked_until {
             for _ in 0..ch.len_utf8() {
                 out.push(' ');
             }
@@ -229,8 +239,9 @@ pub fn extract(body: &str, body_first_line: u32) -> Extracted {
     let mut open: Vec<OpenLink> = Vec::new();
     for (event, range) in Parser::new_ext(body, options).into_offset_iter() {
         match event {
-            // Start/End ranges of a container cover the whole element.
-            Event::Start(Tag::CodeBlock(_)) | Event::End(TagEnd::CodeBlock) => {
+            // A container's Start range covers the whole element (its End
+            // repeats the same span), so one push per block is enough.
+            Event::Start(Tag::CodeBlock(_)) => {
                 code_ranges.push(range);
             }
             Event::Code(text) => {
@@ -462,6 +473,22 @@ mod tests {
         assert!(!has_url_scheme("Note: subtitle")); // space after the colon
         assert!(!has_url_scheme("C:")); // nothing after the colon
         assert!(!has_url_scheme("2026:plan")); // scheme must start with a letter
+        // Recorded decision: with no space after the colon the RFC 3986 scheme
+        // grammar wins, so `[[Note:subtitle]]` is `external`. Write
+        // `[[Note: subtitle]]` for a note whose title contains a colon.
+        assert!(has_url_scheme("Note:subtitle"));
+    }
+
+    #[test]
+    fn mask_ranges_merges_overlaps_and_keeps_offsets() {
+        // Unsorted, overlapping, and duplicated ranges collapse into one mask.
+        assert_eq!(mask_ranges("abcdef", &[3..5, 1..2, 2..4, 1..2]), "a    f");
+        assert_eq!(mask_ranges("abcdef", &[]), "abcdef");
+        assert_eq!(mask_ranges("abcdef", &[0..6]), "      ");
+        // Multi-byte characters become one space per byte.
+        let masked = mask_ranges("x标签y", &[1..7]);
+        assert_eq!(masked, "x      y");
+        assert_eq!(masked.len(), "x标签y".len());
     }
 
     #[test]

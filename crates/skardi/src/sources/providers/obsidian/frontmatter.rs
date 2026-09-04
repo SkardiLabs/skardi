@@ -127,21 +127,22 @@ fn key_to_string(key: Yaml) -> String {
 }
 
 /// `aliases:` — a string becomes a one-element list; a list keeps its string
-/// items (trimmed, empties dropped); any other shape is `None`.
+/// items (trimmed, empties dropped). Any other shape is `None`, and so is a
+/// value with nothing usable in it (`""`, `[]`, `[7]`): the column is NULL
+/// rather than an empty list, one shape for "no aliases".
 pub fn aliases(frontmatter: &Json) -> Option<Vec<String>> {
-    match frontmatter.get("aliases")? {
-        Json::String(s) => Some(vec![s.trim().to_string()]),
-        Json::Array(items) => Some(
-            items
-                .iter()
-                .filter_map(Json::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .collect(),
-        ),
-        _ => None,
-    }
+    let items: Vec<String> = match frontmatter.get("aliases")? {
+        Json::String(s) => vec![s.trim().to_string()],
+        Json::Array(items) => items
+            .iter()
+            .filter_map(Json::as_str)
+            .map(str::trim)
+            .map(str::to_string)
+            .collect(),
+        _ => return None,
+    };
+    let items: Vec<String> = items.into_iter().filter(|s| !s.is_empty()).collect();
+    (!items.is_empty()).then_some(items)
 }
 
 /// `tags:` and `tag:` — a list of strings, or one string split on commas and
@@ -167,8 +168,11 @@ pub fn tags(frontmatter: &Json) -> Vec<String> {
 }
 
 fn push_tag(out: &mut Vec<String>, raw: &str) {
-    let tag = raw.trim().trim_start_matches('#');
-    if tag.is_empty() || out.iter().any(|t| t == tag) {
+    let trimmed = raw.trim();
+    // One leading `#` (spec), and the body-tag grammar's digit rule: Obsidian
+    // rejects a tag with no non-digit character (`2026`), keeps `y2026`.
+    let tag = trimmed.strip_prefix('#').unwrap_or(trimmed);
+    if tag.is_empty() || tag.chars().all(char::is_numeric) || out.iter().any(|t| t == tag) {
         return;
     }
     out.push(tag.to_string());
@@ -300,6 +304,11 @@ mod tests {
         assert_eq!(aliases(&json!({"aliases": 42})), None);
         assert_eq!(aliases(&json!({"aliases": {"a": 1}})), None);
         assert_eq!(aliases(&json!({"title": "x"})), None);
+        // Nothing usable left → NULL, not an empty list; scalar and list agree.
+        assert_eq!(aliases(&json!({"aliases": ""})), None);
+        assert_eq!(aliases(&json!({"aliases": "  "})), None);
+        assert_eq!(aliases(&json!({"aliases": []})), None);
+        assert_eq!(aliases(&json!({"aliases": [7, ""]})), None);
     }
 
     #[test]
@@ -321,6 +330,11 @@ mod tests {
         );
         assert!(tags(&json!({"title": "x"})).is_empty());
         assert!(tags(&json!({"tags": ["", "#"]})).is_empty());
+        // Exactly one `#` is stripped; all-digit tags are dropped like in the body.
+        assert_eq!(
+            tags(&json!({"tags": ["##a", "2026", "#2026", "y2026", "2026-plan"]})),
+            vec!["#a", "y2026", "2026-plan"]
+        );
     }
 
     #[test]

@@ -387,7 +387,7 @@ mod tests {
                 &query(&ctx, "SELECT count(*) FROM vault.main.links").await,
                 0
             ),
-            vec![28]
+            vec![27]
         );
         assert_eq!(
             int64(
@@ -553,13 +553,21 @@ mod tests {
         assert_eq!(strings(&b, 1), vec![Some("Start".to_string())]);
         assert_eq!(strings(&b, 2), vec![Some("Home.md".to_string())]);
 
-        // Frontmatter-only inbound link: B12's in-degree is wrong without it.
+        // Rooms/B12.md is linked from nowhere but Meeting.md's frontmatter
+        // (`location.room`): its whole in-degree is that one row, so without
+        // frontmatter link extraction it would be a sixth orphan above.
         let b = query(
             &ctx,
-            "SELECT count(*) FROM vault.main.links WHERE to_path = 'Rooms/B12.md' AND source = 'frontmatter'",
+            "SELECT count(*) FROM vault.main.links WHERE to_path = 'Rooms/B12.md'",
         )
         .await;
         assert_eq!(int64(&b, 0), vec![1]);
+        let b = query(
+            &ctx,
+            "SELECT source FROM vault.main.links WHERE to_path = 'Rooms/B12.md'",
+        )
+        .await;
+        assert_eq!(strings(&b, 0), vec![Some("frontmatter".to_string())]);
     }
 
     #[tokio::test]
@@ -570,6 +578,85 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(text.contains("ObsidianScanExec"), "{text}");
+    }
+
+    async fn explain(ctx: &SessionContext, sql: &str) -> String {
+        arrow::util::pretty::pretty_format_batches(&query(ctx, sql).await)
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn declared_ordering_lets_the_planner_skip_a_sort() {
+        let ctx = register(&fixture_root(), "vault").await;
+        for sql in [
+            "EXPLAIN SELECT path FROM vault.main.notes ORDER BY path",
+            "EXPLAIN SELECT from_path, target FROM vault.main.links ORDER BY from_path",
+            "EXPLAIN SELECT path, tag, source FROM vault.main.tags ORDER BY path, tag, source",
+        ] {
+            let text = explain(&ctx, sql).await;
+            assert!(!text.contains("SortExec"), "{sql}\n{text}");
+        }
+        // Projecting the leading column away withdraws the guarantee.
+        let text = explain(&ctx, "EXPLAIN SELECT tag FROM vault.main.tags ORDER BY tag").await;
+        assert!(text.contains("SortExec"), "{text}");
+    }
+
+    #[cfg(unix)]
+    fn note_files(root: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().is_some_and(|e| e == "md") {
+                    out.push(p);
+                }
+            }
+        }
+        out
+    }
+
+    /// Spec Failure Modes: a vault where every read fails is a query error
+    /// naming the root — asserted through DataFusion, not just the scan API.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn every_read_failing_fails_the_query_naming_the_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        copy_dir(&fixture_root(), dir.path());
+        let notes = note_files(dir.path());
+        for p in &notes {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        let restore = || {
+            for p in &notes {
+                let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o644));
+            }
+        };
+        if notes.iter().any(|p| std::fs::read(p).is_ok()) {
+            eprintln!("skipping: running as root, chmod 000 does not deny reads");
+            restore();
+            return;
+        }
+        // Registration only checks that the root is a directory.
+        let ctx = register(dir.path(), "vault").await;
+        let err = ctx
+            .sql("SELECT count(*) FROM vault.main.notes")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("every note read under"), "{msg}");
+        assert!(
+            msg.contains(&dir.path().to_string_lossy().into_owned()),
+            "{msg}"
+        );
+        restore();
     }
 
     #[tokio::test]
@@ -589,7 +676,7 @@ mod tests {
                 &query(&ctx, "SELECT count(*) FROM vault.main.links").await,
                 0
             ),
-            vec![28]
+            vec![27]
         );
 
         std::fs::write(dir.path().join("New.md"), "Fresh note linking [[Home]].\n").unwrap();
@@ -605,7 +692,7 @@ mod tests {
                 &query(&ctx, "SELECT count(*) FROM vault.main.links").await,
                 0
             ),
-            vec![29]
+            vec![28]
         );
 
         std::fs::remove_file(dir.path().join("New.md")).unwrap();
