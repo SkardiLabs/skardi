@@ -26,12 +26,16 @@
 //! - **Wholesale-failure guard.** A non-empty listing where every attempted
 //!   read fails is an error naming the root, never three empty tables.
 
-pub mod config;
-pub mod frontmatter;
-pub mod markdown;
-pub mod resolve;
-pub mod scan;
-pub mod table;
+// Private, like `documents`' `parse`/`table`: the whole connector is reached
+// through `register_obsidian_tables`, so the scanner, parsers and resolver are
+// implementation detail. Keeping them out of the crate's public API leaves
+// their signatures free to change without a breaking release.
+mod config;
+mod frontmatter;
+mod markdown;
+mod resolve;
+mod scan;
+mod table;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -89,6 +93,37 @@ pub enum ObsidianError {
 /// No parsing happens at registration. `register_catalog` is the **last**
 /// step: it replaces whatever was registered under `name` unconditionally, so
 /// a failed registration must never have touched the context.
+///
+/// # Example
+///
+/// ```no_run
+/// use std::collections::HashMap;
+///
+/// use datafusion::prelude::SessionContext;
+/// use skardi::sources::hierarchy::HierarchyLevel;
+/// use skardi::sources::providers::obsidian::register_obsidian_tables;
+///
+/// # async fn register() -> anyhow::Result<()> {
+/// let mut ctx = SessionContext::new();
+/// let options = HashMap::from([("max_file_bytes".to_string(), "1048576".to_string())]);
+///
+/// register_obsidian_tables(
+///     &mut ctx,
+///     "vault",
+///     "/home/me/notes",
+///     Some(&options),
+///     false, // read_write: the source is read-only
+///     HierarchyLevel::Catalog,
+/// )
+/// .await?;
+///
+/// let df = ctx
+///     .sql("SELECT path, name FROM vault.main.notes ORDER BY path")
+///     .await?;
+/// df.show().await?;
+/// # Ok(())
+/// # }
+/// ```
 pub async fn register_obsidian_tables(
     session_ctx: &mut SessionContext,
     name: &str,

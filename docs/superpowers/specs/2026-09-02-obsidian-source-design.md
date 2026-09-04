@@ -465,3 +465,8 @@ covered by a test:
   stalling the scan; the strict listing also skips anything that is not a
   regular file or directory. Non-unix keeps the `symlink_metadata`
   approximation, now per component.
+- **The connector's public API is `register_obsidian_tables` alone.** The six
+  submodules are private, as `documents`' `parse`/`table` are: nothing outside
+  the crate uses the scanner, parsers or resolver, and keeping them off the
+  public API leaves their signatures free to change without a breaking
+  release. The registration function carries the module's one doc example.
