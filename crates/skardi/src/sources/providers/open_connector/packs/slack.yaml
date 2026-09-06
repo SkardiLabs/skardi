@@ -40,19 +40,59 @@ tables:
     # not an oomol-lab release.
     action: slack.get_channel_messages
     row_path: "$.messages"
-    fingerprint: e69af337f869bae3c6f25dabe4e064c5567459089166f079c57b8c984617bc79
+    fingerprint: 979c92a8816ee0f1fcb8c9ca62aee4028ebbe5b09222e8cb7ce4d7f4021d395b
     pagination:
       strategy: cursor
       page_size_input: limit
       cursor_input: cursor
       next_cursor_path: "$.nextCursor"
-      page_size: 100
+      page_size: 999
     resources:
       required: [channelId]
+    fixed_inputs:
+      # Load-bearing, not a default. Slack's `oldest` is EXCLUSIVE unless
+      # this is set, and the `sent_at` filter below floors its literal to a
+      # whole second — so a message sitting exactly on that second would be
+      # dropped by the provider, and Inexact re-filtering cannot recover a
+      # row that never arrived. Slack ignores the flag when neither bound
+      # is sent, so it costs nothing on an unfiltered scan.
+      inclusive: true
     columns:
+      # `ts` is the message's identity (unique per conversation, and the
+      # handle `conversations.replies` and permalinks take), so it stays the
+      # raw string. `sent_at` reads the SAME field as a time, because a
+      # pushdown needs a Timestamp-typed column and Arrow milliseconds
+      # cannot hold Slack's microseconds — splitting them keeps identity
+      # exact and makes the truncation visible in the schema.
       - { name: ts, path: ts, type: utf8, nullable: false }
+      - { name: sent_at, path: ts, type: timestamp_s_frac_string_utc, nullable: false }
+      - { name: type, path: type, type: utf8, nullable: true }
+      - { name: subtype, path: subtype, type: utf8, nullable: true }
       - { name: user_id, path: userId, type: utf8, nullable: true }
+      - { name: bot_id, path: botId, type: utf8, nullable: true }
+      - { name: app_id, path: appId, type: utf8, nullable: true }
+      - { name: username, path: username, type: utf8, nullable: true }
+      - { name: team_id, path: teamId, type: utf8, nullable: true }
+      - { name: client_msg_id, path: clientMsgId, type: utf8, nullable: true }
       - { name: text, path: text, type: utf8, nullable: true }
+      - { name: edited_ts, path: editedTs, type: utf8, nullable: true }
+      - { name: thread_ts, path: threadTs, type: utf8, nullable: true }
+      - { name: parent_user_id, path: parentUserId, type: utf8, nullable: true }
+      - { name: reply_count, path: replyCount, type: uint64, nullable: true }
+      - { name: reply_users_count, path: replyUsersCount, type: uint64, nullable: true }
+      - { name: latest_reply, path: latestReply, type: utf8, nullable: true }
+      - { name: is_locked, path: isLocked, type: boolean, nullable: true }
+    filters:
+      # The whole point of the table's incremental story: `sent_at >= X`
+      # becomes Slack's `oldest`, so a scheduled run fetches the delta
+      # instead of the channel's entire history. Inexact and gt_eq are both
+      # forced by the epoch-seconds rendering (see ValueFormat) — the
+      # floored literal widens the fetch by up to a second and DataFusion
+      # trims it back. The STRING spelling because the action types
+      # `oldest` as a Slack `ts` string under a strict
+      # `additionalProperties: false` schema: a bare JSON number is a 400,
+      # not a coercion.
+      - { column: sent_at, op: gt_eq, input: oldest, format: epoch_seconds_string, fidelity: inexact }
 
   users:
     action: slack.list_users

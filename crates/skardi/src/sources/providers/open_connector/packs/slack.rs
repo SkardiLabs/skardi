@@ -47,6 +47,39 @@
 //!   **gone**: OC's `slack.list_files` contract declares no time input at
 //!   all, and its strict schema would 400 any request carrying one — time
 //!   predicates are evaluated by DataFusion after the bounded fetch.
+//! - **`messages.sent_at >= …` pushes to `conversations.history`'s
+//!   `oldest`**, and it is the table's whole incremental story: without
+//!   it a scheduled ETL re-reads the channel's entire history through the
+//!   API on every run and the job can only trim what it *writes*. Three
+//!   things about it are load-bearing rather than stylistic:
+//!   - the column is **`sent_at`, not `ts`**. A pushdown needs a
+//!     Timestamp-typed column — skardi-cloud's recipe layer resolves
+//!     `incremental: auto` by finding a `GtEq` filter on the table's
+//!     *timestamp-role* column, and rejects a role bound to anything but
+//!     an Arrow timestamp — and Arrow's millisecond unit cannot hold
+//!     Slack's microseconds — so `ts` stays the raw string identity
+//!     (unique per conversation, the handle `conversations.replies` and
+//!     permalinks take) and `sent_at` reads the same field as a time.
+//!     Two `ts` a microsecond apart share one `sent_at`.
+//!   - the rendering is
+//!     [`ValueFormat::EpochSecondsString`](crate::sources::providers::open_connector::filters::ValueFormat::EpochSecondsString),
+//!     not `EpochSeconds`: the action types `oldest` as a Slack `ts`
+//!     STRING under `additionalProperties: false`, where a JSON number is
+//!     a 400 rather than a coercion. That rendering floors to a whole
+//!     second, which forces `gt_eq` + `Inexact` (the loader enforces
+//!     both) — the fetch widens by up to a second and DataFusion trims it.
+//!   - **`inclusive: true` is pinned.** Slack's `oldest` is EXCLUSIVE by
+//!     default, so a message sitting exactly on the floored bound would be
+//!     dropped by the provider — and Inexact re-filtering can only remove
+//!     rows, never recover one that never arrived. Slack ignores the flag
+//!     when no bound is sent, so an unfiltered scan pays nothing for it.
+//! - **`ts` is Slack's fractional epoch-seconds string**, read as a time
+//!   through
+//!   [`FieldType::TimestampSecondsFractionalStringUtc`](crate::sources::providers::open_connector::json_to_arrow::FieldType::TimestampSecondsFractionalStringUtc).
+//!   The digits-only string readers stop at the dot and the numeric ones
+//!   want a JSON number, so none of the pre-existing four accepts it — and
+//!   a column that silently failed to parse would give a filter that
+//!   matches nothing, which looks exactly like "no new messages".
 //! - **`files.created` is epoch seconds**, read through
 //!   [`FieldType::TimestampSecondsUtc`](crate::sources::providers::open_connector::json_to_arrow::FieldType::TimestampSecondsUtc) — the millis reader would
 //!   silently produce January-1970 dates. (The normalized conversation
@@ -54,12 +87,12 @@
 //! - **`files` may be scoped to one channel** with the optional
 //!   `channelId` resource — declared as an optional resource so a shared
 //!   binding's key reaches only this table.
-//! - **No message or thread tables**, per the design's Slack caveat:
-//!   Open Connector does not yet provide complete message-history cursor
-//!   handling, and an incomplete message table would violate the admission
-//!   gate's complete-pagination requirement. They land in a later pack
-//!   version once upstream support exists; until then `open_connector_scan`
-//!   can reach allowlisted read actions ad hoc.
+//! - **No thread table yet.** `messages` arrived once the vendored build
+//!   gave `get_channel_messages` the cursor contract the admission gate's
+//!   complete-pagination requirement needs; `get_thread` has the same
+//!   contract now (cursor in, `nextCursor` out, the same time window), so
+//!   a `threads` table is a pack change rather than an upstream one. Until
+//!   then `open_connector_scan` can reach it ad hoc.
 //! - **Nullability is conservative**: only `id` is non-null on every
 //!   table. The normalizer emits explicit `null`s for absent strings and
 //!   booleans and *omits* `memberCount` when Slack didn't send a number;
@@ -876,6 +909,146 @@ bindings:
             bodies.iter().all(|body| body.contains(r#""count":100"#)),
             "files uses classic page/count pagination: {bodies:?}"
         );
+    }
+
+    /// A messages binding needs its `channelId` resource, which `setup`
+    /// does not supply — so this one builds its own config.
+    async fn setup_messages(gateway: &MockGateway, token_env: &str) -> SessionContext {
+        let _token = EnvVarGuard::set(token_env, "test-token");
+        let config: OpenConnectorConfig = serde_yaml::from_str(&format!(
+            r#"
+runtime_token_env: {token_env}
+bindings:
+  - name: ws
+    source_pack: slack
+    resource:
+      channelId: C0001
+    tables: [messages]
+"#
+        ))
+        .expect("parse config");
+        let gateways = OpenConnectorGateways::default();
+        let mut ctx = SessionContext::new();
+        register_open_connector_tables(
+            &mut ctx,
+            "saas",
+            &gateway.url,
+            Some(&config),
+            false,
+            HierarchyLevel::Catalog,
+            Some(&gateways),
+        )
+        .await
+        .expect("gateway registration succeeds");
+        ctx
+    }
+
+    fn messages_gateway(req: &RecordedRequest) -> MockResponse {
+        if req.method == "GET" && req.path == "/v1/health" {
+            return MockResponse::ok("{}");
+        }
+        if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+            return slack_discovery(&req.path);
+        }
+        if req.method == "POST" && req.path == "/v1/actions/slack.get_channel_messages" {
+            // The stub IGNORES `oldest` — the harshest legal Inexact
+            // provider, so the assertion below is about DataFusion trimming
+            // the superset, not about the stub agreeing with the filter.
+            return MockResponse::ok(&envelope_ok(
+                &json!({"messages": [
+                    {"ts": "1735689599.000100", "userId": "U0001", "text": "before"},
+                    {"ts": "1735689600.000100", "userId": "U0001", "text": "on the boundary"},
+                    {"ts": "1735689601.123456", "userId": "U0002", "text": "after",
+                     "subtype": "bot_message", "botId": "B0001", "threadTs": "1735689600.000100",
+                     "replyCount": 2, "isLocked": false}
+                ], "hasMore": false, "nextCursor": null})
+                .to_string(),
+            ));
+        }
+        MockResponse::new(404, "{}")
+    }
+
+    #[tokio::test]
+    async fn sent_at_lower_bound_is_pushed_as_oldest_and_reapplied_locally() {
+        // The point of the table: without this push every scheduled run
+        // re-reads the channel's whole history through Slack's API, and the
+        // job can only trim what it writes.
+        let gateway = MockGateway::start(messages_gateway).await;
+        let ctx = setup_messages(&gateway, "SKARDI_TEST_OC_SLACK_MESSAGES_SINCE").await;
+
+        let batches = collect(
+            &ctx,
+            "SELECT ts FROM saas.ws.messages \
+             WHERE sent_at >= TIMESTAMP '2025-01-01T00:00:00.500Z' ORDER BY ts",
+        )
+        .await;
+        assert_eq!(
+            column_values(&batches, "ts"),
+            vec!["1735689601.123456"],
+            "the ignoring provider's out-of-window rows are trimmed locally"
+        );
+
+        let bodies = execute_bodies(&gateway);
+        assert!(!bodies.is_empty());
+        assert!(
+            // 00:00:00.500Z floors to the whole second 1735689600 — a
+            // WIDER bound, which is why the mapping is Inexact.
+            bodies
+                .iter()
+                .all(|body| body.contains(r#""oldest":"1735689600""#)),
+            "the lower bound reaches Slack as a digit STRING (a number 400s \
+             against the action's strict schema): {bodies:?}"
+        );
+        assert!(
+            bodies
+                .iter()
+                .all(|body| body.contains(r#""inclusive":true"#)),
+            "without this Slack drops a message sitting exactly on the \
+             floored bound, and Inexact cannot recover a row that never \
+             arrived: {bodies:?}"
+        );
+        assert!(
+            bodies.iter().all(|body| body.contains(r#""limit":999"#)),
+            "conversations.history's documented ceiling, not the old 100: {bodies:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn messages_carry_the_fields_beyond_ts_user_and_text() {
+        let gateway = MockGateway::start(messages_gateway).await;
+        let ctx = setup_messages(&gateway, "SKARDI_TEST_OC_SLACK_MESSAGES_COLUMNS").await;
+
+        let batches = collect(
+            &ctx,
+            "SELECT ts, sent_at, subtype, bot_id, thread_ts, reply_count, is_locked \
+             FROM saas.ws.messages WHERE ts = '1735689601.123456'",
+        )
+        .await;
+        assert_eq!(rows_of(&batches), 1);
+        // `ts` keeps microsecond identity; `sent_at` is the same instant
+        // floored into Arrow's millisecond unit.
+        assert_eq!(utf8(&batches[0], "ts").value(0), "1735689601.123456");
+        let sent_at = batches[0]
+            .column_by_name("sent_at")
+            .expect("sent_at")
+            .as_any()
+            .downcast_ref::<TimestampMillisecondArray>()
+            .expect("millis");
+        assert_eq!(sent_at.value(0), 1_735_689_601_123);
+        assert_eq!(utf8(&batches[0], "subtype").value(0), "bot_message");
+        assert_eq!(utf8(&batches[0], "bot_id").value(0), "B0001");
+        assert_eq!(utf8(&batches[0], "thread_ts").value(0), "1735689600.000100");
+        assert_eq!(
+            batches[0]
+                .column_by_name("reply_count")
+                .expect("reply_count")
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .expect("uint64")
+                .value(0),
+            2
+        );
+        assert!(!boolean(&batches[0], "is_locked").value(0));
     }
 
     #[tokio::test]

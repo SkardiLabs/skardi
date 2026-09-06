@@ -507,6 +507,9 @@ fn convert_column(table_id: &str, doc: ColumnDoc) -> Result<FieldMapping, String
         (ColumnType::TimestampSUtc, None) => FieldType::TimestampSecondsUtc,
         (ColumnType::TimestampMsStringUtc, None) => FieldType::TimestampMillisStringUtc,
         (ColumnType::TimestampSStringUtc, None) => FieldType::TimestampSecondsStringUtc,
+        (ColumnType::TimestampSFracStringUtc, None) => {
+            FieldType::TimestampSecondsFractionalStringUtc
+        }
         (ColumnType::Utf8List, None) => FieldType::Utf8List,
         (ColumnType::Json, None) => FieldType::Json,
     };
@@ -819,6 +822,8 @@ enum ColumnType {
     TimestampMsStringUtc,
     #[serde(rename = "timestamp_s_string_utc")]
     TimestampSStringUtc,
+    #[serde(rename = "timestamp_s_frac_string_utc")]
+    TimestampSFracStringUtc,
     #[serde(rename = "utf8_list")]
     Utf8List,
     #[serde(rename = "utf8_list_from_object_key")]

@@ -10,13 +10,96 @@
             "type": "string",
             "description": "The message timestamp identifier."
           },
+          "type": {
+            "type": "string",
+            "description": "The Slack message type, normally 'message'."
+          },
+          "subtype": {
+            "type": "string",
+            "description": "The Slack message subtype ('channel_join', 'bot_message', …) when the message has one."
+          },
           "userId": {
             "type": "string",
             "description": "The user ID of the message author."
           },
+          "botId": {
+            "type": "string",
+            "description": "The bot ID of the message author when a bot posted it."
+          },
+          "appId": {
+            "type": "string",
+            "description": "The Slack app ID that posted the message when an app posted it."
+          },
+          "username": {
+            "type": "string",
+            "description": "The display username Slack attached to a bot or app message."
+          },
+          "teamId": {
+            "type": "string",
+            "description": "The Slack team ID the message belongs to."
+          },
+          "clientMsgId": {
+            "type": "string",
+            "description": "The client-generated message identifier when Slack returns one."
+          },
           "text": {
             "type": "string",
             "description": "The text content of the message."
+          },
+          "editedTs": {
+            "type": "string",
+            "description": "The timestamp of the most recent edit, when the message was edited."
+          },
+          "threadTs": {
+            "type": "string",
+            "description": "The timestamp of the thread parent. Equal to ts on a thread parent, and absent on a message that is not in a thread."
+          },
+          "parentUserId": {
+            "type": "string",
+            "description": "The author of the thread parent, on a threaded reply."
+          },
+          "replyCount": {
+            "type": "integer",
+            "description": "The number of replies to this thread parent."
+          },
+          "replyUsersCount": {
+            "type": "integer",
+            "description": "The number of distinct users who replied to this thread parent."
+          },
+          "latestReply": {
+            "type": "string",
+            "description": "The timestamp of the most recent reply to this thread parent."
+          },
+          "isLocked": {
+            "type": "boolean",
+            "description": "Whether the thread is locked."
+          },
+          "reactions": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string",
+                  "description": "The emoji name of the reaction."
+                },
+                "count": {
+                  "type": "integer",
+                  "description": "How many users added this reaction."
+                },
+                "userIds": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "description": "A Slack user ID."
+                  },
+                  "description": "The users who added this reaction, as far as Slack reports them."
+                }
+              },
+              "additionalProperties": true,
+              "description": "A reaction summary on a Slack message."
+            },
+            "description": "Reaction summaries attached to the message."
           }
         },
         "additionalProperties": true,
