@@ -1277,11 +1277,20 @@ fn raw_link_from_markdown(open: OpenLink) -> RawLink {
     } else {
         Some(open.text)
     };
-    if has_url_scheme(&open.dest) {
+    // pulldown-cmark hands an email autolink its bare address
+    // (`<me@example.com>` -> `me@example.com`); the `mailto:` scheme lives only
+    // in its HTML rendering. Put it back, or the target carries no scheme and
+    // resolves as a note name instead of an external link.
+    let dest = if matches!(open.link_type, LinkType::Email) && !has_url_scheme(&open.dest) {
+        format!("mailto:{}", open.dest)
+    } else {
+        open.dest
+    };
+    if has_url_scheme(&dest) {
         return RawLink {
             syntax,
             embed: open.image,
-            target: open.dest,
+            target: dest,
             heading: None,
             block_id: None,
             display_text,
@@ -1290,9 +1299,9 @@ fn raw_link_from_markdown(open: OpenLink) -> RawLink {
     }
     // Split at the first LITERAL `#` first, then decode the two halves
     // independently, so `foo%23bar.md` stays the file name `foo#bar.md`.
-    let (path, fragment) = match open.dest.split_once('#') {
+    let (path, fragment) = match dest.split_once('#') {
         Some((p, f)) => (p, Some(f)),
-        None => (open.dest.as_str(), None),
+        None => (dest.as_str(), None),
     };
     let target = percent_decode_str(path).decode_utf8_lossy().into_owned();
     let fragment = fragment.map(|f| percent_decode_str(f).decode_utf8_lossy().into_owned());
@@ -3912,10 +3921,8 @@ mod tests {
         assert_eq!(b.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
 
         let b = query(&ctx, "SELECT arrow_typeof(modified_at) FROM vault.main.notes LIMIT 1").await;
-        assert_eq!(
-            strings(&b, 0)[0].as_deref(),
-            Some("Timestamp(Millisecond, Some(\"UTC\"))")
-        );
+        // DataFusion's own rendering of the type, not Arrow's Debug form.
+        assert_eq!(strings(&b, 0)[0].as_deref(), Some("Timestamp(ms, \"UTC\")"));
     }
 
     #[tokio::test]
@@ -4687,6 +4694,10 @@ covered by a test:
 - **Autolinks** (`<https://…>`) carry `display_text = NULL` rather than
   repeating the URL, so `display_text IS NOT NULL` means "the author wrote
   text".
+- **Email autolinks** (`<me@example.com>`) get `mailto:` restored on their
+  target. pulldown-cmark reports the bare address and prepends the scheme only
+  when rendering HTML; without it the target carries no scheme and would
+  resolve as a note name instead of `external`.
 ```
 
 - [ ] **Step 4: Format and checkpoint**
