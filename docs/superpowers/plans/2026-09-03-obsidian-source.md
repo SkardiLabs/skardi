@@ -6,7 +6,7 @@
 
 **Architecture:** The `documents` connector's `blob.rs` is lifted to a shared `providers/blob.rs` and extended with listing metadata and symlink control. A new `providers/obsidian/` module holds four pure parsing units (`config`, `frontmatter`, `markdown`, `resolve`), one synchronous scanner (`scan`) run inside `spawn_blocking`, and one `TableProvider`/`ExecutionPlan` pair parameterized by table kind (`table`). Registration (`mod.rs`) mirrors `rss`: catalog-only, read-only, one `MemoryCatalogProvider` published last. The server gets a `DataSourceType::Obsidian` arm behind a server-level `obsidian` feature.
 
-**Tech Stack:** Rust edition 2024 (toolchain 1.96.1), DataFusion 52 / Arrow, `pulldown-cmark` 0.13 (`default-features = false`), `serde_yaml` 0.9 → `serde_json` (preserve_order), `glob` 0.3, `object_store` 0.12, `chrono` 0.4, `regex`, `percent-encoding` 2.3, `libc` (unix only, `O_NOFOLLOW`), `thiserror` 2, `tokio`.
+**Tech Stack:** Rust edition 2024 (toolchain 1.96.1), DataFusion 52 / Arrow, `pulldown-cmark` 0.13 (`default-features = false`), `serde_yaml` 0.9 → `serde_json` (preserve_order), `glob` 0.3, `object_store` 0.12, `chrono` 0.4, `regex`, `percent-encoding` 2.3, `rustix` 1 (unix only, `openat` + `O_NOFOLLOW`), `thiserror` 2, `tokio`.
 
 **Spec:** `docs/superpowers/specs/2026-09-02-obsidian-source-design.md` (merged to `main` in `5713a6e`). Read it first; the plan argues from it and repeats only what an implementer needs at the keyboard.
 
@@ -16,7 +16,7 @@
 - **No commits by Claude.** Each task ends in a **Checkpoint**: run `cargo fmt --all`, then Owen reviews and commits/pushes. Suggested commit messages are given; Owen may change them.
 - **Branch:** `feature/obsidian-source`, created from `origin/main` at `5713a6e` in worktree `.claude/worktrees/obsidian-sourcepack-dev-745bc6`. Verify with `git branch --show-current` before every destructive git operation.
 - **Toolchain rules:** edition 2024; `unused_qualifications = "deny"` (write `use` imports, never inline `std::...` paths where an import exists in scope — but a one-off fully qualified path with no competing import is fine); clippy `large_futures = "warn"`; rustdoc must be warning-free (every intra-doc link must resolve; use backticks without brackets for names that are private or feature-gated).
-- **Feature gating (verbatim from spec):** `crates/skardi`: `obsidian = ["dep:glob", "dep:object_store", "dep:pulldown-cmark"]`; `libc` as an unconditional `[target.'cfg(unix)'.dependencies]` entry; `blob.rs` compiled under `#[cfg(any(feature = "documents", feature = "obsidian"))]`. `crates/server`: `obsidian = ["skardi/obsidian"]`. Builds with `--features documents` alone, `--features obsidian` alone, and no feature must all compile for both crates.
+- **Feature gating (verbatim from spec):** `crates/skardi`: `obsidian = ["dep:glob", "dep:object_store", "dep:pulldown-cmark", "dep:rustix"]`; `rustix` as an optional `[target.'cfg(unix)'.dependencies]` entry enabled by `obsidian` alone; `blob.rs` compiled under `#[cfg(any(feature = "documents", feature = "obsidian"))]`. `crates/server`: `obsidian = ["skardi/obsidian"]`. Builds with `--features documents` alone, `--features obsidian` alone, and no feature must all compile for both crates.
 - **Async rule (AGENTS.md):** no blocking I/O on a Tokio worker. `VaultScan::run` is synchronous and only ever runs inside `tokio::task::spawn_blocking`; S3 futures inside it use `tokio::runtime::Handle::current().block_on`. The `BlobStore` is resolved inside the same blocking task.
 - **Defaults (verbatim):** `exclude_globs` default `.obsidian/**,.trash/**`; `max_file_bytes` default `16777216`; schema metadata key `skardi.obsidian.surface_version` = `"1"`; catalog schema name `main`; table names `notes`, `links`, `tags`.
 - **Column contracts (verbatim from spec §Table Schemas):** `notes(path Utf8, name Utf8, folder Utf8, body Utf8, frontmatter_json Utf8?, frontmatter_error Utf8?, aliases List<Utf8>?, size_bytes Int64, modified_at Timestamp(ms, "UTC"))`; `links(from_path Utf8, to_path Utf8?, target Utf8, kind Utf8, display_text Utf8?, heading Utf8?, block_id Utf8?, resolution Utf8, source Utf8, line Int32?)`; `tags(path Utf8, tag Utf8, source Utf8)`. `kind ∈ {wikilink, embed, markdown, external}`, `resolution ∈ {exact, name, ambiguous, missing, external}`, `source ∈ {body, frontmatter}`.
@@ -29,7 +29,7 @@
 
 | Path | Responsibility |
 |---|---|
-| `crates/skardi/Cargo.toml` | `obsidian` feature, `pulldown-cmark` optional dep, `libc` unix dep. |
+| `crates/skardi/Cargo.toml` | `obsidian` feature, `pulldown-cmark` optional dep, `rustix` unix dep. |
 | `crates/skardi/src/sources/providers/blob.rs` | **moved** from `documents/blob.rs`; `ListOptions`, `ReadOptions`, `BlobEntry`; symlink control; metadata-carrying listings. |
 | `crates/skardi/src/sources/providers/mod.rs` | `pub(crate) mod blob` (gated on either feature); `pub mod obsidian` (gated on `obsidian`). |
 | `crates/skardi/src/sources/providers/documents/{mod,parse}.rs`, `crates/skardi/src/model/llm_extract/mod.rs` | adapt to the moved module and new API (`follow_symlinks: true`). |
@@ -98,8 +98,11 @@ Add a new section after `[dependencies]` and before `[dev-dependencies]`:
 
 ```toml
 [target.'cfg(unix)'.dependencies]
-# `O_NOFOLLOW` for blob.rs's no-follow read (already in the tree via tokio).
-libc = "0.2"
+# `openat` + `O_NOFOLLOW` for blob.rs's no-follow read. rustix rather than raw
+# `libc`: its `openat` returns an `OwnedFd` and an `Errno` in the `Result`, so
+# the reader needs no `unsafe`. Already in the tree via arrow's comfy-table.
+# Only `obsidian` takes that read path, so it hangs off that feature alone.
+rustix = { version = "1", features = ["fs"], optional = true }
 ```
 
 Update the `glob` and `object_store` comments to say they serve both connectors (`# include_globs (documents) / exclude_globs (obsidian) matching.`).
@@ -300,6 +303,9 @@ fn list_local(root: &Path, opts: ListOptions) -> Result<Vec<BlobEntry>> {
 }
 
 /// Read a local file refusing to follow a symlink at the final path component.
+/// (Review hardened this after the fact: what landed opens *every* component
+/// beneath the root with `rustix::fs::openat` + `O_NOFOLLOW`, so a swapped
+/// directory is refused too, and the final open is non-blocking.)
 /// Unix: `O_NOFOLLOW` makes the open itself fail with `ELOOP` on a symlink,
 /// then the opened handle is checked to be a regular file (a FIFO or device
 /// would otherwise block or misbehave). This closes the listing→read race.

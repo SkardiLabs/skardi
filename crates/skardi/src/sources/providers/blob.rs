@@ -15,8 +15,11 @@
 //! arbitrary files, and a file or a directory can be swapped for a symlink
 //! between the two calls.
 
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+#[cfg(feature = "obsidian")]
+use std::path::Component;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -85,6 +88,10 @@ pub enum Symlinks<'a> {
     /// a file swapped for a symlink after listing is refused. The final open
     /// is non-blocking and the handle must be a regular file: a FIFO named
     /// `note.md` would otherwise stall the scan waiting for a writer.
+    ///
+    /// The reader behind this variant is `#[cfg(feature = "obsidian")]` — it
+    /// is the only caller — so a build of this module without that feature
+    /// refuses the read rather than performing it.
     NoneBeneath(&'a Loc),
 }
 
@@ -460,23 +467,24 @@ fn read_capped(file: std::fs::File, max_bytes: Option<u64>, target: &str) -> Res
 /// final open cannot stall on a FIFO waiting for a writer; the handle is then
 /// `fstat`ed and anything but a regular file is refused (`O_NONBLOCK` is inert
 /// on a regular file).
-#[cfg(unix)]
+#[cfg(all(unix, feature = "obsidian"))]
 fn read_local_no_follow(root: &Path, path: &Path, max_bytes: Option<u64>) -> Result<Vec<u8>> {
-    use std::ffi::CString;
     use std::fs::File;
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::fd::OwnedFd;
+
+    use rustix::fs::{Mode, OFlags};
 
     let rel = path
         .strip_prefix(root)
         .with_context(|| format!("blob: {} is not beneath {}", path.display(), root.display()))?;
-    let root_dir = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
-        .open(root)
-        .with_context(|| format!("blob: opening root directory {}", root.display()))?;
-    let mut dir = OwnedFd::from(root_dir);
+    // The root itself is operator configuration, so it is opened by path (and
+    // may be a symlink); everything below it is opened relative to its parent.
+    let mut dir: OwnedFd = rustix::fs::open(
+        root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .with_context(|| format!("blob: opening root directory {}", root.display()))?;
     let mut file: Option<File> = None;
     let mut components = rel.components().peekable();
     while let Some(component) = components.next() {
@@ -486,33 +494,25 @@ fn read_local_no_follow(root: &Path, path: &Path, max_bytes: Option<u64>) -> Res
                 path.display()
             );
         };
-        let c_name = CString::new(name.as_bytes())
-            .with_context(|| format!("blob: NUL byte in {}", path.display()))?;
         let last = components.peek().is_none();
-        let flags = libc::O_RDONLY
-            | libc::O_NOFOLLOW
-            | libc::O_CLOEXEC
+        let flags = OFlags::RDONLY
+            | OFlags::NOFOLLOW
+            | OFlags::CLOEXEC
             | if last {
-                libc::O_NONBLOCK
+                OFlags::NONBLOCK
             } else {
-                libc::O_DIRECTORY
+                OFlags::DIRECTORY
             };
-        // SAFETY: `dir` is an open directory descriptor owned by this frame
-        // and `c_name` is a NUL-terminated string that outlives the call;
-        // `openat` reads both and writes nothing into our memory.
-        let fd = unsafe { libc::openat(dir.as_raw_fd(), c_name.as_ptr(), flags) };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error()).with_context(|| {
-                format!(
-                    "blob: opening {} without following symlinks (component {})",
-                    path.display(),
-                    name.to_string_lossy()
-                )
-            });
-        }
-        // SAFETY: `fd` was just returned by a successful `openat` and nothing
-        // else owns it; `OwnedFd` closes it exactly once.
-        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        // `rustix::fs::openat` hands back an `OwnedFd`, so the descriptor is
+        // owned from the moment it exists — no raw fd, no `unsafe`, and no
+        // window in which an early return would leak it.
+        let fd = rustix::fs::openat(&dir, name, flags, Mode::empty()).with_context(|| {
+            format!(
+                "blob: opening {} without following symlinks (component {})",
+                path.display(),
+                name.to_string_lossy()
+            )
+        })?;
         if last {
             file = Some(File::from(fd));
         } else {
@@ -547,7 +547,7 @@ fn read_local_no_follow(root: &Path, path: &Path, max_bytes: Option<u64>) -> Res
 /// then a regular-file check, before reading. There is a residual
 /// time-of-check/time-of-use window between the checks and the read;
 /// documented in `docs/obsidian.md`.
-#[cfg(not(unix))]
+#[cfg(all(not(unix), feature = "obsidian"))]
 fn read_local_no_follow(root: &Path, path: &Path, max_bytes: Option<u64>) -> Result<Vec<u8>> {
     let rel = path
         .strip_prefix(root)
@@ -586,6 +586,19 @@ fn read_local_no_follow(root: &Path, path: &Path, max_bytes: Option<u64>) -> Res
     let file =
         std::fs::File::open(&current).with_context(|| format!("reading {}", path.display()))?;
     read_capped(file, max_bytes, &path.display().to_string())
+}
+
+/// Stand-in for builds that compile this module without `obsidian`. Only
+/// `obsidian` ever asks for [`Symlinks::NoneBeneath`], so this is unreachable
+/// in practice; it exists so the no-follow reader — and with it the `rustix`
+/// dependency — is compiled only for the connector that needs it, rather than
+/// for everyone who shares `blob.rs`.
+#[cfg(not(feature = "obsidian"))]
+fn read_local_no_follow(_root: &Path, path: &Path, _max_bytes: Option<u64>) -> Result<Vec<u8>> {
+    anyhow::bail!(
+        "blob: refusing symlinks beneath a root needs the `obsidian` feature ({})",
+        path.display()
+    )
 }
 
 /// List objects under an S3 prefix. Recursive uses a flat `list`; non-recursive
@@ -953,7 +966,7 @@ mod tests {
         assert_eq!(rels, vec!["link.md", "linkdir/secret.md", "real.md"]);
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "obsidian"))]
     #[tokio::test]
     async fn local_get_refuses_symlink_unless_followed() {
         let outside = tempfile::tempdir().unwrap();
@@ -987,7 +1000,7 @@ mod tests {
     /// A directory on the path swapped for a symlink after listing is refused
     /// too: `O_NOFOLLOW` applies to every component beneath the root, not just
     /// the file. The root itself may be a symlink.
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "obsidian"))]
     #[tokio::test]
     async fn local_get_refuses_symlinked_directory_beneath_root() {
         let outside = tempfile::tempdir().unwrap();
@@ -1067,7 +1080,7 @@ mod tests {
     /// shows up after listing, refused by a non-blocking open instead of
     /// stalling the scan until a writer appears. The read runs on its own
     /// thread with a deadline so a regression fails instead of hanging CI.
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "obsidian"))]
     #[tokio::test]
     async fn local_fifo_is_skipped_and_never_blocks() {
         let dir = tempfile::tempdir().unwrap();
@@ -1110,6 +1123,7 @@ mod tests {
     /// The listing's size is a snapshot: a note that grows before the read is
     /// refused by the cap instead of being buffered whole, and the error is a
     /// `SizeCapExceeded` so the caller can treat it as its own policy skip.
+    #[cfg(feature = "obsidian")]
     #[tokio::test]
     async fn local_get_enforces_max_bytes_after_listing() {
         let dir = tempfile::tempdir().unwrap();

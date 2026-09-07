@@ -81,8 +81,8 @@ Obsidian is one of the most widely used personal knowledge bases, and its data i
 
 **Packaging**
 
-- Gate the provider behind an `obsidian` Cargo feature, as `documents` and `rss` are gated. The reason is concrete: `s3://` support needs the optional `object_store` dependency with its AWS backend, which is currently pulled in only by the `documents` feature. `obsidian = ["dep:glob", "dep:object_store", "dep:pulldown-cmark"]` in `crates/skardi` (plus `libc` as an unconditional `cfg(unix)` dependency for `O_NOFOLLOW`, used by the shared `blob.rs`), and the same two-level mapping the siblings use in `crates/server/Cargo.toml`: `obsidian = ["skardi/obsidian"]`, since the server's `config.rs` arm is gated on the *server's* feature name. Without it, `cargo build -p skardi-server --features obsidian` is an unknown-feature error.
-- Lift `documents::blob` to a shared module, `sources/providers/blob.rs`, compiled when either feature is enabled (`#[cfg(any(feature = "documents", feature = "obsidian"))]`), and extend its `list` in one bounded way: it takes `ListOptions { recursive, follow_symlinks }` and returns `Vec<BlobEntry { loc, rel_key, size, modified }>`, carrying the metadata both backends already have at listing time (`DirEntry::metadata()` locally, `ObjectMeta` on S3). `get` gains the same knob — `get(loc, ReadOptions { follow_symlinks })` — because the listing-time symlink check alone is a time-of-check/time-of-use gap: in a writable or shared vault a regular file can be replaced by a symlink between `DirEntry::file_type()` and `std::fs::read`, which follows it. With `follow_symlinks: false` the local arm opens with `O_NOFOLLOW` (unix, via the `libc` crate — a new direct dependency, already in the tree transitively through tokio) and then checks the opened handle's `metadata().file_type().is_file()`; on non-unix targets it falls back to a `symlink_metadata` check before opening, with the residual race documented. `put` is unchanged. `documents` adapts to the new entry type and passes `follow_symlinks: true` to both calls, so its behavior does not change in this work; it simply ignores the two new fields. This is the one refactor in scope.
+- Gate the provider behind an `obsidian` Cargo feature, as `documents` and `rss` are gated. The reason is concrete: `s3://` support needs the optional `object_store` dependency with its AWS backend, which is currently pulled in only by the `documents` feature. `obsidian = ["dep:glob", "dep:object_store", "dep:pulldown-cmark"]` in `crates/skardi` (plus `rustix`, an optional `cfg(unix)` dependency enabled by `obsidian` alone: the no-follow reader in the shared `blob.rs` is `#[cfg(feature = "obsidian")]`, since `documents` follows symlinks at both ends and never takes that path), and the same two-level mapping the siblings use in `crates/server/Cargo.toml`: `obsidian = ["skardi/obsidian"]`, since the server's `config.rs` arm is gated on the *server's* feature name. Without it, `cargo build -p skardi-server --features obsidian` is an unknown-feature error.
+- Lift `documents::blob` to a shared module, `sources/providers/blob.rs`, compiled when either feature is enabled (`#[cfg(any(feature = "documents", feature = "obsidian"))]`), and extend its `list` in one bounded way: it takes `ListOptions { recursive, follow_symlinks }` and returns `Vec<BlobEntry { loc, rel_key, size, modified }>`, carrying the metadata both backends already have at listing time (`DirEntry::metadata()` locally, `ObjectMeta` on S3). `get` gains the same knob — `get(loc, ReadOptions { follow_symlinks })` — because the listing-time symlink check alone is a time-of-check/time-of-use gap: in a writable or shared vault a regular file can be replaced by a symlink between `DirEntry::file_type()` and `std::fs::read`, which follows it. With `follow_symlinks: false` the local arm opens with `O_NOFOLLOW` (unix, via `rustix` — already in the tree transitively through arrow's `comfy-table`) and then checks the opened handle's `metadata().file_type().is_file()`; on non-unix targets it falls back to a `symlink_metadata` check before opening, with the residual race documented. `put` is unchanged. `documents` adapts to the new entry type and passes `follow_symlinks: true` to both calls, so its behavior does not change in this work; it simply ignores the two new fields. This is the one refactor in scope.
 - Enforce `max_file_bytes` from the listing's `size`, before any `get`. Without listing metadata the cap could only fire after a huge object was already in memory (S3 has no cheaper alternative than a HEAD per object), which would make the cap decorative.
 
 **Security and trust boundary**
@@ -155,7 +155,7 @@ pub struct BlobEntry {
 }
 ```
 
-Locally, `ListOptions::follow_symlinks: false` skips any entry whose `DirEntry::file_type()` is a symlink; `true` reproduces today's `Path::is_dir` behavior. `ReadOptions::follow_symlinks: false` opens with `OpenOptions::custom_flags(libc::O_NOFOLLOW)` on unix and errors if the open fails with `ELOOP` or the opened handle's `metadata().file_type()` is not a regular file; on non-unix it checks `symlink_metadata` before opening (documented residual race); `true` is today's `std::fs::read`. S3 has no symlinks; both flags are ignored there. Gated on `any(feature = "documents", feature = "obsidian")`. `documents` imports it from the new location, passes `follow_symlinks: true` to both, and destructures `BlobEntry` where it used the tuple.
+Locally, `ListOptions::follow_symlinks: false` skips any entry whose `DirEntry::file_type()` is a symlink; `true` reproduces today's `Path::is_dir` behavior. `ReadOptions::follow_symlinks: false` opens with `OFlags::NOFOLLOW` on unix and errors if the open fails with `ELOOP` or the opened handle's `metadata().file_type()` is not a regular file; on non-unix it checks `symlink_metadata` before opening (documented residual race); `true` is today's `std::fs::read`. S3 has no symlinks; both flags are ignored there. Gated on `any(feature = "documents", feature = "obsidian")`. `documents` imports it from the new location, passes `follow_symlinks: true` to both, and destructures `BlobEntry` where it used the tuple.
 
 ### `sources/providers/obsidian/mod.rs`
 
@@ -377,7 +377,7 @@ No live or mocked S3 test in the first release (see Non-goals).
 ## Expected Repository Shape
 
 ```
-crates/skardi/Cargo.toml                          # obsidian feature; pulldown-cmark dep; libc (unix, O_NOFOLLOW)
+crates/skardi/Cargo.toml                          # obsidian feature; pulldown-cmark dep; rustix (unix, O_NOFOLLOW)
 crates/skardi/src/sources/data_source_type.rs     # Obsidian variant
 crates/skardi/src/sources/providers/mod.rs        # pub mod blob (shared); pub mod obsidian
 crates/skardi/src/sources/providers/blob.rs       # moved from documents/blob.rs; list → ListOptions / BlobEntry
@@ -465,6 +465,19 @@ covered by a test:
   stalling the scan; the strict listing also skips anything that is not a
   regular file or directory. Non-unix keeps the `symlink_metadata`
   approximation, now per component.
+- **`rustix`, not raw `libc`, and it hangs off `obsidian`.** `rustix::fs::openat`
+  returns an `OwnedFd` and carries the error in its `Result`, so the walk needs
+  no `unsafe`, cannot leak a descriptor if an early return is ever added between
+  the open and the ownership transfer, and never reads a stale global `errno`.
+  It is not a new dependency: arrow's `comfy-table` already builds the same
+  major version. Gating: the shared module compiles under
+  `any(documents, obsidian)`, so a reader gated only on the platform would drag
+  the dependency into documents-only builds and make that feature line claim
+  something `documents` does not use. Both `read_local_no_follow` bodies are
+  therefore `#[cfg(feature = "obsidian")]`, with a third definition under
+  `#[cfg(not(feature = "obsidian"))]` that refuses the read: nothing outside
+  `obsidian` constructs `Symlinks::NoneBeneath`, so it is unreachable and exists
+  only to keep the shared module compiling.
 - **The connector's public API is `register_obsidian_tables` alone.** The six
   submodules are private, as `documents`' `parse`/`table` are: nothing outside
   the crate uses the scanner, parsers or resolver, and keeping them off the
