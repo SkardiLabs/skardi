@@ -264,7 +264,13 @@ impl BlobStore {
                         .into());
                     }
                 }
-                let mut buf: Vec<u8> = Vec::new();
+                // With a cap in force the size above is bounded by it, so it
+                // is a safe allocation hint; without one, a remote-supplied
+                // size is not trusted for a single up-front allocation.
+                let mut buf: Vec<u8> = match opts.max_bytes {
+                    Some(_) => Vec::with_capacity(usize::try_from(res.meta.size).unwrap_or(0)),
+                    None => Vec::new(),
+                };
                 let mut stream = res.into_stream();
                 while let Some(chunk) = stream.next().await {
                     let chunk = chunk.with_context(|| format!("s3 read body {key}"))?;
@@ -368,16 +374,22 @@ fn list_local(root: &Path, opts: ListOptions) -> Result<Vec<BlobEntry>> {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if !opts.follow_symlinks {
+            let is_dir = if opts.follow_symlinks {
+                // The link target decides what this entry is, so it has to be
+                // stat-ed through the link.
+                path.is_dir()
+            } else {
                 // `DirEntry::file_type` does not follow links, so this sees
                 // the symlink itself, whether it points at a file or a dir.
                 // Only directories and regular files go on: a FIFO, socket or
                 // device named `x.md` is not a note, and a blocking open on it
                 // would stall the whole scan. Fail closed: an entry that cannot
-                // be typed (unlinked between readdir and stat) is skipped
-                // rather than handed to `is_dir` below, which does follow.
+                // be typed (unlinked between readdir and stat) is skipped. The
+                // type is also the answer to "recurse into it?", so the strict
+                // walk needs no second — following — stat per entry.
                 match entry.file_type() {
-                    Ok(kind) if kind.is_dir() || kind.is_file() => {}
+                    Ok(kind) if kind.is_dir() => true,
+                    Ok(kind) if kind.is_file() => false,
                     Ok(kind) if kind.is_symlink() => {
                         tracing::warn!(path = %path.display(), "blob: skipping symlink");
                         continue;
@@ -391,8 +403,8 @@ fn list_local(root: &Path, opts: ListOptions) -> Result<Vec<BlobEntry>> {
                         continue;
                     }
                 }
-            }
-            if path.is_dir() {
+            };
+            if is_dir {
                 if opts.recursive {
                     stack.push(path);
                 }
@@ -409,11 +421,18 @@ fn list_local(root: &Path, opts: ListOptions) -> Result<Vec<BlobEntry>> {
                 .modified()
                 .map(DateTime::<Utc>::from)
                 .unwrap_or_else(|_| DateTime::<Utc>::from(std::time::UNIX_EPOCH));
-            let rel_key = path
-                .strip_prefix(root)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace('\\', "/");
+            // Joined from the path's components rather than `to_string_lossy`
+            // with the OS separator replaced: on unix a `\` is a legal
+            // character in a file name, and replacing it would forge a
+            // separator, splitting one key into two segments (and with it
+            // obsidian's `folder`/`path` and documents' `doc_id`).
+            let mut rel_key = String::new();
+            for component in path.strip_prefix(root).unwrap_or(&path).components() {
+                if !rel_key.is_empty() {
+                    rel_key.push('/');
+                }
+                rel_key.push_str(&component.as_os_str().to_string_lossy());
+            }
             out.push(BlobEntry {
                 size: meta.len(),
                 modified,
@@ -644,6 +663,10 @@ fn push_remote_entry(
 ) {
     let full_key: &str = meta.location.as_ref();
     let rel_key = full_key.strip_prefix(norm).unwrap_or(full_key).to_string();
+    // A zero-byte "directory marker" object (`corpus/sub/`) needs no guard
+    // here: `ObjectMeta` carries an `object_store::Path`, whose parser strips
+    // the trailing delimiter, so such a key arrives as `corpus/sub` and is
+    // indistinguishable from a real empty object. Callers filter by extension.
     if rel_key.is_empty() || (single_level && rel_key.contains('/')) {
         return;
     }
@@ -925,6 +948,29 @@ mod tests {
             listed[0].modified,
             DateTime::<Utc>::from(meta.modified().unwrap())
         );
+    }
+
+    /// `\` is a legal character in a unix file name, so it must survive into
+    /// `rel_key` rather than being turned into a path separator.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_list_keeps_a_backslash_inside_a_file_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub").join(r"a\b.md"), b"X").unwrap();
+
+        let listed = BlobStore::Local
+            .list(
+                &Loc::Local(dir.path().to_path_buf()),
+                ListOptions {
+                    recursive: true,
+                    follow_symlinks: false,
+                },
+            )
+            .await
+            .unwrap();
+        let rels: Vec<&str> = listed.iter().map(|e| e.rel_key.as_str()).collect();
+        assert_eq!(rels, vec![r"sub/a\b.md"]);
     }
 
     #[cfg(unix)]
