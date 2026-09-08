@@ -53,7 +53,10 @@ pub enum ConfigCmd {
         #[arg(long, value_name = "TOKEN", conflicts_with = "token_stdin")]
         token: Option<String>,
 
-        /// read the token from stdin (the first line), keeping it off argv
+        /// read the token from a PIPE or a file on stdin, keeping it off argv
+        /// and out of shell history. Refused when stdin is a terminal, because
+        /// a token typed there is echoed: pipe it instead
+        /// (`pbpaste | skardi config set-context …`, or `… < token.txt`)
         #[arg(long)]
         token_stdin: bool,
 
@@ -122,10 +125,51 @@ pub fn run(cmd: ConfigCmd, flag_context: Option<String>) -> Result<()> {
 /// The `docker login --password-stdin` / `gh auth login --with-token` shape.
 /// A trailing newline from `echo` is stripped; an empty read is an error
 /// rather than a context written with an empty credential.
+/// Read the token from a pipe or a file on stdin.
+///
+/// # Why a terminal is refused rather than read
+///
+/// This option exists so a credential stays out of `argv` and out of shell
+/// history. Read from a terminal it defeats its own purpose in the most
+/// visible way possible: the terminal echoes what is typed or pasted, so the
+/// token lands in the scrollback — and from there into a screenshot, a
+/// bug report, or a shared session. Two PATs were exposed exactly that way
+/// before this refusal existed, and both had to be revoked.
+///
+/// Suppressing the echo would be the other answer, and a better one if it
+/// could be relied on: it needs platform terminal handling, and a failure to
+/// restore the terminal's state leaves the user's shell with echo off, which
+/// is a worse outcome than a clear refusal. Refusing needs no dependency and
+/// no restore path, and the message names the two forms that are safe — which
+/// is guidance the previous behaviour never gave.
+///
+/// A terminal was also where the SECOND defect showed: `read_to_string` waits
+/// for EOF, so an interactive user pressed Enter and the CLI hung until
+/// Ctrl-D, while the help text said "the first line". A pipe or a file reaches
+/// EOF on its own, so the read below is unsurprising for every input this now
+/// accepts.
 fn read_token_from_stdin() -> Result<String> {
-    use std::io::Read as _;
+    use std::io::IsTerminal as _;
+    let stdin = std::io::stdin();
+    // The two arguments are split from the reading so every branch below is
+    // reachable in a unit test: the terminal refusal would otherwise need a
+    // pty to exercise, which is why it had no coverage to break.
+    token_from_stdin(stdin.is_terminal(), &mut stdin.lock())
+}
+
+fn token_from_stdin(is_terminal: bool, reader: &mut impl std::io::Read) -> Result<String> {
+    if is_terminal {
+        bail!(
+            "--token-stdin reads a pipe or a file, not a terminal: a token typed here would be \
+             echoed into your scrollback, which is what this option exists to avoid. Pipe it \
+             instead:\n\
+             \x20 pbpaste | skardi config set-context … --token-stdin\n\
+             \x20 skardi config set-context … --token-stdin < token.txt"
+        );
+    }
+
     let mut buffer = String::new();
-    std::io::stdin()
+    reader
         .read_to_string(&mut buffer)
         .context("read token from stdin")?;
     let token = buffer.lines().next().unwrap_or("").trim().to_string();
@@ -429,6 +473,65 @@ fn render_names(names: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A terminal is refused, and the message names both safe forms.
+    ///
+    /// The refusal is the fix for a real leak: read from a terminal, the token
+    /// is echoed into the scrollback, which is exactly what `--token-stdin`
+    /// exists to prevent. Two PATs were exposed that way.
+    #[test]
+    fn token_stdin_refuses_a_terminal_and_teaches_the_safe_forms() {
+        let err =
+            token_from_stdin(true, &mut std::io::empty()).expect_err("a terminal must be refused");
+        let msg = format!("{err}");
+        assert!(msg.contains("not a terminal"), "{msg}");
+        // Guidance, not just a refusal — a user told "no" and nothing else has
+        // no way to proceed.
+        assert!(msg.contains("pbpaste |"), "{msg}");
+        assert!(msg.contains("< token.txt"), "{msg}");
+    }
+
+    /// A pipe or a file is read to EOF and yields its first line.
+    ///
+    /// The second defect lived here: `read_to_string` waits for EOF, so an
+    /// interactive user pressed Enter and the CLI hung — while the help said
+    /// "the first line". Non-terminal input reaches EOF on its own, so the
+    /// read is only surprising for the input that is now refused.
+    #[test]
+    fn token_stdin_yields_the_first_line_of_a_pipe_and_returns() {
+        let mut input = std::io::Cursor::new(b"skardi_pat_abc\nignored second line\n".to_vec());
+        assert_eq!(
+            token_from_stdin(false, &mut input).expect("a pipe is read"),
+            "skardi_pat_abc"
+        );
+    }
+
+    #[test]
+    fn token_stdin_trims_whitespace_and_tolerates_a_missing_newline() {
+        for raw in [
+            "  skardi_pat_abc  \n",
+            "skardi_pat_abc",
+            "skardi_pat_abc\r\n",
+        ] {
+            let mut input = std::io::Cursor::new(raw.as_bytes().to_vec());
+            assert_eq!(
+                token_from_stdin(false, &mut input).expect("read"),
+                "skardi_pat_abc",
+                "input {raw:?}"
+            );
+        }
+    }
+
+    /// Empty input stays an error rather than an empty token in the config —
+    /// the guard that predates this change, now covered.
+    #[test]
+    fn token_stdin_refuses_empty_input_rather_than_storing_it() {
+        for raw in ["", "\n", "   \n"] {
+            let mut input = std::io::Cursor::new(raw.as_bytes().to_vec());
+            let err = token_from_stdin(false, &mut input).expect_err("input {raw:?}");
+            assert!(format!("{err}").contains("held no token"), "input {raw:?}");
+        }
+    }
     use crate::config::{ContextsFile, LegacySpec};
     use tempfile::TempDir;
 
