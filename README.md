@@ -193,6 +193,7 @@ differ only in where the skill directory goes.
 ```text
 /plugin marketplace add SkardiLabs/skardi-skills
 /plugin install auto-context@skardi-skills
+/plugin install retrieval@skardi-skills
 ```
 
 Every other host installs from a checkout:
