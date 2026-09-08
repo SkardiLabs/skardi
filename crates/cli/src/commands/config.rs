@@ -13,6 +13,7 @@ use crate::config::{self, Context, ContextMode, ContextsFile};
 use anyhow::{Context as _, Result, bail};
 use clap::Subcommand;
 use std::collections::BTreeMap;
+use std::io::{BufRead, BufReader, IsTerminal, Read, stdin};
 use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
@@ -149,15 +150,33 @@ pub fn run(cmd: ConfigCmd, flag_context: Option<String>) -> Result<()> {
 /// EOF on its own, so the read below is unsurprising for every input this now
 /// accepts.
 fn read_token_from_stdin() -> Result<String> {
-    use std::io::IsTerminal as _;
-    let stdin = std::io::stdin();
+    let handle = stdin();
     // The two arguments are split from the reading so every branch below is
     // reachable in a unit test: the terminal refusal would otherwise need a
     // pty to exercise, which is why it had no coverage to break.
-    token_from_stdin(stdin.is_terminal(), &mut stdin.lock())
+    token_from_stdin(handle.is_terminal(), handle.lock())
 }
 
-fn token_from_stdin(is_terminal: bool, reader: &mut impl std::io::Read) -> Result<String> {
+/// Read the token from `reader`, refusing a terminal.
+///
+/// # One line, not to EOF
+///
+/// `read_line`, not `read_to_string`, and that is the whole of the second fix.
+/// Refusing a terminal removed the hang an interactive user hit, but the same
+/// hang survived for input this function ACCEPTS: a FIFO, or a credential
+/// helper that writes the token and stays alive, is not a terminal, so
+/// `is_terminal` is false and `read_to_string` waits for an EOF that is not
+/// coming — with the documented first line already complete. Measured: a
+/// `mkfifo` whose writer sleeps after one line left the CLI running
+/// indefinitely.
+///
+/// Stopping at the first newline also bounds the buffer. `read_to_string` on a
+/// pipe nobody closes grows without limit, and a credential path is a poor
+/// place to accept unbounded input.
+///
+/// A file with no trailing newline still works: `read_line` returns what it
+/// has at EOF, and `Ok(0)` is the empty case the guard below already covered.
+fn token_from_stdin(is_terminal: bool, reader: impl Read) -> Result<String> {
     if is_terminal {
         bail!(
             "--token-stdin reads a pipe or a file, not a terminal: a token typed here would be \
@@ -168,11 +187,11 @@ fn token_from_stdin(is_terminal: bool, reader: &mut impl std::io::Read) -> Resul
         );
     }
 
-    let mut buffer = String::new();
-    reader
-        .read_to_string(&mut buffer)
+    let mut line = String::new();
+    BufReader::new(reader)
+        .read_line(&mut line)
         .context("read token from stdin")?;
-    let token = buffer.lines().next().unwrap_or("").trim().to_string();
+    let token = line.trim().to_string();
     if token.is_empty() {
         bail!("--token-stdin was given but stdin held no token");
     }
@@ -473,6 +492,7 @@ fn render_names(names: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Cursor, empty};
 
     /// A terminal is refused, and the message names both safe forms.
     ///
@@ -481,8 +501,7 @@ mod tests {
     /// exists to prevent. Two PATs were exposed that way.
     #[test]
     fn token_stdin_refuses_a_terminal_and_teaches_the_safe_forms() {
-        let err =
-            token_from_stdin(true, &mut std::io::empty()).expect_err("a terminal must be refused");
+        let err = token_from_stdin(true, empty()).expect_err("a terminal must be refused");
         let msg = format!("{err}");
         assert!(msg.contains("not a terminal"), "{msg}");
         // Guidance, not just a refusal — a user told "no" and nothing else has
@@ -499,9 +518,40 @@ mod tests {
     /// read is only surprising for the input that is now refused.
     #[test]
     fn token_stdin_yields_the_first_line_of_a_pipe_and_returns() {
-        let mut input = std::io::Cursor::new(b"skardi_pat_abc\nignored second line\n".to_vec());
+        let input = Cursor::new(b"skardi_pat_abc\nignored second line\n".to_vec());
         assert_eq!(
-            token_from_stdin(false, &mut input).expect("a pipe is read"),
+            token_from_stdin(false, input).expect("a pipe is read"),
+            "skardi_pat_abc"
+        );
+    }
+
+    /// Reading stops at the first newline, so input that never reaches EOF
+    /// cannot hang — the defect the terminal refusal did NOT cover.
+    ///
+    /// A `Cursor` cannot show this: it always reaches EOF, so `read_to_string`
+    /// passes against one. This reader hands back the first line and then
+    /// PANICS if asked for more, which is a deterministic stand-in for a FIFO
+    /// or a credential helper that keeps its end of the pipe open — measured
+    /// to hang the CLI indefinitely before this fix.
+    struct PanicAfterFirstLine(Option<&'static [u8]>);
+
+    impl Read for PanicAfterFirstLine {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.0.take() {
+                Some(line) => {
+                    buf[..line.len()].copy_from_slice(line);
+                    Ok(line.len())
+                }
+                None => panic!("read past the first line — this would block on a live pipe"),
+            }
+        }
+    }
+
+    #[test]
+    fn token_stdin_stops_at_the_first_newline_and_never_waits_for_eof() {
+        let reader = PanicAfterFirstLine(Some(b"skardi_pat_abc\n"));
+        assert_eq!(
+            token_from_stdin(false, reader).expect("the first line is enough"),
             "skardi_pat_abc"
         );
     }
@@ -513,9 +563,9 @@ mod tests {
             "skardi_pat_abc",
             "skardi_pat_abc\r\n",
         ] {
-            let mut input = std::io::Cursor::new(raw.as_bytes().to_vec());
+            let input = Cursor::new(raw.as_bytes().to_vec());
             assert_eq!(
-                token_from_stdin(false, &mut input).expect("read"),
+                token_from_stdin(false, input).expect("read"),
                 "skardi_pat_abc",
                 "input {raw:?}"
             );
@@ -527,8 +577,8 @@ mod tests {
     #[test]
     fn token_stdin_refuses_empty_input_rather_than_storing_it() {
         for raw in ["", "\n", "   \n"] {
-            let mut input = std::io::Cursor::new(raw.as_bytes().to_vec());
-            let err = token_from_stdin(false, &mut input).expect_err("input {raw:?}");
+            let input = Cursor::new(raw.as_bytes().to_vec());
+            let err = token_from_stdin(false, input).expect_err("input {raw:?}");
             assert!(format!("{err}").contains("held no token"), "input {raw:?}");
         }
     }
