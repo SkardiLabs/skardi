@@ -48,6 +48,10 @@ uuid = { workspace = true }
 # Feature unification: these add the MCP *client* side (spawning the binary
 # as a child process) for the e2e tests only.
 rmcp = { version = "=3.1.4", default-features = false, features = ["client", "transport-child-process"] }
+# Parametric cases, per AGENTS.md's testing standard. Declared in
+# `[workspace.dependencies]` already; this is the crate opting in — it is the
+# first one to, so this is also what puts rstest in `Cargo.lock`.
+rstest = { workspace = true }
 tempfile = { workspace = true }
 wiremock = "0.6"
 

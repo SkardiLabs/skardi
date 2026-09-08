@@ -492,7 +492,10 @@ fn render_names(names: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Cursor, empty};
+    use rstest::rstest;
+    // Aliased: `Result` at module scope is anyhow's, and shadowing it
+    // here would change what every other test in this module returns.
+    use std::io::{Cursor, Result as IoResult, empty};
 
     /// A terminal is refused, and the message names both safe forms.
     ///
@@ -516,15 +519,6 @@ mod tests {
     /// interactive user pressed Enter and the CLI hung — while the help said
     /// "the first line". Non-terminal input reaches EOF on its own, so the
     /// read is only surprising for the input that is now refused.
-    #[test]
-    fn token_stdin_yields_the_first_line_of_a_pipe_and_returns() {
-        let input = Cursor::new(b"skardi_pat_abc\nignored second line\n".to_vec());
-        assert_eq!(
-            token_from_stdin(false, input).expect("a pipe is read"),
-            "skardi_pat_abc"
-        );
-    }
-
     /// Reading stops at the first newline, so input that never reaches EOF
     /// cannot hang — the defect the terminal refusal did NOT cover.
     ///
@@ -536,7 +530,7 @@ mod tests {
     struct PanicAfterFirstLine(Option<&'static [u8]>);
 
     impl Read for PanicAfterFirstLine {
-        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
             match self.0.take() {
                 Some(line) => {
                     buf[..line.len()].copy_from_slice(line);
@@ -556,31 +550,34 @@ mod tests {
         );
     }
 
-    #[test]
-    fn token_stdin_trims_whitespace_and_tolerates_a_missing_newline() {
-        for raw in [
-            "  skardi_pat_abc  \n",
-            "skardi_pat_abc",
-            "skardi_pat_abc\r\n",
-        ] {
-            let input = Cursor::new(raw.as_bytes().to_vec());
-            assert_eq!(
-                token_from_stdin(false, input).expect("read"),
-                "skardi_pat_abc",
-                "input {raw:?}"
-            );
-        }
+    /// Every shape a token arrives in from a pipe or a file.
+    ///
+    /// `no_trailing_newline` is the case that constrains the `read_line`
+    /// change: it returns what it has at EOF, so a file written without a
+    /// final newline must still yield its token.
+    #[rstest]
+    #[case::padded("  skardi_pat_abc  \n")]
+    #[case::no_trailing_newline("skardi_pat_abc")]
+    #[case::crlf("skardi_pat_abc\r\n")]
+    #[case::second_line_ignored("skardi_pat_abc\nsomething else\n")]
+    fn token_stdin_yields_the_token(#[case] raw: &str) {
+        let input = Cursor::new(raw.as_bytes().to_vec());
+        assert_eq!(
+            token_from_stdin(false, input).expect("read"),
+            "skardi_pat_abc"
+        );
     }
 
     /// Empty input stays an error rather than an empty token in the config —
     /// the guard that predates this change, now covered.
-    #[test]
-    fn token_stdin_refuses_empty_input_rather_than_storing_it() {
-        for raw in ["", "\n", "   \n"] {
-            let input = Cursor::new(raw.as_bytes().to_vec());
-            let err = token_from_stdin(false, input).expect_err("input {raw:?}");
-            assert!(format!("{err}").contains("held no token"), "input {raw:?}");
-        }
+    #[rstest]
+    #[case::eof_immediately("")]
+    #[case::bare_newline("\n")]
+    #[case::whitespace_only("   \n")]
+    fn token_stdin_refuses_empty_input_rather_than_storing_it(#[case] raw: &str) {
+        let input = Cursor::new(raw.as_bytes().to_vec());
+        let err = token_from_stdin(false, input).expect_err("empty input must be refused");
+        assert!(format!("{err}").contains("held no token"), "{err}");
     }
     use crate::config::{ContextsFile, LegacySpec};
     use tempfile::TempDir;
