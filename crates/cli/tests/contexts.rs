@@ -12,8 +12,9 @@
 
 #![cfg(unix)]
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use tempfile::TempDir;
 
 /// Run the binary with `HOME` redirected, and with the ambient
@@ -508,4 +509,147 @@ fn unknown_keys_survive_a_mutation() {
         rewritten.contains("future-per-context: keep-me-too"),
         "{rewritten}"
     );
+}
+
+/// `--token-stdin` over a real pipe, through the real process.
+///
+/// The unit tests cover `token_from_stdin`, which is the logic split out to be
+/// testable. They cannot cover the three lines that read the process's ACTUAL
+/// stdin — `stdin()`, `is_terminal()`, `lock()` — and those are exactly the
+/// lines where this option's two defects lived: `read_to_string` on a handle
+/// that never reaches EOF, and a terminal read that echoes the token. Codecov
+/// flagged them, and it was right: the manual checks that found both bugs were
+/// not in the repository.
+///
+/// The token here is a fixture string, not a credential.
+#[test]
+fn token_stdin_reads_a_pipe_and_writes_the_context() {
+    let home = TempDir::new().expect("tempdir");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_skardi"))
+        .env("HOME", home.path())
+        .env_remove("SKARDI_SERVER_URL")
+        .env_remove("SKARDI_API_TOKEN")
+        .env_remove("SKARDI_CONTEXT")
+        .args([
+            "config",
+            "set-context",
+            "piped",
+            "--mode",
+            "cloud",
+            "--server",
+            "https://gateway.example.invalid",
+            "--workspace",
+            "ws-piped",
+            "--token-stdin",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn skardi");
+
+    // A second line, to pin that only the first is taken — and the writer is
+    // dropped here, which is what closes the pipe.
+    child
+        .stdin
+        .take()
+        .expect("stdin is piped")
+        .write_all(b"skardi_pat_fixture_not_a_credential\nsecond line\n")
+        .expect("write the token");
+
+    let out = child.wait_with_output().expect("wait for skardi");
+    assert!(
+        out.status.success(),
+        "set-context over a pipe must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The token reached the file — asserted through `view --show-tokens`,
+    // because the point is that the value survived the pipe intact.
+    let shown = stdout(&skardi(home.path(), &["config", "view", "--show-tokens"]));
+    assert!(
+        shown.contains("skardi_pat_fixture_not_a_credential"),
+        "the piped token must be stored verbatim\n{shown}"
+    );
+    assert!(
+        !shown.contains("second line"),
+        "only the first line is the token\n{shown}"
+    );
+}
+
+// # Why there is no pty case here
+//
+// There was one, driven through `script(1)`, and it broke CI: that tool's CLI
+// is incompatible between GNU (`script -q -c "CMD" FILE`) and BSD/macOS
+// (`script -q FILE CMD ARGS`), so on Linux the binary's own arguments were
+// parsed by `script` itself — `script: unrecognized option '--mode'`.
+//
+// It was removed rather than made flavour-aware, because a measurement says
+// it earned nothing. With it deleted, the two pipe tests below still cover
+// every line of the real-stdin adapter — `stdin()`, `is_terminal()`,
+// `lock()` — at 2 hits each. What a pty case uniquely proved is that
+// `std::io::IsTerminal` answers true for a terminal, which is std's behaviour
+// and not this crate's; the mapping that IS this crate's, `is_terminal` to a
+// refusal, is unit-tested directly in `commands::config`.
+//
+// The end-to-end refusal was verified by hand against a real pty on macOS
+// before this note replaced the test: it prints the refusal and writes no
+// context. That is worth recording and not worth a portability liability in
+// the suite.
+
+/// The same option over a pipe whose writer never closes.
+///
+/// This is the second defect, and it is the one a `Cursor` cannot show:
+/// `read_to_string` waits for EOF, so a FIFO — or a credential helper that
+/// writes the token and stays alive — hung the CLI indefinitely with the
+/// documented first line already complete. `is_terminal` is false for a FIFO,
+/// so the terminal refusal does not cover it.
+///
+/// The writer is held open for the whole call. If the binary waits for EOF
+/// this test fails by timing out rather than by assertion, which is the
+/// honest failure mode for a hang.
+#[test]
+fn token_stdin_returns_before_a_live_writer_closes_the_pipe() {
+    let home = TempDir::new().expect("tempdir");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_skardi"))
+        .env("HOME", home.path())
+        .env_remove("SKARDI_SERVER_URL")
+        .env_remove("SKARDI_API_TOKEN")
+        .env_remove("SKARDI_CONTEXT")
+        .args([
+            "config",
+            "set-context",
+            "live-writer",
+            "--mode",
+            "cloud",
+            "--server",
+            "https://gateway.example.invalid",
+            "--workspace",
+            "ws-live",
+            "--token-stdin",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn skardi");
+
+    // Written, flushed, and the handle deliberately KEPT — the pipe stays open
+    // for as long as this binding lives.
+    let mut writer = child.stdin.take().expect("stdin is piped");
+    writer
+        .write_all(b"skardi_pat_fixture_not_a_credential\n")
+        .expect("write the token");
+    writer.flush().expect("flush");
+
+    let status = child.wait().expect("wait for skardi");
+    assert!(
+        status.success(),
+        "the process must finish on the first newline, without the writer closing"
+    );
+    drop(writer);
+
+    let shown = stdout(&skardi(home.path(), &["config", "get-contexts"]));
+    assert!(shown.contains("live-writer"), "{shown}");
 }
