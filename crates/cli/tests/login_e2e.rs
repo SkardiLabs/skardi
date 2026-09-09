@@ -251,7 +251,11 @@ fn the_direct_flow_names_the_control_plane_key_instead() {
     let home = TempDir::new().unwrap();
     let output = skardi(
         home.path(),
-        &["login", "--client-id", "client-123.apps.googleusercontent.com"],
+        &[
+            "login",
+            "--client-id",
+            "client-123.apps.googleusercontent.com",
+        ],
     );
 
     assert_eq!(output.status.code(), Some(1));
