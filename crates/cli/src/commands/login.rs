@@ -28,11 +28,13 @@ pub struct LoginArgs {
     #[arg(long, value_name = "URL")]
     pub control_plane: Option<String>,
 
-    /// log in to one workspace by slug (non-interactive)
+    /// log in to one workspace by slug (non-interactive). Needs --client-id:
+    /// a browser-brokered login is approved for one workspace in the console
     #[arg(long, value_name = "SLUG", conflicts_with = "all_workspaces")]
     pub workspace: Option<String>,
 
-    /// log in to every active workspace this identity belongs to
+    /// log in to every active workspace this identity belongs to. Needs
+    /// --client-id, for the same reason as --workspace
     #[arg(long)]
     pub all_workspaces: bool,
 
@@ -40,11 +42,14 @@ pub struct LoginArgs {
     #[arg(long, value_name = "DURATION", default_value = login::DEFAULT_EXPIRES)]
     pub expires: String,
 
-    /// print the sign-in URL instead of opening a browser
+    /// print the sign-in URL instead of opening a browser. On the default
+    /// console-brokered path this is enough to log in from another machine
     #[arg(long)]
     pub no_browser: bool,
 
-    /// OAuth client id; overrides $SKARDI_OAUTH_CLIENT_ID
+    /// OAuth client id, selecting the direct provider flow; overrides
+    /// $SKARDI_OAUTH_CLIENT_ID. Omit it and the console brokers the sign-in,
+    /// which needs no client id and works over SSH
     #[arg(long, value_name = "ID")]
     pub client_id: Option<String>,
 

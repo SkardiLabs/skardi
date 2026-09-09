@@ -698,7 +698,17 @@ async fn a_non_dev_identity_bearer_is_refused_by_shape() {
 }
 
 #[tokio::test]
-async fn the_browser_path_needs_a_client_id_and_says_so() {
+async fn a_missing_client_id_now_brokers_through_the_console_instead_of_failing() {
+    // This case used to be a dead end: no identity and no usable client id
+    // meant "no OAuth client id: pass --client-id, set
+    // $SKARDI_OAUTH_CLIENT_ID, or use --identity dev:<id>". Every deployment
+    // that wanted CLI access therefore had to provision a Google Desktop
+    // client first, which is the whole problem design 2026-09-08 removes.
+    //
+    // It is now the DEFAULT path, so the assertion inverts: the flow proceeds
+    // and fails at the console, not at the flag check. `127.0.0.1:1` answers
+    // nothing, so the error names the console it could not reach — proof the
+    // broker was selected rather than the OAuth path.
     let home = TempDir::new().unwrap();
     let mut options = options("http://127.0.0.1:1", Some("http://gw.example"));
     options.identity = None;
@@ -707,8 +717,12 @@ async fn the_browser_path_needs_a_client_id_and_says_so() {
         .await
         .unwrap_err()
         .to_string();
-    assert!(err.contains("--client-id"), "{err}");
-    assert!(err.contains("SKARDI_OAUTH_CLIENT_ID"), "{err}");
+    assert!(err.contains("cannot reach the console"), "{err}");
+    assert!(err.contains("cli-login/requests"), "{err}");
+    assert!(
+        !err.contains("SKARDI_OAUTH_CLIENT_ID"),
+        "a client id is no longer required: {err}"
+    );
 }
 
 #[tokio::test]
@@ -1192,4 +1206,372 @@ async fn a_rejected_probe_does_not_advise_the_env_var_it_refuses() {
         ["tok-1"]
     );
     assert!(!path.exists());
+}
+
+// ── The console-brokered flow (design 2026-09-08) ────────────────────────
+//
+// Driven against a wiremock CONSOLE rather than a control plane, because that
+// is what the CLI talks to on this path: skardi-global has no public ingress
+// in any deployment we run, which is the reason the flow exists. The two
+// session-less routes are forwarded by the console's BFF under
+// `/api/global/v1/cli-login/*`.
+
+/// A console whose exchange answers `body` with `status`.
+///
+/// The open call always succeeds — every case below is about what happens
+/// after a request exists.
+async fn console(status: u16, exchange_body: Value) -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/global/v1/cli-login/requests"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "request_id": "7f3a9c0000000000000000000000abcd",
+            "confirm": "7f3a9c",
+            "expires_at": "2026-08-24T12:05:00Z",
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/global/v1/cli-login/exchange"))
+        .respond_with(ResponseTemplate::new(status).set_body_json(exchange_body))
+        .mount(&server)
+        .await;
+    server
+}
+
+/// An approved exchange for one workspace, with the membership §11.2 sends
+/// along.
+fn approved(workspace: &str, gateway_url: &str, token_id: &str) -> Value {
+    json!({
+        "status": "approved",
+        "token": format!("skardi_pat_{token_id}"),
+        "token_id": token_id,
+        "expires_at": "2026-11-22T12:00:00Z",
+        "workspace": workspace,
+        "memberships": [membership("acme", workspace, "active", Some(gateway_url))],
+    })
+}
+
+/// A config file already holding a cloud context for `acme/my-ws`, so the
+/// replacement rule has something to replace.
+fn existing_cloud_context() -> String {
+    [
+        "contexts:",
+        "  - name: acme/my-ws",
+        "    mode: cloud",
+        "    server: http://gw.example",
+        "    workspace: my-ws",
+        "    token: skardi_pat_old",
+        "    token-id: tok-old",
+    ]
+    .join("\n")
+        + "\n"
+}
+
+/// The brokered path's own options: no identity and no client id, which is
+/// what selects it (§9).
+fn broker_options(console_base: &str) -> LoginOptions {
+    let mut options = options(console_base, None);
+    options.identity = None;
+    options.client_id = None;
+    options
+}
+
+#[tokio::test]
+async fn a_browser_login_writes_the_context_from_the_token_the_console_brokered() {
+    let gw = gateway(200).await;
+    let console = console(200, approved("my-ws", &gw.uri(), "tok-1")).await;
+    let home = TempDir::new().unwrap();
+
+    let report = login(broker_options(&console.uri()), &config_in(&home))
+        .await
+        .unwrap();
+
+    assert_eq!(report.written.len(), 1, "one approval, one workspace");
+    let written = &report.written[0];
+    assert_eq!(written.name, "acme/my-ws");
+    assert_eq!(written.workspace, "my-ws");
+    assert_eq!(report.current_context.as_deref(), Some("acme/my-ws"));
+
+    // No mint and no membership listing: the console already did both, which
+    // is what makes this path work with no client id and no IdP.
+    let seen = console.received_requests().await.unwrap();
+    assert!(
+        mint_bodies(&seen).is_empty(),
+        "the CLI must not mint on this path"
+    );
+    assert!(
+        !seen.iter().any(|r| r.url.path() == "/v1/me/workspaces"),
+        "memberships ride along with the exchange (§11.2)"
+    );
+
+    // The context holds the brokered token AND its id — the id is what a later
+    // login names when it replaces this credential.
+    let file = read_yaml(&config_in(&home));
+    let context = &file["contexts"][0];
+    assert_eq!(context["token"].as_str(), Some("skardi_pat_tok-1"));
+    assert_eq!(context["token-id"].as_str(), Some("tok-1"));
+}
+
+#[tokio::test]
+async fn the_open_call_carries_the_pkce_challenge_the_expiry_and_the_machine_name() {
+    let gw = gateway(200).await;
+    let console = console(200, approved("my-ws", &gw.uri(), "tok-1")).await;
+    let home = TempDir::new().unwrap();
+    login(broker_options(&console.uri()), &config_in(&home))
+        .await
+        .unwrap();
+
+    let seen = console.received_requests().await.unwrap();
+    let opened: Value = seen
+        .iter()
+        .find(|r| r.url.path() == "/api/global/v1/cli-login/requests")
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .expect("the flow opens a request");
+
+    // 43 characters is RFC 7636's floor and what `Pkce` produces; the server
+    // refuses anything outside 43..=128.
+    let challenge = opened["challenge"].as_str().unwrap();
+    assert_eq!(challenge.len(), 43, "an S256 challenge: {challenge}");
+    // `--expires` has to ride the OPEN call: the mint happens minutes later in
+    // a browser that never sees the flag.
+    assert_eq!(
+        opened["token_expires_at"].as_str(),
+        Some("2026-11-22T12:00:00+00:00"),
+        "90 days from the injected clock"
+    );
+    // What the consent screen shows, and what the PAT is named upstream — one
+    // name per machine whichever flow wrote it.
+    assert_eq!(opened["client_desc"].as_str(), Some("cli@test-host"));
+
+    // And the exchange proves ownership with the verifier, never the challenge.
+    let exchanged: Value = seen
+        .iter()
+        .find(|r| r.url.path() == "/api/global/v1/cli-login/exchange")
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .expect("the flow polls the exchange");
+    let verifier = exchanged["verifier"].as_str().unwrap();
+    assert_ne!(verifier, challenge, "the verifier is not the challenge");
+    assert_eq!(
+        exchanged["request_id"].as_str(),
+        Some("7f3a9c0000000000000000000000abcd")
+    );
+}
+
+#[tokio::test]
+async fn a_browser_login_refuses_the_flags_it_cannot_honour() {
+    // The consent screen grants exactly one workspace (§11.1), so neither flag
+    // has an honest reading here — and quietly logging into one workspace when
+    // `--all-workspaces` was asked for is a success discovered much later.
+    for (selection, expected) in [
+        (Selection::Named("other".to_string()), "--workspace 'other'"),
+        (Selection::All, "--all-workspaces"),
+    ] {
+        let home = TempDir::new().unwrap();
+        let mut options = broker_options("http://127.0.0.1:1");
+        options.selection = selection;
+        let err = login(options, &config_in(&home))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(expected), "{err}");
+        // Points at the flow that CAN do it, rather than only refusing.
+        assert!(err.contains("--client-id"), "{err}");
+    }
+}
+
+#[tokio::test]
+async fn a_console_without_the_cli_login_route_says_so_and_names_the_alternative() {
+    // What an older console looks like from here: its BFF allowlist has no
+    // CLI-login entry, so its own proxy answers 403. Nothing the user retypes
+    // fixes it, so the message has to name the flag that still works.
+    let console = console(
+        403,
+        json!({ "error": { "code": "route_not_allowed",
+        "message": "this endpoint is not part of the console surface" } }),
+    )
+    .await;
+    let home = TempDir::new().unwrap();
+    let err = login(broker_options(&console.uri()), &config_in(&home))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("does not support browser-brokered"), "{err}");
+    assert!(err.contains("--client-id"), "{err}");
+}
+
+#[tokio::test]
+async fn an_expired_or_redeemed_request_tells_the_user_to_run_login_again() {
+    // One server answer covers expired, unknown and already-redeemed —
+    // deliberately, so the endpoint cannot enumerate live ids — so the CLI has
+    // to translate it into the action that fixes all three.
+    let console = console(
+        404,
+        json!({ "error": { "code": "no_such_request",
+        "message": "no such CLI login request" } }),
+    )
+    .await;
+    let home = TempDir::new().unwrap();
+    let err = login(broker_options(&console.uri()), &config_in(&home))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("no longer open"), "{err}");
+    assert!(err.contains("skardi login"), "{err}");
+}
+
+#[tokio::test]
+async fn nobody_approving_expires_with_the_deadline_named() {
+    let console = console(200, json!({ "status": "pending" })).await;
+    let home = TempDir::new().unwrap();
+    let err = login(broker_options(&console.uri()), &config_in(&home))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("nobody approved this login"), "{err}");
+    // Nothing was written, and there is no credential to warn about — the
+    // exchange never handed one over.
+    assert!(
+        !config_in(&home).exists(),
+        "no context on an unapproved login"
+    );
+    assert!(!err.contains("Revoke token"), "nothing was minted: {err}");
+}
+
+#[tokio::test]
+async fn a_brokered_credential_that_cannot_query_is_reported_by_id_not_revoked() {
+    // The saga's counterpart revokes here. This path cannot: a PAT
+    // authenticates to the gateway, and skardi-global's `/v1/*` does not
+    // accept one — so the id is the only thing standing between the user and
+    // a live credential nobody knows exists.
+    let gw = gateway(403).await;
+    let console = console(200, approved("my-ws", &gw.uri(), "tok-live")).await;
+    let home = TempDir::new().unwrap();
+
+    let err = login(broker_options(&console.uri()), &config_in(&home))
+        .await
+        .unwrap_err();
+    let rendered = format!("{err:#}");
+    assert!(rendered.contains("could not query"), "{rendered}");
+    assert!(rendered.contains("Revoke token tok-live"), "{rendered}");
+    assert!(rendered.contains("cannot revoke"), "{rendered}");
+    // And no context was written, so the failure is not half-committed.
+    assert!(!config_in(&home).exists(), "{rendered}");
+}
+
+#[tokio::test]
+async fn a_brokered_relogin_reports_the_replaced_token_it_cannot_revoke() {
+    let gw = gateway(200).await;
+    let console = console(200, approved("my-ws", &gw.uri(), "tok-2")).await;
+    let home = TempDir::new().unwrap();
+    let path = config_in(&home);
+
+    // A context already holding a credential from an earlier login.
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, existing_cloud_context()).unwrap();
+
+    let report = login(broker_options(&console.uri()), &config_in(&home))
+        .await
+        .unwrap();
+
+    // Nothing was revoked, and nothing pretends to have been: the old id is
+    // reported through the same channel a FAILED revoke uses, because the
+    // outcome for the user is identical — go revoke it in the console.
+    assert!(report.replaced_revoked.is_empty());
+    assert_eq!(report.revoke_failures.len(), 1);
+    let (token_id, reason) = &report.revoke_failures[0];
+    assert_eq!(token_id, "tok-old");
+    assert!(reason.contains("cannot revoke"), "{reason}");
+    assert!(
+        revoked_ids(&console.received_requests().await.unwrap()).is_empty(),
+        "the CLI must not attempt a revoke it cannot authenticate"
+    );
+
+    // The new credential did land.
+    let file = read_yaml(&path);
+    assert_eq!(file["contexts"][0]["token-id"].as_str(), Some("tok-2"));
+}
+
+#[tokio::test]
+async fn keep_old_token_reports_the_replacement_as_kept_rather_than_stranded() {
+    let gw = gateway(200).await;
+    let console = console(200, approved("my-ws", &gw.uri(), "tok-2")).await;
+    let home = TempDir::new().unwrap();
+    let path = config_in(&home);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, existing_cloud_context()).unwrap();
+
+    let mut options = broker_options(&console.uri());
+    options.keep_old_token = true;
+    let report = login(options, &config_in(&home)).await.unwrap();
+
+    // Asked for deliberately, so it is not a warning — an agent mid-task is
+    // still holding the old credential.
+    assert_eq!(report.replaced_kept, vec!["tok-old".to_string()]);
+    assert!(report.revoke_failures.is_empty());
+}
+
+#[tokio::test]
+async fn an_approval_with_no_membership_is_fatal_and_names_the_live_token() {
+    // Exceptional: the approved membership vanished between approval and
+    // redemption. Fatal because the context name is `<org>/<workspace>` and
+    // the org slug has nowhere else to come from — and by this point a
+    // credential exists that this CLI cannot revoke.
+    let console = console(
+        200,
+        json!({
+            "status": "approved",
+            "token": "skardi_pat_orphan",
+            "token_id": "tok-orphan",
+            "workspace": "my-ws",
+            "memberships": [],
+        }),
+    )
+    .await;
+    let home = TempDir::new().unwrap();
+    let err = login(broker_options(&console.uri()), &config_in(&home))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("no membership"), "{err}");
+    assert!(err.contains("revoke token tok-orphan"), "{err}");
+}
+
+#[tokio::test]
+async fn an_unknown_exchange_status_is_reported_rather_than_polled_forever() {
+    // A control plane newer than this CLI. Treating an unrecognised terminal
+    // state as "pending" would spin until the deadline and then blame the
+    // human for not approving.
+    let console = console(200, json!({ "status": "superseded" })).await;
+    let home = TempDir::new().unwrap();
+    let err = login(broker_options(&console.uri()), &config_in(&home))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("unexpected status"), "{err}");
+    assert!(err.contains("older than the control plane"), "{err}");
+}
+
+#[test]
+fn the_console_broker_is_the_default_and_either_credential_flag_opts_out() {
+    let base = |identity: Option<&str>, client_id: Option<&str>| {
+        let mut options = options("http://127.0.0.1:1", None);
+        options.identity = identity.map(str::to_string);
+        options.client_id = client_id.map(str::to_string);
+        options
+    };
+    // §9: with neither flag, the console brokers — which is what makes
+    // `skardi login --control-plane <url>` work with no other argument.
+    assert!(super::uses_console_broker(&base(None, None)));
+    // An empty client id counts as absent, the same way `acquire_bearer`
+    // treats it: `SKARDI_OAUTH_CLIENT_ID=` exported into a shell must not
+    // select a path that then fails for want of that variable's value.
+    assert!(super::uses_console_broker(&base(None, Some("   "))));
+    // Either flag names a way for the CLI to authenticate itself, and keeps
+    // the existing flow.
+    assert!(!super::uses_console_broker(&base(
+        None,
+        Some("client-123.apps.googleusercontent.com")
+    )));
+    assert!(!super::uses_console_broker(&base(Some("dev:alice"), None)));
 }

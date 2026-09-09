@@ -17,6 +17,7 @@
 #[cfg(test)]
 mod tests;
 
+pub mod console_broker;
 pub mod control_plane;
 pub mod loopback;
 pub mod oauth;
@@ -129,6 +130,14 @@ struct MintedRef {
 /// Run the whole flow. `config_path` is a parameter so tests write to a temp
 /// directory instead of the developer's own config.
 pub async fn login(options: LoginOptions, config_path: &Path) -> Result<LoginReport> {
+    // With neither `--identity` nor a client id, the console brokers (design
+    // 2026-09-08 §9). That path is not a different way to get a bearer — it
+    // returns a PAT that is already minted and already scoped, so it skips
+    // membership listing, minting, and the saga entirely. Hence a branch here
+    // rather than a third arm inside `acquire_bearer`.
+    if uses_console_broker(&options) {
+        return console_brokered_login(options, config_path).await;
+    }
     let http = control_plane::client(control_plane::CONTROL_PLANE_TIMEOUT)?;
     let bearer = acquire_bearer(&http, &options).await?;
     let cp = ControlPlane::new(http.clone(), &options.control_plane, bearer);
@@ -229,6 +238,210 @@ pub async fn login(options: LoginOptions, config_path: &Path) -> Result<LoginRep
     }
 }
 
+/// Whether this run goes through the console broker.
+///
+/// `--identity` and `--client-id` both name a way for the CLI to authenticate
+/// itself, and either one keeps the existing flow. Neither means there is no
+/// IdP for the CLI to talk to, which is exactly the case the console broker
+/// exists for — and it is the default, so `skardi login --control-plane <url>`
+/// works with no other argument (§9).
+///
+/// An empty client id counts as absent, the same way `acquire_bearer` treats
+/// it: `SKARDI_OAUTH_CLIENT_ID=` exported into a shell must not select a path
+/// that then fails for want of the value that variable was supposed to carry.
+fn uses_console_broker(options: &LoginOptions) -> bool {
+    options.identity.is_none()
+        && options
+            .client_id
+            .as_deref()
+            .is_none_or(|id| id.trim().is_empty())
+}
+
+/// The console-brokered flow (design 2026-09-08 §4).
+///
+/// # Why this is not the saga
+///
+/// The ID-token flow mints, verifies, and can revoke everything it created,
+/// so a failure anywhere rolls the run back and leaves nothing behind. Here
+/// the credential is minted by skardi-global at the moment the CLI redeems an
+/// approval, and what the CLI holds afterwards is a **PAT** — which
+/// authenticates to the gateway and NOT to skardi-global's `/v1/*`, whose
+/// verifiers accept ID tokens, first-party sessions and `dev:` bearers, and
+/// whose PAT resolution is reachable only over the gRPC directory the gateway
+/// uses.
+///
+/// So there is no rollback available, and pretending otherwise would be worse
+/// than not having one: every point where the saga would revoke, this flow
+/// PRINTS the `token_id` and names the console. A credential nobody can revoke
+/// and nobody knows exists is the outcome §6.5 was written to prevent, and the
+/// id is the only thing that prevents it here.
+async fn console_brokered_login(options: LoginOptions, config_path: &Path) -> Result<LoginReport> {
+    // Refused, not ignored. The consent screen selects exactly one workspace
+    // (§11.1), so there is no honest reading of either flag on this path — and
+    // silently logging into one workspace when `--all-workspaces` was asked
+    // for is the kind of success that gets discovered much later.
+    match &options.selection {
+        Selection::Auto => {}
+        Selection::Named(slug) => bail!(
+            "--workspace '{slug}' cannot be honoured through a browser login: the console's consent screen chooses the workspace, and it grants exactly one. Approve '{slug}' in the browser, or use the OAuth flow with --client-id <ID> to select it here"
+        ),
+        Selection::All => bail!(
+            "--all-workspaces cannot be honoured through a browser login: one approval grants one workspace. Run this once per workspace, or use the OAuth flow with --client-id <ID>"
+        ),
+    }
+
+    let http = control_plane::client(control_plane::CONTROL_PLANE_TIMEOUT)?;
+    let pkce = pkce::Pkce::generate()?;
+    // The same ceiling check the saga does, for the same reason: `DateTime +
+    // TimeDelta` panics on overflow and `parse_expires` cannot catch every
+    // case, because its bound is `TimeDelta`'s range and not `DateTime`'s.
+    let token_expires_at = options
+        .now
+        .checked_add_signed(options.expires)
+        .ok_or_else(|| anyhow!("--expires is longer than any usable credential"))?
+        .to_rfc3339();
+
+    let opened = console_broker::open_request(
+        &http,
+        &options.control_plane,
+        &pkce.challenge,
+        // `client_desc` is what the consent screen shows AND what becomes the
+        // PAT's name upstream, so it is the same `cli@<hostname>` the other
+        // path mints under — one name for one machine, whichever flow wrote it.
+        &options.token_name,
+        &token_expires_at,
+    )
+    .await?;
+    let url = console_broker::approval_url(&options.control_plane, &opened.request_id);
+
+    // The code goes to stderr with the URL, because the human needs both in
+    // front of them: the browser will ask for it, and the pending list under
+    // Agent access shows the same six characters against no request id. That
+    // pairing is what proves the approver is looking at this terminal.
+    eprintln!("opening {url}");
+    eprintln!(
+        "waiting for approval in the browser (the request expires at {})",
+        opened.expires_at
+    );
+    eprintln!("  confirmation code: {}", opened.confirm);
+    if options.no_browser {
+        eprintln!("  --no-browser: open the URL above yourself, on this machine or another");
+    } else if let Err(err) = (options.open_browser)(&url) {
+        // Not fatal: the URL is already on screen, and a headless box failing
+        // to launch a browser is the normal case rather than an error.
+        eprintln!("could not open a browser ({err}) — open the URL above yourself");
+    }
+
+    let brokered = poll_for_approval(&http, &options, &opened.request_id, &pkce.verifier).await?;
+
+    // §11.2: the membership rides along, so the context is written without a
+    // second round trip. Its absence is exceptional — it means the approved
+    // membership vanished between approval and redemption — and it is fatal
+    // here because the context NAME is `<org>/<workspace>` and the org slug
+    // has nowhere else to come from. The token id is printed because at this
+    // point a credential exists that this CLI cannot revoke.
+    let membership = brokered.memberships.first().cloned().ok_or_else(|| {
+        anyhow!(
+            "the console approved workspace '{}' but returned no membership for it, so there is no organization to name the context after. The credential it minted is live and this CLI cannot revoke it — revoke token {} in the console",
+            brokered.workspace,
+            brokered.token_id
+        )
+    })?;
+
+    let token = Minted {
+        token: brokered.token,
+        token_id: brokered.token_id,
+        expires_at: brokered.expires_at,
+    };
+    let server = resolve_server(&options, &membership).map_err(|err| abandoned(&token, err))?;
+    if !options.no_verify
+        && let Err(err) = verify(&server, &membership, &token, options.verify_timeout).await
+    {
+        return Err(abandoned(&token, err));
+    }
+
+    let pending = vec![(membership, token, server)];
+    let replaced = write_contexts(config_path, &options, &pending).map_err(|err| {
+        // `pending` still owns the token, so read the id off it rather than
+        // moving anything: the write failed, and the credential is stranded.
+        abandoned(&pending[0].1, err)
+    })?;
+
+    let mut report = LoginReport::default();
+    report.written = pending
+        .iter()
+        .map(|(membership, token, server)| WrittenContext {
+            name: context_name(&options, membership),
+            server: server.clone(),
+            workspace: membership.tenant_slug.clone(),
+            role: membership.role.clone(),
+            expires_at: token.expires_at.clone(),
+        })
+        .collect();
+    report.current_context = report.written.first().map(|w| w.name.clone());
+
+    // The replacement rule, minus the revoke this path cannot perform. Routed
+    // through `revoke_failures` because that is already the channel that
+    // prints "revoke it in the console" — the outcome is identical to a revoke
+    // that failed, and the reason is stated rather than left as a bare id.
+    for token_id in replaced {
+        if options.keep_old_token {
+            report.replaced_kept.push(token_id);
+        } else {
+            report.revoke_failures.push((
+                token_id,
+                "a browser login holds only a PAT, which cannot revoke tokens at the control plane"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(report)
+}
+
+/// Poll the exchange until a human approves, the request expires, or the
+/// console says the request is gone.
+///
+/// The deadline is the REQUEST's own expiry as the console reported it, parsed
+/// rather than recomputed locally: the server owns the TTL, and a CLI that
+/// kept its own copy would poll past a dead request or give up on a live one
+/// whenever the two drifted. An unparseable stamp falls back to the local
+/// window rather than making the flow depend on the format.
+async fn poll_for_approval(
+    http: &reqwest::Client,
+    options: &LoginOptions,
+    request_id: &str,
+    verifier: &str,
+) -> Result<console_broker::Brokered> {
+    let deadline = tokio::time::Instant::now() + options.callback_timeout;
+    loop {
+        if let Some(brokered) =
+            console_broker::poll_once(http, &options.control_plane, request_id, verifier).await?
+        {
+            return Ok(brokered);
+        }
+        if tokio::time::Instant::now() + console_broker::POLL_INTERVAL >= deadline {
+            bail!(
+                "nobody approved this login within {}s — the request has expired; run `skardi login` again",
+                options.callback_timeout.as_secs()
+            );
+        }
+        tokio::time::sleep(console_broker::POLL_INTERVAL).await;
+    }
+}
+
+/// Attach the "this credential is live and unrevokable" note to a failure that
+/// happens after the exchange succeeded.
+///
+/// One function so every such site says the same thing: the ID-token flow's
+/// equivalent is `rollback`, which can actually revoke. Here the id is all the
+/// user gets, so it must always be there.
+fn abandoned(token: &Minted, cause: anyhow::Error) -> anyhow::Error {
+    cause.context(format!(
+        "the credential the console minted is live and no context holds it — a browser login holds only a PAT, which cannot revoke tokens at the control plane. Revoke token {} in the console",
+        token.token_id
+    ))
+}
+
 /// Step 1-3: the credential presented to the control plane.
 async fn acquire_bearer(http: &reqwest::Client, options: &LoginOptions) -> Result<String> {
     if let Some(identity) = &options.identity {
@@ -244,6 +457,12 @@ async fn acquire_bearer(http: &reqwest::Client, options: &LoginOptions) -> Resul
         .client_id
         .as_deref()
         .filter(|id| !id.trim().is_empty());
+    // Unreachable through `login` since the console broker became the default
+    // (design 2026-09-08 §9): the condition this refuses — no identity and no
+    // usable client id — is exactly what `uses_console_broker` matches, so
+    // that branch returns before this one is reached. Kept because it is the
+    // invariant THIS function depends on, and one line here is cheaper than a
+    // future caller discovering it by sending an empty client id to Google.
     let Some(client_id) = client_id else {
         bail!(
             "no OAuth client id: pass --client-id, set $SKARDI_OAUTH_CLIENT_ID, or use --identity dev:<id> against a loopback control plane"
