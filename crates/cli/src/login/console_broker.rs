@@ -43,6 +43,7 @@
 //! it, and collect a token belonging to whoever approved it from that list.
 
 use anyhow::{Context, Result, anyhow, bail};
+use reqwest::{Client, Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::fmt;
@@ -119,7 +120,7 @@ impl fmt::Debug for Brokered {
 /// own ceiling, so what is sent is a preference — asking for longer than
 /// policy allows yields a shorter credential, not a failure.
 pub async fn open_request(
-    http: &reqwest::Client,
+    http: &Client,
     console_base: &str,
     challenge: &str,
     client_desc: &str,
@@ -156,7 +157,7 @@ pub fn approval_url(console_base: &str, request_id: &str) -> String {
 /// Separated from the loop so the three outcomes — pending, approved, gone —
 /// are testable without a clock.
 pub async fn poll_once(
-    http: &reqwest::Client,
+    http: &Client,
     console_base: &str,
     request_id: &str,
     verifier: &str,
@@ -272,7 +273,7 @@ pub fn is_transport(err: &anyhow::Error) -> bool {
 /// already-redeemed — deliberately, so the endpoint cannot be used to
 /// enumerate live ids — which means the CLI has to translate it into the
 /// action that fixes all three.
-async fn post(http: &reqwest::Client, url: &str, body: Value) -> Result<Value> {
+async fn post(http: &Client, url: &str, body: Value) -> Result<Value> {
     let response = http.post(url).json(&body).send().await.map_err(|err| {
         Failure::Transport.with(format!("cannot reach the console at {url}: {err}"))
     })?;
@@ -287,8 +288,22 @@ async fn post(http: &reqwest::Client, url: &str, body: Value) -> Result<Value> {
         if text.trim().is_empty() {
             return Ok(Value::Null);
         }
-        return serde_json::from_str(&text)
-            .with_context(|| format!("{url} returned a body that is not JSON"));
+        // A success status whose body will not parse is marked TRANSPORT, not
+        // left as a plain failure.
+        //
+        // It is the same hazard as a dropped connection, one step later: if
+        // this was the exchange, the server already committed — consumed the
+        // request and minted the PAT — and the only copy of that token was in
+        // the body we could not read. Reported as a clean error, the poll loop
+        // would exit without retrying and without warning that a credential
+        // may exist. Marked as transport, it is retried, and a subsequent
+        // `gone` is reported as the ambiguity it is.
+        //
+        // Harmless on the open call: nothing is committed there, so the marker
+        // only changes the wording of a failure that ends the run either way.
+        return serde_json::from_str(&text).map_err(|err| {
+            Failure::Transport.with(format!("{url} returned a body that is not JSON: {err}"))
+        });
     }
 
     let (code, message) = parse_error(&text);
@@ -358,7 +373,7 @@ fn snippet(text: &str) -> String {
     format!("{head}… (truncated)")
 }
 
-async fn read_capped(mut response: reqwest::Response, url: &str) -> Result<String> {
+async fn read_capped(mut response: Response, url: &str) -> Result<String> {
     let mut buf: Vec<u8> = Vec::new();
     while let Some(chunk) = response
         .chunk()

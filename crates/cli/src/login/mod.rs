@@ -443,10 +443,23 @@ async fn poll_for_approval(
         Err(_) => options.callback_timeout,
     };
     let deadline = Instant::now() + budget;
-    // Whether the request was ever confirmed to exist. It decides how a later
-    // disappearance is reported: gone after we watched it live means it may
-    // have been approved and redeemed by a response we lost.
-    let mut seen_alive = false;
+    // Whether any poll failed in transit. THIS is what makes a later "gone"
+    // ambiguous, and the reason is what a credential requires to exist: the
+    // exchange must have committed.
+    //
+    //   - `pending` says the server did not consume — no credential;
+    //   - a clean `gone` says it did not consume on that call either;
+    //   - a TRANSPORT failure says nothing, because the call may have
+    //     committed and the answer been lost on the way back.
+    //
+    // So a `gone` following a transport failure may be hiding a live PAT,
+    // whatever the request looked like before. An earlier version keyed this on
+    // "was the request ever seen alive", which was wrong twice over: it missed
+    // the case where approval lands before the first poll (nothing is ever
+    // seen pending, so the flag stayed false and a real ambiguity was reported
+    // as a plain expiry), and it warned on `pending → clean gone`, where no
+    // credential can exist because only this process holds the verifier.
+    let mut lost_a_response = false;
     let mut transport_failures = 0_u32;
 
     loop {
@@ -455,16 +468,19 @@ async fn poll_for_approval(
         {
             Ok(Some(brokered)) => return Ok(brokered),
             Ok(None) => {
-                seen_alive = true;
+                // Consecutive-only, so a single blip mid-login does not spend
+                // the budget a later outage needs. `lost_a_response` is NOT
+                // reset: a poll that may already have committed stays a
+                // possibility for the rest of the run.
                 transport_failures = 0;
             }
             Err(err) => {
-                // A request that vanishes AFTER we saw it alive is the
-                // ambiguous case: the console answers gone/expired/redeemed
-                // identically, so a redemption whose response we lost looks
-                // exactly like an expiry. Say so, because a credential may
-                // exist that this run will never name.
-                if seen_alive && console_broker::is_gone(&err) {
+                // Gone AFTER a lost response is the ambiguous case: the console
+                // answers gone/expired/redeemed identically, so a redemption
+                // whose answer we never received looks exactly like an expiry.
+                // Say so, because a credential may exist that this run will
+                // never name.
+                if lost_a_response && console_broker::is_gone(&err) {
                     return Err(err.context(
  "the login request is gone. If you approved it, a credential may have been minted and this run never received it — check Agent access in the console and revoke anything you did not keep",
                     ));
@@ -477,6 +493,7 @@ async fn poll_for_approval(
                     return Err(err);
                 }
                 transport_failures += 1;
+                lost_a_response = true;
                 if transport_failures > MAX_TRANSPORT_FAILURES {
                     return Err(err.context(
  "the console stopped answering the CLI-login exchange. If you approved the request, check Agent access in the console for a credential this run never received",

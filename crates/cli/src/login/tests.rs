@@ -1616,15 +1616,20 @@ async fn an_unknown_exchange_status_is_reported_rather_than_polled_forever() {
     assert!(err.contains("older than the control plane"), "{err}");
 }
 
-/// A request that disappears AFTER being seen alive is the ambiguous case.
+/// `pending → clean gone` is an EXPIRY, and must not claim a credential exists.
 ///
-/// The console answers gone / expired / already-redeemed identically by
-/// design, so a redemption whose response was lost looks exactly like an
-/// expiry. Saying only "it expired" would hide a credential that may exist and
-/// that this run will never name — and a PAT cannot revoke itself at the
-/// control plane, so the console is the only place to clean it up.
+/// This INVERTS an assertion from the previous review round, because its
+/// premise was wrong. A credential can only exist if the exchange committed; a
+/// clean `gone` says it did not consume on that call, and `pending` says the
+/// same about the call before. Only this process holds the PKCE verifier, so
+/// nobody else could have redeemed the request either. What is left is the
+/// request expiring between two polls — exactly what the plain message says.
+///
+/// Warning here would send the reader hunting through Agent access for a token
+/// that cannot exist. The real ambiguity is keyed on a lost RESPONSE, covered
+/// by the two cases below.
 #[tokio::test]
-async fn a_request_that_vanishes_after_being_seen_alive_warns_a_credential_may_exist() {
+async fn a_request_that_expires_between_polls_is_not_reported_as_ambiguous() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/global/v1/cli-login/requests"))
@@ -1635,10 +1640,57 @@ async fn a_request_that_vanishes_after_being_seen_alive_warns_a_credential_may_e
         })))
         .mount(&server)
         .await;
-    // Pending once — which is what makes the request "seen alive" — then gone.
+    // Pending once, then gone — with every response arriving cleanly, so
+    // nothing was ever lost in transit.
     Mock::given(method("POST"))
         .and(path("/api/global/v1/cli-login/exchange"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "status": "pending" })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/global/v1/cli-login/exchange"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "error": { "code": "no_such_request", "message": "no such CLI login request" }
+        })))
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    let err = login(broker_options(&server.uri()), &config_in(&home))
+        .await
+        .unwrap_err();
+    let rendered = format!("{err:#}");
+    assert!(rendered.contains("no longer open"), "{rendered}");
+    assert!(
+        !rendered.contains("a credential may have been minted"),
+        "no response was lost, so nothing could have been minted: {rendered}"
+    );
+}
+
+/// A malformed SUCCESS body on the exchange is treated as a lost response.
+///
+/// The worst case this guards: the server consumed the request and minted the
+/// PAT, and the only copy of that token was in a body that will not parse.
+/// Reported as a clean error the loop exits silently; marked as transport it is
+/// retried, and the `no_such_request` that follows — because the request really
+/// was consumed — is reported as the ambiguity it is.
+#[tokio::test]
+async fn a_truncated_exchange_body_then_gone_warns_a_credential_may_exist() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/global/v1/cli-login/requests"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "request_id": "7f3a9c0000000000000000000000abcd",
+            "confirm": "7f3a9c",
+            "expires_at": "2026-08-24T12:00:03Z",
+        })))
+        .mount(&server)
+        .await;
+    // 200 with a truncated body: the mint committed, the token is unreadable.
+    Mock::given(method("POST"))
+        .and(path("/api/global/v1/cli-login/exchange"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{\"status\":\"appro"))
         .up_to_n_times(1)
         .mount(&server)
         .await;
@@ -1660,8 +1712,52 @@ async fn a_request_that_vanishes_after_being_seen_alive_warns_a_credential_may_e
         "{rendered}"
     );
     assert!(rendered.contains("Agent access"), "{rendered}");
-    // The underlying cause is still there, not replaced by the warning.
     assert!(rendered.contains("no longer open"), "{rendered}");
+}
+
+/// Approval landing BEFORE the first poll, with that first response lost.
+///
+/// The hole the previous fix left: the flag was set only by a `pending`
+/// answer, so a run that never sees one — approval already done when the first
+/// poll goes out — kept it false and reported a real ambiguity as a plain
+/// "rerun login". Keying on the lost response covers it, because there is no
+/// earlier poll to have seen anything.
+#[tokio::test]
+async fn a_lost_first_response_then_gone_warns_without_ever_seeing_pending() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/global/v1/cli-login/requests"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "request_id": "7f3a9c0000000000000000000000abcd",
+            "confirm": "7f3a9c",
+            "expires_at": "2026-08-24T12:00:03Z",
+        })))
+        .mount(&server)
+        .await;
+    // The very FIRST exchange: committed server-side, answer unreadable.
+    Mock::given(method("POST"))
+        .and(path("/api/global/v1/cli-login/exchange"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/global/v1/cli-login/exchange"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "error": { "code": "no_such_request", "message": "no such CLI login request" }
+        })))
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    let err = login(broker_options(&server.uri()), &config_in(&home))
+        .await
+        .unwrap_err();
+    let rendered = format!("{err:#}");
+    assert!(
+        rendered.contains("a credential may have been minted"),
+        "no `pending` was ever seen, and the warning must still fire: {rendered}"
+    );
 }
 
 /// A first poll that finds the request already gone is NOT the ambiguous case.
