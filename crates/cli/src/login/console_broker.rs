@@ -203,6 +203,66 @@ struct ExchangeBody {
 /// the control-plane client uses.
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 
+/// How much of an UNRECOGNIZED error body may reach the terminal.
+///
+/// A console's 404 is a full Next.js HTML document on a single line, so the
+/// old `text.lines().next()` fallback printed the entire page as the failure
+/// reason — several kilobytes of markup where a sentence belonged. Bodies we
+/// can parse are unaffected; this bounds only the fallback.
+const MAX_SNIPPET_CHARS: usize = 200;
+
+/// Why a CLI-login call failed, in the terms the poll loop branches on.
+///
+/// A marker attached with `anyhow::Context` rather than a new error enum: the
+/// callers all render `anyhow::Error`, and the loop needs exactly two
+/// questions answered — is this worth retrying, and did the request disappear.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Failure {
+    /// The request no longer exists: expired, unknown, or already redeemed.
+    /// One answer for all three by design, so the endpoint cannot enumerate
+    /// live ids.
+    Gone,
+    /// The console could not be reached, or its answer could not be read.
+    /// Retryable: the poll is idempotent while a request is pending.
+    Transport,
+}
+
+impl fmt::Display for Failure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Failure::Gone => write!(f, "the CLI-login request is gone"),
+            Failure::Transport => write!(f, "the console could not be reached"),
+        }
+    }
+}
+
+impl std::error::Error for Failure {}
+
+impl Failure {
+    /// This failure, carrying `message` as what the user reads.
+    ///
+    /// The marker is the ROOT and the sentence is context ON TOP, not the
+    /// other way round: `anyhow::Error::to_string` renders the outermost
+    /// context, so attaching the marker last replaced the explanation with
+    /// "the CLI-login request is gone" and threw away the sentence that told
+    /// the reader what to do about it.
+    fn with(self, message: impl fmt::Display + Send + Sync + 'static) -> anyhow::Error {
+        anyhow::Error::new(self).context(message)
+    }
+}
+
+/// Whether `err` reports a request that no longer exists.
+pub fn is_gone(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.downcast_ref::<Failure>() == Some(&Failure::Gone))
+}
+
+/// Whether `err` is a transport failure, and so worth retrying.
+pub fn is_transport(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.downcast_ref::<Failure>() == Some(&Failure::Transport))
+}
+
 /// One POST, with the console's error envelope mapped.
 ///
 /// The BFF passes skardi-global's body through untouched, so the envelope is
@@ -213,14 +273,15 @@ const MAX_BODY_BYTES: usize = 1024 * 1024;
 /// enumerate live ids — which means the CLI has to translate it into the
 /// action that fixes all three.
 async fn post(http: &reqwest::Client, url: &str, body: Value) -> Result<Value> {
-    let response = http
-        .post(url)
-        .json(&body)
-        .send()
-        .await
-        .with_context(|| format!("cannot reach the console at {url}"))?;
+    let response = http.post(url).json(&body).send().await.map_err(|err| {
+        Failure::Transport.with(format!("cannot reach the console at {url}: {err}"))
+    })?;
     let status = response.status();
-    let text = read_capped(response, url).await?;
+    let text = read_capped(response, url)
+        .await
+        // `{err:#}` flattens the read's own cause chain into the message, so
+        // nothing is lost by making the marker the root.
+        .map_err(|err| Failure::Transport.with(format!("{err:#}")))?;
 
     if status.is_success() {
         if text.trim().is_empty() {
@@ -242,8 +303,8 @@ async fn post(http: &reqwest::Client, url: &str, body: Value) -> Result<Value> {
         );
     }
     match code.as_str() {
-        "no_such_request" => Err(anyhow!(
-            "the login request is no longer open — it expired, or it was already redeemed. Run `skardi login` again"
+        "no_such_request" => Err(Failure::Gone.with(
+            "the login request is no longer open — it expired, or it was already redeemed. Run `skardi login` again",
         )),
         "verifier_mismatch" => Err(anyhow!(
             "the console refused this CLI's proof of ownership for the login request — start a fresh `skardi login` rather than reusing a request id"
@@ -278,11 +339,23 @@ fn parse_error(text: &str) -> (Option<String>, String) {
             envelope.error.code,
             envelope.error.message.unwrap_or_default(),
         ),
-        Err(_) => (
-            None,
-            text.lines().next().unwrap_or_default().trim().to_string(),
-        ),
+        Err(_) => (None, snippet(text)),
     }
+}
+
+/// The first line of an unrecognized body, bounded.
+///
+/// A console's 404 is one enormous line of HTML, so "first line" was the whole
+/// document; without the char cap the CLI printed a Next.js page where an
+/// explanation belonged. Truncation is marked, so a reader can tell the
+/// message was cut rather than that the server sent gibberish.
+fn snippet(text: &str) -> String {
+    let line = text.lines().next().unwrap_or_default().trim();
+    if line.chars().count() <= MAX_SNIPPET_CHARS {
+        return line.to_string();
+    }
+    let head: String = line.chars().take(MAX_SNIPPET_CHARS).collect();
+    format!("{head}… (truncated)")
 }
 
 async fn read_capped(mut response: reqwest::Response, url: &str) -> Result<String> {

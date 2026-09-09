@@ -187,11 +187,26 @@ log in at all. Here the CLI speaks to no identity provider, learns nothing
 about which one you used, and needs no client id.
 
 Only one input has no built-in default, and it fails by name rather than
-guessing: the **control plane** (`--control-plane` >
-`$SKARDI_CONTROL_PLANE_URL` > `control-plane:` in the config file). For the
-brokered path this is the **console's** URL — the same address you open in a
-browser — because that is what serves the approval page. Once a `login`
-succeeds it is recorded in the config file and later runs need no flag.
+guessing: the URL (`--control-plane` > `$SKARDI_CONTROL_PLANE_URL` > the
+config file). For the brokered path that is the **console's** URL — the same
+address you open in a browser — because that is what serves the approval page.
+Once a `login` succeeds it is recorded and later runs need no flag.
+
+**The two paths record it under different keys**, and that matters if you mix
+them:
+
+| Path | File key |
+|---|---|
+| console-brokered | `console:` |
+| direct OAuth, and `logout --revoke` | `control-plane:` |
+
+They are different services. `ControlPlane` calls bare `/v1/me/...`; a console
+serves that API under `/api/global/v1/...` and only to a browser holding a
+session. One key for both meant a brokered login left the console's URL where
+the direct flows look, so a later `logout --revoke` cleared the local
+credential and then sent `DELETE /v1/me/tokens/{id}` at the console, which
+answered with its 404 page. Kept apart, a direct flow with nothing recorded
+of its own says so and names `control-plane:`.
 
 The direct-OAuth path additionally needs the **OAuth client id**
 (`--client-id` > `$SKARDI_OAUTH_CLIENT_ID`), which is per deployment, so
@@ -228,13 +243,17 @@ Two consequences of the token arriving already-minted, both of which the CLI
 reports rather than hides:
 
 - **`--workspace` and `--all-workspaces` are refused on this path.** One
-  approval grants one workspace. The error names `--client-id`, which is the
-  flow that can select workspaces from the terminal.
+  approval grants one workspace. The error names both flows that *can* select
+  from the terminal: `--client-id`, and `--identity dev:<id>` against a
+  loopback control plane.
 - **Nothing can be revoked from here.** The credential is a workspace token,
   which authenticates to the gateway and not to the control plane — so where
   the direct-OAuth path revokes, this one prints the token id and tells you to
   revoke it in the console. That applies to a token this run had to abandon
-  (a failed verify) and to a credential a re-login replaced.
+  (a failed verify) and to a credential a re-login replaced. `logout --revoke`
+  is the same story: it re-authenticates, so after a brokered login it needs
+  `--client-id` or `--identity` and otherwise reports the live token ids
+  rather than pretending to revoke them.
 
 ### The direct-OAuth flow (`--client-id`), in order
 

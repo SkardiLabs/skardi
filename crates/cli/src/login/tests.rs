@@ -11,6 +11,7 @@ use super::{
     LoginOptions, Selection, login, oauth, parse_expires, render_workspace_menu, select_memberships,
 };
 use chrono::{DateTime, Duration, Utc};
+use rstest::rstest;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
@@ -121,6 +122,7 @@ fn options(control_plane: &str, server_override: Option<&str>) -> LoginOptions {
         open_browser: oauth::open_in_browser,
         verify_timeout: std::time::Duration::from_millis(200),
         callback_timeout: std::time::Duration::from_millis(50),
+        poll_interval: std::time::Duration::from_millis(1),
         token_name: "cli@test-host".to_string(),
         now: at("2026-08-24T12:00:00Z"),
     }
@@ -1227,7 +1229,11 @@ async fn console(status: u16, exchange_body: Value) -> MockServer {
         .respond_with(ResponseTemplate::new(201).set_body_json(json!({
             "request_id": "7f3a9c0000000000000000000000abcd",
             "confirm": "7f3a9c",
-            "expires_at": "2026-08-24T12:05:00Z",
+            // Three seconds past `options()`'s frozen clock, not the real
+            // five minutes: the deadline is derived from THIS value, so the
+            // production TTL here would make the give-up test sleep for five
+            // actual minutes.
+            "expires_at": "2026-08-24T12:00:03Z",
         })))
         .mount(&server)
         .await;
@@ -1358,26 +1364,29 @@ async fn the_open_call_carries_the_pkce_challenge_the_expiry_and_the_machine_nam
     );
 }
 
+#[rstest]
+#[case::workspace(Selection::Named("other".to_string()), "--workspace 'other'")]
+#[case::all_workspaces(Selection::All, "--all-workspaces")]
 #[tokio::test]
-async fn a_browser_login_refuses_the_flags_it_cannot_honour() {
+async fn a_browser_login_refuses_the_flags_it_cannot_honour(
+    #[case] selection: Selection,
+    #[case] expected: &str,
+) {
     // The consent screen grants exactly one workspace (§11.1), so neither flag
     // has an honest reading here — and quietly logging into one workspace when
     // `--all-workspaces` was asked for is a success discovered much later.
-    for (selection, expected) in [
-        (Selection::Named("other".to_string()), "--workspace 'other'"),
-        (Selection::All, "--all-workspaces"),
-    ] {
-        let home = TempDir::new().unwrap();
-        let mut options = broker_options("http://127.0.0.1:1");
-        options.selection = selection;
-        let err = login(options, &config_in(&home))
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains(expected), "{err}");
-        // Points at the flow that CAN do it, rather than only refusing.
-        assert!(err.contains("--client-id"), "{err}");
-    }
+    let home = TempDir::new().unwrap();
+    let mut options = broker_options("http://127.0.0.1:1");
+    options.selection = selection;
+    let err = login(options, &config_in(&home))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains(expected), "{err}");
+    // Points at the flows that CAN do it, rather than only refusing. Both are
+    // named, because `--identity` opts out of the broker too.
+    assert!(err.contains("--client-id"), "{err}");
+    assert!(err.contains("--identity"), "{err}");
 }
 
 #[tokio::test]
@@ -1436,6 +1445,61 @@ async fn nobody_approving_expires_with_the_deadline_named() {
         "no context on an unapproved login"
     );
     assert!(!err.contains("Revoke token"), "nothing was minted: {err}");
+}
+
+/// The give-up deadline comes from the SERVER's request expiry, not from the
+/// local OAuth callback timeout.
+///
+/// The two differ by design — a brokered request lives five minutes, the
+/// loopback listener waits 120 seconds — so using the local one abandoned the
+/// poll while the request was still open and told the human they had not
+/// approved in time when they had minutes left. `options()` sets a 50ms
+/// callback timeout and the console reports an expiry 3s past the frozen
+/// clock, so the reported budget names which one was used.
+#[tokio::test]
+async fn the_poll_deadline_comes_from_the_request_expiry_not_the_callback_timeout() {
+    let console = console(200, json!({ "status": "pending" })).await;
+    let home = TempDir::new().unwrap();
+    let options = broker_options(&console.uri());
+    assert_eq!(
+        options.callback_timeout,
+        std::time::Duration::from_millis(50),
+        "the fixture must make the two budgets distinguishable"
+    );
+
+    let err = login(options, &config_in(&home))
+        .await
+        .unwrap_err()
+        .to_string();
+    // 3s is the console's expiry; the callback timeout would render as 0s.
+    assert!(err.contains("within 3s"), "{err}");
+    assert!(!err.contains("within 0s"), "{err}");
+}
+
+/// A brokered login records the console under `console:`, leaving
+/// `control-plane:` alone.
+///
+/// They are different services: `ControlPlane` appends bare `/v1/me/...`,
+/// while a console serves that API under `/api/global/v1/...` and only to a
+/// browser holding a session. Recording a console URL as `control-plane`
+/// poisoned every later direct call — a `logout --revoke` cleared the local
+/// credential and then sent `DELETE /v1/me/tokens/{id}` at the console, which
+/// replied with its own 404 page.
+#[tokio::test]
+async fn a_brokered_login_records_the_console_url_under_its_own_key() {
+    let gw = gateway(200).await;
+    let console = console(200, approved("my-ws", &gw.uri(), "tok-1")).await;
+    let home = TempDir::new().unwrap();
+    login(broker_options(&console.uri()), &config_in(&home))
+        .await
+        .unwrap();
+
+    let file = read_yaml(&config_in(&home));
+    assert_eq!(file["console"].as_str(), Some(console.uri().as_str()));
+    assert!(
+        file["control-plane"].is_null(),
+        "a console URL must not become the control-plane API base: {file:?}"
+    );
 }
 
 #[tokio::test]

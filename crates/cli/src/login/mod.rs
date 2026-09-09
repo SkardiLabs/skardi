@@ -29,6 +29,7 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use chrono::{DateTime, Duration, Utc};
 use control_plane::{ControlPlane, CpError, Membership, Minted};
 use std::path::Path;
+use tokio::time::{Instant, sleep};
 
 /// Default PAT lifetime (§6.1 step 5), as `--expires` spells it. A string so
 /// clap's default and this documented value are the same token, parsed by the
@@ -83,6 +84,13 @@ pub struct LoginOptions {
     /// browser path covered rather than argued.
     pub open_browser: fn(&str) -> std::io::Result<()>,
     pub callback_timeout: std::time::Duration,
+    /// How long the brokered flow waits between polls of the exchange.
+    ///
+    /// Injectable for the same reason the timeouts are: the deadline now comes
+    /// from the SERVER's five-minute request expiry, so a test that exercises
+    /// the give-up path would otherwise sleep for five real minutes — which it
+    /// did, taking the suite from 0.3s to 298s.
+    pub poll_interval: std::time::Duration,
     /// Ceiling on the post-mint verification probe (§6.1 step 6).
     pub verify_timeout: std::time::Duration,
     /// The PAT's name at the control plane, `cli@<hostname>`.
@@ -250,11 +258,17 @@ pub async fn login(options: LoginOptions, config_path: &Path) -> Result<LoginRep
 /// it: `SKARDI_OAUTH_CLIENT_ID=` exported into a shell must not select a path
 /// that then fails for want of the value that variable was supposed to carry.
 fn uses_console_broker(options: &LoginOptions) -> bool {
-    options.identity.is_none()
-        && options
-            .client_id
-            .as_deref()
-            .is_none_or(|id| id.trim().is_empty())
+    selects_console_broker(options.identity.as_deref(), options.client_id.as_deref())
+}
+
+/// The same question, asked before a [`LoginOptions`] exists.
+///
+/// `commands::login` needs it to decide which recorded URL to fall back to —
+/// the console that brokers, or the control-plane API itself — and those are
+/// different keys in the config file. One predicate, so the key a brokered
+/// login WRITES is always the key the next brokered login READS.
+pub fn selects_console_broker(identity: Option<&str>, client_id: Option<&str>) -> bool {
+    identity.is_none() && client_id.is_none_or(|id| id.trim().is_empty())
 }
 
 /// The console-brokered flow (design 2026-09-08 §4).
@@ -283,10 +297,10 @@ async fn console_brokered_login(options: LoginOptions, config_path: &Path) -> Re
     match &options.selection {
         Selection::Auto => {}
         Selection::Named(slug) => bail!(
-            "--workspace '{slug}' cannot be honoured through a browser login: the console's consent screen chooses the workspace, and it grants exactly one. Approve '{slug}' in the browser, or use the OAuth flow with --client-id <ID> to select it here"
+            "--workspace '{slug}' cannot be honoured through a browser login: the console's consent screen chooses the workspace, and it grants exactly one. Approve '{slug}' in the browser, or select it from the terminal with --client-id <ID> (or --identity dev:<id> against a loopback control plane)"
         ),
         Selection::All => bail!(
-            "--all-workspaces cannot be honoured through a browser login: one approval grants one workspace. Run this once per workspace, or use the OAuth flow with --client-id <ID>"
+            "--all-workspaces cannot be honoured through a browser login: one approval grants one workspace. Run this once per workspace, or select from the terminal with --client-id <ID> (or --identity dev:<id> against a loopback control plane)"
         ),
     }
 
@@ -332,7 +346,7 @@ async fn console_brokered_login(options: LoginOptions, config_path: &Path) -> Re
         eprintln!("could not open a browser ({err}) — open the URL above yourself");
     }
 
-    let brokered = poll_for_approval(&http, &options, &opened.request_id, &pkce.verifier).await?;
+    let brokered = poll_for_approval(&http, &options, &opened, &pkce.verifier).await?;
 
     // §11.2: the membership rides along, so the context is written without a
     // second round trip. Its absence is exceptional — it means the approved
@@ -409,25 +423,83 @@ async fn console_brokered_login(options: LoginOptions, config_path: &Path) -> Re
 async fn poll_for_approval(
     http: &reqwest::Client,
     options: &LoginOptions,
-    request_id: &str,
+    opened: &console_broker::Opened,
     verifier: &str,
 ) -> Result<console_broker::Brokered> {
-    let deadline = tokio::time::Instant::now() + options.callback_timeout;
+    // The SERVER's expiry, not the local OAuth callback timeout. Those differ
+    // by design — the request lives five minutes and the loopback listener
+    // waits 120 seconds — so using the local one gave up while the request was
+    // still open, and told the human they had not approved in time when they
+    // had two more minutes. The doc above claimed this behaviour before the
+    // code had it.
+    //
+    // An unparseable stamp falls back to the local window rather than failing:
+    // a console that changes its timestamp format should shorten this loop, not
+    // break the login.
+    let budget = match DateTime::parse_from_rfc3339(&opened.expires_at) {
+        Ok(at) => (at.with_timezone(&Utc) - options.now)
+            .to_std()
+            .unwrap_or(options.callback_timeout),
+        Err(_) => options.callback_timeout,
+    };
+    let deadline = Instant::now() + budget;
+    // Whether the request was ever confirmed to exist. It decides how a later
+    // disappearance is reported: gone after we watched it live means it may
+    // have been approved and redeemed by a response we lost.
+    let mut seen_alive = false;
+    let mut transport_failures = 0_u32;
+
     loop {
-        if let Some(brokered) =
-            console_broker::poll_once(http, &options.control_plane, request_id, verifier).await?
+        match console_broker::poll_once(http, &options.control_plane, &opened.request_id, verifier)
+            .await
         {
-            return Ok(brokered);
+            Ok(Some(brokered)) => return Ok(brokered),
+            Ok(None) => {
+                seen_alive = true;
+                transport_failures = 0;
+            }
+            Err(err) => {
+                // A request that vanishes AFTER we saw it alive is the
+                // ambiguous case: the console answers gone/expired/redeemed
+                // identically, so a redemption whose response we lost looks
+                // exactly like an expiry. Say so, because a credential may
+                // exist that this run will never name.
+                if seen_alive && console_broker::is_gone(&err) {
+                    return Err(err.context(
+                        "the login request is gone. If you approved it, a credential may have                          been minted and this run never received it — check Agent access in the                          console and revoke anything you did not keep",
+                    ));
+                }
+                // Transport failures are retried rather than fatal: the poll is
+                // idempotent while the request is pending, and a console
+                // restarting mid-approval should not end a login the human is
+                // still working through.
+                if !console_broker::is_transport(&err) {
+                    return Err(err);
+                }
+                transport_failures += 1;
+                if transport_failures > MAX_TRANSPORT_FAILURES {
+                    return Err(err.context(
+                        "the console stopped answering the CLI-login exchange. If you approved                          the request, check Agent access in the console for a credential this                          run never received",
+                    ));
+                }
+            }
         }
-        if tokio::time::Instant::now() + console_broker::POLL_INTERVAL >= deadline {
+        if Instant::now() + options.poll_interval >= deadline {
             bail!(
                 "nobody approved this login within {}s — the request has expired; run `skardi login` again",
-                options.callback_timeout.as_secs()
+                budget.as_secs()
             );
         }
-        tokio::time::sleep(console_broker::POLL_INTERVAL).await;
+        sleep(options.poll_interval).await;
     }
 }
+
+/// Consecutive transport failures tolerated while polling the exchange.
+///
+/// Small on purpose: the point is to survive a console restart or a dropped
+/// connection mid-approval, not to keep trying at a console that is gone. At
+/// the default poll interval this is a few seconds of grace.
+const MAX_TRANSPORT_FAILURES: u32 = 3;
 
 /// Attach the "this credential is live and unrevokable" note to a failure that
 /// happens after the exchange succeeded.
@@ -767,8 +839,20 @@ fn write_contexts(
         file.current_context = Some(context_name(options, membership));
     }
     // Recorded so a later `login` with no --control-plane reaches the same
-    // control plane this one did.
-    file.control_plane = Some(options.control_plane.clone());
+    // place this one did — under the key that matches WHICH place it is.
+    //
+    // Both flows take the URL from the same `--control-plane` flag, but they
+    // point at different services: the brokered flow is given a console, whose
+    // control-plane API lives under `/api/global/v1/...` and only answers a
+    // browser with a session. Recording a console URL as `control-plane`
+    // poisoned every later direct call — a `logout --revoke` cleared the local
+    // credential and then sent `DELETE /v1/me/tokens/{id}` at the console,
+    // which replied with its own 404 page.
+    if uses_console_broker(options) {
+        file.console = Some(options.control_plane.clone());
+    } else {
+        file.control_plane = Some(options.control_plane.clone());
+    }
     config::save(path, &file)?;
     Ok(replaced)
 }
