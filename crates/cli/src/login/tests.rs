@@ -1616,6 +1616,286 @@ async fn an_unknown_exchange_status_is_reported_rather_than_polled_forever() {
     assert!(err.contains("older than the control plane"), "{err}");
 }
 
+/// A request that disappears AFTER being seen alive is the ambiguous case.
+///
+/// The console answers gone / expired / already-redeemed identically by
+/// design, so a redemption whose response was lost looks exactly like an
+/// expiry. Saying only "it expired" would hide a credential that may exist and
+/// that this run will never name — and a PAT cannot revoke itself at the
+/// control plane, so the console is the only place to clean it up.
+#[tokio::test]
+async fn a_request_that_vanishes_after_being_seen_alive_warns_a_credential_may_exist() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/global/v1/cli-login/requests"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "request_id": "7f3a9c0000000000000000000000abcd",
+            "confirm": "7f3a9c",
+            "expires_at": "2026-08-24T12:00:03Z",
+        })))
+        .mount(&server)
+        .await;
+    // Pending once — which is what makes the request "seen alive" — then gone.
+    Mock::given(method("POST"))
+        .and(path("/api/global/v1/cli-login/exchange"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "status": "pending" })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/global/v1/cli-login/exchange"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "error": { "code": "no_such_request", "message": "no such CLI login request" }
+        })))
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    let err = login(broker_options(&server.uri()), &config_in(&home))
+        .await
+        .unwrap_err();
+    let rendered = format!("{err:#}");
+    assert!(
+        rendered.contains("a credential may have been minted"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("Agent access"), "{rendered}");
+    // The underlying cause is still there, not replaced by the warning.
+    assert!(rendered.contains("no longer open"), "{rendered}");
+}
+
+/// A first poll that finds the request already gone is NOT the ambiguous case.
+///
+/// Nothing was ever approved through this run, so claiming a credential might
+/// exist would send the reader hunting for one that does not.
+#[tokio::test]
+async fn a_request_gone_on_the_first_poll_does_not_claim_a_credential_exists() {
+    let console = console(
+        404,
+        json!({ "error": { "code": "no_such_request",
+        "message": "no such CLI login request" } }),
+    )
+    .await;
+    let home = TempDir::new().unwrap();
+    let err = login(broker_options(&console.uri()), &config_in(&home))
+        .await
+        .unwrap_err();
+    let rendered = format!("{err:#}");
+    assert!(rendered.contains("no longer open"), "{rendered}");
+    assert!(
+        !rendered.contains("a credential may have been minted"),
+        "{rendered}"
+    );
+}
+
+/// An unparseable request expiry falls back to the local window rather than
+/// failing the login: a console that changes its timestamp format should
+/// shorten this loop, not break signing in.
+#[tokio::test]
+async fn an_unparseable_request_expiry_falls_back_to_the_local_window() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/global/v1/cli-login/requests"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "request_id": "7f3a9c0000000000000000000000abcd",
+            "confirm": "7f3a9c",
+            "expires_at": "next tuesday",
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/global/v1/cli-login/exchange"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "status": "pending" })))
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    let err = login(broker_options(&server.uri()), &config_in(&home))
+        .await
+        .unwrap_err()
+        .to_string();
+    // `options()`'s 50ms callback timeout renders as 0s — the local window,
+    // not a parsed one.
+    assert!(err.contains("nobody approved this login"), "{err}");
+    assert!(err.contains("within 0s"), "{err}");
+}
+
+/// A browser that will not launch is not a failure: the URL is already on
+/// screen, and a headless box is the normal case rather than an error.
+#[tokio::test]
+async fn a_browser_that_cannot_be_opened_does_not_fail_the_login() {
+    let gw = gateway(200).await;
+    let console = console(200, approved("my-ws", &gw.uri(), "tok-1")).await;
+    let home = TempDir::new().unwrap();
+    let mut options = broker_options(&console.uri());
+    // `no_browser` off, so the launch is attempted — and it refuses.
+    options.no_browser = false;
+    options.open_browser = |_| {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no browser here",
+        ))
+    };
+
+    let report = login(options, &config_in(&home)).await.unwrap();
+    assert_eq!(report.written.len(), 1, "the login still completed");
+}
+
+/// A console that answers the exchange with no recognizable error body still
+/// produces a message naming the status, not an empty one.
+#[tokio::test]
+async fn an_unrecognizable_refusal_still_names_the_status() {
+    let console = console(500, json!({ "unexpected": "shape" })).await;
+    let home = TempDir::new().unwrap();
+    let err = login(broker_options(&console.uri()), &config_in(&home))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("HTTP 500"), "{err}");
+    assert!(err.contains("refused the CLI-login request"), "{err}");
+}
+
+/// An oversized exchange body is refused by the read cap, and that counts as
+/// a TRANSPORT failure — so it is retried rather than ending the login, and
+/// exhausting the retries says the console stopped answering.
+///
+/// One test for two guards: the 1MiB ceiling that stops a runaway endpoint
+/// exhausting memory, and the retry loop that survives a console restarting
+/// mid-approval.
+#[tokio::test]
+async fn an_oversized_exchange_body_is_capped_retried_and_then_reported() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/global/v1/cli-login/requests"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "request_id": "7f3a9c0000000000000000000000abcd",
+            "confirm": "7f3a9c",
+            "expires_at": "2026-08-24T12:00:03Z",
+        })))
+        .mount(&server)
+        .await;
+    // Comfortably past the 1MiB cap.
+    Mock::given(method("POST"))
+        .and(path("/api/global/v1/cli-login/exchange"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("x".repeat(1_200_000)))
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    let err = login(broker_options(&server.uri()), &config_in(&home))
+        .await
+        .unwrap_err();
+    let rendered = format!("{err:#}");
+    assert!(rendered.contains("stopped answering"), "{rendered}");
+    assert!(rendered.contains("refusing to buffer it"), "{rendered}");
+}
+
+/// A config write that cannot land strands the credential, and says so by id.
+///
+/// The exchange already committed, so a PAT exists — and a browser login
+/// cannot revoke it. Pointing the config at a path whose parent is a FILE
+/// makes the write fail the way a read-only home would.
+#[tokio::test]
+async fn a_config_write_that_fails_reports_the_stranded_credential_by_id() {
+    let gw = gateway(200).await;
+    let console = console(200, approved("my-ws", &gw.uri(), "tok-stranded")).await;
+    let home = TempDir::new().unwrap();
+    let blocker = home.path().join(".skardi");
+    std::fs::write(&blocker, "not a directory").unwrap();
+
+    let err = login(broker_options(&console.uri()), &blocker.join("config.yaml"))
+        .await
+        .unwrap_err();
+    let rendered = format!("{err:#}");
+    assert!(rendered.contains("Revoke token tok-stranded"), "{rendered}");
+    assert!(rendered.contains("cannot revoke"), "{rendered}");
+}
+
+/// A reused request id is refused by PKCE, and the message says to start over
+/// rather than to retype anything.
+#[tokio::test]
+async fn a_verifier_mismatch_tells_the_user_to_start_a_fresh_login() {
+    let console = console(
+        403,
+        json!({ "error": { "code": "verifier_mismatch",
+        "message": "the PKCE verifier does not match this request" } }),
+    )
+    .await;
+    let home = TempDir::new().unwrap();
+    let err = login(broker_options(&console.uri()), &config_in(&home))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("proof of ownership"), "{err}");
+    assert!(err.contains("start a fresh"), "{err}");
+}
+
+/// An error envelope carrying a code but no message still names the status,
+/// rather than rendering an empty sentence.
+#[tokio::test]
+async fn a_refusal_with_no_message_names_the_status_instead() {
+    let console = console(500, json!({ "error": { "code": "internal" } })).await;
+    let home = TempDir::new().unwrap();
+    let err = login(broker_options(&console.uri()), &config_in(&home))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("HTTP 500"), "{err}");
+    assert!(!err.contains(": (HTTP"), "no empty message clause: {err}");
+}
+
+/// A console that opens a request with no id is refused, rather than polling
+/// an exchange that can never match.
+#[tokio::test]
+async fn an_opened_request_with_no_id_is_refused() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/global/v1/cli-login/requests"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "request_id": "",
+            "confirm": "",
+            "expires_at": "2026-08-24T12:00:03Z",
+        })))
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    let err = login(broker_options(&server.uri()), &config_in(&home))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("no id"), "{err}");
+}
+
+/// An exchange answering 200 with an empty body is an unknown state, not a
+/// pending one — polling forever on it would blame the human for not
+/// approving.
+#[tokio::test]
+async fn an_empty_exchange_body_is_reported_as_an_unexpected_status() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/global/v1/cli-login/requests"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "request_id": "7f3a9c0000000000000000000000abcd",
+            "confirm": "7f3a9c",
+            "expires_at": "2026-08-24T12:00:03Z",
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/global/v1/cli-login/exchange"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(""))
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    let err = login(broker_options(&server.uri()), &config_in(&home))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("unexpected status"), "{err}");
+}
+
 #[test]
 fn the_console_broker_is_the_default_and_either_credential_flag_opts_out() {
     let base = |identity: Option<&str>, client_id: Option<&str>| {

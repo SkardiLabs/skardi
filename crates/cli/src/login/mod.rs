@@ -466,7 +466,7 @@ async fn poll_for_approval(
                 // exist that this run will never name.
                 if seen_alive && console_broker::is_gone(&err) {
                     return Err(err.context(
-                        "the login request is gone. If you approved it, a credential may have                          been minted and this run never received it — check Agent access in the                          console and revoke anything you did not keep",
+ "the login request is gone. If you approved it, a credential may have been minted and this run never received it — check Agent access in the console and revoke anything you did not keep",
                     ));
                 }
                 // Transport failures are retried rather than fatal: the poll is
@@ -479,7 +479,7 @@ async fn poll_for_approval(
                 transport_failures += 1;
                 if transport_failures > MAX_TRANSPORT_FAILURES {
                     return Err(err.context(
-                        "the console stopped answering the CLI-login exchange. If you approved                          the request, check Agent access in the console for a credential this                          run never received",
+ "the console stopped answering the CLI-login exchange. If you approved the request, check Agent access in the console for a credential this run never received",
                     ));
                 }
             }

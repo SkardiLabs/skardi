@@ -376,3 +376,110 @@ async fn read_capped(mut response: reqwest::Response, url: &str) -> Result<Strin
 fn trim(base: &str) -> &str {
     base.trim_end_matches('/')
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Brokered, Failure, MAX_SNIPPET_CHARS, is_gone, is_transport, parse_error, snippet,
+    };
+
+    /// The raw PAT must not be reachable through an `{err:?}` rendering or a
+    /// stray log line, so `Debug` is hand-written — and that is worth pinning
+    /// rather than trusting, the same way `Minted`'s is.
+    #[test]
+    fn a_brokered_debug_output_redacts_the_token() {
+        let brokered = Brokered {
+            token: "skardi_pat_the_real_secret".to_string(),
+            token_id: "tok-1".to_string(),
+            expires_at: Some("2026-11-22T12:00:00Z".to_string()),
+            workspace: "acme-prod".to_string(),
+            memberships: Vec::new(),
+        };
+        let rendered = format!("{brokered:?}");
+        assert!(!rendered.contains("the_real_secret"), "{rendered}");
+        assert!(rendered.contains("(redacted)"), "{rendered}");
+        // What a caller legitimately needs to see, including the id that is
+        // the only handle on an abandoned credential.
+        assert!(rendered.contains("tok-1"), "{rendered}");
+        assert!(rendered.contains("acme-prod"), "{rendered}");
+    }
+
+    /// The marker is the ROOT of the chain and the sentence is context on top.
+    ///
+    /// The reverse is the bug this pins: attaching the marker last made
+    /// `to_string()` render "the CLI-login request is gone" and threw away the
+    /// sentence telling the reader to run `skardi login` again.
+    #[test]
+    fn a_failure_marker_does_not_replace_the_message_a_user_reads() {
+        let err = Failure::Gone.with("the login request is no longer open — run `skardi login`");
+        assert_eq!(
+            err.to_string(),
+            "the login request is no longer open — run `skardi login`"
+        );
+        assert!(is_gone(&err));
+        assert!(!is_transport(&err));
+        // The markers' own wording, which surfaces only in an `{err:#}` chain.
+        assert_eq!(Failure::Gone.to_string(), "the CLI-login request is gone");
+        assert_eq!(
+            Failure::Transport.to_string(),
+            "the console could not be reached"
+        );
+    }
+
+    #[test]
+    fn the_classifiers_do_not_fire_on_an_unmarked_error() {
+        // The loop branches on these: a false positive on `is_transport` would
+        // retry something terminal, and one on `is_gone` would claim a
+        // credential may exist when nothing was ever approved.
+        let plain = anyhow::anyhow!("something else went wrong");
+        assert!(!is_gone(&plain));
+        assert!(!is_transport(&plain));
+        let transport = Failure::Transport.with("cannot reach the console");
+        assert!(is_transport(&transport));
+        assert!(!is_gone(&transport));
+    }
+
+    /// A console's 404 is a single enormous line of HTML, so "first line" was
+    /// no bound at all — the whole page reached the terminal where a sentence
+    /// belonged.
+    #[test]
+    fn an_unparseable_body_is_bounded_and_marked() {
+        let page = format!(
+            "<!DOCTYPE html><html><body>{}</body></html>",
+            "<div></div>".repeat(300)
+        );
+        assert_eq!(page.lines().count(), 1, "the real page is one line");
+        let out = snippet(&page);
+        assert!(out.ends_with("… (truncated)"), "{out}");
+        assert!(out.starts_with("<!DOCTYPE html>"), "{out}");
+        assert!(
+            out.chars().count() <= MAX_SNIPPET_CHARS + "… (truncated)".chars().count(),
+            "{} chars",
+            out.chars().count()
+        );
+    }
+
+    #[test]
+    fn a_short_unparseable_body_is_passed_through() {
+        // The ordinary case — a proxy's one-line plaintext error — must not be
+        // mangled by the cap.
+        assert_eq!(snippet("upstream connect error"), "upstream connect error");
+        assert_eq!(snippet("  padded  \nsecond line"), "padded");
+    }
+
+    #[test]
+    fn parse_error_reads_the_nested_envelope() {
+        let (code, message) = parse_error(
+            r#"{"error":{"code":"no_such_request","message":"no such CLI login request"}}"#,
+        );
+        assert_eq!(code.as_deref(), Some("no_such_request"));
+        assert_eq!(message, "no such CLI login request");
+    }
+
+    #[test]
+    fn parse_error_falls_back_to_a_bounded_snippet() {
+        let (code, message) = parse_error("not json at all");
+        assert_eq!(code, None);
+        assert_eq!(message, "not json at all");
+    }
+}
