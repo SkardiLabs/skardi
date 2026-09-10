@@ -28,11 +28,14 @@ pub struct LoginArgs {
     #[arg(long, value_name = "URL")]
     pub control_plane: Option<String>,
 
-    /// log in to one workspace by slug (non-interactive)
+    /// log in to one workspace by slug (non-interactive). Needs --client-id or
+    /// --identity: a browser-brokered login is approved for one workspace in
+    /// the console, so the terminal does not choose
     #[arg(long, value_name = "SLUG", conflicts_with = "all_workspaces")]
     pub workspace: Option<String>,
 
-    /// log in to every active workspace this identity belongs to
+    /// log in to every active workspace this identity belongs to. Needs
+    /// --client-id or --identity, for the same reason as --workspace
     #[arg(long)]
     pub all_workspaces: bool,
 
@@ -40,11 +43,14 @@ pub struct LoginArgs {
     #[arg(long, value_name = "DURATION", default_value = login::DEFAULT_EXPIRES)]
     pub expires: String,
 
-    /// print the sign-in URL instead of opening a browser
+    /// print the sign-in URL instead of opening a browser. On the default
+    /// console-brokered path this is enough to log in from another machine
     #[arg(long)]
     pub no_browser: bool,
 
-    /// OAuth client id; overrides $SKARDI_OAUTH_CLIENT_ID
+    /// OAuth client id, selecting the direct provider flow; overrides
+    /// $SKARDI_OAUTH_CLIENT_ID. Omit it and the console brokers the sign-in,
+    /// which needs no client id and works over SSH
     #[arg(long, value_name = "ID")]
     pub client_id: Option<String>,
 
@@ -120,10 +126,28 @@ fn options_from(
     path: &Path,
 ) -> Result<LoginOptions> {
     let file = config::load(path);
+    let client_id = args
+        .client_id
+        .clone()
+        .or_else(|| std::env::var(CLIENT_ID_ENV).ok());
+    let identity = args
+        .identity
+        .clone()
+        .or_else(|| std::env::var(DEV_IDENTITY_ENV).ok());
+    // Which URL this run falls back to depends on which flow it will take, so
+    // the credential flags are resolved FIRST. The predicate is `login`'s own,
+    // shared rather than restated, so the key written by a brokered login is
+    // always the key the next brokered login reads.
+    let kind = if login::selects_console_broker(identity.as_deref(), client_id.as_deref()) {
+        UrlKind::Console
+    } else {
+        UrlKind::ControlPlane
+    };
     let control_plane = resolve_control_plane(
         args.control_plane.clone(),
         std::env::var(CONTROL_PLANE_ENV).ok(),
         file.as_ref(),
+        kind,
     )?;
     let selection = match (&args.workspace, args.all_workspaces) {
         (Some(slug), _) => Selection::Named(slug.clone()),
@@ -132,14 +156,8 @@ fn options_from(
     };
     Ok(LoginOptions {
         control_plane,
-        client_id: args
-            .client_id
-            .clone()
-            .or_else(|| std::env::var(CLIENT_ID_ENV).ok()),
-        identity: args
-            .identity
-            .clone()
-            .or_else(|| std::env::var(DEV_IDENTITY_ENV).ok()),
+        client_id,
+        identity,
         allow_dev_auth_off_loopback: args.i_know_this_is_dev_auth,
         selection,
         context_name: flag_context,
@@ -152,6 +170,7 @@ fn options_from(
         endpoints: oauth::Endpoints::default(),
         open_browser: oauth::open_in_browser,
         callback_timeout: oauth::CALLBACK_TIMEOUT,
+        poll_interval: login::console_broker::POLL_INTERVAL,
         verify_timeout: control_plane::CONTROL_PLANE_TIMEOUT,
         token_name: login::default_token_name(),
         now: chrono::Utc::now(),
@@ -166,20 +185,53 @@ fn options_from(
 /// answers nothing would fail at DNS with no mention of the three real inputs.
 /// So the chain ends the way §6.2's does — a typed error naming them — and a
 /// one-line constant replaces it the day the hosted URL exists.
+/// Which recorded URL a flow should fall back to.
+///
+/// Both arrive through `--control-plane`, and they are NOT interchangeable: a
+/// console serves the control-plane API under `/api/global/v1/...` and only to
+/// a browser holding a session, while `ControlPlane` appends bare
+/// `/v1/me/...`. Reading the wrong one sent `logout --revoke` at a console,
+/// which answered with its 404 page after the local credential was already
+/// cleared — so the fallback key is part of the flow's identity, not a detail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum UrlKind {
+    /// The console that brokers a browser login (`console:` in the file).
+    Console,
+    /// The control-plane API itself (`control-plane:` in the file), for the
+    /// OAuth/dev login and for `logout --revoke`.
+    ControlPlane,
+}
+
+impl UrlKind {
+    /// The file key this kind falls back to, named in the error too so the
+    /// message and the lookup cannot drift.
+    const fn file_key(self) -> &'static str {
+        match self {
+            UrlKind::Console => "console:",
+            UrlKind::ControlPlane => "control-plane:",
+        }
+    }
+}
+
 fn resolve_control_plane(
     flag: Option<String>,
     env: Option<String>,
     file: Option<&ContextsFile>,
+    kind: UrlKind,
 ) -> Result<String> {
-    let from_file = file.and_then(|f| f.control_plane.clone());
+    let from_file = file.and_then(|f| match kind {
+        UrlKind::Console => f.console.clone(),
+        UrlKind::ControlPlane => f.control_plane.clone(),
+    });
     let resolved = [flag, env, from_file]
         .into_iter()
         .flatten()
         .map(|url| url.trim().to_string())
         .find(|url| !url.is_empty());
     let Some(url) = resolved else {
+        let key = kind.file_key();
         bail!(
-            "no control plane configured: pass --control-plane <URL>, set ${CONTROL_PLANE_ENV}, or add 'control-plane:' to ~/.skardi/config.yaml"
+            "no control plane configured: pass --control-plane <URL>, set ${CONTROL_PLANE_ENV}, or add '{key}' to ~/.skardi/config.yaml"
         )
     };
     // This is the leg carrying the most sensitive traffic in the flow — the ID
@@ -209,6 +261,9 @@ pub(super) fn control_plane_for_revoke(
         args.control_plane.clone(),
         env_control_plane.map(str::to_string),
         config::load(path).as_ref(),
+        // Never the console: `--revoke` calls `DELETE /v1/me/tokens/{id}`
+        // directly, which a console does not serve.
+        UrlKind::ControlPlane,
     )
 }
 
@@ -269,10 +324,11 @@ fn render_report(report: &LoginReport) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{LoginArgs, options_from, render_report, resolve_control_plane};
+    use super::{LoginArgs, UrlKind, options_from, render_report, resolve_control_plane};
     use crate::config::ContextsFile;
     use crate::login::{LoginReport, Selection, WrittenContext};
     use chrono::Duration;
+    use rstest::rstest;
     use std::path::Path;
 
     fn login_args() -> LoginArgs {
@@ -432,17 +488,24 @@ mod tests {
             resolve_control_plane(
                 Some("https://flag.example".into()),
                 Some("https://env.example".into()),
-                Some(&file)
+                Some(&file),
+                UrlKind::ControlPlane,
             )
             .unwrap(),
             "https://flag.example"
         );
         assert_eq!(
-            resolve_control_plane(None, Some("https://env.example".into()), Some(&file)).unwrap(),
+            resolve_control_plane(
+                None,
+                Some("https://env.example".into()),
+                Some(&file),
+                UrlKind::ControlPlane,
+            )
+            .unwrap(),
             "https://env.example"
         );
         assert_eq!(
-            resolve_control_plane(None, None, Some(&file)).unwrap(),
+            resolve_control_plane(None, None, Some(&file), UrlKind::ControlPlane).unwrap(),
             "https://file.example"
         );
     }
@@ -453,18 +516,79 @@ mod tests {
     fn blank_values_are_skipped_not_honoured() {
         let file = file_with(Some("https://file.example"));
         assert_eq!(
-            resolve_control_plane(Some("   ".into()), Some(String::new()), Some(&file)).unwrap(),
+            resolve_control_plane(
+                Some("   ".into()),
+                Some(String::new()),
+                Some(&file),
+                UrlKind::ControlPlane,
+            )
+            .unwrap(),
             "https://file.example"
         );
     }
 
     #[test]
     fn no_control_plane_names_all_three_inputs() {
-        let err = resolve_control_plane(None, None, Some(&file_with(None)))
+        let err = resolve_control_plane(None, None, Some(&file_with(None)), UrlKind::ControlPlane)
             .unwrap_err()
             .to_string();
         assert!(err.contains("--control-plane"), "{err}");
         assert!(err.contains("SKARDI_CONTROL_PLANE_URL"), "{err}");
         assert!(err.contains("control-plane:"), "{err}");
+    }
+
+    /// Each flow falls back to ITS OWN recorded URL, and never the other's.
+    ///
+    /// The defect this pins: a brokered login recorded the console URL as
+    /// `control-plane`, so a later `logout --revoke` sent
+    /// `DELETE /v1/me/tokens/{id}` at a console — which answered with its 404
+    /// page, after the local credential had already been cleared. The two URLs
+    /// are different services with different path layouts, so the fallback key
+    /// is part of the flow's identity.
+    #[rstest]
+    #[case::console_reads_console(UrlKind::Console, "https://console.example")]
+    #[case::direct_reads_control_plane(UrlKind::ControlPlane, "https://cp.example")]
+    fn each_kind_falls_back_to_its_own_key(#[case] kind: UrlKind, #[case] expected: &str) {
+        let file = ContextsFile {
+            control_plane: Some("https://cp.example".to_string()),
+            console: Some("https://console.example".to_string()),
+            ..ContextsFile::default()
+        };
+        assert_eq!(
+            resolve_control_plane(None, None, Some(&file), kind).unwrap(),
+            expected
+        );
+    }
+
+    /// A file holding ONLY a console URL leaves the direct flows unconfigured,
+    /// which is the point: they say so by name instead of aiming
+    /// `/v1/me/tokens` at a console.
+    #[test]
+    fn a_console_only_file_does_not_configure_the_direct_flows() {
+        let file = ContextsFile {
+            console: Some("https://console.example".to_string()),
+            ..ContextsFile::default()
+        };
+        let err = resolve_control_plane(None, None, Some(&file), UrlKind::ControlPlane)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--control-plane"), "{err}");
+        assert!(err.contains("control-plane:"), "{err}");
+        // And the reverse: the brokered flow is configured by it.
+        assert_eq!(
+            resolve_control_plane(None, None, Some(&file), UrlKind::Console).unwrap(),
+            "https://console.example"
+        );
+    }
+
+    /// The error names the key the flow actually reads, so a reader is not
+    /// told to add `control-plane:` when the brokered flow wants `console:`.
+    #[test]
+    fn the_missing_url_error_names_the_key_for_that_flow() {
+        let err = resolve_control_plane(None, None, None, UrlKind::Console)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("console:"), "{err}");
+        assert!(!err.contains("control-plane:"), "{err}");
     }
 }

@@ -232,6 +232,21 @@ curl -fSL "https://github.com/SkardiLabs/skardi/releases/latest/download/skardi-
 sudo mv skardi /usr/local/bin/
 ```
 
+Against **skardi-cloud**, one command signs the CLI in — the console
+authenticates you in a browser and you approve one workspace, so there is no
+OAuth client to provision per deployment:
+
+```bash
+skardi login --control-plane https://your-console.example.com
+```
+
+It writes a workspace-scoped token into `~/.skardi/config.yaml`. `--no-browser`
+prints the approval URL instead of opening one, which is how a headless or
+SSH'd host logs in: nothing has to come back to the machine running `skardi`.
+See [docs/cli.md](docs/cli.md#signing-in-to-skardi-cloud--login--logout) for the
+other way in (`--client-id`, which selects workspaces from the terminal) and
+for what a cloud context can and cannot do.
+
 **Server** — a Docker image, or a source build (no pre-built binary yet):
 
 ```bash

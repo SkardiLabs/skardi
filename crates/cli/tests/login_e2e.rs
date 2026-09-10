@@ -222,8 +222,14 @@ fn a_cleartext_control_plane_is_warned_about_before_anything_is_sent() {
     }
 }
 
-/// With no `--control-plane`, no environment, and no `control-plane:` in the
-/// file, the failure names all three rather than dialing a guess.
+/// With no `--control-plane`, no environment, and nothing recorded in the
+/// file, the failure names all three rather than dialing a guess — and it
+/// names the file key belonging to the flow that ran.
+///
+/// Bare `skardi login` is the console-brokered flow, so the key is `console:`.
+/// That is not cosmetic: a console and the control-plane API are different
+/// services with different path layouts, so telling a brokered user to add
+/// `control-plane:` would configure the flow they are not using.
 #[test]
 fn no_control_plane_anywhere_names_the_three_inputs() {
     let home = TempDir::new().unwrap();
@@ -233,7 +239,29 @@ fn no_control_plane_anywhere_names_the_three_inputs() {
     let stderr = err(&output);
     assert!(stderr.contains("--control-plane"), "{stderr}");
     assert!(stderr.contains("SKARDI_CONTROL_PLANE_URL"), "{stderr}");
+    assert!(stderr.contains("console:"), "{stderr}");
+}
+
+/// The direct-OAuth flow names `control-plane:`, the key IT reads.
+///
+/// The pair of tests is the point: one flag changes which service the URL
+/// belongs to, and so which key the message should send the reader to.
+#[test]
+fn the_direct_flow_names_the_control_plane_key_instead() {
+    let home = TempDir::new().unwrap();
+    let output = skardi(
+        home.path(),
+        &[
+            "login",
+            "--client-id",
+            "client-123.apps.googleusercontent.com",
+        ],
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = err(&output);
     assert!(stderr.contains("control-plane:"), "{stderr}");
+    assert!(!stderr.contains("console:"), "{stderr}");
 }
 
 /// The global `--token`/`--server` flags mean nothing to these two commands,

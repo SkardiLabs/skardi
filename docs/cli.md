@@ -162,35 +162,100 @@ headers before forwarding upstream.
 workspace and writes a context for each, so nothing is copied by hand:
 
 ```bash
-# Sign in; a lone workspace is used automatically, several prompt
-skardi login --control-plane https://global.skardi.ai \
-  --client-id <your-deployment's-oauth-client-id>
+# The default: the console signs you in and approves the token
+skardi login --control-plane https://skardi-console.example.com
 
-# With both pinned in the environment, the flags go away
-export SKARDI_CONTROL_PLANE_URL=https://global.skardi.ai
-export SKARDI_OAUTH_CLIENT_ID=<client-id>
-skardi login
-
-# Non-interactive selection
-skardi login --workspace acme-prod
-skardi login --all-workspaces
-
-# Print the sign-in URL instead of opening a browser
+# Print the approval URL instead of opening a browser — works over SSH
 skardi login --no-browser
 
 # Shorter-lived credential (default: 90d; `12h` also works)
 skardi login --expires 30d
 ```
 
-Two inputs have no built-in default, and both fail by name rather than
-guessing: the **control plane** (`--control-plane` >
-`$SKARDI_CONTROL_PLANE_URL` > `control-plane:` in the config file) and the
-**OAuth client id** (`--client-id` > `$SKARDI_OAUTH_CLIENT_ID`). The client id
-is per deployment — it is the same value the deployment gives its console — so
-there is nothing correct to hardcode. Once a `login` succeeds, the control
-plane is recorded in the config file and later runs need no flag for it.
+There are **two ways in**, and which one runs depends on whether you name a
+credential for the CLI itself:
 
-What it does, in order:
+| You pass | What happens |
+|---|---|
+| nothing | **Console-brokered** (the default). The CLI opens a page on the console; the console signs you in with whatever it accepts — email or Google — and you approve one workspace |
+| `--client-id <ID>` | **Direct OAuth**. The CLI talks to the identity provider itself and mints per workspace, which is what `--workspace` and `--all-workspaces` need |
+| `--identity dev:<id>` | Dev auth, loopback control planes only |
+
+The console-brokered path is the default because the alternative needs a
+Google **Desktop** OAuth client provisioned per deployment before anyone can
+log in at all. Here the CLI speaks to no identity provider, learns nothing
+about which one you used, and needs no client id.
+
+Only one input has no built-in default, and it fails by name rather than
+guessing: the URL (`--control-plane` > `$SKARDI_CONTROL_PLANE_URL` > the
+config file). For the brokered path that is the **console's** URL — the same
+address you open in a browser — because that is what serves the approval page.
+Once a `login` succeeds it is recorded and later runs need no flag.
+
+**The two paths record it under different keys**, and that matters if you mix
+them:
+
+| Path | File key |
+|---|---|
+| console-brokered | `console:` |
+| direct OAuth, and `logout --revoke` | `control-plane:` |
+
+They are different services. `ControlPlane` calls bare `/v1/me/...`; a console
+serves that API under `/api/global/v1/...` and only to a browser holding a
+session. One key for both meant a brokered login left the console's URL where
+the direct flows look, so a later `logout --revoke` cleared the local
+credential and then sent `DELETE /v1/me/tokens/{id}` at the console, which
+answered with its 404 page. Kept apart, a direct flow with nothing recorded
+of its own says so and names `control-plane:`.
+
+The direct-OAuth path additionally needs the **OAuth client id**
+(`--client-id` > `$SKARDI_OAUTH_CLIENT_ID`), which is per deployment, so
+there is nothing correct to hardcode.
+
+### The console-brokered flow, in order
+
+```
+$ skardi login --control-plane https://skardi-console.example.com
+opening https://skardi-console.example.com/cli-login?request_id=7f3a9c…
+waiting for approval in the browser (the request expires at 2026-09-09T12:05:00Z)
+  confirmation code: 7f3a9c
+wrote context 'acme/my-workspace' (current)
+```
+
+1. Opens a login request on the console and prints the URL, the deadline, and
+   a **confirmation code**.
+2. Opens your browser at that URL (`--no-browser` just prints it).
+3. The console signs you in if you are not already, on its own `/login`.
+4. You pick **one** workspace and retype the confirmation code. The code is
+   required, not decorative: the console's *Waiting for approval* list under
+   Agent access shows the same six characters and no request id, so an
+   approver has to be looking at the terminal that started the login. Without
+   it, someone could open a request, never visit it, and collect a token
+   belonging to whoever approved it from that list.
+5. The CLI polls until you approve, then receives a token scoped to that one
+   workspace at your role there, verifies it against the gateway, and writes
+   the context.
+
+The request expires in five minutes. If nobody approves it, the CLI says so
+and writes nothing.
+
+Two consequences of the token arriving already-minted, both of which the CLI
+reports rather than hides:
+
+- **`--workspace` and `--all-workspaces` are refused on this path.** One
+  approval grants one workspace. The error names both flows that *can* select
+  from the terminal: `--client-id`, and `--identity dev:<id>` against a
+  loopback control plane.
+- **Nothing can be revoked from here.** The credential is a workspace token,
+  which authenticates to the gateway and not to the control plane — so where
+  the direct-OAuth path revokes, this one prints the token id and tells you to
+  revoke it in the console. That applies to a token this run had to abandon
+  (a failed verify) and to a credential a re-login replaced. `logout --revoke`
+  is the same story: it re-authenticates, so after a brokered login it needs
+  `--client-id` or `--identity` and otherwise reports the live token ids
+  rather than pretending to revoke them.
+
+### The direct-OAuth flow (`--client-id`), in order
 
 1. Resolves the control plane, as above. With none of the three sources, it
    stops and says so rather than guessing a host. A plain-`http://`
@@ -221,17 +286,24 @@ What it does, in order:
 ### `--no-browser` and remote shells
 
 `--no-browser` prints the URL instead of launching a browser, for a host that
-has none or none the CLI can start. It does **not** on its own make `login`
-work over SSH: the redirect goes to `127.0.0.1:<port>` on the machine running
-`skardi`, so opening that URL on your laptop sends the callback to your
-laptop's port, where nothing is listening.
+has none or none the CLI can start. What happens next depends on which flow
+you are in, and the difference is the whole reason to prefer the default.
 
-To sign in against a remote host, the browser must reach that host's loopback
-port. Either run a browser there, or forward the port the printed URL names —
-it is fresh per run, so with OpenSSH add the forward mid-session (`~C` then
+**Console-brokered (default): this works over SSH.** The CLI polls the console
+for the result, so there is no local listener and nothing has to come back to
+the machine running `skardi`. Run it on a server, open the printed URL on your
+laptop, type the confirmation code, and the server's `skardi` picks the token
+up on its next poll. That is the headless capability the device-code grant
+would have provided, without a device-code endpoint.
+
+**Direct OAuth (`--client-id`): this does not.** The redirect goes to
+`127.0.0.1:<port>` on the machine running `skardi`, so opening that URL on
+your laptop sends the callback to your laptop's port, where nothing is
+listening. The browser has to reach the remote host's loopback port: either
+run a browser there, or forward the port the printed URL names — it is fresh
+per run, so with OpenSSH add the forward mid-session (`~C` then
 `-L <port>:127.0.0.1:<port>`), or use `ssh -L` on a connection opened after
-the URL is shown. A headless flow needing no local listener is the device-code
-grant, which is deliberately out of scope for this milestone.
+the URL is shown.
 
 For a loopback control plane (a local or compose stack), `--identity` skips the
 browser entirely — see [Working against a local stack](#working-against-a-local-stack).
@@ -241,7 +313,7 @@ The gateway URL comes from `--server` > `$SKARDI_GATEWAY_URL` > the control
 fall back to `http://127.0.0.1:8080`: a context pointing at a local port
 would fail later and further from the cause.
 
-Minting is a **saga**. Each token commits independently at the control plane,
+On the direct-OAuth path, minting is a **saga**. Each token commits independently at the control plane,
 so if a later mint fails — or the config write fails — every token this run
 created is revoked before the original failure is reported, and no context is
 written. If a rollback cannot complete, the surviving token ids are printed
@@ -250,7 +322,9 @@ than a loud failure.
 
 Running `login` again over an existing context replaces it and revokes the
 token it replaced. `--keep-old-token` retains the old one — for an agent
-that is mid-task — and says so.
+that is mid-task — and says so. On the console-brokered path the replaced
+token is **reported rather than revoked**, with its id, for the reason given
+above.
 
 If your identity belongs to more than one organization, minting is not
 available in v1: `login` prints the organizations and the way round it

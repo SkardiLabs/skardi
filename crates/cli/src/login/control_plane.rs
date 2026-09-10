@@ -309,15 +309,39 @@ fn parse_error(status: u16, text: &str) -> CpError {
         Err(_) => CpError {
             status,
             code: None,
-            message: text.lines().next().unwrap_or("").to_string(),
+            message: snippet(text),
             orgs: Vec::new(),
         },
     }
 }
 
+/// How much of an UNRECOGNIZED error body may reach the terminal.
+///
+/// Bodies that parse as skardi-global's envelope are unaffected; this bounds
+/// only the fallback, and the fallback is what a *non*-control-plane answer
+/// lands in.
+const MAX_SNIPPET_CHARS: usize = 200;
+
+/// The first line of an unrecognized body, bounded.
+///
+/// "First line" alone was not a bound. A Next.js 404 page is a single enormous
+/// line, so pointing this client at a console — which is exactly what a
+/// `logout --revoke` did after a brokered login recorded a console URL as its
+/// control plane — printed the whole HTML document as the reason a credential
+/// could not be revoked, burying the one fact that mattered. Truncation is
+/// marked so a reader can tell the message was cut.
+fn snippet(text: &str) -> String {
+    let line = text.lines().next().unwrap_or_default().trim();
+    if line.chars().count() <= MAX_SNIPPET_CHARS {
+        return line.to_string();
+    }
+    let head: String = line.chars().take(MAX_SNIPPET_CHARS).collect();
+    format!("{head}… (truncated)")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Membership, MembershipsBody, Minted, parse_error};
+    use super::{MAX_SNIPPET_CHARS, Membership, MembershipsBody, Minted, parse_error};
 
     /// The raw token must not reach a log line, a panic message, or an
     /// `{err:?}` rendering through this type — so `Debug` is hand-written, and
@@ -424,5 +448,47 @@ mod tests {
         // A well-formed envelope with no message still says something.
         let bare = parse_error(500, r#"{"error": {"code": "internal"}}"#);
         assert_eq!(bare.message, "no message");
+    }
+
+    /// A non-control-plane answer is summarized, not dumped.
+    ///
+    /// Measured, not hypothetical: after a brokered login recorded a console
+    /// URL as its control plane, `logout --revoke` sent
+    /// `DELETE /v1/me/tokens/{id}` at that console and printed the entire
+    /// Next.js 404 page as the reason the credential could not be revoked.
+    /// "First line" was no bound at all — that page is one enormous line — so
+    /// several kilobytes of markup buried the one fact that mattered.
+    #[test]
+    fn an_unparseable_error_body_is_bounded_and_marked() {
+        let page = format!(
+            "<!DOCTYPE html><html><head><title>Not found</title></head><body>{}</body></html>",
+            "<div class=\"filler\"></div>".repeat(200)
+        );
+        assert!(page.lines().count() == 1, "the real page is a single line");
+
+        let err = parse_error(404, &page);
+        assert_eq!(err.status, 404);
+        assert_eq!(err.code, None);
+        assert!(
+            err.message.chars().count() <= MAX_SNIPPET_CHARS + "… (truncated)".chars().count(),
+            "message was {} chars",
+            err.message.chars().count()
+        );
+        assert!(err.message.ends_with("… (truncated)"), "{}", err.message);
+        // The head is kept, so a reader can still tell WHAT answered.
+        assert!(
+            err.message.starts_with("<!DOCTYPE html>"),
+            "{}",
+            err.message
+        );
+    }
+
+    /// A short unparseable body is passed through untouched — the cap must not
+    /// mangle the ordinary case (a proxy's one-line plaintext error).
+    #[test]
+    fn a_short_unparseable_body_is_not_truncated() {
+        let err = parse_error(502, "upstream connect error");
+        assert_eq!(err.message, "upstream connect error");
+        assert!(!err.message.contains("truncated"));
     }
 }

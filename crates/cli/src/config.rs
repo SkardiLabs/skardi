@@ -136,9 +136,27 @@ pub struct ContextsFile {
     /// Present so a rewrite keeps the manifest recognizable; not read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
-    /// Where `login` talks. Optional: only the cloud flow reads it.
+    /// The control-plane API base, for the flows that call it directly:
+    /// the OAuth/dev `login` and `logout --revoke`. Optional — only the cloud
+    /// flow reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_plane: Option<String>,
+    /// The CONSOLE's base URL, for the browser-brokered `login`.
+    ///
+    /// Deliberately a separate key rather than reusing `control-plane`, even
+    /// though both arrive through the same `--control-plane` flag. The two are
+    /// different services with different path layouts: `ControlPlane` appends
+    /// bare `/v1/me/...`, while a console serves that API under
+    /// `/api/global/v1/...` and only for a session-carrying browser.
+    ///
+    /// Writing a console URL into `control-plane` therefore poisoned it for
+    /// every later direct call: a `logout --revoke` after a brokered login
+    /// cleared the local credential and then sent `DELETE /v1/me/tokens/{id}`
+    /// at the console, which answered with its 404 page. Keeping them apart
+    /// means a direct flow with no `control-plane` of its own says so by name
+    /// instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub console: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_context: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
