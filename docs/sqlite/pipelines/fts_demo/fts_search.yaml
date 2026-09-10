@@ -8,7 +8,7 @@ metadata:
     Returns matching rows ranked by BM25 relevance (higher _score = more relevant).
 
 # Parameters:
-#   {query} - Search terms (space-separated, "quoted" for phrase, NOT for negation)
+#   {query} - Search text (web-search syntax: AND, "phrase", or, -not)
 #   {limit} - Maximum number of results to return
 
 spec:

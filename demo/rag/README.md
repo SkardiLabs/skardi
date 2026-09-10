@@ -504,9 +504,10 @@ skardi run search-hybrid \
   -p vector_weight=0.3 -p text_weight=0.7 -p limit=5
 ```
 
-> FTS5 reserves `?`, `"`, `+`, `-`, `~`, `^`, and parentheses as query
-> syntax. A bare `?` in `text_query` will fail with an `fts5: syntax
-> error` — phrase-quote or strip it out for natural-language queries.
+> `text_query` is search text, not an FTS5 expression: `sqlite_fts` parses it
+> the way `pg_fts` parses its own `query` (web-search syntax — AND by default,
+> `"phrase"`, `or`, `-not`), so punctuation is searched for rather than
+> executed and no input can turn a question into a query error.
 
 The structure mirrors the server's `search_hybrid.yaml` exactly —
 `sqlite_knn` and `sqlite_fts` replace `pg_knn` / `pg_fts`, RRF is the same

@@ -9,7 +9,7 @@ metadata:
     mirror plus a _score column.
 
 # Parameters:
-#   {query}  - FTS5 query (term, "phrase", +must -mustnot, fuzzy~1)
+#   {query}  - Search text (web-search syntax: AND, "phrase", or, -not)
 #   {limit}  - Maximum number of results
 
 spec:
