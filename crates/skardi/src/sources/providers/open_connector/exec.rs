@@ -33,7 +33,9 @@ use super::error::OpenConnectorError;
 use super::json_to_arrow::RowConverter;
 use super::pagination::{CursorContinuation, Pagination, PaginationStrategy};
 use super::row_path::RowPath;
+use super::source_pack::RowShape;
 use super::source_pack::{FixedValue, SourcePackTable};
+use std::slice;
 
 /// The scanned collection's identity and pagination contract — the shape
 /// shared by YAML-bound source-pack tables and `open_connector_scan` raw
@@ -61,6 +63,12 @@ pub struct ScanTarget {
     /// [`super::pagination::CursorContinuation`]); `None` for raw scans and
     /// for every table whose provider accepts the cursor on its own action.
     pub continuation: Option<CursorContinuation>,
+    /// Whether the row path locates an array of rows or a single row object
+    /// (see [`RowShape`]). Carried on the target rather than passed
+    /// alongside it: this is the per-table response contract, exactly like
+    /// `pagination` and `error_path`. Raw scans are always
+    /// [`RowShape::Array`].
+    pub row_shape: RowShape,
 }
 
 impl ScanTarget {
@@ -74,6 +82,7 @@ impl ScanTarget {
             fixed_inputs: table.fixed_inputs,
             source_pack_version,
             continuation: table.continuation,
+            row_shape: table.row_shape,
         }
     }
 }
@@ -541,7 +550,14 @@ impl ScanState {
                 code,
             });
         }
-        let rows = self.row_path.rows(&envelope, page)?;
+        // Object-shaped tables hand the single response object to the SAME
+        // converter as a one-element slice: `from_ref` borrows it in place,
+        // so there is no clone of the response and no second conversion
+        // path to keep in sync with schema, projection, and error handling.
+        let rows = match self.target.row_shape {
+            RowShape::Array => self.row_path.rows(&envelope, page)?,
+            RowShape::Object => slice::from_ref(self.row_path.row_object(&envelope, page)?),
+        };
         let batch = self.converter.convert(rows, page)?;
         // Conversion is synchronous, so it cannot be preempted by Tokio; do
         // not emit its result if it consumed the remaining scan budget.
@@ -713,6 +729,7 @@ mod tests {
             id: "split.entries",
             action_id: "split.list",
             row_path: "$.entries",
+            row_shape: RowShape::Array,
             fields: &[FieldMapping {
                 name: "id",
                 path: "id",
@@ -739,6 +756,140 @@ mod tests {
                 cursor_only: true,
             }),
         }))
+    }
+
+    /// A point-read table whose whole response IS the row — the
+    /// `feishu.get_document_content` shape this extension exists for.
+    fn object_row_table() -> &'static SourcePackTable {
+        Box::leak(Box::new(SourcePackTable {
+            id: "docs.document_content",
+            action_id: "docs.get_document_content",
+            row_path: "$",
+            row_shape: RowShape::Object,
+            fields: &[
+                FieldMapping {
+                    name: "document_id",
+                    path: "documentId",
+                    field_type: FieldType::Utf8,
+                    nullable: false,
+                },
+                FieldMapping {
+                    name: "content",
+                    path: "content",
+                    field_type: FieldType::Utf8,
+                    nullable: true,
+                },
+            ],
+            pagination: PaginationStrategy::SinglePage {
+                next_cursor_path: None,
+            },
+            required_resources: &["documentId"],
+            optional_resources: &[],
+            exclusive_resources: &[],
+            fixed_inputs: &[],
+            filters: &[],
+            error_path: None,
+            expected_fingerprint: None,
+            continuation: None,
+        }))
+    }
+
+    #[tokio::test]
+    async fn object_row_response_becomes_exactly_one_row() {
+        // The end-to-end proof: a single-object response reaches the same
+        // converter as an array of one and yields one row with real values,
+        // in one gateway call.
+        let gateway = MockGateway::start(|req: &RecordedRequest| {
+            if req.path == "/v1/actions/docs.get_document_content" {
+                return MockResponse::ok(&envelope_ok(
+                    &json!({"documentId": "doc-1", "content": "hello world"}).to_string(),
+                ));
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+
+        let table = object_row_table();
+        let exec = OpenConnectorExec::new(
+            online_client(&gateway).await,
+            None,
+            "saas".to_string(),
+            Some("ws".to_string()),
+            None,
+            ScanTarget::from_pack_table(table, 1),
+            Arc::new(RowConverter::new(table.fields).expect("converter")),
+            RowPath::parse_object_root(table.row_path).expect("object root"),
+            json!({"documentId": "doc-1"}),
+            vec![],
+            None,
+            None,
+            10,
+            1000,
+            Duration::from_secs(30),
+        )
+        .expect("build exec");
+
+        let mut state = ScanState::new(&exec).expect("state");
+        let first = state
+            .next_page()
+            .await
+            .expect("page")
+            .expect("one batch is emitted");
+        assert_eq!(
+            first.num_rows(),
+            1,
+            "the response object is exactly one row"
+        );
+        let content = first
+            .column(1)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::StringArray>()
+            .expect("utf8 column");
+        assert_eq!(content.value(0), "hello world", "values survive conversion");
+        assert!(
+            state.next_page().await.expect("second page").is_none(),
+            "a single-page object table stops after one call"
+        );
+    }
+
+    #[tokio::test]
+    async fn object_row_table_fails_loudly_when_the_response_is_not_an_object() {
+        // A point read that returns null/array/primitive must fail, not
+        // report zero rows — "this document has no content" would be a lie.
+        let gateway = MockGateway::start(|req: &RecordedRequest| {
+            if req.path == "/v1/actions/docs.get_document_content" {
+                return MockResponse::ok(&envelope_ok(&json!(null).to_string()));
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+
+        let table = object_row_table();
+        let exec = OpenConnectorExec::new(
+            online_client(&gateway).await,
+            None,
+            "saas".to_string(),
+            Some("ws".to_string()),
+            None,
+            ScanTarget::from_pack_table(table, 1),
+            Arc::new(RowConverter::new(table.fields).expect("converter")),
+            RowPath::parse_object_root(table.row_path).expect("object root"),
+            json!({"documentId": "doc-1"}),
+            vec![],
+            None,
+            None,
+            10,
+            1000,
+            Duration::from_secs(30),
+        )
+        .expect("build exec");
+
+        let mut state = ScanState::new(&exec).expect("state");
+        let err = state.next_page().await.expect_err("null must fail loudly");
+        assert!(
+            err.to_string().contains("expected an object"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]

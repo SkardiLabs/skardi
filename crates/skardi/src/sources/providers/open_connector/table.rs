@@ -19,6 +19,7 @@ use super::exec::{OpenConnectorExec, ScanTarget};
 use super::filters::translate_filters;
 use super::json_to_arrow::RowConverter;
 use super::row_path::RowPath;
+use super::source_pack::RowShape;
 use super::source_pack::SourcePackTable;
 
 /// A source-pack table bound to a concrete resource (one binding).
@@ -75,7 +76,10 @@ impl OpenConnectorTableProvider {
         scan_timeout: Duration,
     ) -> Result<Self, super::error::OpenConnectorError> {
         let converter = Arc::new(RowConverter::new(table.fields)?);
-        let row_path = RowPath::parse(table.row_path)?;
+        let row_path = match table.row_shape {
+            RowShape::Array => RowPath::parse(table.row_path)?,
+            RowShape::Object => RowPath::parse_object_root(table.row_path)?,
+        };
         // Same bind-time guarantee as the row path: a malformed pack-authored
         // pagination path fails here at registration, not mid-scan.
         table.pagination.validate()?;
@@ -195,6 +199,7 @@ mod tests {
             id: "test.t",
             action_id: "test.action",
             row_path: "$.items",
+            row_shape: RowShape::Array,
             fields: &[FieldMapping {
                 name: "id",
                 path: "id",

@@ -127,8 +127,8 @@ Work module by module; the reference packs are the style guide.
    embedded YAML assets. Author the declaration in the YAML (`kind: pack`,
    `pack:`, `version:`, `tables:` keyed by bare short names — the id is
    derived as `<pack>.<table>`; per-table `action`, `row_path`,
-   `fingerprint`, `pagination`, `resources`, `fixed_inputs`, `columns`,
-   `filters`, `error_path`; design rationale as YAML comments). The `.rs`
+   `row_shape`, `fingerprint`, `pagination`, `resources`, `fixed_inputs`,
+   `columns`, `filters`, `error_path`; design rationale as YAML comments). The `.rs`
    module is a small accessor (`OnceLock` + `loader::builtin` +
    `include_str!`) plus the module doc and the test suite; add the
    registry entry in `source_pack.rs` builtins and a `mod` line in
@@ -140,6 +140,35 @@ Work module by module; the reference packs are the style guide.
    your authoring attention goes to the SEMANTIC choices the loader
    cannot check: which action, which columns, which fidelity, which
    termination signal.
+   **Response shape.** `row_shape` defaults to `array`: `row_path` locates
+   the row array, which is how every shipped table works. A point-read
+   action whose ENTIRE response is the row — `feishu.get_document_content`,
+   Notion's rendered Markdown — declares `row_shape: object` instead, and
+   then three rules apply, all enforced at load time:
+
+   - `row_path` must be exactly `"$"` (the response root). Any deeper path
+     is rejected; `$` remains invalid for array tables.
+   - pagination must be `single_page`. An object row IS the whole response,
+     so a second page could only re-fetch the same row.
+   - a response that is null, an array, or a primitive fails the scan
+     loudly. It never degrades to zero rows — "this document has no
+     content" would be a lie about a broken action contract.
+
+   ```yaml
+   document_content:
+     action: feishu.get_document_content
+     row_path: "$"
+     row_shape: object
+     pagination: { strategy: single_page }
+     columns:
+       - { name: content, path: content, type: utf8, nullable: true }
+   ```
+
+   Raw-action scans (`open_connector_scan`) do NOT accept `$`: object rows
+   are a pack-declared contract whose response shape a fingerprint pins,
+   and deriving a row type from the response root is a different inference
+   rule. Asking for it fails at planning time with a targeted error.
+
 2. **Fixtures** (`packs/fixtures/<provider>/*.json`) — redacted,
    provider-shaped pages covering ALL SIX admission-gate categories:
    null-bearing, null-parent, empty-list/empty-page, nested,

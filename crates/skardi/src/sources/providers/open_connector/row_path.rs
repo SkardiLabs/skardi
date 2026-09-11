@@ -1,10 +1,17 @@
 //! Row-path parsing and extraction.
 //!
 //! A source-pack table declares a fixed *row path* — the JSON location of
-//! the row array inside an action's response envelope (`$.issues`,
+//! the rows inside an action's response envelope (`$.issues`,
 //! `$.data.items`). Paths are deliberately limited to object-key segments:
 //! they are relational contracts maintained by Skardi, not a user query
 //! language, so arrays/wildcards are out of scope.
+//!
+//! Root `$` is a separate, narrower case: it is accepted ONLY when a table
+//! declares `row_shape: object`, for actions whose whole response IS the
+//! single row (a point read such as `feishu.get_document_content`). It is
+//! parsed through [`RowPath::parse_object_root`], never through
+//! [`RowPath::parse`], so the array contract stays exactly as strict as it
+//! was for every table that locates a row array.
 
 use serde_json::Value;
 
@@ -53,6 +60,60 @@ impl RowPath {
     }
 
     /// The path as written, e.g. `$.data.items`.
+    /// Parse the root path `$` for an object-row table.
+    ///
+    /// Separate from [`RowPath::parse`] on purpose: making `$` valid there
+    /// would silently legalise a rowless path for the 37 array-shaped
+    /// tables, where it can only ever be a mistake. Only the object-row
+    /// loader reaches this constructor, and only after it has checked that
+    /// the table declares `row_shape: object`.
+    ///
+    /// # Example
+    /// ```
+    /// use skardi::sources::providers::open_connector::row_path::RowPath;
+    ///
+    /// let path = RowPath::parse_object_root("$").unwrap();
+    /// assert_eq!(path.as_str(), "$");
+    /// assert!(RowPath::parse_object_root("$.data").is_err()); // only root
+    /// ```
+    pub fn parse_object_root(path: &str) -> Result<Self, OpenConnectorError> {
+        if path != "$" {
+            return Err(OpenConnectorError::InvalidRowPath {
+                path: path.to_string(),
+                reason: "object row shape selects the response root; the only valid path is '$'"
+                    .to_string(),
+            });
+        }
+        Ok(Self {
+            raw: path.to_string(),
+            segments: Vec::new(),
+        })
+    }
+
+    /// Extract the single row object at the path.
+    ///
+    /// A response that is null, an array, or a primitive fails loudly with
+    /// [`OpenConnectorError::RowPathNotObject`] rather than degrading to an
+    /// empty result: a point read that returns "no object" is a contract
+    /// break at the gateway, and a silent zero-row scan would report it as
+    /// "this document has no content".
+    pub fn row_object<'a>(
+        &self,
+        value: &'a Value,
+        page: usize,
+    ) -> Result<&'a Value, OpenConnectorError> {
+        let target = self.extract(value, page)?;
+        if !target.is_object() {
+            return Err(OpenConnectorError::RowPathNotObject {
+                path: self.raw.clone(),
+                segment: "<root>".to_string(),
+                page,
+                found: json_kind(target),
+            });
+        }
+        Ok(target)
+    }
+
     pub fn as_str(&self) -> &str {
         &self.raw
     }
@@ -139,6 +200,56 @@ mod tests {
                     Err(OpenConnectorError::InvalidRowPath { .. })
                 ),
                 "{bad} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn object_root_parses_only_the_bare_root() {
+        assert_eq!(RowPath::parse_object_root("$").unwrap().as_str(), "$");
+        for bad in ["$.data", "data", "", "$$"] {
+            assert!(
+                matches!(
+                    RowPath::parse_object_root(bad),
+                    Err(OpenConnectorError::InvalidRowPath { .. })
+                ),
+                "{bad} should be rejected for object rows"
+            );
+        }
+    }
+
+    #[test]
+    fn object_root_stays_invalid_for_the_array_parser() {
+        // The whole point of a separate constructor: `$` must not become a
+        // legal row path for the array-shaped tables.
+        assert!(matches!(
+            RowPath::parse("$"),
+            Err(OpenConnectorError::InvalidRowPath { .. })
+        ));
+    }
+
+    #[test]
+    fn row_object_returns_the_response_root() {
+        let page = json!({"documentId": "doc-1", "content": "hello"});
+        let row = RowPath::parse_object_root("$")
+            .unwrap()
+            .row_object(&page, 1)
+            .unwrap();
+        assert_eq!(row, &page);
+    }
+
+    #[test]
+    fn row_object_fails_loudly_on_null_array_and_primitive() {
+        // A point read that did not return an object is a broken contract;
+        // it must never degrade into an empty (zero-row) scan.
+        for bad in [json!(null), json!([{"id": 1}]), json!("text"), json!(7)] {
+            let err = RowPath::parse_object_root("$")
+                .unwrap()
+                .row_object(&bad, 1)
+                .unwrap_err();
+            assert!(
+                matches!(err, OpenConnectorError::RowPathNotObject { .. }),
+                "{bad} should fail as not-an-object, got {err}"
             );
         }
     }
