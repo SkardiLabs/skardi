@@ -97,6 +97,19 @@ impl RowPath {
     /// empty result: a point read that returns "no object" is a contract
     /// break at the gateway, and a silent zero-row scan would report it as
     /// "this document has no content".
+    ///
+    /// ```
+    /// use skardi::sources::providers::open_connector::row_path::RowPath;
+    /// use serde_json::json;
+    ///
+    /// let path = RowPath::parse_object_root("$").unwrap();
+    ///
+    /// let doc = json!({ "id": "doc_1", "title": "Spec" });
+    /// assert_eq!(path.row_object(&doc, 1).unwrap(), &doc);
+    ///
+    /// // An array at the root is the array shape's job, not this one.
+    /// assert!(path.row_object(&json!([{ "id": "doc_1" }]), 1).is_err());
+    /// ```
     pub fn row_object<'a>(
         &self,
         value: &'a Value,

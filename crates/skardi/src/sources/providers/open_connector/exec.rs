@@ -346,6 +346,7 @@ impl ScanState {
             projection: &projection_names,
             limit: exec.limit,
             schema_fingerprint: &schema_fingerprint(&exec.schema),
+            row_shape: exec.target.row_shape,
         });
 
         // A cache hit replays whole batches (LIMIT is part of the key, so a

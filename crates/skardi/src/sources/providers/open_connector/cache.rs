@@ -26,6 +26,7 @@ use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use serde_json::{Value, json};
 
+use super::source_pack::RowShape;
 use crate::util::json::blake3_hex;
 use crate::util::json::canonical_json;
 
@@ -62,6 +63,12 @@ pub struct ScanKeyParts<'a> {
     pub limit: Option<usize>,
     /// Fingerprint of the Arrow schema the scan emits.
     pub schema_fingerprint: &'a str,
+    /// How the row path's target is read into rows. Part of the key because
+    /// two tables can share every field above yet interpret the same
+    /// response differently: an object-shaped table reads the root as one
+    /// row, an array-shaped table reads it as many. Without this, one would
+    /// replay the other's cached batches under the wrong contract.
+    pub row_shape: RowShape,
 }
 
 /// Build the canonical cache key for one scan.
@@ -88,6 +95,10 @@ pub fn scan_cache_key(parts: &ScanKeyParts) -> String {
         "projection": parts.projection,
         "limit": parts.limit,
         "schema_fingerprint": parts.schema_fingerprint,
+        "row_shape": match parts.row_shape {
+            RowShape::Array => "array",
+            RowShape::Object => "object",
+        },
     }))
 }
 
@@ -259,6 +270,7 @@ mod tests {
             projection,
             limit: None,
             schema_fingerprint: "fp",
+            row_shape: RowShape::Array,
         }
     }
 
@@ -365,6 +377,14 @@ mod tests {
             ..parts("saas", &projection)
         };
         assert_ne!(base, scan_cache_key(&pack_v2));
+
+        // Two tables identical in every field above but reading the same
+        // response under different row shapes must not share cached batches.
+        let object_shape = ScanKeyParts {
+            row_shape: RowShape::Object,
+            ..parts("saas", &projection)
+        };
+        assert_ne!(base, scan_cache_key(&object_shape));
 
         let other_projection = scan_cache_key(&parts("saas", &["name".to_string()]));
         assert_ne!(base, other_projection);
