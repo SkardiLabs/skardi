@@ -25,9 +25,10 @@ pub async fn run(
     table: bool,
     purpose: Option<String>,
     session_id: Option<String>,
+    task: Option<String>,
 ) -> Result<()> {
     let text = resolve_sql(sql, file)?;
-    let ai_context = build_ai_context(purpose, session_id)?;
+    let ai_context = build_ai_context(purpose, session_id, task)?;
     let body = build_body(&text, max_rows, ai_context);
 
     let response = client.post("/query", &body).await?;
@@ -81,15 +82,24 @@ fn build_body(sql: &str, max_rows: Option<usize>, ai_context: Option<Value>) -> 
 /// where the server asks only for a non-empty string within the cap, so
 /// applying the header predicate here would reject values the server accepts.
 /// Only the cap is shared, hence the constant import.
-fn build_ai_context(purpose: Option<String>, session_id: Option<String>) -> Result<Option<Value>> {
+fn build_ai_context(
+    purpose: Option<String>,
+    session_id: Option<String>,
+    task: Option<String>,
+) -> Result<Option<Value>> {
     match (purpose, session_id) {
         (None, None) => Ok(None),
         (Some(purpose), Some(session_id)) => {
             validate_context_string(&purpose, "--purpose", MAX_PURPOSE_CHARS)?;
             validate_context_string(&session_id, "--session-id", MAX_SESSION_ID_CHARS)?;
-            Ok(Some(
-                json!({ "purpose": purpose, "session_id": session_id }),
-            ))
+            let mut context = json!({ "purpose": purpose, "session_id": session_id });
+            // clap's `requires = "purpose"` already refuses a lone --task, so
+            // reaching here with one means the pair is present too.
+            if let Some(task) = task {
+                validate_context_string(&task, "--task", MAX_PURPOSE_CHARS)?;
+                context["task"] = Value::String(task);
+            }
+            Ok(Some(context))
         }
         (Some(_), None) => bail!("--purpose requires --session-id"),
         (None, Some(_)) => bail!("--session-id requires --purpose"),
@@ -161,14 +171,18 @@ mod tests {
 
     #[test]
     fn neither_flag_yields_no_ai_context() {
-        assert_eq!(build_ai_context(None, None).unwrap(), None);
+        assert_eq!(build_ai_context(None, None, None).unwrap(), None);
     }
 
     #[test]
     fn both_flags_yield_the_object_the_server_validates() {
-        let ctx = build_ai_context(Some("count paid orders".into()), Some("sess-1".into()))
-            .unwrap()
-            .expect("expected an ai_context");
+        let ctx = build_ai_context(
+            Some("count paid orders".into()),
+            Some("sess-1".into()),
+            None,
+        )
+        .unwrap()
+        .expect("expected an ai_context");
         assert_eq!(
             ctx,
             json!({"purpose": "count paid orders", "session_id": "sess-1"})
@@ -176,16 +190,37 @@ mod tests {
     }
 
     #[test]
+    /// `--task` is what turns a day of queries into a description of work
+    /// rather than a list of lookups, so it has to survive into the object
+    /// the server stores, and its absence must leave no key behind.
+    #[test]
+    fn a_task_rides_inside_the_pair_and_its_absence_adds_no_key() {
+        let with = build_ai_context(
+            Some("count merged PRs".into()),
+            Some("sess-1".into()),
+            Some("month-long delivery review".into()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(with["task"], json!("month-long delivery review"));
+
+        let without = build_ai_context(Some("p".into()), Some("sess-1".into()), None)
+            .unwrap()
+            .unwrap();
+        assert!(without.get("task").is_none(), "{without}");
+    }
+
+    #[test]
     fn one_flag_without_the_other_is_an_error() {
         // Clap's `requires` catches this at parse time; the builder stays
         // honest for any other caller instead of dropping half a context.
-        let err = build_ai_context(Some("p".into()), None).unwrap_err();
+        let err = build_ai_context(Some("p".into()), None, None).unwrap_err();
         assert!(
             err.to_string().contains("--purpose requires --session-id"),
             "error was: {err}"
         );
 
-        let err = build_ai_context(None, Some("s".into())).unwrap_err();
+        let err = build_ai_context(None, Some("s".into()), None).unwrap_err();
         assert!(
             err.to_string().contains("--session-id requires --purpose"),
             "error was: {err}"
@@ -210,7 +245,7 @@ mod tests {
         ];
 
         for (purpose, session_id, flag) in cases {
-            let err = build_ai_context(Some(purpose), Some(session_id)).unwrap_err();
+            let err = build_ai_context(Some(purpose), Some(session_id), None).unwrap_err();
             assert!(
                 err.to_string().contains(flag),
                 "expected a {flag} message, got: {err}"
@@ -226,7 +261,7 @@ mod tests {
         // within the cap, and rejecting more than it does would be a
         // client-side regression invisible from the server side.
         for sid in ["sess 1", "会话-1", "sess-1, sess-2", "  padded  "] {
-            let ctx = build_ai_context(Some("p".into()), Some(sid.to_string()))
+            let ctx = build_ai_context(Some("p".into()), Some(sid.to_string()), None)
                 .unwrap()
                 .expect("expected an ai_context");
             assert_eq!(ctx["session_id"], json!(sid));
@@ -253,6 +288,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             None,
             None,
         )
@@ -286,6 +322,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         )
         .await;
 
@@ -300,7 +337,7 @@ mod tests {
         // real request here would surface as a connect error, not this one.
         let client = ApiClient::new(&test_config("http://127.0.0.1:1")).unwrap();
 
-        let err = run(&client, None, None, None, false, None, None)
+        let err = run(&client, None, None, None, false, None, None, None)
             .await
             .unwrap_err();
 
@@ -332,6 +369,7 @@ mod tests {
             false,
             Some("count paid orders".to_string()),
             Some("sess-1".to_string()),
+            None,
         )
         .await;
 
@@ -361,6 +399,7 @@ mod tests {
             false,
             Some(String::new()),
             Some("sess-1".to_string()),
+            None,
         )
         .await
         .unwrap_err();
@@ -392,6 +431,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             None,
             None,
         )
