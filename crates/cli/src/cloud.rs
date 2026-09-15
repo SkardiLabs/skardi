@@ -55,15 +55,24 @@ impl Capability {
         }
     }
 
-    /// Whether a skardi-cloud gateway serves this command.
+    /// Whether this CLI will *attempt* the command against a skardi-cloud
+    /// gateway.
     ///
-    /// The gateway's route table is `POST /query`, `GET /data_source`,
-    /// `GET /pipelines`, `GET /pipeline/:name` and a governed
-    /// `POST /:name/execute` (§7.4, extended by the cloud-side pipeline work
-    /// at skardi-cloud commit `129c3723`); everything else remains an
-    /// engine-local surface that only a `mode: server` context reaches.
+    /// Read this as a client-side gate and nothing more. `query` and `schema`
+    /// ride the gateway's long-standing `POST /query` and `GET /data_source`
+    /// (§7.4). `run` and `pipeline` are no longer refused here, because the
+    /// cloud side is growing routes for them — but **this list is not a
+    /// promise that any particular gateway mounts them**: whether it does
+    /// depends on that deployment's version, and one that predates the routes
+    /// fails at the request rather than before it, reporting the gateway's
+    /// own error. That is the better failure: a client-side refusal reports
+    /// "not available" for a capability the operator may already have
+    /// deployed, and no shipped CLI can know which.
     ///
-    /// `mcp` stays refused even though its tools now have somewhere to call:
+    /// Everything else is an engine-local surface no gateway mounts, which
+    /// only a `mode: server` context reaches.
+    ///
+    /// `mcp` stays refused, and not because of which routes a gateway mounts:
     /// the cloud gateway serves its **own** `/mcp` with its own tool
     /// catalog (the console documents `claude mcp add --transport http
     /// skardi <url>` as the cloud agent path), so this CLI's stdio bridge
