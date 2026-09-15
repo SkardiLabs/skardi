@@ -72,14 +72,23 @@
 //!   Feishu's non-zero `code` envelope, so the gateway returns a failure
 //!   envelope and `error_path` is `None` for every table.
 //! - **Fingerprints are pinned** from the live capture
-//!   (`fixtures/feishu/contracts/`), but the gateway declares every
-//!   item schema LOOSE (`additionalProperties: true`, zero declared
-//!   properties) — so ALL mapped columns ride passthrough outside the
-//!   fingerprint gate, and the coverage-gap pin records that honestly.
-//!   Column truth is therefore settled ONLY by real rows, and ALL SEVEN
-//!   tables are reconciled against a live workspace (2026-08-04, with
-//!   document_blocks recaptured 2026-09-01; every fixture is a redacted
-//!   live capture). What the pass changed: chats
+//!   (`fixtures/feishu/contracts/`), and the gateway declares the seven
+//!   LIST actions' item schemas LOOSE (`additionalProperties: true`,
+//!   zero declared properties) — so for those seven tables ALL mapped
+//!   columns ride passthrough outside the fingerprint gate, and the
+//!   coverage-gap pin records that honestly. Column truth for them is
+//!   therefore settled ONLY by real rows.
+//!   **`document_content` is the exception**: `get_document_content`
+//!   DECLARES `documentId` and `content` with
+//!   `additionalProperties: false`, so its two columns sit INSIDE the
+//!   fingerprint gate — an upstream rename fails registration rather
+//!   than surfacing as a null column at scan time. That half is pinned
+//!   by `fingerprint_coverage_gap_is_pinned`, which asserts "every
+//!   column uncovered" for the seven and "no column uncovered" for it.
+//!   ALL EIGHT tables are reconciled against a live workspace
+//!   (2026-08-04, with document_blocks recaptured 2026-09-01 and
+//!   document_content captured 2026-09-03; every fixture is a redacted
+//!   live capture). What the 2026-08-04 pass changed: chats
 //!   gained `chat_mode`/`chat_status`; tasks lost the nonexistent
 //!   `completed` boolean for `status`/`completed_at`; wiki tables
 //!   gained `open_sharing`/`creator`/`url`; messages' page size dropped
@@ -283,9 +292,23 @@ mod tests {
         // Round-2 review blind spot: real member names survived inside the
         // JSON-encoded `body.content` payload — strings one decode level
         // BELOW the outer tree the redaction pass walked. Two tripwires:
-        // no CJK text anywhere in the audited row fixtures (the live
-        // workspace's real names were Chinese), and every membership entry
-        // inside a decoded message payload is a `member-NNNN` placeholder.
+        // no CJK text anywhere in ANY feishu fixture (the live workspace's
+        // real names were Chinese), and every membership entry inside a
+        // decoded message payload is a `member-NNNN` placeholder.
+        //
+        // ONE fixture is exempt, deliberately and by name:
+        // `document_blocks_page_size_501_error.json` is Feishu's own
+        // rejection envelope, and its `msg` carries the API's bilingual
+        // boilerplate `排查建议查看(Troubleshooting suggestions)`. That is
+        // vendor product text, identical for every caller, carrying nothing
+        // from the workspace. Excluding it here — rather than narrowing the
+        // claim to "the audited row fixtures" — is what keeps the tripwire
+        // pointed at the fixture that actually matters:
+        // `document_content.json` is a redacted capture of a REAL
+        // document's text, so a future live recapture is the one plausible
+        // way real Chinese prose lands in this public repo. It is in the
+        // list below for exactly that reason. Anything new goes in the list
+        // too; the exemption is for this one error envelope only.
         let fixtures = [
             (
                 "chat_members",
@@ -303,6 +326,10 @@ mod tests {
             (
                 "document_blocks_page_2",
                 include_str!("fixtures/feishu/document_blocks_page_2.json"),
+            ),
+            (
+                "document_content",
+                include_str!("fixtures/feishu/document_content.json"),
             ),
             ("messages", include_str!("fixtures/feishu/messages.json")),
             ("tasks", include_str!("fixtures/feishu/tasks.json")),
@@ -545,12 +572,14 @@ mod tests {
 
     #[test]
     fn fingerprint_coverage_gap_is_pinned() {
-        // The gateway declares every feishu items schema LOOSE (zero
-        // declared properties, additionalProperties: true), so EVERY
-        // mapped column of EVERY table rides passthrough — outside the
-        // fingerprint gate, drift surfacing at scan time per conversion
+        // The gateway declares the seven LIST actions' items schemas LOOSE
+        // (zero declared properties, additionalProperties: true), so every
+        // mapped column of those seven tables rides passthrough — outside
+        // the fingerprint gate, drift surfacing at scan time per conversion
         // rules. Pinned so any change is a conscious decision; the
         // real-data phase is what actually vouches for these columns.
+        // `document_content` is NOT in this list and is asserted the other
+        // way at the end of this test — see there for why.
         for short in [
             "chats",
             "messages",

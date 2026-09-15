@@ -7,7 +7,8 @@
 //! `pg_fts` (the UDTF next door) hand-builds its Postgres SQL as a string, so
 //! these three names live there only inside a `format!`. Nothing ever
 //! registered them with DataFusion. A raw-SQL full-text query — the shape the
-//! cloud pipeline generator emits —
+//! cloud pipeline generator's design originally specified, before the
+//! `ts_rank` projection was dropped from it on 2026-09-15 —
 //!
 //! ```sql
 //! SELECT path,
@@ -18,7 +19,17 @@
 //! ```
 //!
 //! therefore failed at SQL→LogicalPlan resolution, *before* federation or any
-//! provider was consulted. Registering the scalars is the only fix that serves
+//! provider was consulted.
+//!
+//! **No generator emits that statement today**, and nobody should go hunting
+//! for a production query that does. The `ts_rank(...) AS rank` projection was
+//! dropped for exactly the reason "How far the pushdown actually reaches"
+//! gives below — a SELECT-list expression is evaluated in DataFusion and hits
+//! this module's deliberate error — leaving the WHERE clause, which does push
+//! down. It is kept here verbatim because it remains the clearest single
+//! illustration of which half travels to Postgres and which half does not.
+//!
+//! Registering the scalars is the only fix that serves
 //! both servers: the UDTF route is structurally unavailable on the cloud
 //! engine, which deregisters every table function by design (a UDTF's provider
 //! is constructed at plan time, ahead of any authorization check).
@@ -256,7 +267,13 @@ mod tests {
         assert_all_three_are_immutable(&ctx);
     }
 
-    /// The exact predicate shape the cloud `search-okf` generator emits.
+    /// The statement shape the cloud `search-okf` generator's design
+    /// originally specified. Its `ts_rank(...) AS rank` projection was dropped
+    /// on 2026-09-15 — a SELECT-list expression is evaluated locally and hits
+    /// this module's deliberate error — so **no generator emits this today**.
+    /// It is retained because the WHERE clause is unchanged and the projection
+    /// is precisely the half that must NOT be read as a pushdown; see the
+    /// module doc.
     const SEARCH_OKF_SQL: &str = "SELECT path, ts_rank(to_tsvector('english', body), \
          websearch_to_tsquery('english', 'cats')) AS rank \
          FROM docs WHERE to_tsvector('english', body) @@ \
@@ -293,10 +310,25 @@ mod tests {
             .unwrap_or_else(|e| panic!("the search-okf predicate must plan: {e}"));
     }
 
-    /// `@@` must type-check as a filter, which is only true because
-    /// `to_tsvector`/`websearch_to_tsquery` return `Utf8`: DataFusion coerces
-    /// `AtAt` through `like_coercion`, which demands strings and yields
-    /// `Boolean`. A non-string return type would fail here, not at run time.
+    /// `@@` survives SQL→LogicalPlan resolution with these two UDFs in place,
+    /// and the operator reaches the plan rather than being rewritten away.
+    ///
+    /// What this does **not** pin is the return types, and the earlier comment
+    /// claiming it did was wrong. `create_logical_plan` stops short of the
+    /// `TypeCoercion` **analyzer** rule, so nothing here consults
+    /// `like_coercion` at all — measured against this module by swapping the
+    /// registered return types, `Int64 @@ Int64` and `Float32 @@ Float32` both
+    /// plan cleanly at this stage. A wrong return type fails one stage later,
+    /// in the analyzer (`Cannot infer common argument type for AtAt operation
+    /// …`); `constant_folding_does_not_kill_the_plan` is the test that reaches
+    /// it, via `into_optimized_plan`.
+    ///
+    /// "Non-string" is not the boundary even there. `AtAt` coerces through
+    /// `like_coercion`, whose `binary_to_string_coercion` arm accepts a
+    /// binary/string *pair* — `Binary @@ Utf8` optimizes fine — while
+    /// `Binary @@ Binary`, the shape someone modelling an opaque `tsvector`
+    /// would most likely reach for, has no rule and is rejected. `Utf8` on
+    /// both sides is the choice that does not depend on that asymmetry.
     #[tokio::test]
     async fn the_at_at_operator_type_checks_over_the_two_string_returns() {
         let ctx = ctx_with_docs();
