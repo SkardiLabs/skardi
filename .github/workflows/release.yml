@@ -319,3 +319,60 @@ jobs:
       - name: Dry run summary
         if: ${{ inputs.dry_run }}
         run: echo "Dry run complete. All build steps passed for ${{ inputs.version }}. No artifacts were pushed or published."
+
+  homebrew:
+    name: "Publish Homebrew formula (${{ inputs.version }})"
+    # Runs after the GitHub Release exists: the formula's urls point at the
+    # release tarballs, so publishing before `release` would create a window
+    # where the tap serves 404s.
+    needs: [build, release]
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    env:
+      TAP_REPO: SkardiLabs/homebrew-tap
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.version }}
+
+      - name: Download CLI artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: skardi-*
+          merge-multiple: true
+
+      - name: Render and push formula
+        env:
+          VERSION: ${{ inputs.version }}
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          version="${VERSION#v}"
+          formula="$(cat packaging/homebrew/skardi.rb)"
+          formula="${formula//@VERSION@/$version}"
+          for target in aarch64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            key="$(tr 'a-z-' 'A-Z_' <<< "$target")"
+            sha="$(cut -d' ' -f1 "artifacts/skardi-${target}.tar.gz.sha256")"
+            formula="${formula//@SHA256_${key}@/$sha}"
+          done
+          if grep -q '@[A-Z_]*@' <<< "$formula"; then
+            echo "Unsubstituted placeholder remains in formula:"
+            grep -n '@[A-Z_]*@' <<< "$formula"
+            exit 1
+          fi
+
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/${TAP_REPO}.git" tap
+          mkdir -p tap/Formula
+          printf '%s\n' "$formula" > tap/Formula/skardi.rb
+
+          git -C tap config user.name "github-actions[bot]"
+          git -C tap config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C tap add Formula/skardi.rb
+          if git -C tap diff --cached --quiet; then
+            echo "Formula already up to date for ${VERSION}; nothing to push."
+            exit 0
+          fi
+          git -C tap commit -m "skardi ${version}"
+          git -C tap push
