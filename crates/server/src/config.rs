@@ -22,6 +22,7 @@ use skardi::sources::providers::rss::register_rss_tables;
 use skardi::sources::providers::seekdb::register_seekdb_tables;
 use skardi::sources::providers::sqlite::register_sqlite_tables;
 use skardi::sources::providers::sqlx::postgres::register_postgres_tables;
+use skardi::sources::providers::sqlx::register_pg_fts_udfs;
 use skardi::sources::sql_validator::{AdhocSqlPolicy, SqlValidatorConfig, validate_sql};
 use skardi::util::json_getters::register_json_getter_udfs;
 use skardi::util::json_pack::register_json_pack_udf;
@@ -545,6 +546,10 @@ pub async fn load_server_config(args: CliArgs) -> Result<ServerConfig> {
     // graph node/relationship properties included; UDFs only, never the
     // `->` operator rewrite — see util::json_getters.
     register_json_getter_udfs(&session_ctx)?;
+    // to_tsvector / websearch_to_tsquery / ts_rank: planned here, evaluated
+    // by PostgreSQL. Without them a raw-SQL full-text statement cannot even
+    // resolve — see sources::providers::sqlx::pg::fts_udfs.
+    register_pg_fts_udfs(&session_ctx);
 
     // This auth layer is used only for SQL planning and is discarded after current function returns.
     // The live auth layer is built separately in setup_app_state.
