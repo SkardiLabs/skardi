@@ -44,26 +44,43 @@
 //!
 //! # How far the pushdown actually reaches
 //!
-//! Two different mechanisms can carry these to Postgres, and they carry
-//! different amounts:
+//! **Only the WHERE clause, on every engine that exists today.** Read this
+//! before putting one of these three in a SELECT list.
 //!
-//! - **Scan-level** (what skardi's own Postgres source uses today): a plain
-//!   `SqlTable` from datafusion-table-providers. Its
-//!   `supports_filters_pushdown` is `default_filter_pushdown`, i.e. "does
-//!   `Unparser<PostgreSqlDialect>::expr_to_sql` succeed?" — so the WHERE
-//!   predicate goes down whole and `Exact`, but the SELECT list does not.
-//!   A `ts_rank(...) AS rank` projection is therefore evaluated in DataFusion
-//!   and hits the error below. Tested by
+//! - **Scan-level is the only live path.** skardi's Postgres source is a
+//!   plain `SqlTable` from datafusion-table-providers
+//!   (`sqlx/pg/postgres.rs`). Its `supports_filters_pushdown` is
+//!   `default_filter_pushdown`, which is literally
+//!   "`Unparser<PostgreSqlDialect>::expr_to_sql` succeeded and the expression
+//!   holds no subquery ⇒ `Exact`". So the WHERE predicate goes down whole,
+//!   and the SELECT list does not: a `ts_rank(...) AS rank` projection is
+//!   evaluated in DataFusion and hits the error below. Pinned by
 //!   `the_predicate_unparses_back_to_postgres_sql`.
-//! - **Whole-plan federation** (`FederatedTableProviderAdaptor` +
-//!   `datafusion-federation`, which skardi's cloud engine uses): the entire
-//!   subtree is unparsed with `plan_to_sql`, projection, ORDER BY and LIMIT
-//!   included. Tested by
-//!   `the_whole_search_okf_statement_unparses_back_to_postgres_sql`.
+//! - **Whole-plan federation is NOT available on either server.** Not in OSS:
+//!   nothing wraps a Postgres provider in a `FederatedTableProviderAdaptor`
+//!   (datafusion-table-providers is built without its `postgres-federation`
+//!   feature), so `get_leaf_provider` yields `NopFederationProvider`, whose
+//!   `optimizer()` is `None`, and no `Extension` node is ever produced —
+//!   `datafusion_federation::default_session_state()` in the server is inert
+//!   for these tables. And not on the cloud engine, which refuses federation
+//!   at boot (`skardi-server/src/planning.rs`, `FEDERATION_RULES`) and denies
+//!   `LogicalPlan::Extension` again in its RBAC plan walk.
 //!
-//! Both renderings are valid Postgres. The distinction matters to any caller
-//! that puts one of these in a SELECT list: it needs the federated path, or a
-//! `pg_fts`-style provider, not a bare `SqlTable`.
+//! `the_whole_search_okf_statement_unparses_back_to_postgres_sql` therefore
+//! pins a **rendering, not a deployed path**: it proves DataFusion's unparser
+//! can emit the whole statement — projection, `@@`, ORDER BY and LIMIT — as
+//! valid Postgres, which is what a whole-plan-federating engine *would* push
+//! if one existed. Do not read it as evidence that such a query runs. If you
+//! need the rank value, today that means `pg_fts` (which builds the SQL by
+//! hand and sends it itself), not these UDFs.
+//!
+//! And note what the scan-level proof does *not* prove: `Exact` means the
+//! expression unparsed, nothing more. No test here touches a real PostgreSQL
+//! — no connection, no EXPLAIN, no index. What it establishes is that the
+//! predicate renders to SQL of the same shape `fts_exec.rs`'s `build_query`
+//! already constructs and sends live. That is good corroboration that
+//! Postgres will accept it; it is not proof of acceptance, and it says
+//! nothing about whether a GIN index gets used.
 //!
 //! # Types
 //!
@@ -180,6 +197,7 @@ mod tests {
     use arrow::datatypes::{Field, Schema, SchemaRef};
     use datafusion::common::tree_node::TreeNode;
     use datafusion::datasource::MemTable;
+    use datafusion::execution::FunctionRegistry;
     use datafusion::logical_expr::{Expr, LogicalPlan, TableProviderFilterPushDown};
     use datafusion::sql::unparser::Unparser;
     use datafusion::sql::unparser::dialect::PostgreSqlDialect;
@@ -211,6 +229,31 @@ mod tests {
         ctx.register_table("docs", Arc::new(table))
             .expect("register");
         ctx
+    }
+
+    const FTS_FUNCTION_NAMES: [&str; 3] = ["to_tsvector", "websearch_to_tsquery", "ts_rank"];
+
+    /// All three must be `Immutable`, and that is a load-bearing property,
+    /// not a stylistic one — see `constant_folding_does_not_kill_the_plan`,
+    /// whose whole premise is that the const-evaluator *does* reach these.
+    fn assert_all_three_are_immutable(ctx: &SessionContext) {
+        for name in FTS_FUNCTION_NAMES {
+            let udf = ctx.udf(name).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(
+                udf.signature().volatility,
+                Volatility::Immutable,
+                "{name} must stay Immutable"
+            );
+        }
+    }
+
+    /// Pinned on its own as well as inside the const-folding test, so a
+    /// volatility change fails with a message that names the cause.
+    #[tokio::test]
+    async fn the_three_functions_are_registered_immutable() {
+        let ctx = SessionContext::new();
+        register_pg_fts_udfs(&ctx);
+        assert_all_three_are_immutable(&ctx);
     }
 
     /// The exact predicate shape the cloud `search-okf` generator emits.
@@ -281,6 +324,13 @@ mod tests {
     #[tokio::test]
     async fn constant_folding_does_not_kill_the_plan() {
         let ctx = ctx_with_docs();
+        // Without this the test is vacuous under any other volatility: the
+        // const-evaluator refuses to touch a `Volatile` function at all
+        // (`ConstEvaluator::volatility_ok`), so the assertions below would
+        // pass while testing nothing — a green test with a misleading name.
+        // Measured: flipping the registration to `Volatile` left all seven
+        // tests in this module passing.
+        assert_all_three_are_immutable(&ctx);
         let optimized = ctx
             .sql(SEARCH_OKF_SQL)
             .await
@@ -358,13 +408,19 @@ mod tests {
     }
 
     /// The pushdown contract skardi's Postgres provider actually uses:
-    /// `SqlTable::supports_filters_pushdown` calls
-    /// `default_filter_pushdown`, which is nothing but
-    /// `Unparser::new(PostgreSqlDialect).expr_to_sql(filter)` — a filter that
-    /// unparses is `Exact` (pushed whole), one that does not is `Unsupported`
-    /// (evaluated locally, which for these three means the loud error above).
-    /// So this assertion is the difference between the design working and the
-    /// design failing every query.
+    /// `SqlTable::supports_filters_pushdown` calls `default_filter_pushdown`,
+    /// which is nothing but "`Unparser::new(PostgreSqlDialect)
+    /// .expr_to_sql(filter)` succeeded and the expression holds no subquery".
+    /// A filter that unparses is `Exact` and is handed to Postgres as text;
+    /// one that does not is `Unsupported` and is evaluated locally, which for
+    /// these three means the loud error above. So this is the difference
+    /// between the WHERE clause working and every such query failing.
+    ///
+    /// What it does NOT establish: `Exact` means "it unparsed", full stop.
+    /// There is no PostgreSQL in this test — no connection, no EXPLAIN, no
+    /// index. The corroboration that Postgres will actually accept the text
+    /// is that `fts_exec.rs`'s `build_query` constructs the same shape by
+    /// hand and sends it live today.
     #[tokio::test]
     async fn the_predicate_unparses_back_to_postgres_sql() {
         let ctx = ctx_with_docs();
@@ -392,19 +448,27 @@ mod tests {
             );
         }
 
-        // ...and the provider must therefore classify it as fully pushed.
+        // ...so the provider classifies it `Exact` and sends it as text
+        // rather than evaluating it locally. (`Exact` is a statement about
+        // unparsing, not about what Postgres does with the result.)
         assert_eq!(
             default_filter_pushdown(&[&predicate], &PostgreSqlDialect {}),
             vec![TableProviderFilterPushDown::Exact],
-            "the predicate is pushed whole, not evaluated locally"
+            "the predicate goes to Postgres as text, not to DataFusion"
         );
     }
 
     /// The whole statement — projection, `ts_rank`, ORDER BY and LIMIT
-    /// included — must render back to Postgres. This is the shape a federated
-    /// engine pushes down (the cloud server, and any provider wrapped in a
-    /// `FederatedTableProviderAdaptor`); the scan-level pushdown above only
-    /// carries the WHERE clause.
+    /// included — renders back to valid Postgres.
+    ///
+    /// **This pins a rendering, not a deployed path.** No engine in either
+    /// repo federates whole-plan today: OSS never wraps a Postgres provider
+    /// in a `FederatedTableProviderAdaptor`, and the cloud engine refuses
+    /// federation at boot and again in its RBAC plan walk (module doc, "How
+    /// far the pushdown actually reaches"). So this test says the unparser
+    /// *could* emit the whole `search-okf` statement if such an engine
+    /// existed; it does not say any query in that shape runs. The scan-level
+    /// path above — WHERE only — is what actually happens.
     #[tokio::test]
     async fn the_whole_search_okf_statement_unparses_back_to_postgres_sql() {
         let ctx = ctx_with_docs();

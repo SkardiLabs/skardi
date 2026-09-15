@@ -816,6 +816,66 @@ spec:
         assert_eq!(packed, r#"{"z":"v"}"#);
     }
 
+    /// Both PRODUCTION registration paths for the Postgres FTS UDFs
+    /// (`register_pg_fts_udfs`), the same shape as the etl-runtime-UDF test
+    /// above: the planning context (`load_server_config`, which must infer a
+    /// schema for a pipeline naming all three) and the runtime context
+    /// (`setup_app_state`, which must PLAN a statement naming them).
+    ///
+    /// Note the asymmetry with the etl UDFs: these three must plan but must
+    /// NOT execute — `invoke_with_args` errors by design, because PostgreSQL
+    /// evaluates them and a NULL-returning stub would answer "no matches".
+    /// So this test asserts planning on both sides and never collects.
+    /// The unit tests in `sources::providers::sqlx::pg::fts_udfs` register
+    /// the functions directly and stay green if either production call is
+    /// deleted; THIS test is what fails in that case.
+    #[tokio::test]
+    async fn production_contexts_register_the_pg_fts_udfs() {
+        const FTS_SQL: &str = "SELECT ts_rank(to_tsvector('english', 'a doc'), \
+             websearch_to_tsquery('english', 'a')) AS rank";
+
+        let temp_dir = TempDir::new().unwrap();
+        let pipeline_path = temp_dir.path().join("pg-fts-udf-wiring.yaml");
+        fs::write(
+            &pipeline_path,
+            format!(
+                r#"
+kind: pipeline
+metadata:
+  name: "pg-fts-udf-wiring"
+  version: "1.0.0"
+spec:
+  query: |
+    {FTS_SQL}
+"#
+            ),
+        )
+        .unwrap();
+        let args = CliArgs {
+            pipeline_path: Some(pipeline_path),
+            jobs_path: None,
+            jobs_db_path: None,
+            ctx_file: None,
+            semantics_path: None,
+            port: 8080,
+            query_audit_db: None,
+            query_audit_retention_days: None,
+            mcp_allowed_hosts: vec![],
+        };
+        let config = crate::config::load_server_config(args)
+            .await
+            .expect("the PLANNING context resolves the three FTS functions");
+        assert!(config.pipelines.contains_key("pg-fts-udf-wiring"));
+
+        let state = setup_app_state(config).await.expect("app state");
+        state
+            .session_ctx
+            .state()
+            .create_logical_plan(FTS_SQL)
+            .await
+            .expect("the RUNTIME context plans the three FTS functions");
+    }
+
     #[tokio::test]
     async fn test_setup_app_state_with_data_sources() {
         let (config, _temp_dir) = create_test_config_with_data_sources_and_temp_dir().await;
