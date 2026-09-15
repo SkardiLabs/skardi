@@ -256,4 +256,98 @@ mod tests {
             "error was: {message}"
         );
     }
+
+    // -- show: 404 + probe fails for an unrelated reason (500): fall back -
+
+    #[tokio::test]
+    async fn show_404_with_probe_server_error_falls_back_to_not_found() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/pipeline/ghost"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "success": false,
+                "error": "not found",
+                "error_type": "not_found",
+                "details": null,
+                "timestamp": "2026-07-23T00:00:00Z",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // A transient 500 on the probe says nothing about whether
+        // pipelines are served — it must not be read as "no surface".
+        Mock::given(method("GET"))
+            .and(path("/pipelines"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("internal error"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = ApiClient::new(&test_config(&server.uri())).unwrap();
+        let err = run(
+            &client,
+            PipelineCmd::Show {
+                name: "ghost".to_string(),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        let message = err.to_string();
+        assert!(
+            message.contains("pipeline 'ghost' not found"),
+            "error was: {message}"
+        );
+        assert!(
+            !message.contains("does not serve pipelines"),
+            "a probe 500 must not be read as proof the server lacks pipelines: {message}"
+        );
+    }
+
+    // -- show: 404 + probe can't even connect: fall back too -------------
+
+    #[tokio::test]
+    async fn show_404_with_probe_connection_failure_falls_back_to_not_found() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/pipeline/ghost"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "success": false,
+                "error": "not found",
+                "error_type": "not_found",
+                "details": null,
+                "timestamp": "2026-07-23T00:00:00Z",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/pipelines"))
+            .respond_with_err(|_req: &wiremock::Request| {
+                std::io::Error::new(std::io::ErrorKind::ConnectionReset, "simulated reset")
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = ApiClient::new(&test_config(&server.uri())).unwrap();
+        let err = run(
+            &client,
+            PipelineCmd::Show {
+                name: "ghost".to_string(),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        let message = err.to_string();
+        assert!(
+            message.contains("pipeline 'ghost' not found"),
+            "error was: {message}"
+        );
+        assert!(
+            !message.contains("does not serve pipelines"),
+            "a probe connection failure must not be read as proof the server lacks pipelines: {message}"
+        );
+    }
 }
