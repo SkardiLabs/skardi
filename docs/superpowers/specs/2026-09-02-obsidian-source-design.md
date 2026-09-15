@@ -1,8 +1,8 @@
 # Obsidian Vault Source Design
 
-**Status:** Draft for review
+**Status:** Implemented (plan: docs/superpowers/plans/2026-09-03-obsidian-source.md, branch feature/obsidian-source)
 **Date:** 2026-09-02
-**Branch:** `feature/obsidian-source-design`
+**Branch:** `feature/obsidian-source`
 
 ## Summary
 
@@ -81,8 +81,8 @@ Obsidian is one of the most widely used personal knowledge bases, and its data i
 
 **Packaging**
 
-- Gate the provider behind an `obsidian` Cargo feature, as `documents` and `rss` are gated. The reason is concrete: `s3://` support needs the optional `object_store` dependency with its AWS backend, which is currently pulled in only by the `documents` feature. `obsidian = ["dep:glob", "dep:object_store", "dep:pulldown-cmark"]` in `crates/skardi` (plus `libc` as an unconditional `cfg(unix)` dependency for `O_NOFOLLOW`, used by the shared `blob.rs`), and the same two-level mapping the siblings use in `crates/server/Cargo.toml`: `obsidian = ["skardi/obsidian"]`, since the server's `config.rs` arm is gated on the *server's* feature name. Without it, `cargo build -p skardi-server --features obsidian` is an unknown-feature error.
-- Lift `documents::blob` to a shared module, `sources/providers/blob.rs`, compiled when either feature is enabled (`#[cfg(any(feature = "documents", feature = "obsidian"))]`), and extend its `list` in one bounded way: it takes `ListOptions { recursive, follow_symlinks }` and returns `Vec<BlobEntry { loc, rel_key, size, modified }>`, carrying the metadata both backends already have at listing time (`DirEntry::metadata()` locally, `ObjectMeta` on S3). `get` gains the same knob — `get(loc, ReadOptions { follow_symlinks })` — because the listing-time symlink check alone is a time-of-check/time-of-use gap: in a writable or shared vault a regular file can be replaced by a symlink between `DirEntry::file_type()` and `std::fs::read`, which follows it. With `follow_symlinks: false` the local arm opens with `O_NOFOLLOW` (unix, via the `libc` crate — a new direct dependency, already in the tree transitively through tokio) and then checks the opened handle's `metadata().file_type().is_file()`; on non-unix targets it falls back to a `symlink_metadata` check before opening, with the residual race documented. `put` is unchanged. `documents` adapts to the new entry type and passes `follow_symlinks: true` to both calls, so its behavior does not change in this work; it simply ignores the two new fields. This is the one refactor in scope.
+- Gate the provider behind an `obsidian` Cargo feature, as `documents` and `rss` are gated. The reason is concrete: `s3://` support needs the optional `object_store` dependency with its AWS backend, which is currently pulled in only by the `documents` feature. `obsidian = ["dep:glob", "dep:object_store", "dep:pulldown-cmark"]` in `crates/skardi` (plus `rustix`, an optional `cfg(unix)` dependency enabled by `obsidian` alone: the no-follow reader in the shared `blob.rs` is `#[cfg(feature = "obsidian")]`, since `documents` follows symlinks at both ends and never takes that path), and the same two-level mapping the siblings use in `crates/server/Cargo.toml`: `obsidian = ["skardi/obsidian"]`, since the server's `config.rs` arm is gated on the *server's* feature name. Without it, `cargo build -p skardi-server --features obsidian` is an unknown-feature error.
+- Lift `documents::blob` to a shared module, `sources/providers/blob.rs`, compiled when either feature is enabled (`#[cfg(any(feature = "documents", feature = "obsidian"))]`), and extend its `list` in one bounded way: it takes `ListOptions { recursive, follow_symlinks }` and returns `Vec<BlobEntry { loc, rel_key, size, modified }>`, carrying the metadata both backends already have at listing time (`DirEntry::metadata()` locally, `ObjectMeta` on S3). `get` gains the same knob — `get(loc, ReadOptions { follow_symlinks })` — because the listing-time symlink check alone is a time-of-check/time-of-use gap: in a writable or shared vault a regular file can be replaced by a symlink between `DirEntry::file_type()` and `std::fs::read`, which follows it. With `follow_symlinks: false` the local arm opens with `O_NOFOLLOW` (unix, via `rustix` — already in the tree transitively through arrow's `comfy-table`) and then checks the opened handle's `metadata().file_type().is_file()`; on non-unix targets it falls back to a `symlink_metadata` check before opening, with the residual race documented. `put` is unchanged. `documents` adapts to the new entry type and passes `follow_symlinks: true` to both calls, so its behavior does not change in this work; it simply ignores the two new fields. This is the one refactor in scope.
 - Enforce `max_file_bytes` from the listing's `size`, before any `get`. Without listing metadata the cap could only fire after a huge object was already in memory (S3 has no cheaper alternative than a HEAD per object), which would make the cap decorative.
 
 **Security and trust boundary**
@@ -155,7 +155,7 @@ pub struct BlobEntry {
 }
 ```
 
-Locally, `ListOptions::follow_symlinks: false` skips any entry whose `DirEntry::file_type()` is a symlink; `true` reproduces today's `Path::is_dir` behavior. `ReadOptions::follow_symlinks: false` opens with `OpenOptions::custom_flags(libc::O_NOFOLLOW)` on unix and errors if the open fails with `ELOOP` or the opened handle's `metadata().file_type()` is not a regular file; on non-unix it checks `symlink_metadata` before opening (documented residual race); `true` is today's `std::fs::read`. S3 has no symlinks; both flags are ignored there. Gated on `any(feature = "documents", feature = "obsidian")`. `documents` imports it from the new location, passes `follow_symlinks: true` to both, and destructures `BlobEntry` where it used the tuple.
+Locally, `ListOptions::follow_symlinks: false` skips any entry whose `DirEntry::file_type()` is a symlink; `true` reproduces today's `Path::is_dir` behavior. `ReadOptions::follow_symlinks: false` opens with `OFlags::NOFOLLOW` on unix and errors if the open fails with `ELOOP` or the opened handle's `metadata().file_type()` is not a regular file; on non-unix it checks `symlink_metadata` before opening (documented residual race); `true` is today's `std::fs::read`. S3 has no symlinks; both flags are ignored there. Gated on `any(feature = "documents", feature = "obsidian")`. `documents` imports it from the new location, passes `follow_symlinks: true` to both, and destructures `BlobEntry` where it used the tuple.
 
 ### `sources/providers/obsidian/mod.rs`
 
@@ -377,7 +377,7 @@ No live or mocked S3 test in the first release (see Non-goals).
 ## Expected Repository Shape
 
 ```
-crates/skardi/Cargo.toml                          # obsidian feature; pulldown-cmark dep; libc (unix, O_NOFOLLOW)
+crates/skardi/Cargo.toml                          # obsidian feature; pulldown-cmark dep; rustix (unix, O_NOFOLLOW)
 crates/skardi/src/sources/data_source_type.rs     # Obsidian variant
 crates/skardi/src/sources/providers/mod.rs        # pub mod blob (shared); pub mod obsidian
 crates/skardi/src/sources/providers/blob.rs       # moved from documents/blob.rs; list → ListOptions / BlobEntry
@@ -403,3 +403,83 @@ README.md                                         # source list entry
 - `kind = 'external'` already ships; bare-URL detection could join it.
 - Block-level rows (headings, callouts) if chunking pipelines want structure finer than a note.
 - Live S3 verification as an opt-in integration test, mirroring `documents_s3_live`.
+
+## Implementation notes (2026-09)
+
+Deviations from this spec that were settled during implementation, each
+covered by a test:
+
+- **Bare wikilink names containing `.`** (`[[Note.md]]`, `[[Note v2.1]]`)
+  try a root-level exact path first and fall back to the name lookup. The
+  spec's pure name rule made `[[Note.md]]` `missing` while Obsidian opens it.
+- **URL-scheme detection** uses `^[A-Za-z][A-Za-z0-9+.-]*:\S` (RFC 3986
+  scheme grammar) instead of a fixed scheme list, so `obsidian://`,
+  `zotero://`, `mailto:` all classify as `external`.
+- **Scan entry point** is an async `run_scan(root, opts)` wrapper around the
+  synchronous `VaultScan::run` on `spawn_blocking`; `ObsidianScanExec` awaits
+  it inside a one-item stream. No blocking on a Tokio worker.
+- **Autolinks** (`<https://…>`) carry `display_text = NULL` rather than
+  repeating the URL, so `display_text IS NOT NULL` means "the author wrote
+  text".
+- **Email autolinks** (`<me@example.com>`) get `mailto:` restored on their
+  target. pulldown-cmark reports the bare address and prepends the scheme only
+  when rendering HTML; without it the target carries no scheme and would
+  resolve as a note name instead of `external`.
+- **Tags inside comments and math** are not masked: `%%…%%`, `<!-- … -->`
+  and `$…$` can yield `tags` rows. Only code is excluded, as Parsing Rules
+  say; recorded so the gap is a decision rather than an oversight.
+- **`[[Note:subtitle]]`** (no space after the colon) is `external` under the
+  scheme grammar above; `[[Note: subtitle]]` is a note name. Tested.
+- **A leading `/` in a Markdown link** is the vault root only; the linking
+  note's folder is never tried (matches the docs' "root-relative" row).
+- **`aliases` with nothing usable** (`""`, `[]`, `[7]`) is NULL, not an empty
+  list — one shape for "no aliases".
+- **Frontmatter tags** follow the body grammar's digit rule (`2026` dropped,
+  `y2026` kept) and lose exactly one leading `#`.
+- **Declared output ordering.** `ObsidianScanExec` declares `notes` by
+  `path`, `links` by `from_path`, `tags` by `(path, tag, source)` whenever the
+  projection keeps those leading columns, so an `ORDER BY` on them plans no
+  sort. Emission type is `Final`: one batch after the whole scan.
+- **Fixture:** `People/Bob.md` links only `[[Alice]]`, making `Rooms/B12.md`
+  reachable solely through `Meeting.md`'s frontmatter — the frontmatter-only
+  inbound note the Testing Strategy asks for. The link total is 27.
+- **`max_file_bytes` is enforced at read time as well.** The listing's `size`
+  is a snapshot, so a note that grows or is replaced before its `get` would
+  otherwise be buffered in full. `ReadOptions` therefore became a struct —
+  `{ symlinks, max_bytes }` — and the reader stops at `max_bytes + 1` observed
+  bytes: locally an `fstat` on the open handle plus a `take`-bounded read, on
+  S3 a size check against the body's own `ObjectMeta` plus a per-chunk running
+  total over `into_stream()`, which aborts the transfer instead of collecting
+  the whole response. The failure is a typed `SizeCapExceeded`, so the scan
+  classifies it as the same policy skip as the listing-time cap (a skip, not
+  an attempt) rather than as an unreadable note.
+- **Read-time symlink guard covers every component.** The policy is
+  `ReadOptions::symlinks` — `Symlinks::Follow` (what `documents` passes) or
+  `Symlinks::NoneBeneath(&Loc)`, which carries the listed root — because
+  `O_NOFOLLOW` guards only the last component of a path. The unix arm opens
+  the root normally (operator configuration, may be a symlink), then `openat`s
+  each component beneath it with `O_NOFOLLOW`: `O_DIRECTORY` for directories,
+  `O_NONBLOCK` for the file, so a directory swapped for a symlink after
+  listing fails with `ELOOP` too. The non-blocking final open plus an `fstat`
+  regular-file check means a FIFO named `note.md` is refused instead of
+  stalling the scan; the strict listing also skips anything that is not a
+  regular file or directory. Non-unix keeps the `symlink_metadata`
+  approximation, now per component.
+- **`rustix`, not raw `libc`, and it hangs off `obsidian`.** `rustix::fs::openat`
+  returns an `OwnedFd` and carries the error in its `Result`, so the walk needs
+  no `unsafe`, cannot leak a descriptor if an early return is ever added between
+  the open and the ownership transfer, and never reads a stale global `errno`.
+  It is not a new dependency: arrow's `comfy-table` already builds the same
+  major version. Gating: the shared module compiles under
+  `any(documents, obsidian)`, so a reader gated only on the platform would drag
+  the dependency into documents-only builds and make that feature line claim
+  something `documents` does not use. Both `read_local_no_follow` bodies are
+  therefore `#[cfg(feature = "obsidian")]`, with a third definition under
+  `#[cfg(not(feature = "obsidian"))]` that refuses the read: nothing outside
+  `obsidian` constructs `Symlinks::NoneBeneath`, so it is unreachable and exists
+  only to keep the shared module compiling.
+- **The connector's public API is `register_obsidian_tables` alone.** The six
+  submodules are private, as `documents`' `parse`/`table` are: nothing outside
+  the crate uses the scanner, parsers or resolver, and keeping them off the
+  public API leaves their signatures free to change without a breaking
+  release. The registration function carries the module's one doc example.

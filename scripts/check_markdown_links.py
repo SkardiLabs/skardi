@@ -7,7 +7,8 @@ silently start landing at the top of a page — or nowhere.
 
 Scope is deliberately narrow so the check stays deterministic:
   - only git-tracked *.md files, minus docs/superpowers/ (historical
-    plans/specs that describe past states of the tree);
+    plans/specs that describe past states of the tree) and the obsidian
+    fixture vault (test data whose broken links are the fixture);
   - only relative targets — http(s)/mailto links are never fetched;
   - fragments are resolved against GitHub's heading-slug rules, plus
     explicit <a name=...>/<a id=...>/id="..." HTML anchors.
@@ -21,7 +22,12 @@ import subprocess
 import sys
 from pathlib import Path
 
-EXCLUDE_PREFIXES = ("docs/superpowers/",)
+EXCLUDE_PREFIXES = (
+    "docs/superpowers/",
+    # The obsidian source's fixture vault: its notes deliberately link to
+    # missing files so `links.resolution = 'missing'` has rows to assert on.
+    "crates/skardi/src/sources/providers/obsidian/fixtures/",
+)
 
 FENCE_RE = re.compile(r"^(```|~~~).*?^\1\s*$", re.M | re.S)
 INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
