@@ -363,12 +363,15 @@ recorded id at all, and `--revoke` names it rather than skipping it quietly.
 
 ### What a cloud context cannot do
 
-A skardi-cloud gateway serves `query` and `schema`. `run`, `pipeline`, `job`,
+A skardi-cloud gateway serves `query`, `schema`, `run`, and `pipeline`. `job`
 and `health` are engine-local surfaces it does not mount, so they fail
-immediately, naming the context, with no request issued:
+immediately, naming the context, with no request issued. `mcp` is refused
+too, though the gateway now serves the same routes the bridge would use — it
+serves its own `/mcp` with its own tool catalog, so the stdio bridge would be
+a redundant surface there rather than a missing one:
 
 ```
-error: 'job' is not available in a cloud context (acme/acme-prod). Available: query, schema.
+error: 'job' is not available in a cloud context (acme/acme-prod). Available: query, schema, run, pipeline.
 ```
 
 Two credential failures are reported in the context's own terms rather than
