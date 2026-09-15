@@ -139,10 +139,21 @@ impl McpBridge {
         if let Some(purpose) = args.get("purpose").and_then(Value::as_str) {
             let purpose = purpose.trim();
             if !purpose.is_empty() {
-                body.insert(
-                    "ai_context".to_string(),
-                    serde_json::json!({"purpose": purpose, "session_id": self.session_id}),
-                );
+                let mut context =
+                    serde_json::json!({"purpose": purpose, "session_id": self.session_id});
+                // Both bindings assemble this body separately while sharing
+                // one tool schema, so a field added on only one side is
+                // advertised to every host and silently dropped by this one.
+                // `task` rides only alongside a `purpose`: the server takes
+                // `ai_context` whole, and a partial object 400s a query that
+                // would otherwise have answered.
+                if let Some(task) = args.get("task").and_then(Value::as_str) {
+                    let task = task.trim();
+                    if !task.is_empty() {
+                        context["task"] = Value::String(task.to_string());
+                    }
+                }
+                body.insert("ai_context".to_string(), context);
             }
         }
         self.client.post("/query", &Value::Object(body)).await
@@ -321,6 +332,11 @@ mod tests {
             .map(|r| serde_json::from_slice(&r.body).unwrap())
             .collect();
         assert_eq!(bodies[0]["ai_context"]["purpose"], json!("why"));
+        assert!(
+            bodies[0]["ai_context"].get("task").is_none(),
+            "no task was sent, so none should be synthesized: {:?}",
+            bodies[0]
+        );
         let sid0 = bodies[0]["ai_context"]["session_id"].as_str().unwrap();
         let sid1 = bodies[1]["ai_context"]["session_id"].as_str().unwrap();
         assert_eq!(sid0, sid1, "session id must be stable per connection");

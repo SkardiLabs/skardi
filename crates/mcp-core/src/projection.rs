@@ -163,6 +163,13 @@ pub fn builtin_tools() -> Vec<Tool> {
             "purpose": {
                 "type": "string",
                 "description": "One line on why you are running this query; recorded in the query audit log."
+            },
+            "task": {
+                "type": "string",
+                "description": "One line naming the larger piece of work this query belongs to, \
+                                repeated verbatim on every query that serves it. `purpose` is why \
+                                this one query; `task` is what the run of queries is for. Without \
+                                it a day of queries can only be summarized as a list of lookups."
             }
         }),
         vec!["sql".to_string()],
@@ -394,6 +401,10 @@ mod tests {
         assert_eq!(schema["properties"]["max_rows"]["type"], json!("integer"));
         assert_eq!(schema["properties"]["max_rows"]["minimum"], json!(1));
         assert!(schema["properties"]["purpose"].is_object());
+        assert!(
+            schema["properties"]["task"].is_object(),
+            "an agent cannot send a field the tool schema never advertises"
+        );
         assert_eq!(schema["additionalProperties"], json!(false));
         let lds = tools
             .iter()
