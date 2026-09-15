@@ -364,6 +364,62 @@ mod tests {
         assert_eq!(result.is_error, Some(false));
     }
 
+    /// This binding assembles its own `/query` body, so the shared tool schema
+    /// advertising `task` proves nothing about what actually leaves here.
+    #[tokio::test]
+    async fn query_task_reaches_the_body_this_binding_builds() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/query"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"success": true, "data": [], "rows": 0})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let bridge = bridge_for(&server);
+        let args = json!({
+            "sql": "select 1",
+            "purpose": "count merged PRs",
+            "task": "the September delivery review",
+        })
+        .as_object()
+        .cloned();
+        let result = bridge.do_call_tool("query", args).await.unwrap();
+        assert_eq!(result.is_error, Some(false));
+        let requests = server.received_requests().await.unwrap();
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(
+            body["ai_context"]["task"],
+            json!("the September delivery review")
+        );
+        assert_eq!(body["ai_context"]["purpose"], json!("count merged PRs"));
+    }
+
+    /// The server takes `ai_context` whole or not at all, so a task with no
+    /// purpose must send no object rather than a partial one that 400s.
+    #[tokio::test]
+    async fn a_task_without_a_purpose_sends_no_ai_context() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/query"))
+            .and(body_json(json!({"sql": "select 1"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"success": true, "data": [], "rows": 0})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let bridge = bridge_for(&server);
+        let args = json!({"sql": "select 1", "task": "a task with no purpose"})
+            .as_object()
+            .cloned();
+        let result = bridge.do_call_tool("query", args).await.unwrap();
+        assert_eq!(result.is_error, Some(false));
+    }
+
     #[tokio::test]
     async fn server_error_becomes_is_error_tool_result_with_error_type() {
         let server = MockServer::start().await;

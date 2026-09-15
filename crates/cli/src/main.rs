@@ -284,7 +284,16 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             task,
         } => {
             commands::query::run(
-                &client, sql, file, max_rows, table, purpose, session_id, task,
+                &client,
+                sql,
+                file,
+                max_rows,
+                table,
+                commands::query::ContextFlags {
+                    purpose,
+                    session_id,
+                    task,
+                },
             )
             .await
         }
@@ -405,6 +414,35 @@ mod tests {
                 "--all-workspaces"
             ])
             .is_err()
+        );
+        // `--task` rides inside `ai_context`, which the server takes whole or
+        // not at all, so a lone one has nothing valid to travel in. clap
+        // refuses it here rather than letting the flow build a partial object.
+        assert!(
+            super::Cli::try_parse_from([
+                "skardi",
+                "query",
+                "-e",
+                "select 1",
+                "--task",
+                "the September delivery review"
+            ])
+            .is_err()
+        );
+        assert!(
+            super::Cli::try_parse_from([
+                "skardi",
+                "query",
+                "-e",
+                "select 1",
+                "--purpose",
+                "count merged PRs",
+                "--session-id",
+                "sess-1",
+                "--task",
+                "the September delivery review"
+            ])
+            .is_ok()
         );
     }
 

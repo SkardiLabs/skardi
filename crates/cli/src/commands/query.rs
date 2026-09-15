@@ -14,6 +14,15 @@ use std::path::PathBuf;
 /// must move together.
 const MAX_PURPOSE_CHARS: usize = 2000;
 
+/// The three flags that become `ai_context`, carried together because they are
+/// validated together and travel to the server as one object or not at all.
+#[derive(Debug, Default)]
+pub struct ContextFlags {
+    pub purpose: Option<String>,
+    pub session_id: Option<String>,
+    pub task: Option<String>,
+}
+
 /// Run `skardi query`: resolve the SQL text to send (file wins over `-e`
 /// when both are given), `POST` it to `/query`, and hand the response
 /// envelope to [`print_result`].
@@ -23,12 +32,10 @@ pub async fn run(
     file: Option<PathBuf>,
     max_rows: Option<usize>,
     table: bool,
-    purpose: Option<String>,
-    session_id: Option<String>,
-    task: Option<String>,
+    context: ContextFlags,
 ) -> Result<()> {
     let text = resolve_sql(sql, file)?;
-    let ai_context = build_ai_context(purpose, session_id, task)?;
+    let ai_context = build_ai_context(context.purpose, context.session_id, context.task)?;
     let body = build_body(&text, max_rows, ai_context);
 
     let response = client.post("/query", &body).await?;
@@ -120,7 +127,9 @@ fn validate_context_string(value: &str, flag: &str, max_chars: usize) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_PURPOSE_CHARS, MAX_SESSION_ID_CHARS, build_ai_context, build_body, run};
+    use super::{
+        ContextFlags, MAX_PURPOSE_CHARS, MAX_SESSION_ID_CHARS, build_ai_context, build_body, run,
+    };
     use crate::client::ApiClient;
     use crate::config::ClientConfig;
     use serde_json::json;
@@ -189,7 +198,6 @@ mod tests {
         );
     }
 
-    #[test]
     /// `--task` is what turns a day of queries into a description of work
     /// rather than a list of lookups, so it has to survive into the object
     /// the server stores, and its absence must leave no key behind.
@@ -288,9 +296,7 @@ mod tests {
             None,
             None,
             false,
-            None,
-            None,
-            None,
+            ContextFlags::default(),
         )
         .await;
 
@@ -320,9 +326,7 @@ mod tests {
             Some(file.path().to_path_buf()),
             None,
             false,
-            None,
-            None,
-            None,
+            ContextFlags::default(),
         )
         .await;
 
@@ -337,7 +341,7 @@ mod tests {
         // real request here would surface as a connect error, not this one.
         let client = ApiClient::new(&test_config("http://127.0.0.1:1")).unwrap();
 
-        let err = run(&client, None, None, None, false, None, None, None)
+        let err = run(&client, None, None, None, false, ContextFlags::default())
             .await
             .unwrap_err();
 
@@ -367,9 +371,11 @@ mod tests {
             None,
             None,
             false,
-            Some("count paid orders".to_string()),
-            Some("sess-1".to_string()),
-            None,
+            ContextFlags {
+                purpose: Some("count paid orders".to_string()),
+                session_id: Some("sess-1".to_string()),
+                task: None,
+            },
         )
         .await;
 
@@ -397,9 +403,11 @@ mod tests {
             None,
             None,
             false,
-            Some(String::new()),
-            Some("sess-1".to_string()),
-            None,
+            ContextFlags {
+                purpose: Some(String::new()),
+                session_id: Some("sess-1".to_string()),
+                task: None,
+            },
         )
         .await
         .unwrap_err();
@@ -431,9 +439,7 @@ mod tests {
             None,
             None,
             false,
-            None,
-            None,
-            None,
+            ContextFlags::default(),
         )
         .await
         .unwrap_err();
