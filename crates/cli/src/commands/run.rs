@@ -2,6 +2,7 @@
 //! `POST /{name}/execute` and render the result.
 
 use crate::client::{ApiClient, ApiError, encode_component};
+use crate::commands::pipeline::{NO_PIPELINE_SURFACE, serves_pipelines};
 use crate::output::print_result;
 use crate::params::build_body;
 use crate::session::validate_session_id;
@@ -15,10 +16,15 @@ use serde_json::Value;
 /// so the server records this execution against that session in its audit
 /// ledger; when `None`, no such header is sent.
 ///
-/// A 404 response is remapped to a friendly "pipeline not found" error
-/// naming `name`; every other `ApiError` passes through unchanged (so, e.g.,
-/// `main`'s `downcast_ref::<ApiError>` exit-code mapping for connect
-/// failures keeps working).
+/// A 404 response from `/{name}/execute` is ambiguous: it could mean this
+/// pipeline doesn't exist, or that the server doesn't serve pipelines at
+/// all (an older or differently configured deployment, where the route
+/// itself is missing). Rather than guess, this probes `GET /pipelines`
+/// (see [`crate::commands::pipeline::serves_pipelines`]) and reports
+/// whichever is actually true of the server that answered. Every other
+/// `ApiError` passes through unchanged (so, e.g., `main`'s
+/// `downcast_ref::<ApiError>` exit-code mapping for connect failures keeps
+/// working).
 pub async fn run(
     client: &ApiClient,
     name: &str,
@@ -48,9 +54,15 @@ pub async fn run(
             print_result(&response, table);
             Ok(())
         }
-        Err(ApiError::Http { status: 404, .. }) => Err(anyhow!(
-            "pipeline '{name}' not found — try 'skardi pipeline list'"
-        )),
+        Err(ApiError::Http { status: 404, .. }) => {
+            if serves_pipelines(client).await {
+                Err(anyhow!(
+                    "pipeline '{name}' not found — try 'skardi pipeline list'"
+                ))
+            } else {
+                Err(anyhow!(NO_PIPELINE_SURFACE))
+            }
+        }
         Err(err) => Err(err.into()),
     }
 }
@@ -141,6 +153,107 @@ mod tests {
                 "details": null,
                 "timestamp": "2026-07-23T00:00:00Z",
             })))
+            .mount(&server)
+            .await;
+        // The 404 handler probes `GET /pipelines` to tell "no pipeline
+        // surface" apart from "this pipeline doesn't exist"; a server that
+        // does serve pipelines answers this with success.
+        Mock::given(method("GET"))
+            .and(path("/pipelines"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&server)
+            .await;
+
+        let client = ApiClient::new(&test_config(&server.uri())).unwrap();
+        let err = run(&client, "ghost", None, &[], false, None)
+            .await
+            .unwrap_err();
+
+        let message = err.to_string();
+        assert!(
+            message.contains("pipeline 'ghost' not found"),
+            "error was: {message}"
+        );
+        assert!(
+            message.contains("skardi pipeline list"),
+            "error was: {message}"
+        );
+    }
+
+    // -- 3b. 404 + /pipelines also 404s: no-pipeline-surface message -----
+
+    #[tokio::test]
+    async fn not_found_with_no_pipeline_surface_yields_honest_message() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ghost/execute"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "success": false,
+                "error": "not found",
+                "error_type": "not_found",
+                "details": null,
+                "timestamp": "2026-07-23T00:00:00Z",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/pipelines"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "success": false,
+                "error": "not found",
+                "error_type": "not_found",
+                "details": null,
+                "timestamp": "2026-07-23T00:00:00Z",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = ApiClient::new(&test_config(&server.uri())).unwrap();
+        let err = run(&client, "ghost", None, &[], false, None)
+            .await
+            .unwrap_err();
+
+        let message = err.to_string();
+        assert!(
+            message.contains("does not serve pipelines"),
+            "error was: {message}"
+        );
+        assert!(
+            !message.contains("pipeline 'ghost' not found"),
+            "should not claim the pipeline specifically doesn't exist: {message}"
+        );
+        // Must not name any product, version, or deployment.
+        for banned in ["skardi-cloud", "gateway", "cloud"] {
+            assert!(
+                !message.to_lowercase().contains(banned),
+                "error mentions a product/deploy term ({banned}): {message}"
+            );
+        }
+    }
+
+    // -- 3c. 404 + /pipelines succeeds: keep today's pipeline-not-found ---
+
+    #[tokio::test]
+    async fn not_found_with_pipeline_surface_present_keeps_friendly_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ghost/execute"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "success": false,
+                "error": "not found",
+                "error_type": "not_found",
+                "details": null,
+                "timestamp": "2026-07-23T00:00:00Z",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/pipelines"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([{"name": "other"}])))
+            .expect(1)
             .mount(&server)
             .await;
 
