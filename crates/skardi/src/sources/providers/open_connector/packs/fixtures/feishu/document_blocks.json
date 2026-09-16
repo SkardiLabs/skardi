@@ -1,0 +1,61 @@
+{
+  "items": [
+    {
+      "block_id": "docx_0001",
+      "block_type": 1,
+      "children": [
+        "doxcn_0001",
+        "doxcn_0002",
+        "doxcn_0003"
+      ],
+      "page": {
+        "elements": [
+          {
+            "text_run": {
+              "content": "skardi-acl-measure-doc",
+              "text_element_style": {
+                "bold": false,
+                "inline_code": false,
+                "italic": false,
+                "strikethrough": false,
+                "underline": false
+              }
+            }
+          }
+        ],
+        "style": {
+          "align": 1
+        }
+      },
+      "parent_id": ""
+    },
+    {
+      "block_id": "doxcn_0001",
+      "block_type": 2,
+      "parent_id": "docx_0001",
+      "text": {
+        "elements": [
+          {
+            "text_run": {
+              "content": "skardi-document-block-fixture-1",
+              "text_element_style": {
+                "bold": false,
+                "inline_code": false,
+                "italic": false,
+                "strikethrough": false,
+                "underline": false
+              }
+            }
+          }
+        ],
+        "style": {
+          "align": 1,
+          "folded": false
+        }
+      }
+    }
+  ],
+  "pageToken": "page-token-0002",
+  "hasMore": true,
+  "total": null
+}

@@ -1,0 +1,15 @@
+{
+  "type": "object",
+  "properties": {
+    "documentId": {
+      "type": "string",
+      "description": "The document id whose content was read."
+    },
+    "content": {
+      "type": "string",
+      "description": "The full plain-text content of the document."
+    }
+  },
+  "additionalProperties": false,
+  "description": "The plain-text content of a Feishu docx document."
+}

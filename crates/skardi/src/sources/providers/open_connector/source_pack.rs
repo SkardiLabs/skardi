@@ -670,12 +670,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_shipped_table_is_array_shaped() {
-        // The zero-behaviour-change invariant, asserted against what
-        // actually ships rather than a synthetic YAML: object rows are new,
-        // so no built-in table may have acquired the shape by accident. The
-        // day a pack legitimately declares one (feishu document_content),
-        // this test names it explicitly instead of being deleted.
+    fn only_the_named_shipped_tables_are_object_shaped() {
+        // Object rows stay opt-in and enumerated: a table may not acquire
+        // the shape by accident, because a `row_shape: object` typo turns a
+        // list endpoint into a silent one-row table. This began life as
+        // `every_shipped_table_is_array_shaped`, asserting the list was
+        // EMPTY, with a comment promising to name the first legitimate
+        // declaration rather than be deleted. `feishu.document_content` is
+        // that declaration — the point-read whose response object IS the
+        // row — so the empty assertion became this allowlist.
+        const OBJECT_ROW_TABLES: &[&str] = &["feishu.document_content"];
+
         let registry = SourcePackRegistry::builtins().expect("embedded assets parse");
         let mut object_tables = Vec::new();
         for pack in registry.packs.values() {
@@ -685,10 +690,56 @@ mod tests {
                 }
             }
         }
-        assert!(
-            object_tables.is_empty(),
-            "no shipped pack declares object rows yet, found: {object_tables:?}"
+        object_tables.sort_unstable();
+        assert_eq!(
+            object_tables, OBJECT_ROW_TABLES,
+            "object rows are enumerated; add a table here only deliberately"
         );
+    }
+
+    /// The reconcile's whole point, asserted against what ships.
+    ///
+    /// skardi-cloud pinned `skardi` at a rev on
+    /// `claude/slack-messages-ts-pushdown` because main lacked these tables,
+    /// and a live corpus reads them. Main and that branch had independently
+    /// implemented the same design contract (a pack table may be one
+    /// object), so the branch could not simply merge; main's `RowShape`
+    /// kept, the branch's pack content re-landed on top. If a later edit
+    /// drops one of these, the pin move that this test exists to unblock
+    /// silently empties the corpus instead of failing — so assert the
+    /// declarations, not merely the names.
+    #[test]
+    fn the_reconciled_pack_set_keeps_what_the_cloud_pin_carried() {
+        let registry = SourcePackRegistry::builtins().expect("embedded assets parse");
+
+        // slack.messages, with the `conversations.history` time window that
+        // makes an incremental scan a delta instead of a full history.
+        let slack = registry.require("slack").expect("slack pack ships");
+        let messages = registry
+            .table(slack, "messages")
+            .expect("slack.messages survived the reconcile");
+        assert_eq!(messages.action_id, "slack.get_channel_messages");
+        assert!(
+            messages
+                .filters
+                .iter()
+                .any(|f| f.input_field == "oldest" && f.column == "sent_at"),
+            "the sent_at -> oldest pushdown is the table's incremental story"
+        );
+
+        // feishu's two document tables: the structural block listing, and
+        // the point-read whose response object IS the row.
+        let feishu = registry.require("feishu").expect("feishu pack ships");
+        let blocks = registry
+            .table(feishu, "document_blocks")
+            .expect("feishu.document_blocks survived the reconcile");
+        assert_eq!(blocks.row_shape, RowShape::Array);
+
+        let content = registry
+            .table(feishu, "document_content")
+            .expect("feishu.document_content survived the reconcile");
+        assert_eq!(content.row_shape, RowShape::Object);
+        assert_eq!(content.row_path, "$");
     }
 
     #[test]

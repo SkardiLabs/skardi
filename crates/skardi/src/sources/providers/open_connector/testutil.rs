@@ -308,10 +308,18 @@ pub(crate) fn fingerprint_uncovered_columns(
         node
     }
     let contract: serde_json::Value = serde_json::from_str(contract).expect("contract parses");
-    let items = &descend(&contract, row_path.strip_prefix("$.").expect("row path"))["items"];
+    // Where the ROW's declared fields live. For an array table that is the
+    // `items` schema under the row path; for a `row_shape: object` table the
+    // response object IS the row, so `$` names the contract itself and there
+    // is no `items` wrapper to step through.
+    let row_schema: &serde_json::Value = if row_path == "$" {
+        &contract
+    } else {
+        &descend(&contract, row_path.strip_prefix("$.").expect("row path"))["items"]
+    };
     fields
         .iter()
-        .filter(|field| descend(items, field.path).is_null())
+        .filter(|field| descend(row_schema, field.path).is_null())
         .map(|field| field.name)
         .collect()
 }

@@ -55,6 +55,22 @@ pub enum FieldType {
     /// `obj_create_time`), with the same strict digit-string rule and the
     /// same overflow guard as [`FieldType::TimestampSecondsUtc`].
     TimestampSecondsStringUtc,
+    /// JSON string of epoch **seconds with an optional fractional part**
+    /// (`"1700000000.123456"`) ↔ Arrow Timestamp(Millisecond, UTC). Slack's
+    /// message `ts` is this shape, and it is the only one of the four
+    /// timestamp readers that accepts it:
+    /// [`FieldType::TimestampSecondsStringUtc`] is digits-only by design
+    /// (Feishu shape drift must fail loudly), and relaxing it would make a
+    /// fractional Feishu value parse instead of failing.
+    ///
+    /// Sub-millisecond precision is **floored**, not rounded: Arrow's
+    /// millisecond unit cannot hold Slack's microseconds, and flooring
+    /// keeps the column monotonic with the `ts` string it is derived from.
+    /// A column of this type is therefore a *time*, not an identity — Slack
+    /// `ts` values one microsecond apart land on the same millisecond, so
+    /// keep the raw string in its own `utf8` column wherever the row needs
+    /// a key.
+    TimestampSecondsFractionalStringUtc,
     /// JSON array of strings ↔ Arrow List\<Utf8\>.
     Utf8List,
     /// JSON array of objects, each contributing the string under the given
@@ -80,7 +96,8 @@ impl FieldType {
             Self::TimestampMillisUtc
             | Self::TimestampSecondsUtc
             | Self::TimestampMillisStringUtc
-            | Self::TimestampSecondsStringUtc => {
+            | Self::TimestampSecondsStringUtc
+            | Self::TimestampSecondsFractionalStringUtc => {
                 DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()))
             }
             Self::Utf8List | Self::Utf8ListFromObjectKey(_) => {
@@ -100,6 +117,7 @@ impl FieldType {
             Self::TimestampSecondsUtc => "epoch-seconds timestamp",
             Self::TimestampMillisStringUtc => "epoch-millis digit string",
             Self::TimestampSecondsStringUtc => "epoch-seconds digit string",
+            Self::TimestampSecondsFractionalStringUtc => "fractional epoch-seconds string",
             Self::Utf8List => "array of strings",
             Self::Utf8ListFromObjectKey(_) => "array of objects each carrying a string key",
             Self::Json => "any JSON value",
@@ -355,6 +373,15 @@ impl RowConverter {
                 )?)
                 .with_timezone("UTC"),
             )),
+            FieldType::TimestampSecondsFractionalStringUtc => Ok(Arc::new(
+                TimestampMillisecondArray::from(collect_cells_described(
+                    &cells,
+                    spec,
+                    parse_epoch_fractional_seconds_string,
+                    fail,
+                )?)
+                .with_timezone("UTC"),
+            )),
             FieldType::Utf8List => self.convert_string_list(field, &cells, page, None),
             FieldType::Utf8ListFromObjectKey(key) => {
                 self.convert_string_list(field, &cells, page, Some(key))
@@ -540,6 +567,43 @@ fn parse_epoch_digit_string(value: &Value, scale: i64) -> Result<i64, String> {
     epoch
         .checked_mul(scale)
         .ok_or_else(|| "an epoch out of range for millisecond timestamps".to_string())
+}
+
+/// Fractional epoch-seconds string → epoch millis, flooring anything below
+/// a millisecond (Slack `ts`: `"1700000000.123456"`).
+///
+/// Accepts `<digits>` and `<digits>.<digits>`; a bare `.`, a sign, an
+/// exponent, whitespace or any other shape is drift and fails with a
+/// description rather than parsing as zero — the same rule
+/// [`parse_epoch_digit_string`] applies, widened by exactly one dot.
+///
+/// Flooring is done on the digit string, not via floating point: `f64`
+/// cannot represent `1700000000.123456` exactly, and the nearest double
+/// rounds *below* it, which would put a value one millisecond early for
+/// some inputs and misorder rows against the `ts` string beside them.
+fn parse_epoch_fractional_seconds_string(value: &Value) -> Result<i64, String> {
+    const OUT_OF_RANGE: &str = "an epoch out of range for millisecond timestamps";
+
+    let Some(text) = value.as_str() else {
+        return Err(json_kind(value).to_string());
+    };
+    let (whole, fraction) = text.split_once('.').unwrap_or((text, "0"));
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if !digits(whole) || !digits(fraction) {
+        return Err("a non-epoch string".to_string());
+    }
+    let seconds: i64 = whole.parse().map_err(|_| OUT_OF_RANGE.to_string())?;
+    // First three fractional digits, right-padded — `.5` is 500ms, and
+    // `.123456` truncates to 123ms.
+    let millis = fraction
+        .bytes()
+        .chain(std::iter::repeat(b'0'))
+        .take(3)
+        .fold(0i64, |acc, b| acc * 10 + i64::from(b - b'0'));
+    seconds
+        .checked_mul(1000)
+        .and_then(|base| base.checked_add(millis))
+        .ok_or_else(|| OUT_OF_RANGE.to_string())
 }
 
 /// RFC 3339 string or epoch-millis number → epoch millis.
@@ -966,6 +1030,112 @@ mod tests {
                     err,
                     OpenConnectorError::ConversionFailed { found: ref f, ref expected, .. }
                         if f == found && expected == "epoch-seconds timestamp"
+                ),
+                "got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn fractional_epoch_strings_floor_to_millis_and_reject_other_shapes() {
+        // Slack's message `ts` is "<epoch seconds>.<microseconds>", which
+        // every other reader refuses: the digit-string readers stop at the
+        // dot, and the numeric ones want a JSON number. Sub-millisecond
+        // precision floors, so the column stays ordered the same way as the
+        // `ts` string it is derived from.
+        let converter = RowConverter::new(&[FieldMapping {
+            name: "sent_at",
+            path: "ts",
+            field_type: FieldType::TimestampSecondsFractionalStringUtc,
+            nullable: true,
+        }])
+        .unwrap();
+
+        let batch = converter
+            .convert(
+                &[
+                    serde_json::json!({"ts": "1735689600.123456"}),
+                    // A bare seconds string is legal and means .000.
+                    serde_json::json!({"ts": "1735689600"}),
+                    // Fewer than three fractional digits right-pad: .5 is
+                    // half a second, not half a millisecond.
+                    serde_json::json!({"ts": "1735689600.5"}),
+                    serde_json::json!({"ts": null}),
+                ],
+                1,
+            )
+            .unwrap();
+        let ts = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMillisecondArray>()
+            .unwrap();
+        assert_eq!(ts.value(0), 1_735_689_600_123, "microseconds floor away");
+        assert_eq!(ts.value(1), 1_735_689_600_000);
+        assert_eq!(ts.value(2), 1_735_689_600_500);
+        assert!(ts.is_null(3));
+
+        // Two `ts` one microsecond apart land on the same millisecond —
+        // the reason the raw string stays its own column rather than this
+        // one doubling as the row key.
+        let collided = converter
+            .convert(
+                &[
+                    serde_json::json!({"ts": "1735689600.123456"}),
+                    serde_json::json!({"ts": "1735689600.123457"}),
+                ],
+                1,
+            )
+            .unwrap();
+        let collided = collided
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMillisecondArray>()
+            .unwrap();
+        assert_eq!(collided.value(0), collided.value(1));
+
+        for (bad, found) in [
+            // The number spelling belongs to the numeric readers; accepting
+            // it here would blur this variant's contract with theirs.
+            (
+                serde_json::json!({"ts": 1_735_689_600.123_456_f64}),
+                "a number",
+            ),
+            (
+                serde_json::json!({"ts": "2025-01-01T00:00:00Z"}),
+                "a non-epoch string",
+            ),
+            (serde_json::json!({"ts": ""}), "a non-epoch string"),
+            // A dot with nothing on one side of it is drift, not zero.
+            (
+                serde_json::json!({"ts": "1735689600."}),
+                "a non-epoch string",
+            ),
+            (serde_json::json!({"ts": ".123"}), "a non-epoch string"),
+            (
+                serde_json::json!({"ts": "-1735689600.1"}),
+                "a non-epoch string",
+            ),
+            (
+                serde_json::json!({"ts": "1735689600.1e3"}),
+                "a non-epoch string",
+            ),
+            // Two dots would otherwise leave "1.2" in the fraction.
+            (
+                serde_json::json!({"ts": "1735689600.1.2"}),
+                "a non-epoch string",
+            ),
+            (
+                serde_json::json!({"ts": "9223372036854775807.9"}),
+                "an epoch out of range for millisecond timestamps",
+            ),
+        ] {
+            let err = converter.convert(&[bad], 1).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    OpenConnectorError::ConversionFailed { found: ref f, ref expected, .. }
+                        if f == found && expected == "fractional epoch-seconds string"
                 ),
                 "got {err}"
             );

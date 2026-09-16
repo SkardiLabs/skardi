@@ -1,0 +1,4 @@
+{
+  "documentId": "docx_measure_0001",
+  "content": "skardi-acl-measure-doc\nskardi-document-block-fixture-1\nskardi-document-block-fixture-2\nskardi-document-block-fixture-3\nSkardi ingests SaaS content into a per-workspace corpus so an agent can answer questions over it.\nThis document is the Feishu ETL measurement corpus. It exists to prove that document text — not just block structure — reaches the corpus database.\nThe ACL mirror and the ETL pipeline are separate concerns: the mirror decides who may read, the pipeline decides what exists to read.\nFeishu docx stores text under a key named by block_type, so a fixed relational mapping over list_document_blocks cannot address it.\nThe raw-content action returns the whole document as plain text in one call, which is the shape an OKF document row wants.\nIf you are reading this row in Postgres, the pipeline worked end to end."
+}

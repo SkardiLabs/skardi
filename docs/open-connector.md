@@ -17,12 +17,14 @@ gateway **runtime token**.
 > provider packs have landed alongside the synthetic `mock` pack used by
 > the test suite: [GitHub](open-connector-github.md) (repositories, issues,
 > pull requests, reviews, commits, workflow runs, releases),
-> [Slack](open-connector-slack.md) (conversations, users, files — message
-> tables are gated on upstream cursor support), and
+> [Slack](open-connector-slack.md) (conversations, messages, users,
+> files — per-channel history with a `sent_at >=` time-window pushdown;
+> thread replies are not a table yet), and
 > [Notion](open-connector-notion.md) (users, pages, data sources, block
 > children — dynamic-schema rows are gated on binding-time schema
 > freeze), [Feishu](open-connector-feishu.md) (chats, messages,
-> chat members, tasks, wiki — live-verified against a real workspace),
+> chat members, docx document content and blocks, tasks, wiki —
+> live-verified against a real workspace),
 > [Discord](open-connector-discord.md) (guilds, connections, sticker
 > packs — live-verified against a real account; entitlements gated on
 > upstream pagination inputs),

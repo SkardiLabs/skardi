@@ -687,6 +687,115 @@ WHERE category = 'ai'
 ORDER BY _score DESC
 ```
 
+### Raw SQL FTS: `to_tsvector`, `websearch_to_tsquery`, `ts_rank`
+
+`pg_fts` builds its Postgres SQL itself, which means the query shape is
+fixed. When you want to write the full-text predicate yourself — against a
+generated column, a multi-column `tsvector`, a non-default text search
+configuration — the three PostgreSQL functions are also registered as SQL
+functions you can name directly in pipeline SQL:
+
+| Function | Arguments | Returns |
+|---|---|---|
+| `to_tsvector` | `(text)` or `(regconfig, text)` | `tsvector` (modelled as a string) |
+| `websearch_to_tsquery` | `(text)` or `(regconfig, text)` | `tsquery` (modelled as a string) |
+| `ts_rank` | `(vector, query)`, plus an optional leading `weights float4[]` and/or an optional trailing `normalization integer` — 2, 3 or 4 arguments | `float4` |
+
+**PostgreSQL only.** These names exist so that a statement using them can be
+planned and handed to PostgreSQL; they are not portable SQL and no other
+source implements them.
+
+> **They belong in the `WHERE` clause, and nowhere else.**
+> Skardi never evaluates these functions — PostgreSQL does. A `WHERE`
+> predicate is pushed down to PostgreSQL whole, so the predicate form works.
+> A `ts_rank(...)` in the `SELECT` list (or an `ORDER BY` over such an
+> alias) is *not* pushed down: DataFusion evaluates the projection locally,
+> and these functions deliberately refuse to run there. **For ranking, use
+> `pg_fts`** — its `_score` is exactly the `ts_rank` value, computed inside
+> PostgreSQL.
+
+> **And they require a READ-ONLY registration.**
+> Everything below assumes the source is registered read-only — that is,
+> without `access_mode: "read_write"` in its `ctx.yaml` entry. Against a
+> read-write source these predicates **fail at execution**, every time, with
+>
+> ```
+> to_tsvector is evaluated by PostgreSQL; this query was not pushed down
+> ```
+>
+> This is not a gap waiting to be closed; it is the cost of a deliberate
+> trade. A read-write source is served by a provider that also implements
+> `UPDATE` and `DELETE`, and DataFusion builds those statements' `WHERE`
+> from the filters it hands those methods — which it only has while the
+> filter node is still in the plan. So that provider reports its filters as
+> *inexact*: they are still sent to PostgreSQL, but DataFusion also keeps a
+> local copy of the predicate. For an ordinary predicate that costs a
+> redundant re-check. For these functions it is fatal, because the local
+> copy invokes them and they refuse to run. Reporting them *exact* instead
+> would delete the filter node and silently turn
+> `UPDATE … WHERE id = 1` into an `UPDATE` of the whole table.
+>
+> **`pg_fts` works in both modes** — it builds its own SQL against a pooled
+> connection and never passes through that provider. Use it when the source
+> must stay writable.
+
+#### Supported: the predicate form
+
+```sql
+-- Pipeline SQL, against a READ-ONLY postgres source. The whole WHERE
+-- clause is pushed into PostgreSQL, where a GIN index on
+-- to_tsvector('english', body) can serve it.
+SELECT id, title, category
+FROM articles
+WHERE to_tsvector('english', body) @@ websearch_to_tsquery('english', {query})
+ORDER BY id
+LIMIT 10
+```
+
+The single-argument spellings work the same way and use the database's
+default text search configuration:
+
+```sql
+SELECT id, title
+FROM articles
+WHERE to_tsvector(body) @@ websearch_to_tsquery({query})
+```
+
+#### Unsupported: `ts_rank` in the projection
+
+```sql
+-- DO NOT DO THIS — the WHERE clause pushes down, the projection does not.
+SELECT id, title,
+       ts_rank(to_tsvector('english', body),
+               websearch_to_tsquery('english', {query})) AS rank
+FROM articles
+WHERE to_tsvector('english', body) @@ websearch_to_tsquery('english', {query})
+ORDER BY rank DESC
+```
+
+This plans, then **fails at execution** with:
+
+```
+ts_rank is evaluated by PostgreSQL; this query was not pushed down
+```
+
+Use `pg_fts` for the ranked shape instead:
+
+```sql
+SELECT id, title, _score
+FROM pg_fts('articles', 'body', {query}, 10)
+ORDER BY _score DESC
+```
+
+#### Why the failure is loud
+
+The error is deliberate, and it is better than the alternative. If these
+functions returned `NULL` when Skardi evaluated them locally, the predicate
+`NULL @@ NULL` would be `NULL`, the filter would keep no rows, and the query
+would answer "no matches" — indistinguishable from a search that genuinely
+found nothing. A failed pushdown is a bug in the query, not an empty result
+set, so it is reported as one.
+
 ## Troubleshooting
 
 ### Connection Refused
@@ -774,6 +883,11 @@ spec:
 > **Notes:**
 > - `table` and `schema` options are rejected when `hierarchy_level: catalog` is set.
 > - `allowed_schemas` must be either absent (loads all non-system schemas) or a non-empty comma-separated string. An empty string causes a startup error.
+> - `access_mode: "read_write"` costs you the raw-SQL full-text predicate:
+>   `to_tsvector(...) @@ websearch_to_tsquery(...)` fails at execution
+>   against a writable source. `pg_fts` still works. See
+>   [Raw SQL FTS](#raw-sql-fts-to_tsvector-websearch_to_tsquery-ts_rank)
+>   for why.
 
 ### Quick Start with Catalog Mode
 
