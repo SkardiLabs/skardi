@@ -13,7 +13,7 @@ use datafusion::common::Constraints;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::logical_expr::{Expr, dml::InsertOp};
+use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, dml::InsertOp};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
@@ -492,6 +492,35 @@ impl TableProvider for SqlxPostgresTableProvider {
 
     fn constraints(&self) -> Option<&Constraints> {
         self.read_provider.constraints()
+    }
+
+    /// Forwarded, and load-bearing rather than tidy.
+    ///
+    /// `TableProvider`'s default answers `Unsupported` for every filter, so
+    /// a wrapper that forwards `scan` but not this one is handed an EMPTY
+    /// filter slice: DataFusion keeps a `Filter` node above the scan and
+    /// evaluates every predicate locally. Reads through this provider
+    /// therefore pushed down NOTHING — not the FTS predicates, not a plain
+    /// `WHERE id = 1` — while the read-only path (bare `SqlTable`, which
+    /// does implement this) pushed down normally. Same source, same SQL,
+    /// different plan depending only on whether writes were enabled.
+    ///
+    /// For ordinary columns that is a performance bug: the whole table
+    /// crosses the wire. For the Postgres FTS scalars it is fatal.
+    /// `to_tsvector` and `websearch_to_tsquery` are registered to ERROR
+    /// when evaluated locally — deliberately, because a NULL-returning stub
+    /// would make `NULL @@ NULL` filter everything out and report "no
+    /// matches", indistinguishable from a genuine empty result — so a
+    /// full-text query against a read-write registration aborted with
+    /// "this query was not pushed down" instead of running at all.
+    ///
+    /// The verdict must come from `read_provider`: it is what builds the
+    /// SQL that is actually sent, so only it knows what it can express.
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
+        self.read_provider.supports_filters_pushdown(filters)
     }
 
     async fn scan(
@@ -1068,7 +1097,7 @@ mod tests {
         BooleanArray, Float64Array, Int16Array, Int32Array, Int64Array, StringArray,
     };
     use datafusion::common::Column;
-    use datafusion::logical_expr::Operator;
+    use datafusion::logical_expr::{Operator, TableProviderFilterPushDown};
     use secrecy::ExposeSecret;
 
     // ─── build_sqlx_connection_url tests ────────────────────────────────
@@ -2335,5 +2364,178 @@ mod tests {
         assert!(field_names.contains(&"user_id"));
         assert!(field_names.contains(&"user_name"));
         assert!(field_names.contains(&"total_orders"));
+    }
+
+    // ─── read-write filter pushdown ─────────────────────────────────────
+
+    /// A stand-in for `SqlTable`, reporting the pushdown verdict a real
+    /// read provider reports so the WRAPPER's forwarding is what is under
+    /// test rather than the inner provider's own logic.
+    #[derive(Debug)]
+    struct PushdownProbe {
+        verdict: TableProviderFilterPushDown,
+    }
+
+    #[async_trait]
+    impl TableProvider for PushdownProbe {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn schema(&self) -> SchemaRef {
+            Arc::new(Schema::new(vec![Field::new("body", DataType::Utf8, true)]))
+        }
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+        fn supports_filters_pushdown(
+            &self,
+            filters: &[&Expr],
+        ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
+            Ok(vec![self.verdict.clone(); filters.len()])
+        }
+        async fn scan(
+            &self,
+            _state: &dyn Session,
+            _projection: Option<&Vec<usize>>,
+            _filters: &[Expr],
+            _limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            unreachable!("this probe is only asked about pushdown, never scanned")
+        }
+    }
+
+    fn rw_provider_over(verdict: TableProviderFilterPushDown) -> SqlxPostgresTableProvider {
+        SqlxPostgresTableProvider {
+            read_provider: Arc::new(PushdownProbe { verdict }),
+            // Lazy: constructing a pool performs no I/O, and this test
+            // never reaches a write path.
+            sqlx_pool: sqlx::postgres::PgPoolOptions::new()
+                .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+                .expect("lazy pool"),
+            table_reference: TableReference::bare("docs"),
+            auto_generated_columns: Vec::new(),
+        }
+    }
+
+    /// The read-write wrapper must report what its READ provider reports.
+    ///
+    /// It does not by default: `TableProvider::supports_filters_pushdown`
+    /// answers `Unsupported` for every filter unless a provider overrides
+    /// it, so a wrapper that forwards `scan` but not this one is handed an
+    /// EMPTY filter slice and DataFusion evaluates every predicate locally.
+    ///
+    /// For ordinary columns that is merely slow. For the Postgres FTS
+    /// scalars it is fatal: `to_tsvector` and friends are registered to
+    /// ERROR when evaluated locally (there is no honest local answer), so
+    /// a full-text query against a read-write registration aborts with
+    /// "this query was not pushed down" instead of running.
+    // `#[tokio::test]`: constructing a lazy sqlx pool still requires a
+    // Tokio context, even though it opens no connection.
+    #[tokio::test]
+    async fn read_write_wrapper_forwards_the_read_providers_pushdown_verdict() {
+        let filter = Expr::Column(Column::from_name("body"));
+        for verdict in [
+            TableProviderFilterPushDown::Exact,
+            TableProviderFilterPushDown::Inexact,
+            TableProviderFilterPushDown::Unsupported,
+        ] {
+            let provider = rw_provider_over(verdict.clone());
+            assert_eq!(
+                provider.supports_filters_pushdown(&[&filter]).unwrap(),
+                vec![verdict.clone()],
+                "the wrapper must not answer for the read provider"
+            );
+        }
+    }
+
+    /// The arity contract: one verdict per filter, in order. A forwarding
+    /// bug that returned a single verdict for a multi-filter query would
+    /// make DataFusion panic or silently mis-assign predicates.
+    #[tokio::test]
+    async fn read_write_wrapper_answers_once_per_filter() {
+        let a = Expr::Column(Column::from_name("body"));
+        let b = Expr::Column(Column::from_name("path"));
+        let provider = rw_provider_over(TableProviderFilterPushDown::Exact);
+        assert_eq!(
+            provider.supports_filters_pushdown(&[&a, &b]).unwrap().len(),
+            2
+        );
+    }
+
+    /// A probe that RECORDS the filters its `scan` is handed, so the test
+    /// can assert the consequence of the forwarding rather than the
+    /// forwarding itself.
+    #[derive(Debug)]
+    struct ScanFilterRecorder {
+        seen: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl TableProvider for ScanFilterRecorder {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn schema(&self) -> SchemaRef {
+            Arc::new(Schema::new(vec![Field::new("body", DataType::Utf8, true)]))
+        }
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+        fn supports_filters_pushdown(
+            &self,
+            filters: &[&Expr],
+        ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
+            Ok(vec![TableProviderFilterPushDown::Exact; filters.len()])
+        }
+        async fn scan(
+            &self,
+            _state: &dyn Session,
+            _projection: Option<&Vec<usize>>,
+            filters: &[Expr],
+            _limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            *self.seen.lock().unwrap() = filters.iter().map(|f| f.to_string()).collect();
+            Ok(Arc::new(datafusion::physical_plan::empty::EmptyExec::new(
+                self.schema(),
+            )))
+        }
+    }
+
+    /// The consequence, end to end through the planner: a predicate must
+    /// REACH the read provider's `scan`.
+    ///
+    /// This is the assertion that would have caught the bug in the field.
+    /// Checking the verdict alone tests the accessor; checking that the
+    /// filter arrives tests what DataFusion actually does with it — and an
+    /// empty slice here is precisely why a full-text query through a
+    /// read-write registration died with "this query was not pushed down".
+    #[tokio::test]
+    async fn a_predicate_reaches_the_read_providers_scan_in_read_write_mode() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = SqlxPostgresTableProvider {
+            read_provider: Arc::new(ScanFilterRecorder {
+                seen: Arc::clone(&seen),
+            }),
+            sqlx_pool: sqlx::postgres::PgPoolOptions::new()
+                .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+                .expect("lazy pool"),
+            table_reference: TableReference::bare("docs"),
+            auto_generated_columns: Vec::new(),
+        };
+        let ctx = SessionContext::new();
+        ctx.register_table("docs", Arc::new(provider))
+            .expect("register");
+        ctx.sql("SELECT body FROM docs WHERE body = 'needle'")
+            .await
+            .expect("plans")
+            .collect()
+            .await
+            .expect("executes");
+        let seen = seen.lock().unwrap().clone();
+        assert!(
+            seen.iter().any(|f| f.contains("needle")),
+            "the predicate must reach the read provider's scan; \
+             an empty slice means DataFusion is filtering locally: {seen:?}"
+        );
     }
 }
