@@ -39,9 +39,8 @@ fn as_phrase(text: &str) -> String {
     format!("\"{}\"", text.replace('"', "\"\""))
 }
 
-/// Parse `input` into terms plus the positions where the user wrote a bare
-/// `or`. Returns the terms and, for each term after the first, whether an `or`
-/// joined it to the previous one.
+/// Parse `input` into terms, each paired with whether a bare `or` came
+/// immediately before it — the point at which a new OR alternative starts.
 fn parse(input: &str) -> Vec<(Term, bool)> {
     let chars: Vec<char> = input.chars().collect();
     let mut out: Vec<(Term, bool)> = Vec::new();
@@ -97,15 +96,61 @@ fn parse(input: &str) -> Vec<(Term, bool)> {
         if !is_searchable(&text) {
             continue;
         }
-        // A negated term never participates in an OR group; the `or` the user
-        // typed beside it is dropped rather than silently changing what the
-        // negation applies to.
-        let joined_by_or = pending_or && !negated && !out.is_empty();
+        let after_or = pending_or;
         pending_or = false;
-        out.push((Term { negated, text }, joined_by_or));
+        out.push((Term { negated, text }, after_or));
     }
 
     out
+}
+
+/// One OR-separated alternative: the terms that must all match, and the terms
+/// excluded from them.
+#[derive(Default)]
+struct Branch {
+    positives: Vec<String>,
+    negatives: Vec<String>,
+}
+
+impl Branch {
+    /// This alternative as an FTS5 expression, or `None` when there is no
+    /// positive side for the exclusions to be subtracted from.
+    ///
+    /// FTS5 binds `NOT` tighter than `AND` and `AND` tighter than `OR`. Only
+    /// the subtracted side truly needs parentheses: unparenthesised,
+    /// `a NOT b OR c` offers `c` as an alternative to the whole subtraction
+    /// instead of adding it to what is excluded. The positive side is
+    /// parenthesised for legibility in `EXPLAIN` output and logs — `AND` is
+    /// associative, so `a AND b NOT c` selects the same rows as
+    /// `(a AND b) NOT c`.
+    fn render(&self) -> Option<String> {
+        if self.positives.is_empty() {
+            return None;
+        }
+        let positive = self.positives.join(" AND ");
+        if self.negatives.is_empty() {
+            return Some(positive);
+        }
+        let positive = if self.positives.len() > 1 {
+            format!("({positive})")
+        } else {
+            positive
+        };
+        let excluded = self.negatives.join(" OR ");
+        let excluded = if self.negatives.len() > 1 {
+            format!("({excluded})")
+        } else {
+            excluded
+        };
+        Some(format!("{positive} NOT {excluded}"))
+    }
+
+    /// True when [`Branch::render`] emits an operator, so the alternative
+    /// needs parentheses of its own to read unambiguously beside a sibling
+    /// `OR`.
+    fn is_compound(&self) -> bool {
+        self.positives.len() > 1 || !self.negatives.is_empty()
+    }
 }
 
 /// Translate user-typed search text into an FTS5 `MATCH` expression, mirroring
@@ -116,9 +161,12 @@ fn parse(input: &str) -> Vec<(Term, bool)> {
 ///
 /// - words separated by whitespace are ANDed;
 /// - `"…"` is a phrase, and an unterminated quote runs to the end of the input;
-/// - a bare `or` (any case) between two words makes them alternatives, binding
-///   tighter than the implicit AND — `a b or c` is `a AND (b OR c)`;
-/// - a `-` against the front of a word excludes it.
+/// - a bare `or` (any case, as `websearch_to_tsquery` also matches it)
+///   separates alternatives and binds loosest of all — `a b or c` is
+///   `(a AND b) OR c`, because tsquery gives `|` the lowest precedence and
+///   FTS5 orders `NOT`, `AND` and `OR` the same way;
+/// - a `-` against the front of a word excludes it from the alternative it
+///   sits in.
 ///
 /// Everything else is literal text. No input can produce a parse error: every
 /// term is emitted as a quoted phrase, and text with nothing to tokenize
@@ -127,11 +175,12 @@ fn parse(input: &str) -> Vec<(Term, bool)> {
 ///
 /// Two places where FTS5 cannot follow `websearch_to_tsquery` exactly:
 ///
-/// - FTS5's `NOT` is binary, so exclusions are subtracted from the positive
-///   side as `(positives) NOT (a OR b)`, and the positive side is parenthesised
-///   because `NOT` binds tighter than `AND` there. A query that is *only*
-///   exclusions has nothing to subtract from and yields `None` rather than an
-///   invented positive side.
+/// - FTS5's `NOT` is binary, tsquery's `!` is unary. An exclusion is therefore
+///   subtracted from the alternative it sits in, and an alternative that is
+///   *only* exclusions has nothing to subtract from and is dropped: `-a or b`
+///   searches for `b`, where tsquery's `!a | b` would also return everything
+///   lacking `a`. Dropping it narrows the result rather than inventing a
+///   positive side; a query that is only exclusions yields `None`.
 /// - Whether a term matches at all is still the tokenizer's call. Under
 ///   `tokenize='trigram'` a one- or two-character term cannot match through the
 ///   index, exactly as before this translation.
@@ -148,49 +197,52 @@ fn parse(input: &str) -> Vec<(Term, bool)> {
 ///     websearch_to_fts5("what's the retry policy").as_deref(),
 ///     Some(r#""what's" AND "the" AND "retry" AND "policy""#)
 /// );
+/// assert_eq!(
+///     websearch_to_fts5("gateway mode or runbook").as_deref(),
+///     Some(r#"("gateway" AND "mode") OR "runbook""#)
+/// );
 /// assert_eq!(websearch_to_fts5("   "), None);
 /// ```
 pub fn websearch_to_fts5(input: &str) -> Option<String> {
-    let terms = parse(input);
+    // A bare `or` opens the next alternative; every other term lands in the
+    // one currently open.
+    let mut branches: Vec<Branch> = vec![Branch::default()];
 
-    // Positives become AND-separated groups; an `or` merges a term into the
-    // group its predecessor is in.
-    let mut groups: Vec<Vec<String>> = Vec::new();
-    let mut negatives: Vec<String> = Vec::new();
-
-    for (term, joined_by_or) in terms {
-        if term.negated {
-            negatives.push(as_phrase(&term.text));
-        } else if joined_by_or && !groups.is_empty() {
-            let last = groups.len() - 1;
-            groups[last].push(as_phrase(&term.text));
-        } else {
-            groups.push(vec![as_phrase(&term.text)]);
+    for (term, after_or) in parse(input) {
+        if after_or {
+            branches.push(Branch::default());
+        }
+        // `branches` starts with one alternative and only ever grows.
+        if let Some(branch) = branches.last_mut() {
+            if term.negated {
+                branch.negatives.push(as_phrase(&term.text));
+            } else {
+                branch.positives.push(as_phrase(&term.text));
+            }
         }
     }
 
-    if groups.is_empty() {
-        return None;
-    }
-
-    let positive = groups
+    let mut rendered: Vec<(String, bool)> = branches
         .iter()
-        .map(|group| {
-            if group.len() == 1 {
-                group[0].clone()
-            } else {
-                format!("({})", group.join(" OR "))
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" AND ");
+        .filter_map(|branch| Some((branch.render()?, branch.is_compound())))
+        .collect();
 
-    if negatives.is_empty() {
-        return Some(positive);
+    match rendered.len() {
+        0 => None,
+        // A lone alternative is the whole expression and needs no parentheses.
+        1 => rendered.pop().map(|(expr, _)| expr),
+        _ => Some(
+            rendered
+                .into_iter()
+                .map(
+                    |(expr, compound)| {
+                        if compound { format!("({expr})") } else { expr }
+                    },
+                )
+                .collect::<Vec<_>>()
+                .join(" OR "),
+        ),
     }
-
-    let excluded = negatives.join(" OR ");
-    Some(format!("({positive}) NOT ({excluded})"))
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -275,15 +327,26 @@ mod tests {
         );
     }
 
+    /// `websearch_to_tsquery` ANDs adjacent words and then turns `or` into
+    /// `|`, which has the lowest precedence in tsquery — the documented
+    /// `'"sad cat" or "fat rat"'` comes back as
+    /// `'sad' <-> 'cat' | 'fat' <-> 'rat'`, ungrouped. So the words on either
+    /// side of `or` collect into alternatives; the `or` does not join one word
+    /// into the AND chain. FTS5 orders `NOT`, `AND`, `OR` the same way, so the
+    /// same grouping is expressible.
     #[test]
-    fn a_bare_or_binds_tighter_than_the_implicit_and() {
+    fn a_bare_or_separates_alternatives_and_binds_loosest() {
         assert_eq!(
             websearch_to_fts5("sync fails or stalls").as_deref(),
-            Some(r#""sync" AND ("fails" OR "stalls")"#)
+            Some(r#"("sync" AND "fails") OR "stalls""#)
         );
         assert_eq!(
             websearch_to_fts5("fat OR rat").as_deref(),
-            Some(r#"("fat" OR "rat")"#)
+            Some(r#""fat" OR "rat""#)
+        );
+        assert_eq!(
+            websearch_to_fts5("sync fails or replication stalls").as_deref(),
+            Some(r#"("sync" AND "fails") OR ("replication" AND "stalls")"#)
         );
     }
 
@@ -297,19 +360,51 @@ mod tests {
 
     #[test]
     fn a_leading_hyphen_excludes_and_the_positive_side_is_parenthesised() {
-        // FTS5's NOT binds tighter than AND, so an unparenthesised
-        // `a AND b NOT c` would subtract c from b alone.
+        // The parentheses group what the exclusion applies to explicitly.
+        // They do not change the row set — FTS5 binds NOT tighter than AND
+        // and AND is associative — but the emitted expression shows up in
+        // EXPLAIN output, so it should read the way it means.
         assert_eq!(
             websearch_to_fts5("sync failure -postgres").as_deref(),
-            Some(r#"("sync" AND "failure") NOT ("postgres")"#)
+            Some(r#"("sync" AND "failure") NOT "postgres""#)
         );
     }
 
     #[test]
     fn several_exclusions_are_ored_on_the_subtracted_side() {
+        // These parentheses are load-bearing: OR binds looser than NOT, so an
+        // unparenthesised `a NOT b OR c` returns everything matching c as
+        // well, instead of excluding both b and c.
         assert_eq!(
             websearch_to_fts5("sync -postgres -mysql").as_deref(),
-            Some(r#"("sync") NOT ("postgres" OR "mysql")"#)
+            Some(r#""sync" NOT ("postgres" OR "mysql")"#)
+        );
+    }
+
+    /// tsquery binds `!` tightest and `|` loosest, so `a or b -c` is
+    /// `a | (b & !c)`: the exclusion belongs to one alternative, not to the
+    /// whole query.
+    #[test]
+    fn an_exclusion_applies_only_to_the_alternative_it_sits_in() {
+        assert_eq!(
+            websearch_to_fts5("gateway or runbook -policy").as_deref(),
+            Some(r#""gateway" OR ("runbook" NOT "policy")"#)
+        );
+        assert_eq!(
+            websearch_to_fts5("gateway -mode or runbook").as_deref(),
+            Some(r#"("gateway" NOT "mode") OR "runbook""#)
+        );
+    }
+
+    #[test]
+    fn an_alternative_that_is_only_exclusions_is_dropped() {
+        // tsquery's `!a | b` returns everything lacking `a` as well, but
+        // FTS5's NOT is binary and has no unary spelling. Dropping the
+        // alternative narrows the result; inventing a positive side for it
+        // would answer a different question.
+        assert_eq!(
+            websearch_to_fts5("-postgres or sync").as_deref(),
+            Some(r#""sync""#)
         );
     }
 

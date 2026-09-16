@@ -480,6 +480,27 @@ mod tests {
         batches.iter().map(|b| b.num_rows()).sum()
     }
 
+    /// The `title` column of every returned row, sorted so an assertion names
+    /// the row set rather than the BM25 order.
+    fn sorted_titles(batches: &[RecordBatch]) -> Vec<String> {
+        let mut titles: Vec<String> = batches
+            .iter()
+            .flat_map(|batch| {
+                let column = batch
+                    .column_by_name("title")
+                    .expect("title column")
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("title is Utf8");
+                (0..column.len())
+                    .map(|i| column.value(i).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        titles.sort();
+        titles
+    }
+
     #[tokio::test]
     #[ignore]
     async fn test_fts_basic_search() {
@@ -754,14 +775,11 @@ mod tests {
         )
         .await;
 
-        let titles = batches[0]
-            .column_by_name("title")
-            .expect("title column")
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("title is Utf8");
-        assert_eq!(total_rows(&batches), 1, "expected the read-only row");
-        assert_eq!(titles.value(0), "Gateway Modes");
+        assert_eq!(
+            sorted_titles(&batches),
+            vec!["Gateway Modes".to_string()],
+            "expected the read-only row"
+        );
     }
 
     /// The apostrophe matters most: a natural English question hits it before
@@ -829,17 +847,77 @@ mod tests {
             "SELECT title FROM sqlite_fts('articles_fts', 'body', 'gateway or runbook', 10)",
         )
         .await;
-        assert_eq!(total_rows(&both), 2, "or should reach both ops articles");
+        assert_eq!(
+            sorted_titles(&both),
+            vec!["Gateway Modes".to_string(), "Retry Policy".to_string()],
+            "or should reach both ops articles"
+        );
 
-        let excluded = query_all(
+        let kept = query_all(
             &ctx,
-            "SELECT title FROM sqlite_fts('articles_fts', 'body', 'gateway or runbook -policy', 10)",
+            "SELECT title FROM sqlite_fts('articles_fts', 'body', 'runbook -gateway', 10)",
         )
         .await;
         assert_eq!(
-            total_rows(&excluded),
-            1,
-            "-policy should drop the runbook row"
+            sorted_titles(&kept),
+            vec!["Retry Policy".to_string()],
+            "an exclusion the row does not carry leaves it in place"
+        );
+
+        let dropped = query_all(
+            &ctx,
+            "SELECT title FROM sqlite_fts('articles_fts', 'body', 'runbook -policy', 10)",
+        )
+        .await;
+        assert_eq!(
+            total_rows(&dropped),
+            0,
+            "-policy should drop the one runbook row"
+        );
+    }
+
+    /// `or` binds loosest, as `|` does in tsquery: `a b or c` asks for rows
+    /// carrying both `a` and `b`, *or* rows carrying `c`. Grouping it the
+    /// other way — `a AND (b OR c)` — would require every row to carry
+    /// `gateway` and so would never return the runbook row.
+    #[tokio::test]
+    #[ignore]
+    async fn test_fts_or_groups_looser_than_the_implicit_and() {
+        let mut ctx = SessionContext::new();
+        let (_reg, _db) = register_ci_fts(&mut ctx).await;
+
+        let batches = query_all(
+            &ctx,
+            "SELECT title FROM sqlite_fts('articles_fts', 'body', 'gateway mode or runbook', 10)",
+        )
+        .await;
+
+        assert_eq!(
+            sorted_titles(&batches),
+            vec!["Gateway Modes".to_string(), "Retry Policy".to_string()],
+        );
+    }
+
+    /// An exclusion belongs to the alternative it sits in, not to the whole
+    /// query: tsquery binds `!` tightest and `|` loosest, so `a or b -c` is
+    /// `a | (b & !c)` and `-c` never reaches the first alternative. Applying
+    /// it to both — `(a OR b) NOT c` — would drop the gateway row, which
+    /// carries `mode`.
+    #[tokio::test]
+    #[ignore]
+    async fn test_fts_exclusion_stays_inside_its_alternative() {
+        let mut ctx = SessionContext::new();
+        let (_reg, _db) = register_ci_fts(&mut ctx).await;
+
+        let batches = query_all(
+            &ctx,
+            "SELECT title FROM sqlite_fts('articles_fts', 'body', 'gateway or runbook -mode', 10)",
+        )
+        .await;
+
+        assert_eq!(
+            sorted_titles(&batches),
+            vec!["Gateway Modes".to_string(), "Retry Policy".to_string()],
         );
     }
 }

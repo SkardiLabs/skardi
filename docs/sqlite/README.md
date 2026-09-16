@@ -478,6 +478,12 @@ way:
 | `foo or bar` | OR (either term) | `machine or database` |
 | `-foo` | NOT (exclude term) | `learning -database` |
 
+`or` binds loosest, so it splits the query into alternatives:
+`neural network or database` finds rows carrying both `neural` and `network`,
+plus rows carrying `database`. An exclusion belongs to the alternative it sits
+in, so in `neural or database -sql` the `-sql` narrows the `database` side
+only. That is the grouping `websearch_to_tsquery` gives the same text.
+
 Everything else is literal text. Apostrophes, colons and hyphens are ordinary
 characters — `what's the retry policy`, `note: check the gateway` and
 `read-only mode` are all searched for as written, and no input can turn a
@@ -486,8 +492,11 @@ pure punctuation) returns no rows.
 
 Because the parameter is search text, FTS5's own operator syntax is not
 reachable through it: `mach*` prefix queries, `NEAR()`, `column : term` filters
-and the uppercase `AND` / `OR` / `NOT` keywords are searched for literally
-rather than executed. Use the `or` and `-` forms above instead.
+and the `AND` / `NOT` keywords are searched for literally rather than executed.
+Use the `or` and `-` forms above for boolean logic. `or` is the one word that
+stays an operator, and it is matched in any case: `or`, `OR` and `Or` all mean
+the same thing, as they do in `websearch_to_tsquery`. To search for the word
+itself, quote it as `"or"`.
 
 ### Write
 
