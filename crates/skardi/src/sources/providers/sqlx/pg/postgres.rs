@@ -1122,6 +1122,7 @@ async fn detect_auto_generated_columns(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sources::providers::sqlx::pg::register_pg_fts_udfs;
     use arrow::array::{
         BooleanArray, Float64Array, Int16Array, Int32Array, Int64Array, StringArray,
     };
@@ -1862,6 +1863,27 @@ mod tests {
         .unwrap_or_else(|e| panic!("register {} failed: {}", table, e));
     }
 
+    /// The same table registered READ-ONLY — a bare `SqlTable`, with no
+    /// read-write wrapper and so no `Inexact` clamp.
+    async fn register_ci_table_read_only(ctx: &mut SessionContext, table: &str) {
+        let mut options = HashMap::new();
+        options.insert("table".to_string(), table.to_string());
+        options.insert("schema".to_string(), "public".to_string());
+        options.insert("user_env".to_string(), "PG_USER".to_string());
+        options.insert("pass_env".to_string(), "PG_PASSWORD".to_string());
+        register_postgres_tables(
+            ctx,
+            table,
+            "postgresql://127.0.0.1:5432/mydb?sslmode=disable",
+            Some(&options),
+            false,
+            None,
+            HierarchyLevel::Table,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("register {} read-only failed: {}", table, e));
+    }
+
     async fn query_all(ctx: &SessionContext, sql: &str) -> Vec<RecordBatch> {
         let df = ctx.sql(sql).await.expect("parse sql");
         df.collect().await.expect("collect results")
@@ -2267,6 +2289,63 @@ mod tests {
         )
         .await;
         assert!(total_rows(&batches) >= 3);
+    }
+
+    /// The other half of the documented contract: the predicate the guide
+    /// tells users to write DOES work against a read-only source. Without
+    /// this, the guidance "use a read-only registration" would be advice
+    /// nothing verifies.
+    #[tokio::test]
+    #[ignore]
+    async fn raw_fts_predicate_works_against_a_read_only_registration() {
+        let mut ctx = SessionContext::new();
+        register_ci_table_read_only(&mut ctx, "articles").await;
+        register_pg_fts_udfs(&ctx);
+
+        let batches = query_all(
+            &ctx,
+            "SELECT id, title FROM articles \
+             WHERE to_tsvector('english', body) @@ \
+                   websearch_to_tsquery('english', 'database')",
+        )
+        .await;
+        // The seeded corpus has exactly one article about databases.
+        assert_eq!(total_rows(&batches), 1);
+    }
+
+    /// The documented limitation of `docs/postgres/README.md`'s raw-SQL FTS
+    /// section, pinned against a real database.
+    ///
+    /// A read-write registration reports its filters `Inexact` (see
+    /// `supports_filters_pushdown`), which keeps a LOCAL copy of the
+    /// predicate in the plan. For an ordinary column that is a redundant
+    /// re-check; for the FTS scalars it is fatal, because the local copy
+    /// invokes them and they refuse to run. The guide tells users raw FTS
+    /// needs a read-only source — this is the test that keeps that true.
+    #[tokio::test]
+    #[ignore]
+    async fn raw_fts_predicate_fails_against_a_read_write_registration() {
+        let mut ctx = SessionContext::new();
+        register_ci_table(&mut ctx, "articles").await;
+        register_pg_fts_udfs(&ctx);
+
+        let err = ctx
+            .sql(
+                "SELECT id, title FROM articles \
+                 WHERE to_tsvector('english', body) @@ \
+                       websearch_to_tsquery('english', 'database')",
+            )
+            .await
+            .expect("the statement PLANS — only execution fails")
+            .collect()
+            .await
+            .expect_err("a read-write registration cannot execute this predicate");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("this query was not pushed down"),
+            "the refusal must name the cause: {message}"
+        );
     }
 
     #[tokio::test]

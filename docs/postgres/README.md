@@ -714,11 +714,37 @@ source implements them.
 > `pg_fts`** — its `_score` is exactly the `ts_rank` value, computed inside
 > PostgreSQL.
 
+> **And they require a READ-ONLY registration.**
+> Everything below assumes the source is registered read-only — that is,
+> without `access_mode: "read_write"` in its `ctx.yaml` entry. Against a
+> read-write source these predicates **fail at execution**, every time, with
+>
+> ```
+> to_tsvector is evaluated by PostgreSQL; this query was not pushed down
+> ```
+>
+> This is not a gap waiting to be closed; it is the cost of a deliberate
+> trade. A read-write source is served by a provider that also implements
+> `UPDATE` and `DELETE`, and DataFusion builds those statements' `WHERE`
+> from the filters it hands those methods — which it only has while the
+> filter node is still in the plan. So that provider reports its filters as
+> *inexact*: they are still sent to PostgreSQL, but DataFusion also keeps a
+> local copy of the predicate. For an ordinary predicate that costs a
+> redundant re-check. For these functions it is fatal, because the local
+> copy invokes them and they refuse to run. Reporting them *exact* instead
+> would delete the filter node and silently turn
+> `UPDATE … WHERE id = 1` into an `UPDATE` of the whole table.
+>
+> **`pg_fts` works in both modes** — it builds its own SQL against a pooled
+> connection and never passes through that provider. Use it when the source
+> must stay writable.
+
 #### Supported: the predicate form
 
 ```sql
--- Pipeline SQL. The whole WHERE clause is pushed into PostgreSQL, where
--- a GIN index on to_tsvector('english', body) can serve it.
+-- Pipeline SQL, against a READ-ONLY postgres source. The whole WHERE
+-- clause is pushed into PostgreSQL, where a GIN index on
+-- to_tsvector('english', body) can serve it.
 SELECT id, title, category
 FROM articles
 WHERE to_tsvector('english', body) @@ websearch_to_tsquery('english', {query})
@@ -857,6 +883,11 @@ spec:
 > **Notes:**
 > - `table` and `schema` options are rejected when `hierarchy_level: catalog` is set.
 > - `allowed_schemas` must be either absent (loads all non-system schemas) or a non-empty comma-separated string. An empty string causes a startup error.
+> - `access_mode: "read_write"` costs you the raw-SQL full-text predicate:
+>   `to_tsvector(...) @@ websearch_to_tsquery(...)` fails at execution
+>   against a writable source. `pg_fts` still works. See
+>   [Raw SQL FTS](#raw-sql-fts-to_tsvector-websearch_to_tsquery-ts_rank)
+>   for why.
 
 ### Quick Start with Catalog Mode
 
