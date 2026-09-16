@@ -1,7 +1,9 @@
 {
-  "pageId": "7b2e4c1a-9d3f-4e5b-8a6c-1f2d3e4b5a60",
-  "markdown": "# skardi-notion-measure-page\n\nSkardi ingests SaaS content into a per-workspace corpus so an agent can answer questions over it.\n\nThis page is the Notion ETL measurement corpus. It exists to prove that page text — rendered as Markdown, not block structure — reaches the corpus database.\n\n- `block_children` carries a block's payload under a key named by its own type, which a fixed relational mapping cannot address.\n- `retrieve_page_markdown` returns the whole page rendered in one call, which is the shape an OKF document row wants.\n\nIf you are reading this row in Postgres, the pipeline worked end to end.\n",
+  "object": "page_markdown",
+  "id": "7b2e4c1a-9d3f-4e5b-8a6c-1f2d3e4b5a60",
+  "markdown": "# skardi-notion-measure-page\n\nSkardi ingests SaaS content into a per-workspace corpus so an agent can answer questions over it.\n\nThis page is the Notion ETL measurement corpus. It exists to prove that page text \u2014 rendered as Markdown, not block structure \u2014 reaches the corpus database.\n\n- `block_children` carries a block's payload under a key named by its own type, which a fixed relational mapping cannot address.\n- `retrieve_page_markdown` returns the whole page rendered in one call, which is the shape an OKF document row wants.\n\nIf you are reading this row in Postgres, the pipeline worked end to end.\n",
   "truncated": false,
-  "unknownBlockIds": [],
+  "unknown_block_ids": [],
+  "pageId": "7b2e4c1a-9d3f-4e5b-8a6c-1f2d3e4b5a60",
   "lastEditedTime": "2026-09-15T18:42:11.000Z"
 }

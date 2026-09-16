@@ -134,7 +134,7 @@ tables:
     action: notion.retrieve_page_markdown
     row_path: "$"
     row_shape: object
-    fingerprint: d77029cf6920c55736345faf4807347632b54e355ddd2e48faff963bee6ecc23
+    fingerprint: 72d26f8371b5fc3ab164070018cb10c03e13e552095a06f848022484cc3a3081
     pagination:
       strategy: single_page
     resources:
@@ -153,8 +153,16 @@ tables:
       # types, so it is non-empty on ordinary pages and is not on its own a
       # partial-read signal. Read together.
       - { name: truncated, path: truncated, type: boolean, nullable: false }
-      - { name: unknown_block_ids, path: unknownBlockIds, type: json, nullable: false }
+      - { name: unknown_block_ids, path: unknown_block_ids, type: json, nullable: false }
       # The markdown endpoint reports no revision; the action reads this off
-      # `GET /pages/{id}`. It is what lets a consumer window its ingest on
-      # the page's own clock instead of re-loading every page every run.
+      # the page's own object (`GET /pages/{id}`, or `/blocks/{id}` when the
+      # id names a block subtree). It is what lets a consumer window its
+      # ingest on the page's own clock instead of re-loading every page every
+      # run.
+      #
+      # Note the two spellings above and below are deliberate, not drift:
+      # `markdown`, `truncated` and `unknown_block_ids` are NOTION's fields,
+      # forwarded verbatim under Notion's own names so the action stays wire-
+      # compatible for the SDK and CLI callers it has had since it shipped;
+      # `pageId` and `lastEditedTime` are the two the action constructs.
       - { name: last_edited_time, path: lastEditedTime, type: timestamp_ms_utc, nullable: false }
