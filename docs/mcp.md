@@ -182,6 +182,7 @@ Ad-hoc SQL against the federated engine — the MCP face of `POST /query`.
 | `sql` | string, **required** | One statement. DML only on `access_mode: read_write` sources; DDL is always rejected. |
 | `max_rows` | integer, optional | Result row cap; server default 1000. |
 | `purpose` | string, optional | One line on why you are running this query. Sent as `ai_context: {purpose, session_id}` and recorded in the server's query audit log; the `session_id` is the same per-connection (bridge) or per-session/per-request (`/mcp`) id pipeline calls carry, so related calls group together in the ledger. Omitted entirely when not provided — a query without `purpose` is audited without a session id and does not group with the session's other calls. |
+| `task` | string, optional | The larger piece of work this run of queries belongs to, repeated verbatim on every query that serves it. Where `purpose` describes one statement, `task` is what lets a whole run be read as work rather than a list of lookups. Rides inside the same `ai_context`, so it requires `purpose`: a `task` sent without one is dropped rather than sent as a partial object the server would reject. |
 
 ### `list_data_sources`
 

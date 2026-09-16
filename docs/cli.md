@@ -411,9 +411,11 @@ skardi query -e "SELECT * FROM events" --max-rows 50
 # Render as an ASCII table instead of JSON
 skardi query -e "SELECT * FROM products LIMIT 10" --table
 
-# Record why this query ran, and which session it belongs to
+# Record why this query ran, which session it belongs to, and the larger
+# task it serves
 skardi query -e "SELECT count(*) FROM orders WHERE status = 'paid'" \
-  --purpose "weekly paid-order count" --session-id sess-2026-08-27
+  --purpose "weekly paid-order count" --session-id sess-2026-08-27 \
+  --task "September revenue review"
 ```
 
 Default output is the response's `data` array, pretty-printed JSON, on
@@ -437,20 +439,31 @@ piping:
 note: results truncated; pass a higher --max-rows to see the rest
 ```
 
-### Recording intent — `--purpose` / `--session-id`
+### Recording intent — `--purpose` / `--session-id` / `--task`
 
-The two flags travel together as the request body's `ai_context` object,
+These flags travel together as the request body's `ai_context` object,
 which the server records in its query audit ledger when it was started with
-`--query-audit-db`. `--purpose` says why the query ran; `--session-id`
+`--query-audit-db`. `--purpose` says why *this* query ran; `--session-id`
 groups it with the rest of one agent session, so a later reader can tell a
 repeated question from a one-off. Without them the ledger still records the
 SQL, but nothing about intent — the column that makes "we have answered this
 before" answerable stays empty.
 
-Either flag requires the other: the server rejects an `ai_context` carrying
-only one of the pair, so the CLI refuses it at parse time rather than
-spending a round trip on a 400. Values are checked client-side before any
-request (non-empty, `--purpose` ≤ 2000 characters, `--session-id` ≤ 200).
+`--task` names the larger piece of work a run of queries belongs to, repeated
+verbatim on every query that serves it. Where `--purpose` describes one
+statement, `--task` is the one fact a day of queries cannot be reassembled
+into afterwards: it is what lets the daily brief describe *what was being
+done* rather than list the lookups it took. It is optional and requires
+`--purpose`.
+
+`--purpose` and `--session-id` each require the other, and `--task` requires
+`--purpose`: the server takes `ai_context` whole or not at all, so a partial
+object has nothing valid to travel in. The CLI refuses these combinations at
+parse time rather than spending a round trip on a 400. Values are checked
+client-side before any request: non-empty, `--purpose` and `--task` ≤ 2000
+characters each, `--session-id` ≤ 200, and the serialized `ai_context` ≤ 4096
+bytes in total — the last catches a purpose and task that are each legal but
+together overflow the object the server accepts.
 
 Unlike `run --session-id`, which travels as an HTTP header and is therefore
 held to header-safe characters, these values ride inside JSON — any

@@ -14,6 +14,15 @@ use std::path::PathBuf;
 /// must move together.
 const MAX_PURPOSE_CHARS: usize = 2000;
 
+/// Maximum serialized `ai_context` size, in bytes. Restates the server's
+/// `query_handlers::MAX_AI_CONTEXT_BYTES` for the same reason as
+/// [`MAX_PURPOSE_CHARS`]. The per-field caps do not imply this one:
+/// `--purpose` and `--task` are each `MAX_PURPOSE_CHARS`, so two full values
+/// plus a session id and the JSON framing serialize past 4096 bytes while
+/// every field is individually legal. Checked here so that invocation fails
+/// with a local message naming the cap, not as a remote 400 after the POST.
+const MAX_AI_CONTEXT_BYTES: usize = 4096;
+
 /// The three flags that become `ai_context`, carried together because they are
 /// validated together and travel to the server as one object or not at all.
 #[derive(Debug, Default)]
@@ -106,6 +115,16 @@ fn build_ai_context(
                 validate_context_string(&task, "--task", MAX_PURPOSE_CHARS)?;
                 context["task"] = Value::String(task);
             }
+            // The per-field caps each pass yet their sum can exceed the whole,
+            // so check the serialized object the way the server will. Same
+            // `.to_string().len()` the server measures, so the boundary matches.
+            let bytes = context.to_string().len();
+            if bytes > MAX_AI_CONTEXT_BYTES {
+                bail!(
+                    "ai_context serializes to {bytes} bytes, over the {MAX_AI_CONTEXT_BYTES}-byte \
+                     limit; shorten --purpose or --task"
+                );
+            }
             Ok(Some(context))
         }
         (Some(_), None) => bail!("--purpose requires --session-id"),
@@ -128,7 +147,8 @@ fn validate_context_string(value: &str, flag: &str, max_chars: usize) -> Result<
 #[cfg(test)]
 mod tests {
     use super::{
-        ContextFlags, MAX_PURPOSE_CHARS, MAX_SESSION_ID_CHARS, build_ai_context, build_body, run,
+        ContextFlags, MAX_AI_CONTEXT_BYTES, MAX_PURPOSE_CHARS, MAX_SESSION_ID_CHARS,
+        build_ai_context, build_body, run,
     };
     use crate::client::ApiClient;
     use crate::config::ClientConfig;
@@ -216,6 +236,35 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(without.get("task").is_none(), "{without}");
+    }
+
+    /// Each field is within its own cap, but the object they build is not:
+    /// two `MAX_PURPOSE_CHARS` values and a full session id serialize to about
+    /// 4,240 bytes, past the server's whole-object cap. Without a local check
+    /// that is a remote 400; this pins that it fails here, naming the cap.
+    #[test]
+    fn fields_within_their_caps_can_still_bust_the_object_cap() {
+        let purpose = "x".repeat(MAX_PURPOSE_CHARS);
+        let task = "y".repeat(MAX_PURPOSE_CHARS);
+        let session_id = "s".repeat(MAX_SESSION_ID_CHARS);
+        let err = build_ai_context(Some(purpose), Some(session_id), Some(task))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(&MAX_AI_CONTEXT_BYTES.to_string()), "{err}");
+    }
+
+    /// The whole-object check must not reject the ordinary case; a purpose,
+    /// a session id and a short task together are nowhere near the cap.
+    #[test]
+    fn a_normal_context_with_a_task_passes_the_object_cap() {
+        let ctx = build_ai_context(
+            Some("count merged PRs".into()),
+            Some("sess-1".into()),
+            Some("September delivery review".into()),
+        )
+        .unwrap()
+        .expect("expected an ai_context");
+        assert_eq!(ctx["task"], json!("September delivery review"));
     }
 
     #[test]
