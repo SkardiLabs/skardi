@@ -108,7 +108,8 @@ use arrow::datatypes::DataType;
 use datafusion::common::not_impl_err;
 use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::{
-    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
+    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature,
+    Volatility,
 };
 use datafusion::prelude::SessionContext;
 
@@ -122,13 +123,32 @@ struct PgFtsUdf {
 }
 
 impl PgFtsUdf {
-    fn new(name: &'static str, arg_count: usize, return_type: DataType) -> Self {
+    /// `arities` are the argument counts Postgres accepts for this function,
+    /// registered as one `one_of` signature.
+    ///
+    /// Pinning a single arity would have made this registration support only
+    /// the spelling `pg_fts` happens to generate, not the Postgres functions
+    /// it claims to expose: `to_tsvector(body)` (the default-regconfig form)
+    /// and `ts_rank(vector, query, normalization)` are ordinary SQL that a
+    /// hand-written pipeline is entitled to use, and they would have failed
+    /// to PLAN with a "no function matches" error.
+    ///
+    /// `TypeSignature::Any` rather than `String`: Postgres' own argument
+    /// types here are not all text — `ts_rank`'s normalization is an integer
+    /// and its optional leading `weights` is `float4[]` — and these stubs are
+    /// never evaluated, so the destination does the real type-checking. What
+    /// must stay exact is the RETURN type, which is what lets `@@` coerce and
+    /// the predicate type-check as a filter.
+    fn new(name: &'static str, arities: &[usize], return_type: DataType) -> Self {
         Self {
             name,
             // `Volatility::Immutable` matches Postgres (all three are declared
             // IMMUTABLE there) and is what lets the optimizer move these
             // freely so they reach the pushdown boundary intact.
-            signature: Signature::string(arg_count, Volatility::Immutable),
+            signature: Signature::one_of(
+                arities.iter().copied().map(TypeSignature::Any).collect(),
+                Volatility::Immutable,
+            ),
             return_type,
         }
     }
@@ -188,10 +208,13 @@ impl ScalarUDFImpl for PgFtsUdf {
 /// ```
 pub fn register_pg_fts_udfs(ctx: &SessionContext) {
     for udf in [
-        PgFtsUdf::new("to_tsvector", 2, DataType::Utf8),
-        PgFtsUdf::new("websearch_to_tsquery", 2, DataType::Utf8),
-        // Postgres' ts_rank returns float4.
-        PgFtsUdf::new("ts_rank", 2, DataType::Float32),
+        // Both Postgres forms: with an explicit regconfig, and without.
+        PgFtsUdf::new("to_tsvector", &[1, 2], DataType::Utf8),
+        PgFtsUdf::new("websearch_to_tsquery", &[1, 2], DataType::Utf8),
+        // Postgres' ts_rank returns float4, and takes 2-4 arguments:
+        // (vector, query), plus an optional leading `weights float4[]` and an
+        // optional trailing `normalization integer`.
+        PgFtsUdf::new("ts_rank", &[2, 3, 4], DataType::Float32),
     ] {
         ctx.register_udf(ScalarUDF::new_from_impl(udf));
     }
@@ -299,6 +322,43 @@ mod tests {
                 .await
                 .unwrap_or_else(|e| panic!("{sql} must plan: {e}"));
         }
+    }
+
+    /// Every arity Postgres accepts must PLAN, not just the spelling
+    /// `pg_fts` generates.
+    ///
+    /// A single pinned arity made `to_tsvector(body)` — the default-regconfig
+    /// form, ordinary Postgres, and what a hand-written pipeline is entitled
+    /// to write — fail with "no function matches", at plan time, before
+    /// anything could be pushed down.
+    #[rstest::rstest]
+    #[case::to_tsvector_default_regconfig("SELECT to_tsvector('a')")]
+    #[case::to_tsvector_explicit_regconfig("SELECT to_tsvector('english', 'a')")]
+    #[case::websearch_default_regconfig("SELECT websearch_to_tsquery('cats')")]
+    #[case::websearch_explicit_regconfig("SELECT websearch_to_tsquery('english', 'cats')")]
+    #[case::the_reviewers_predicate("SELECT to_tsvector('a') @@ websearch_to_tsquery('cats')")]
+    #[case::ts_rank_two_args(
+        "SELECT ts_rank(to_tsvector('english','a'), websearch_to_tsquery('english','a'))"
+    )]
+    #[case::ts_rank_with_normalization(
+        "SELECT ts_rank(to_tsvector('english','a'), websearch_to_tsquery('english','a'), 32)"
+    )]
+    #[case::ts_rank_with_leading_weights(
+        "SELECT ts_rank(ARRAY[0.1, 0.2, 0.4, 1.0], to_tsvector('english','a'), \
+         websearch_to_tsquery('english','a'))"
+    )]
+    #[case::ts_rank_with_weights_and_normalization(
+        "SELECT ts_rank(ARRAY[0.1, 0.2, 0.4, 1.0], to_tsvector('english','a'), \
+         websearch_to_tsquery('english','a'), 32)"
+    )]
+    #[tokio::test]
+    async fn every_postgres_overload_plans(#[case] sql: &str) {
+        let ctx = SessionContext::new();
+        register_pg_fts_udfs(&ctx);
+        ctx.state()
+            .create_logical_plan(sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql} must plan: {e}"));
     }
 
     #[tokio::test]
