@@ -75,7 +75,7 @@ async fn a_gated_command_refuses_before_issuing_any_request() {
     assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
     assert!(
         stderr(&out).contains(
-            "'job' is not available in a cloud context (acme/prod). Available: query, schema."
+            "'job' is not available in a cloud context (acme/prod). Available: query, schema, run, pipeline."
         ),
         "stderr was: {}",
         stderr(&out)
@@ -86,9 +86,10 @@ async fn a_gated_command_refuses_before_issuing_any_request() {
     );
 }
 
-/// `mcp` straddles gateway-served (`query`) and engine-local (pipeline
-/// execution, `/pipelines`) surfaces, so a cloud context refuses it whole
-/// before the bridge ever starts speaking MCP on stdout.
+/// The gateway now mounts `run` and `pipeline` too, but it serves its own
+/// `/mcp` with its own tool catalog, so this stdio bridge is refused as a
+/// redundant surface rather than a missing one — before it ever starts
+/// speaking MCP on stdout.
 #[tokio::test]
 async fn mcp_is_gated_in_a_cloud_context_before_serving() {
     let gateway = MockServer::start().await;
@@ -105,7 +106,7 @@ async fn mcp_is_gated_in_a_cloud_context_before_serving() {
     assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
     assert!(
         stderr(&out).contains(
-            "'mcp' is not available in a cloud context (acme/prod). Available: query, schema."
+            "'mcp' is not available in a cloud context (acme/prod). Available: query, schema, run, pipeline."
         ),
         "stderr was: {}",
         stderr(&out)

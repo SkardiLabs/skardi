@@ -73,10 +73,14 @@ file (`~/.skardi/config.yaml`, honoring the current context). Because the
 bridge is transport-level, pointing `--server` at a remote skardi-server
 also works, making `skardi mcp` a local MCP gateway to a remote deployment.
 
-One exception: **cloud contexts are refused.** The cloud gateway serves only
-`query` and `schema`; it does not serve pipeline execution or
-`/data_source`, so `skardi mcp` in a cloud context exits with an error
-before serving instead of offering tools that would all fail.
+One exception: **cloud contexts are refused.** That is not a statement about
+which routes a given gateway mounts — the refusal would stand either way,
+because a cloud gateway serves its own
+`/mcp` endpoint with its own tool catalog (the console documents
+`claude mcp add --transport http skardi <url>` as the cloud agent path), so
+this stdio bridge would be a second, redundant surface there rather than a
+missing one. `skardi mcp` in a cloud context exits with an error before
+serving instead of offering a duplicate.
 
 ---
 
