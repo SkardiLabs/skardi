@@ -110,9 +110,12 @@ fn build_ai_context(
             validate_context_string(&session_id, "--session-id", MAX_SESSION_ID_CHARS)?;
             let mut context = json!({ "purpose": purpose, "session_id": session_id });
             // clap's `requires = "purpose"` already refuses a lone --task, so
-            // reaching here with one means the pair is present too.
+            // reaching here with one means the pair is present too. `task`
+            // carries NO per-field length cap, deliberately: the server treats
+            // it as a free-form key and bounds it only through the whole-object
+            // limit below, so a per-field cap here would reject a long task the
+            // MCP and REST entrypoints accept — the three would disagree.
             if let Some(task) = task {
-                validate_context_string(&task, "--task", MAX_PURPOSE_CHARS)?;
                 context["task"] = Value::String(task);
             }
             // The per-field caps each pass yet their sum can exceed the whole,
@@ -238,12 +241,11 @@ mod tests {
         assert!(without.get("task").is_none(), "{without}");
     }
 
-    /// Each field is within its own cap, but the object they build is not:
-    /// two `MAX_PURPOSE_CHARS` values and a full session id serialize to about
-    /// 4,240 bytes, past the server's whole-object cap. Without a local check
-    /// that is a remote 400; this pins that it fails here, naming the cap.
+    /// A capped purpose, a full session id and a long task serialize past the
+    /// server's whole-object cap. Without a local check that is a remote 400;
+    /// this pins that it fails here, naming the cap.
     #[test]
-    fn fields_within_their_caps_can_still_bust_the_object_cap() {
+    fn a_capped_purpose_and_a_long_task_bust_the_object_cap() {
         let purpose = "x".repeat(MAX_PURPOSE_CHARS);
         let task = "y".repeat(MAX_PURPOSE_CHARS);
         let session_id = "s".repeat(MAX_SESSION_ID_CHARS);
@@ -251,6 +253,20 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains(&MAX_AI_CONTEXT_BYTES.to_string()), "{err}");
+    }
+
+    /// `task` has no per-field length cap: the server treats it as free-form
+    /// and bounds it only through the whole-object limit, so the CLI must not
+    /// reject a long task that MCP and REST would accept. A task well past
+    /// `MAX_PURPOSE_CHARS`, with a short purpose so the object stays under the
+    /// byte cap, is accepted.
+    #[test]
+    fn a_long_task_within_the_object_cap_is_accepted() {
+        let task = "y".repeat(MAX_PURPOSE_CHARS + 500);
+        let ctx = build_ai_context(Some("p".into()), Some("sess-1".into()), Some(task.clone()))
+            .unwrap()
+            .expect("expected an ai_context");
+        assert_eq!(ctx["task"], json!(task));
     }
 
     /// The whole-object check must not reject the ordinary case; a purpose,

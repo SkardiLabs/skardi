@@ -460,10 +460,13 @@ done* rather than list the lookups it took. It is optional and requires
 `--purpose`: the server takes `ai_context` whole or not at all, so a partial
 object has nothing valid to travel in. The CLI refuses these combinations at
 parse time rather than spending a round trip on a 400. Values are checked
-client-side before any request: non-empty, `--purpose` and `--task` ≤ 2000
-characters each, `--session-id` ≤ 200, and the serialized `ai_context` ≤ 4096
-bytes in total — the last catches a purpose and task that are each legal but
-together overflow the object the server accepts.
+client-side before any request: `--purpose` non-empty and ≤ 2000 characters,
+`--session-id` non-empty and ≤ 200, and the serialized `ai_context` ≤ 4096
+bytes in total. `--task` has no length cap of its own — the server treats it
+as a free-form key bounded only by that whole-object size, so capping it here
+would reject a task the REST and MCP entrypoints accept. The object-size check
+is what catches a purpose and task that are each legal but together overflow
+what the server accepts.
 
 Unlike `run --session-id`, which travels as an HTTP header and is therefore
 held to header-safe characters, these values ride inside JSON — any

@@ -13,6 +13,7 @@ use commands::config::ConfigCmd;
 use commands::jobs::JobCmd;
 use commands::login::{LoginArgs, LogoutArgs};
 use commands::pipeline::PipelineCmd;
+use commands::query::ContextFlags;
 use config::ClientConfig;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -289,7 +290,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 file,
                 max_rows,
                 table,
-                commands::query::ContextFlags {
+                ContextFlags {
                     purpose,
                     session_id,
                     task,
