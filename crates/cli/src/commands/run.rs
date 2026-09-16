@@ -9,6 +9,12 @@ use crate::session::validate_session_id;
 use anyhow::{Result, anyhow};
 use serde_json::Value;
 
+/// The server's `error_type` for "this pipeline does not exist", emitted by
+/// `crates/server/src/pipeline_handlers.rs`. Matching on it is what
+/// separates a missing PIPELINE from a missing ROUTE — the two are both
+/// `404`, and only the server can tell them apart.
+const PIPELINE_NOT_FOUND: &str = "pipeline_not_found";
+
 /// Run `skardi run <name>`: build the request body from `-d`/`-p`, `POST` it
 /// to `/{name}/execute`, and hand the response envelope to [`print_result`].
 ///
@@ -16,13 +22,22 @@ use serde_json::Value;
 /// so the server records this execution against that session in its audit
 /// ledger; when `None`, no such header is sent.
 ///
-/// A 404 response from `/{name}/execute` is ambiguous: it could mean this
-/// pipeline doesn't exist, or that the server doesn't serve pipelines at
-/// all (an older or differently configured deployment, where the route
-/// itself is missing). Rather than guess, this probes `GET /pipelines`
-/// (see [`crate::commands::pipeline::serves_pipelines`]) and reports
-/// whichever is actually true of the server that answered. Every other
-/// `ApiError` passes through unchanged (so, e.g., `main`'s
+/// A 404 from `/{name}/execute` has three possible meanings, and they are
+/// told apart by the server's own `error_type` rather than by guessing:
+///
+/// - `pipeline_not_found` — the route ran and the pipeline is genuinely
+///   absent. Reported as such.
+/// - any other 404 **with** a pipeline surface present — genuinely
+///   ambiguous between "this pipeline is absent" and "this deployment has
+///   no execute route" (a cloud gateway predating `skardi run` answers
+///   that way, and `cloud.rs` deliberately admits such a gateway). The
+///   server's own message is preserved and BOTH possibilities are named,
+///   because asserting either one would be a guess.
+/// - any 404 with **no** pipeline surface at all (`GET /pipelines` also
+///   404s, see [`crate::commands::pipeline::serves_pipelines`]) — an older
+///   or differently configured deployment with no pipeline API.
+///
+/// Every other `ApiError` passes through unchanged (so, e.g., `main`'s
 /// `downcast_ref::<ApiError>` exit-code mapping for connect failures keeps
 /// working).
 pub async fn run(
@@ -54,10 +69,32 @@ pub async fn run(
             print_result(&response, table);
             Ok(())
         }
-        Err(ApiError::Http { status: 404, .. }) => {
+        // The server named the failure, so believe it rather than probing.
+        Err(ApiError::Http {
+            status: 404,
+            error_type: Some(kind),
+            ..
+        }) if kind == PIPELINE_NOT_FOUND => Err(anyhow!(
+            "pipeline '{name}' not found — try 'skardi pipeline list'"
+        )),
+        // A 404 that is NOT the server's typed pipeline_not_found is a
+        // ROUTE-level 404: this deployment has no `POST /{{name}}/execute`
+        // at all. Claiming the pipeline is missing would be a guess, and a
+        // wrong one against a gateway that predates the execute route —
+        // exactly the deployment `cloud.rs` admits `Run` for. Keep the
+        // server's own message.
+        Err(ApiError::Http {
+            status: 404,
+            message,
+            ..
+        }) => {
             if serves_pipelines(client).await {
                 Err(anyhow!(
-                    "pipeline '{name}' not found — try 'skardi pipeline list'"
+                    "POST /{name}/execute returned 404: {message}\n\
+                     This server does serve pipelines, so either '{name}' does \
+                     not exist or this deployment has no execute route (a \
+                     gateway predating 'skardi run' answers that way). Run \
+                     'skardi pipeline list' to see which pipelines it knows."
                 ))
             } else {
                 Err(anyhow!(NO_PIPELINE_SURFACE))
@@ -139,8 +176,12 @@ mod tests {
         assert!(result.is_ok(), "expected Ok, got {result:?}");
     }
 
-    // -- 3. 404 remapped to friendly "pipeline not found" error ----------
+    // -- 3. typed pipeline_not_found -> friendly "pipeline not found" ----
 
+    /// A real skardi server emits `error_type: "pipeline_not_found"` when
+    /// the route ran and the pipeline is genuinely absent
+    /// (`crates/server/src/pipeline_handlers.rs`). That typed answer is the
+    /// only thing that licenses the friendly message.
     #[tokio::test]
     async fn not_found_status_yields_friendly_error() {
         let server = MockServer::start().await;
@@ -149,7 +190,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(404).set_body_json(json!({
                 "success": false,
                 "error": "pipeline not found",
-                "error_type": "not_found",
+                "error_type": "pipeline_not_found",
                 "details": null,
                 "timestamp": "2026-07-23T00:00:00Z",
             })))
@@ -233,16 +274,21 @@ mod tests {
         }
     }
 
-    // -- 3c. 404 + /pipelines succeeds: keep today's pipeline-not-found ---
+    // -- 3d. route-level 404 against a gateway that HAS pipelines ---------
 
+    /// The regression this arm exists for: a cloud gateway that predates
+    /// `POST /{name}/execute` answers the route itself with a 404 that is
+    /// NOT the server's `pipeline_not_found`. Reporting "pipeline not
+    /// found" there discards what the gateway said and asserts something
+    /// unproven — the pipeline may well exist.
     #[tokio::test]
-    async fn not_found_with_pipeline_surface_present_keeps_friendly_error() {
+    async fn route_level_404_is_not_reported_as_a_missing_pipeline() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/ghost/execute"))
+            .and(path("/real-pipeline/execute"))
             .respond_with(ResponseTemplate::new(404).set_body_json(json!({
                 "success": false,
-                "error": "not found",
+                "error": "no route for POST /real-pipeline/execute",
                 "error_type": "not_found",
                 "details": null,
                 "timestamp": "2026-07-23T00:00:00Z",
@@ -250,33 +296,45 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
+        // Discovery works on this deployment — only execution is missing.
         Mock::given(method("GET"))
             .and(path("/pipelines"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!([{"name": "other"}])))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!([{"name": "real-pipeline"}])),
+            )
             .expect(1)
             .mount(&server)
             .await;
 
         let client = ApiClient::new(&test_config(&server.uri())).unwrap();
-        let err = run(&client, "ghost", None, &[], false, None)
+        let err = run(&client, "real-pipeline", None, &[], false, None)
             .await
             .unwrap_err();
 
         let message = err.to_string();
         assert!(
-            message.contains("pipeline 'ghost' not found"),
-            "error was: {message}"
+            !message.contains("pipeline 'real-pipeline' not found"),
+            "a route-level 404 must not claim the pipeline is absent: {message}"
+        );
+        assert!(
+            message.contains("no execute route"),
+            "the route possibility must be named: {message}"
         );
         assert!(
             message.contains("skardi pipeline list"),
             "error was: {message}"
+        );
+        // The gateway's own words survive.
+        assert!(
+            message.contains("no route for POST /real-pipeline/execute"),
+            "the server's message must be preserved: {message}"
         );
     }
 
     // -- 3d. 404 + probe fails for an unrelated reason (500): fall back --
 
     #[tokio::test]
-    async fn not_found_with_probe_server_error_keeps_friendly_error() {
+    async fn probe_server_error_is_not_proof_the_server_lacks_pipelines() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/ghost/execute"))
@@ -308,8 +366,14 @@ mod tests {
 
         let message = err.to_string();
         assert!(
-            message.contains("pipeline 'ghost' not found"),
-            "error was: {message}"
+            message.contains("skardi pipeline list"),
+            "the message must still be actionable: {message}"
+        );
+        // The untyped 404 is ambiguous, so neither possibility may be
+        // asserted — least of all the one the probe could not establish.
+        assert!(
+            !message.contains("pipeline 'ghost' not found"),
+            "an untyped 404 must not claim the pipeline is absent: {message}"
         );
         assert!(
             !message.contains("does not serve pipelines"),
@@ -320,7 +384,7 @@ mod tests {
     // -- 3e. 404 + probe can't even connect: fall back too ---------------
 
     #[tokio::test]
-    async fn not_found_with_probe_connection_failure_keeps_friendly_error() {
+    async fn probe_connection_failure_is_not_proof_the_server_lacks_pipelines() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/ghost/execute"))
@@ -353,8 +417,14 @@ mod tests {
 
         let message = err.to_string();
         assert!(
-            message.contains("pipeline 'ghost' not found"),
-            "error was: {message}"
+            message.contains("skardi pipeline list"),
+            "the message must still be actionable: {message}"
+        );
+        // The untyped 404 is ambiguous, so neither possibility may be
+        // asserted — least of all the one the probe could not establish.
+        assert!(
+            !message.contains("pipeline 'ghost' not found"),
+            "an untyped 404 must not claim the pipeline is absent: {message}"
         );
         assert!(
             !message.contains("does not serve pipelines"),
