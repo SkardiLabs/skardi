@@ -292,7 +292,7 @@ agents; deploy it next to your data, behind your usual auth.
 
 | Type | CRUD | Catalog | Notes | Docs |
 |------|------|---------|-------|------|
-| PostgreSQL | Full | Yes | pgvector KNN, FTS | [docs](docs/postgres/) |
+| PostgreSQL | Full | Yes | pgvector KNN, FTS (`pg_fts`, plus `tsvector` predicates pushed down from raw SQL) | [docs](docs/postgres/) |
 | MySQL | Full | Yes | Table or catalog registration | [docs](docs/mysql/) |
 | SQLite | Full | Yes | sqlite-vec KNN, FTS | [docs](docs/sqlite/) |
 | MongoDB | Full | No | Collections with point lookups | [docs](docs/mongo/) |
@@ -305,7 +305,7 @@ agents; deploy it next to your data, behind your usual auth.
 | InfluxDB 3 | Read | No | Time series over Arrow Flight SQL | [docs](docs/influxdb/) |
 | S3 / GCS / Azure | Read | No | CSV, Parquet, Lance in object stores | [docs](docs/S3_USAGE.md) |
 | CSV / Parquet | Read | No | Local or remote files | [docs](docs/server.md) |
-| SaaS via Open Connector | Read | Yes | GitHub, Slack, Notion, Feishu, Gmail, Discord, Outlook, OneDrive, Google Drive, Dropbox packs as stable SQL tables; pushdown + TTL cache | [docs](docs/open-connector.md) |
+| SaaS via Open Connector | Read | Yes | GitHub, Slack, Notion, Feishu, Gmail, Discord, Outlook, OneDrive, Google Drive, Dropbox packs as stable SQL tables; Slack channel history and Feishu document text as content tables, with time-window pushdown for incremental scans; pushdown + TTL cache | [docs](docs/open-connector.md) |
 | Documents | Read | No | PDF/Office/ODF/image → per-page Markdown, tables, images | [docs](docs/documents.md) |
 | RSS / Atom | Read | Yes | Feeds as `feeds` + `items`; per-feed TTL cache, fault isolation, un-sandboxed fetch egress | [docs](docs/rss.md) |
 | Graph (Apache AGE) | Read | Yes | Read-only openCypher over Postgres; YAML views as catalog tables, `cypher_query` UDTF | [docs](docs/graph.md) |

@@ -687,6 +687,89 @@ WHERE category = 'ai'
 ORDER BY _score DESC
 ```
 
+### Raw SQL FTS: `to_tsvector`, `websearch_to_tsquery`, `ts_rank`
+
+`pg_fts` builds its Postgres SQL itself, which means the query shape is
+fixed. When you want to write the full-text predicate yourself — against a
+generated column, a multi-column `tsvector`, a non-default text search
+configuration — the three PostgreSQL functions are also registered as SQL
+functions you can name directly in pipeline SQL:
+
+| Function | Arguments | Returns |
+|---|---|---|
+| `to_tsvector` | `(text)` or `(regconfig, text)` | `tsvector` (modelled as a string) |
+| `websearch_to_tsquery` | `(text)` or `(regconfig, text)` | `tsquery` (modelled as a string) |
+| `ts_rank` | `(vector, query)`, plus an optional leading `weights float4[]` and/or an optional trailing `normalization integer` — 2, 3 or 4 arguments | `float4` |
+
+**PostgreSQL only.** These names exist so that a statement using them can be
+planned and handed to PostgreSQL; they are not portable SQL and no other
+source implements them.
+
+> **They belong in the `WHERE` clause, and nowhere else.**
+> Skardi never evaluates these functions — PostgreSQL does. A `WHERE`
+> predicate is pushed down to PostgreSQL whole, so the predicate form works.
+> A `ts_rank(...)` in the `SELECT` list (or an `ORDER BY` over such an
+> alias) is *not* pushed down: DataFusion evaluates the projection locally,
+> and these functions deliberately refuse to run there. **For ranking, use
+> `pg_fts`** — its `_score` is exactly the `ts_rank` value, computed inside
+> PostgreSQL.
+
+#### Supported: the predicate form
+
+```sql
+-- Pipeline SQL. The whole WHERE clause is pushed into PostgreSQL, where
+-- a GIN index on to_tsvector('english', body) can serve it.
+SELECT id, title, category
+FROM articles
+WHERE to_tsvector('english', body) @@ websearch_to_tsquery('english', {query})
+ORDER BY id
+LIMIT 10
+```
+
+The single-argument spellings work the same way and use the database's
+default text search configuration:
+
+```sql
+SELECT id, title
+FROM articles
+WHERE to_tsvector(body) @@ websearch_to_tsquery({query})
+```
+
+#### Unsupported: `ts_rank` in the projection
+
+```sql
+-- DO NOT DO THIS — the WHERE clause pushes down, the projection does not.
+SELECT id, title,
+       ts_rank(to_tsvector('english', body),
+               websearch_to_tsquery('english', {query})) AS rank
+FROM articles
+WHERE to_tsvector('english', body) @@ websearch_to_tsquery('english', {query})
+ORDER BY rank DESC
+```
+
+This plans, then **fails at execution** with:
+
+```
+ts_rank is evaluated by PostgreSQL; this query was not pushed down
+```
+
+Use `pg_fts` for the ranked shape instead:
+
+```sql
+SELECT id, title, _score
+FROM pg_fts('articles', 'body', {query}, 10)
+ORDER BY _score DESC
+```
+
+#### Why the failure is loud
+
+The error is deliberate, and it is better than the alternative. If these
+functions returned `NULL` when Skardi evaluated them locally, the predicate
+`NULL @@ NULL` would be `NULL`, the filter would keep no rows, and the query
+would answer "no matches" — indistinguishable from a search that genuinely
+found nothing. A failed pushdown is a bug in the query, not an empty result
+set, so it is reported as one.
+
 ## Troubleshooting
 
 ### Connection Refused
