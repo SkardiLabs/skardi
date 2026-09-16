@@ -434,7 +434,9 @@ mod tests {
                    ('Database Systems', 'Overview of relational database management systems and SQL', 'database'),
                    ('Deep Learning', 'Advanced neural network architectures for machine learning', 'ai'),
                    ('Web Development', 'Modern web frameworks and frontend technologies', 'web'),
-                   ('Natural Language Processing', 'NLP techniques for text analysis and machine learning applications', 'ai');",
+                   ('Natural Language Processing', 'NLP techniques for text analysis and machine learning applications', 'ai'),
+                   ('Gateway Modes', 'The gateway runs in read-only mode and it doesn''t write anything back', 'ops'),
+                   ('Retry Policy', 'note: the retry policy is described in the ops runbook', 'ops');",
             )?;
             Ok(())
         })
@@ -476,6 +478,27 @@ mod tests {
 
     fn total_rows(batches: &[RecordBatch]) -> usize {
         batches.iter().map(|b| b.num_rows()).sum()
+    }
+
+    /// The `title` column of every returned row, sorted so an assertion names
+    /// the row set rather than the BM25 order.
+    fn sorted_titles(batches: &[RecordBatch]) -> Vec<String> {
+        let mut titles: Vec<String> = batches
+            .iter()
+            .flat_map(|batch| {
+                let column = batch
+                    .column_by_name("title")
+                    .expect("title column")
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("title is Utf8");
+                (0..column.len())
+                    .map(|i| column.value(i).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        titles.sort();
+        titles
     }
 
     #[tokio::test]
@@ -728,6 +751,173 @@ mod tests {
             total_rows(&batches),
             0,
             "deleted article must not appear in FTS results"
+        );
+    }
+
+    // ─── The parameter is user text, not an FTS5 expression ──────────────
+    // Every query in this block returned an execution error before
+    // `websearch_to_fts5` sat in front of FTS5 (SkardiLabs/skardi-skills#39):
+    // FTS5 read the apostrophe as a string delimiter, the colon as a column
+    // filter, and the hyphen as a term boundary. These are the questions a
+    // person types into a search box, so they have to answer.
+
+    /// A hyphenated technical term is the vocabulary a technical corpus is
+    /// made of. It has to find the row, not merely avoid erroring.
+    #[tokio::test]
+    #[ignore]
+    async fn test_fts_hyphenated_term_finds_the_row() {
+        let mut ctx = SessionContext::new();
+        let (_reg, _db) = register_ci_fts(&mut ctx).await;
+
+        let batches = query_all(
+            &ctx,
+            "SELECT title FROM sqlite_fts('articles_fts', 'body', 'read-only mode', 10)",
+        )
+        .await;
+
+        assert_eq!(
+            sorted_titles(&batches),
+            vec!["Gateway Modes".to_string()],
+            "expected the read-only row"
+        );
+    }
+
+    /// The apostrophe matters most: a natural English question hits it before
+    /// a hyphenated term does.
+    #[tokio::test]
+    #[ignore]
+    async fn test_fts_apostrophe_finds_the_row() {
+        let mut ctx = SessionContext::new();
+        let (_reg, _db) = register_ci_fts(&mut ctx).await;
+
+        // Doubled for the SQL string literal; FTS5 sees `doesn't write`.
+        let batches = query_all(
+            &ctx,
+            "SELECT title FROM sqlite_fts('articles_fts', 'body', 'doesn''t write', 10)",
+        )
+        .await;
+        assert_eq!(total_rows(&batches), 1, "expected the read-only row");
+    }
+
+    /// A colon used to be read as a column filter and reported as
+    /// `no such column: note`.
+    #[tokio::test]
+    #[ignore]
+    async fn test_fts_colon_is_literal_text_not_a_column_filter() {
+        let mut ctx = SessionContext::new();
+        let (_reg, _db) = register_ci_fts(&mut ctx).await;
+
+        let batches = query_all(
+            &ctx,
+            "SELECT title FROM sqlite_fts('articles_fts', 'body', 'note: retry policy', 10)",
+        )
+        .await;
+        assert_eq!(total_rows(&batches), 1, "expected the retry-policy row");
+    }
+
+    /// A blank question is answerable without asking FTS5, which rejects an
+    /// empty match string outright. Zero rows is the honest answer; the
+    /// alternative that used to be possible — rows for a question nobody
+    /// asked — is worse than an error.
+    #[tokio::test]
+    #[ignore]
+    async fn test_fts_query_with_nothing_to_search_for_returns_no_rows() {
+        let mut ctx = SessionContext::new();
+        let (_reg, _db) = register_ci_fts(&mut ctx).await;
+
+        for query in ["", "   ", "---"] {
+            let batches = query_all(
+                &ctx,
+                &format!("SELECT title FROM sqlite_fts('articles_fts', 'body', '{query}', 10)"),
+            )
+            .await;
+            assert_eq!(total_rows(&batches), 0, "query {query:?}");
+        }
+    }
+
+    /// `websearch_to_tsquery`'s two operators, honoured on this backend too.
+    #[tokio::test]
+    #[ignore]
+    async fn test_fts_or_and_exclusion_operators() {
+        let mut ctx = SessionContext::new();
+        let (_reg, _db) = register_ci_fts(&mut ctx).await;
+
+        let both = query_all(
+            &ctx,
+            "SELECT title FROM sqlite_fts('articles_fts', 'body', 'gateway or runbook', 10)",
+        )
+        .await;
+        assert_eq!(
+            sorted_titles(&both),
+            vec!["Gateway Modes".to_string(), "Retry Policy".to_string()],
+            "or should reach both ops articles"
+        );
+
+        let kept = query_all(
+            &ctx,
+            "SELECT title FROM sqlite_fts('articles_fts', 'body', 'runbook -gateway', 10)",
+        )
+        .await;
+        assert_eq!(
+            sorted_titles(&kept),
+            vec!["Retry Policy".to_string()],
+            "an exclusion the row does not carry leaves it in place"
+        );
+
+        let dropped = query_all(
+            &ctx,
+            "SELECT title FROM sqlite_fts('articles_fts', 'body', 'runbook -policy', 10)",
+        )
+        .await;
+        assert_eq!(
+            total_rows(&dropped),
+            0,
+            "-policy should drop the one runbook row"
+        );
+    }
+
+    /// `or` binds loosest, as `|` does in tsquery: `a b or c` asks for rows
+    /// carrying both `a` and `b`, *or* rows carrying `c`. Grouping it the
+    /// other way — `a AND (b OR c)` — would require every row to carry
+    /// `gateway` and so would never return the runbook row.
+    #[tokio::test]
+    #[ignore]
+    async fn test_fts_or_groups_looser_than_the_implicit_and() {
+        let mut ctx = SessionContext::new();
+        let (_reg, _db) = register_ci_fts(&mut ctx).await;
+
+        let batches = query_all(
+            &ctx,
+            "SELECT title FROM sqlite_fts('articles_fts', 'body', 'gateway mode or runbook', 10)",
+        )
+        .await;
+
+        assert_eq!(
+            sorted_titles(&batches),
+            vec!["Gateway Modes".to_string(), "Retry Policy".to_string()],
+        );
+    }
+
+    /// An exclusion belongs to the alternative it sits in, not to the whole
+    /// query: tsquery binds `!` tightest and `|` loosest, so `a or b -c` is
+    /// `a | (b & !c)` and `-c` never reaches the first alternative. Applying
+    /// it to both — `(a OR b) NOT c` — would drop the gateway row, which
+    /// carries `mode`.
+    #[tokio::test]
+    #[ignore]
+    async fn test_fts_exclusion_stays_inside_its_alternative() {
+        let mut ctx = SessionContext::new();
+        let (_reg, _db) = register_ci_fts(&mut ctx).await;
+
+        let batches = query_all(
+            &ctx,
+            "SELECT title FROM sqlite_fts('articles_fts', 'body', 'gateway or runbook -mode', 10)",
+        )
+        .await;
+
+        assert_eq!(
+            sorted_titles(&batches),
+            vec!["Gateway Modes".to_string(), "Retry Policy".to_string()],
         );
     }
 }
