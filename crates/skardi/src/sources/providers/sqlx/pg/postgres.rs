@@ -494,33 +494,62 @@ impl TableProvider for SqlxPostgresTableProvider {
         self.read_provider.constraints()
     }
 
-    /// Forwarded, and load-bearing rather than tidy.
+    /// Report what the read provider can express, but never `Exact`.
     ///
-    /// `TableProvider`'s default answers `Unsupported` for every filter, so
-    /// a wrapper that forwards `scan` but not this one is handed an EMPTY
-    /// filter slice: DataFusion keeps a `Filter` node above the scan and
-    /// evaluates every predicate locally. Reads through this provider
-    /// therefore pushed down NOTHING — not the FTS predicates, not a plain
-    /// `WHERE id = 1` — while the read-only path (bare `SqlTable`, which
-    /// does implement this) pushed down normally. Same source, same SQL,
-    /// different plan depending only on whether writes were enabled.
+    /// **Why forward at all.** `TableProvider`'s default answers
+    /// `Unsupported` for every filter, so a wrapper that forwards `scan`
+    /// but not this one is handed an EMPTY filter slice: DataFusion keeps a
+    /// `Filter` node above the scan and evaluates every predicate locally,
+    /// after dragging the whole table across the wire. Reads through this
+    /// provider pushed down NOTHING — not `WHERE id = 1`, nothing — while
+    /// the same source registered read-only (a bare `SqlTable`, which does
+    /// implement this) pushed down normally. Same source, same SQL,
+    /// different plan, decided only by whether writes were enabled.
     ///
-    /// For ordinary columns that is a performance bug: the whole table
-    /// crosses the wire. For the Postgres FTS scalars it is fatal.
-    /// `to_tsvector` and `websearch_to_tsquery` are registered to ERROR
-    /// when evaluated locally — deliberately, because a NULL-returning stub
-    /// would make `NULL @@ NULL` filter everything out and report "no
-    /// matches", indistinguishable from a genuine empty result — so a
-    /// full-text query against a read-write registration aborted with
-    /// "this query was not pushed down" instead of running at all.
+    /// **Why the verdict is clamped to `Inexact`.** This provider also
+    /// implements [`TableProvider::delete_from`] and
+    /// [`TableProvider::update`], and DataFusion builds their `WHERE` from
+    /// the filters it hands those methods. An `Exact` verdict tells the
+    /// optimizer the scan applies the predicate itself, so `PushDownFilter`
+    /// REMOVES the `Filter` node — and the DML methods are then invoked
+    /// with an empty filter list. Measured, on the CI fixtures:
     ///
-    /// The verdict must come from `read_provider`: it is what builds the
-    /// SQL that is actually sent, so only it knows what it can express.
+    /// ```text
+    /// UPDATE users SET email = '…' WHERE name = 'Alice Smith'
+    ///   -- reaches Postgres as:
+    /// UPDATE public.users SET "email" = '…'
+    /// ```
+    ///
+    /// Every row, silently. `DELETE` degrades the same way. `Inexact` keeps
+    /// the `Filter` node in the plan, so the DML planner still has the
+    /// predicate to hand over, while the scan still receives the filters and
+    /// still renders them into the SQL it sends — the pushdown is real, it
+    /// is merely also re-checked locally, which costs a redundant pass over
+    /// rows Postgres has already narrowed.
+    ///
+    /// This matches the rule the DynamoDB and MongoDB providers already
+    /// follow for the same reason. It is a house rule for any provider that
+    /// serves DML through these methods, not a Postgres quirk.
+    ///
+    /// **Known limitation.** Because the `Filter` node survives, a predicate
+    /// that CANNOT be evaluated locally still fails here: the Postgres FTS
+    /// scalars (`to_tsvector`, `websearch_to_tsquery`) are registered to
+    /// error rather than return NULL, so a full-text query against a
+    /// read-write registration errors even with this fix. Full-text search
+    /// needs a read-only registration, which is what a serving engine uses.
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
-        self.read_provider.supports_filters_pushdown(filters)
+        Ok(self
+            .read_provider
+            .supports_filters_pushdown(filters)?
+            .into_iter()
+            .map(|verdict| match verdict {
+                TableProviderFilterPushDown::Exact => TableProviderFilterPushDown::Inexact,
+                other => other,
+            })
+            .collect())
     }
 
     async fn scan(
@@ -1098,7 +1127,11 @@ mod tests {
     };
     use datafusion::common::Column;
     use datafusion::logical_expr::{Operator, TableProviderFilterPushDown};
+    use datafusion::physical_plan::displayable;
+    use datafusion::physical_plan::empty::EmptyExec;
     use secrecy::ExposeSecret;
+    use sqlx::postgres::PgPoolOptions;
+    use std::sync::Mutex;
 
     // ─── build_sqlx_connection_url tests ────────────────────────────────
 
@@ -2368,12 +2401,23 @@ mod tests {
 
     // ─── read-write filter pushdown ─────────────────────────────────────
 
-    /// A stand-in for `SqlTable`, reporting the pushdown verdict a real
-    /// read provider reports so the WRAPPER's forwarding is what is under
-    /// test rather than the inner provider's own logic.
+    /// A stand-in for `SqlTable`, reporting a fixed verdict so the WRAPPER's
+    /// handling is what is under test rather than the inner provider's logic.
     #[derive(Debug)]
     struct PushdownProbe {
         verdict: TableProviderFilterPushDown,
+        /// Filters the last `scan` was handed, so a test can assert the
+        /// CONSEQUENCE of the forwarding and not merely the verdict.
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl PushdownProbe {
+        fn new(verdict: TableProviderFilterPushDown) -> Self {
+            Self {
+                verdict,
+                seen: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
     }
 
     #[async_trait]
@@ -2397,19 +2441,20 @@ mod tests {
             &self,
             _state: &dyn Session,
             _projection: Option<&Vec<usize>>,
-            _filters: &[Expr],
+            filters: &[Expr],
             _limit: Option<usize>,
         ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-            unreachable!("this probe is only asked about pushdown, never scanned")
+            *self.seen.lock().unwrap() = filters.iter().map(|f| f.to_string()).collect();
+            Ok(Arc::new(EmptyExec::new(self.schema())))
         }
     }
 
-    fn rw_provider_over(verdict: TableProviderFilterPushDown) -> SqlxPostgresTableProvider {
+    /// Lazy: constructing a pool performs no I/O, and these tests never
+    /// reach a write path.
+    fn rw_provider_over(probe: Arc<PushdownProbe>) -> SqlxPostgresTableProvider {
         SqlxPostgresTableProvider {
-            read_provider: Arc::new(PushdownProbe { verdict }),
-            // Lazy: constructing a pool performs no I/O, and this test
-            // never reaches a write path.
-            sqlx_pool: sqlx::postgres::PgPoolOptions::new()
+            read_provider: probe,
+            sqlx_pool: PgPoolOptions::new()
                 .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
                 .expect("lazy pool"),
             table_reference: TableReference::bare("docs"),
@@ -2417,113 +2462,62 @@ mod tests {
         }
     }
 
-    /// The read-write wrapper must report what its READ provider reports.
-    ///
-    /// It does not by default: `TableProvider::supports_filters_pushdown`
-    /// answers `Unsupported` for every filter unless a provider overrides
-    /// it, so a wrapper that forwards `scan` but not this one is handed an
-    /// EMPTY filter slice and DataFusion evaluates every predicate locally.
-    ///
-    /// For ordinary columns that is merely slow. For the Postgres FTS
-    /// scalars it is fatal: `to_tsvector` and friends are registered to
-    /// ERROR when evaluated locally (there is no honest local answer), so
-    /// a full-text query against a read-write registration aborts with
-    /// "this query was not pushed down" instead of running.
-    // `#[tokio::test]`: constructing a lazy sqlx pool still requires a
-    // Tokio context, even though it opens no connection.
+    /// The wrapper reports what the read provider can express — **except**
+    /// that `Exact` is clamped to `Inexact`, because this provider also
+    /// serves UPDATE and DELETE through `TableProvider` and an `Exact`
+    /// verdict strips the `Filter` node those methods build their `WHERE`
+    /// from. See `supports_filters_pushdown`'s doc for the measured
+    /// full-table `UPDATE` that results.
+    #[rstest::rstest]
+    #[case::exact_is_clamped_so_dml_keeps_its_predicate(
+        TableProviderFilterPushDown::Exact,
+        TableProviderFilterPushDown::Inexact
+    )]
+    #[case::inexact_passes_through(
+        TableProviderFilterPushDown::Inexact,
+        TableProviderFilterPushDown::Inexact
+    )]
+    #[case::unsupported_passes_through(
+        TableProviderFilterPushDown::Unsupported,
+        TableProviderFilterPushDown::Unsupported
+    )]
     #[tokio::test]
-    async fn read_write_wrapper_forwards_the_read_providers_pushdown_verdict() {
+    async fn read_write_wrapper_reports(
+        #[case] read_provider_says: TableProviderFilterPushDown,
+        #[case] wrapper_reports: TableProviderFilterPushDown,
+    ) {
         let filter = Expr::Column(Column::from_name("body"));
-        for verdict in [
-            TableProviderFilterPushDown::Exact,
-            TableProviderFilterPushDown::Inexact,
-            TableProviderFilterPushDown::Unsupported,
-        ] {
-            let provider = rw_provider_over(verdict.clone());
-            assert_eq!(
-                provider.supports_filters_pushdown(&[&filter]).unwrap(),
-                vec![verdict.clone()],
-                "the wrapper must not answer for the read provider"
-            );
-        }
+        let provider = rw_provider_over(Arc::new(PushdownProbe::new(read_provider_says)));
+        assert_eq!(
+            provider.supports_filters_pushdown(&[&filter]).unwrap(),
+            vec![wrapper_reports]
+        );
     }
 
-    /// The arity contract: one verdict per filter, in order. A forwarding
-    /// bug that returned a single verdict for a multi-filter query would
-    /// make DataFusion panic or silently mis-assign predicates.
+    /// The arity contract: one verdict per filter, in order.
     #[tokio::test]
     async fn read_write_wrapper_answers_once_per_filter() {
         let a = Expr::Column(Column::from_name("body"));
         let b = Expr::Column(Column::from_name("path"));
-        let provider = rw_provider_over(TableProviderFilterPushDown::Exact);
+        let provider = rw_provider_over(Arc::new(PushdownProbe::new(
+            TableProviderFilterPushDown::Exact,
+        )));
         assert_eq!(
             provider.supports_filters_pushdown(&[&a, &b]).unwrap().len(),
             2
         );
     }
 
-    /// A probe that RECORDS the filters its `scan` is handed, so the test
-    /// can assert the consequence of the forwarding rather than the
-    /// forwarding itself.
-    #[derive(Debug)]
-    struct ScanFilterRecorder {
-        seen: Arc<std::sync::Mutex<Vec<String>>>,
-    }
-
-    #[async_trait]
-    impl TableProvider for ScanFilterRecorder {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-        fn schema(&self) -> SchemaRef {
-            Arc::new(Schema::new(vec![Field::new("body", DataType::Utf8, true)]))
-        }
-        fn table_type(&self) -> TableType {
-            TableType::Base
-        }
-        fn supports_filters_pushdown(
-            &self,
-            filters: &[&Expr],
-        ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
-            Ok(vec![TableProviderFilterPushDown::Exact; filters.len()])
-        }
-        async fn scan(
-            &self,
-            _state: &dyn Session,
-            _projection: Option<&Vec<usize>>,
-            filters: &[Expr],
-            _limit: Option<usize>,
-        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-            *self.seen.lock().unwrap() = filters.iter().map(|f| f.to_string()).collect();
-            Ok(Arc::new(datafusion::physical_plan::empty::EmptyExec::new(
-                self.schema(),
-            )))
-        }
-    }
-
-    /// The consequence, end to end through the planner: a predicate must
-    /// REACH the read provider's `scan`.
-    ///
-    /// This is the assertion that would have caught the bug in the field.
-    /// Checking the verdict alone tests the accessor; checking that the
-    /// filter arrives tests what DataFusion actually does with it — and an
-    /// empty slice here is precisely why a full-text query through a
-    /// read-write registration died with "this query was not pushed down".
+    /// The point of forwarding: a predicate must REACH the read provider's
+    /// `scan`, so it lands in the SQL actually sent. Checking the verdict
+    /// alone only tests the accessor; an empty slice here is what made
+    /// read-write registrations pull whole tables.
     #[tokio::test]
     async fn a_predicate_reaches_the_read_providers_scan_in_read_write_mode() {
-        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let provider = SqlxPostgresTableProvider {
-            read_provider: Arc::new(ScanFilterRecorder {
-                seen: Arc::clone(&seen),
-            }),
-            sqlx_pool: sqlx::postgres::PgPoolOptions::new()
-                .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
-                .expect("lazy pool"),
-            table_reference: TableReference::bare("docs"),
-            auto_generated_columns: Vec::new(),
-        };
+        let probe = Arc::new(PushdownProbe::new(TableProviderFilterPushDown::Exact));
+        let seen = Arc::clone(&probe.seen);
         let ctx = SessionContext::new();
-        ctx.register_table("docs", Arc::new(provider))
+        ctx.register_table("docs", Arc::new(rw_provider_over(probe)))
             .expect("register");
         ctx.sql("SELECT body FROM docs WHERE body = 'needle'")
             .await
@@ -2534,8 +2528,41 @@ mod tests {
         let seen = seen.lock().unwrap().clone();
         assert!(
             seen.iter().any(|f| f.contains("needle")),
-            "the predicate must reach the read provider's scan; \
-             an empty slice means DataFusion is filtering locally: {seen:?}"
+            "the predicate must reach the read provider's scan; an empty \
+             slice means DataFusion is filtering locally: {seen:?}"
+        );
+    }
+
+    /// The regression guard for the bug this clamp exists to prevent.
+    ///
+    /// DataFusion derives a DML statement's `WHERE` from the filters it
+    /// hands `delete_from` / `update`, and it only has them to hand over
+    /// while the `Filter` node is still in the plan. An `Exact` verdict
+    /// removes that node, and the measured result was
+    /// `UPDATE public.users SET "email" = '…'` — every row — from a
+    /// statement written `WHERE name = 'Alice Smith'`.
+    ///
+    /// Asserting on the physical plan keeps this honest without a database:
+    /// the live proof is the `#[ignore]`d Postgres suite above, which CI
+    /// runs and which failed on all ten write tests when this was `Exact`.
+    #[tokio::test]
+    async fn the_filter_node_survives_so_update_and_delete_keep_their_where() {
+        let probe = Arc::new(PushdownProbe::new(TableProviderFilterPushDown::Exact));
+        let ctx = SessionContext::new();
+        ctx.register_table("docs", Arc::new(rw_provider_over(probe)))
+            .expect("register");
+        let plan = ctx
+            .sql("SELECT body FROM docs WHERE body = 'needle'")
+            .await
+            .expect("plans")
+            .create_physical_plan()
+            .await
+            .expect("physical plan");
+        let rendered = format!("{}", displayable(plan.as_ref()).indent(false));
+        assert!(
+            rendered.contains("FilterExec"),
+            "the Filter node must survive, or UPDATE/DELETE lose their \
+             WHERE and rewrite the whole table:\n{rendered}"
         );
     }
 }

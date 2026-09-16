@@ -173,6 +173,9 @@ datafusion-functions-json = "0.52"
 
 [dev-dependencies]
 tokio-test = "0.4"
+# Parametric test cases, per AGENTS.md's testing standards. The workspace
+# already pins it; `crates/cli` was simply the first consumer.
+rstest = { workspace = true }
 tempfile = { workspace = true }
 redis-test = "0.13.0"
 gguf-rs-lib = "0.2"
