@@ -189,7 +189,10 @@ configured in Open Connector:
   `conversations` deliberately excludes). The bot must also be a member of
   the channel it reads. A missing scope surfaces as Slack's own
   `missing_scope` code on the failing scan, per the in-band error rule
-  below — not as an empty result.
+  below — not as an empty result. (Scope NAMES here are from Slack's own
+  documentation, not measured against a live workspace the way the
+  pagination caps below were; treat them as the starting point and let
+  `missing_scope` correct you.)
 - `users` needs `users:read`. Deleted members stay listed with
   `deleted = true`. (Emails are not part of the gateway's normalized user
   contract, so there is no `email` column.)

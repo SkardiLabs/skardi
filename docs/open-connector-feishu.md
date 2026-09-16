@@ -202,8 +202,12 @@ Feishu console gates independently of each other:
   (99992402 above it) despite the gateway schema declaring 100 — the
   pack requests 50.
 - The document tables need the docx read scope —
-  **`docx:document:readonly`** (or the read-write `docx:document`) — and
-  the authorizing user must be able to open the document. A document the
+  **`docx:document:readonly`** (or the read-write `docx:document`). That
+  NAME is from Feishu's documentation; unlike the page-size caps below it
+  was not measured against the live gateway, so confirm it against your own
+  app's enabled scopes before relying on the snippet — a wrong scope name
+  fails at authorization, not at scan time. The authorizing user must also
+  be able to open the document. A document the
   user cannot read is an error from Feishu, not an empty table.
   `docx/v1/documents/:id/blocks` caps `page_size` at **500** the same way
   (99992402 at 501, live-verified 2026-09-01); the pack requests 500.
