@@ -14,6 +14,24 @@ use std::path::PathBuf;
 /// must move together.
 const MAX_PURPOSE_CHARS: usize = 2000;
 
+/// Maximum serialized `ai_context` size, in bytes. Restates the server's
+/// `query_handlers::MAX_AI_CONTEXT_BYTES` for the same reason as
+/// [`MAX_PURPOSE_CHARS`]. The per-field caps do not imply this one:
+/// `--purpose` and `--task` are each `MAX_PURPOSE_CHARS`, so two full values
+/// plus a session id and the JSON framing serialize past 4096 bytes while
+/// every field is individually legal. Checked here so that invocation fails
+/// with a local message naming the cap, not as a remote 400 after the POST.
+const MAX_AI_CONTEXT_BYTES: usize = 4096;
+
+/// The three flags that become `ai_context`, carried together because they are
+/// validated together and travel to the server as one object or not at all.
+#[derive(Debug, Default)]
+pub struct ContextFlags {
+    pub purpose: Option<String>,
+    pub session_id: Option<String>,
+    pub task: Option<String>,
+}
+
 /// Run `skardi query`: resolve the SQL text to send (file wins over `-e`
 /// when both are given), `POST` it to `/query`, and hand the response
 /// envelope to [`print_result`].
@@ -23,11 +41,10 @@ pub async fn run(
     file: Option<PathBuf>,
     max_rows: Option<usize>,
     table: bool,
-    purpose: Option<String>,
-    session_id: Option<String>,
+    context: ContextFlags,
 ) -> Result<()> {
     let text = resolve_sql(sql, file)?;
-    let ai_context = build_ai_context(purpose, session_id)?;
+    let ai_context = build_ai_context(context.purpose, context.session_id, context.task)?;
     let body = build_body(&text, max_rows, ai_context);
 
     let response = client.post("/query", &body).await?;
@@ -81,15 +98,37 @@ fn build_body(sql: &str, max_rows: Option<usize>, ai_context: Option<Value>) -> 
 /// where the server asks only for a non-empty string within the cap, so
 /// applying the header predicate here would reject values the server accepts.
 /// Only the cap is shared, hence the constant import.
-fn build_ai_context(purpose: Option<String>, session_id: Option<String>) -> Result<Option<Value>> {
+fn build_ai_context(
+    purpose: Option<String>,
+    session_id: Option<String>,
+    task: Option<String>,
+) -> Result<Option<Value>> {
     match (purpose, session_id) {
         (None, None) => Ok(None),
         (Some(purpose), Some(session_id)) => {
             validate_context_string(&purpose, "--purpose", MAX_PURPOSE_CHARS)?;
             validate_context_string(&session_id, "--session-id", MAX_SESSION_ID_CHARS)?;
-            Ok(Some(
-                json!({ "purpose": purpose, "session_id": session_id }),
-            ))
+            let mut context = json!({ "purpose": purpose, "session_id": session_id });
+            // clap's `requires = "purpose"` already refuses a lone --task, so
+            // reaching here with one means the pair is present too. `task`
+            // carries NO per-field length cap, deliberately: the server treats
+            // it as a free-form key and bounds it only through the whole-object
+            // limit below, so a per-field cap here would reject a long task the
+            // MCP and REST entrypoints accept — the three would disagree.
+            if let Some(task) = task {
+                context["task"] = Value::String(task);
+            }
+            // The per-field caps each pass yet their sum can exceed the whole,
+            // so check the serialized object the way the server will. Same
+            // `.to_string().len()` the server measures, so the boundary matches.
+            let bytes = context.to_string().len();
+            if bytes > MAX_AI_CONTEXT_BYTES {
+                bail!(
+                    "ai_context serializes to {bytes} bytes, over the {MAX_AI_CONTEXT_BYTES}-byte \
+                     limit; shorten --purpose or --task"
+                );
+            }
+            Ok(Some(context))
         }
         (Some(_), None) => bail!("--purpose requires --session-id"),
         (None, Some(_)) => bail!("--session-id requires --purpose"),
@@ -110,7 +149,10 @@ fn validate_context_string(value: &str, flag: &str, max_chars: usize) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_PURPOSE_CHARS, MAX_SESSION_ID_CHARS, build_ai_context, build_body, run};
+    use super::{
+        ContextFlags, MAX_AI_CONTEXT_BYTES, MAX_PURPOSE_CHARS, MAX_SESSION_ID_CHARS,
+        build_ai_context, build_body, run,
+    };
     use crate::client::ApiClient;
     use crate::config::ClientConfig;
     use serde_json::json;
@@ -161,31 +203,97 @@ mod tests {
 
     #[test]
     fn neither_flag_yields_no_ai_context() {
-        assert_eq!(build_ai_context(None, None).unwrap(), None);
+        assert_eq!(build_ai_context(None, None, None).unwrap(), None);
     }
 
     #[test]
     fn both_flags_yield_the_object_the_server_validates() {
-        let ctx = build_ai_context(Some("count paid orders".into()), Some("sess-1".into()))
-            .unwrap()
-            .expect("expected an ai_context");
+        let ctx = build_ai_context(
+            Some("count paid orders".into()),
+            Some("sess-1".into()),
+            None,
+        )
+        .unwrap()
+        .expect("expected an ai_context");
         assert_eq!(
             ctx,
             json!({"purpose": "count paid orders", "session_id": "sess-1"})
         );
     }
 
+    /// `--task` is what turns a day of queries into a description of work
+    /// rather than a list of lookups, so it has to survive into the object
+    /// the server stores, and its absence must leave no key behind.
+    #[test]
+    fn a_task_rides_inside_the_pair_and_its_absence_adds_no_key() {
+        let with = build_ai_context(
+            Some("count merged PRs".into()),
+            Some("sess-1".into()),
+            Some("month-long delivery review".into()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(with["task"], json!("month-long delivery review"));
+
+        let without = build_ai_context(Some("p".into()), Some("sess-1".into()), None)
+            .unwrap()
+            .unwrap();
+        assert!(without.get("task").is_none(), "{without}");
+    }
+
+    /// A capped purpose, a full session id and a long task serialize past the
+    /// server's whole-object cap. Without a local check that is a remote 400;
+    /// this pins that it fails here, naming the cap.
+    #[test]
+    fn a_capped_purpose_and_a_long_task_bust_the_object_cap() {
+        let purpose = "x".repeat(MAX_PURPOSE_CHARS);
+        let task = "y".repeat(MAX_PURPOSE_CHARS);
+        let session_id = "s".repeat(MAX_SESSION_ID_CHARS);
+        let err = build_ai_context(Some(purpose), Some(session_id), Some(task))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(&MAX_AI_CONTEXT_BYTES.to_string()), "{err}");
+    }
+
+    /// `task` has no per-field length cap: the server treats it as free-form
+    /// and bounds it only through the whole-object limit, so the CLI must not
+    /// reject a long task that MCP and REST would accept. A task well past
+    /// `MAX_PURPOSE_CHARS`, with a short purpose so the object stays under the
+    /// byte cap, is accepted.
+    #[test]
+    fn a_long_task_within_the_object_cap_is_accepted() {
+        let task = "y".repeat(MAX_PURPOSE_CHARS + 500);
+        let ctx = build_ai_context(Some("p".into()), Some("sess-1".into()), Some(task.clone()))
+            .unwrap()
+            .expect("expected an ai_context");
+        assert_eq!(ctx["task"], json!(task));
+    }
+
+    /// The whole-object check must not reject the ordinary case; a purpose,
+    /// a session id and a short task together are nowhere near the cap.
+    #[test]
+    fn a_normal_context_with_a_task_passes_the_object_cap() {
+        let ctx = build_ai_context(
+            Some("count merged PRs".into()),
+            Some("sess-1".into()),
+            Some("September delivery review".into()),
+        )
+        .unwrap()
+        .expect("expected an ai_context");
+        assert_eq!(ctx["task"], json!("September delivery review"));
+    }
+
     #[test]
     fn one_flag_without_the_other_is_an_error() {
         // Clap's `requires` catches this at parse time; the builder stays
         // honest for any other caller instead of dropping half a context.
-        let err = build_ai_context(Some("p".into()), None).unwrap_err();
+        let err = build_ai_context(Some("p".into()), None, None).unwrap_err();
         assert!(
             err.to_string().contains("--purpose requires --session-id"),
             "error was: {err}"
         );
 
-        let err = build_ai_context(None, Some("s".into())).unwrap_err();
+        let err = build_ai_context(None, Some("s".into()), None).unwrap_err();
         assert!(
             err.to_string().contains("--session-id requires --purpose"),
             "error was: {err}"
@@ -210,7 +318,7 @@ mod tests {
         ];
 
         for (purpose, session_id, flag) in cases {
-            let err = build_ai_context(Some(purpose), Some(session_id)).unwrap_err();
+            let err = build_ai_context(Some(purpose), Some(session_id), None).unwrap_err();
             assert!(
                 err.to_string().contains(flag),
                 "expected a {flag} message, got: {err}"
@@ -226,7 +334,7 @@ mod tests {
         // within the cap, and rejecting more than it does would be a
         // client-side regression invisible from the server side.
         for sid in ["sess 1", "会话-1", "sess-1, sess-2", "  padded  "] {
-            let ctx = build_ai_context(Some("p".into()), Some(sid.to_string()))
+            let ctx = build_ai_context(Some("p".into()), Some(sid.to_string()), None)
                 .unwrap()
                 .expect("expected an ai_context");
             assert_eq!(ctx["session_id"], json!(sid));
@@ -253,8 +361,7 @@ mod tests {
             None,
             None,
             false,
-            None,
-            None,
+            ContextFlags::default(),
         )
         .await;
 
@@ -284,8 +391,7 @@ mod tests {
             Some(file.path().to_path_buf()),
             None,
             false,
-            None,
-            None,
+            ContextFlags::default(),
         )
         .await;
 
@@ -300,7 +406,7 @@ mod tests {
         // real request here would surface as a connect error, not this one.
         let client = ApiClient::new(&test_config("http://127.0.0.1:1")).unwrap();
 
-        let err = run(&client, None, None, None, false, None, None)
+        let err = run(&client, None, None, None, false, ContextFlags::default())
             .await
             .unwrap_err();
 
@@ -330,8 +436,11 @@ mod tests {
             None,
             None,
             false,
-            Some("count paid orders".to_string()),
-            Some("sess-1".to_string()),
+            ContextFlags {
+                purpose: Some("count paid orders".to_string()),
+                session_id: Some("sess-1".to_string()),
+                task: None,
+            },
         )
         .await;
 
@@ -359,8 +468,11 @@ mod tests {
             None,
             None,
             false,
-            Some(String::new()),
-            Some("sess-1".to_string()),
+            ContextFlags {
+                purpose: Some(String::new()),
+                session_id: Some("sess-1".to_string()),
+                task: None,
+            },
         )
         .await
         .unwrap_err();
@@ -392,8 +504,7 @@ mod tests {
             None,
             None,
             false,
-            None,
-            None,
+            ContextFlags::default(),
         )
         .await
         .unwrap_err();

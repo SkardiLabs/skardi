@@ -80,12 +80,13 @@ cargo run --release --bin skardi-server -- \
 
 **2 — Your agent explores freely, declaring intent.** Any SQL over any
 registered source, federated in one statement. `ai_context` is how the agent
-says *why* — `purpose` and `session_id` are recorded, never executed.
+says *why* — `purpose` (this query), `session_id` (this run), and optional
+`task` (the larger work a run of queries serves) are recorded, never executed.
 
 ```bash
 curl -X POST localhost:8080/query -H 'Content-Type: application/json' -d @- <<'JSON'
 { "sql": "SELECT plan, COUNT(*) AS cancels FROM warehouse.public.subs WHERE cancelled_at > now() - interval '7 days' GROUP BY plan",
-  "ai_context": { "purpose": "weekly churn check, by plan", "session_id": "sess-1a2b" } }
+  "ai_context": { "purpose": "weekly churn check, by plan", "session_id": "sess-1a2b", "task": "Q3 retention review" } }
 JSON
 ```
 

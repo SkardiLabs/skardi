@@ -231,10 +231,18 @@ impl McpHandler {
         if let Some(purpose) = args.get("purpose").and_then(Value::as_str) {
             let purpose = purpose.trim();
             if !purpose.is_empty() {
-                body.insert(
-                    "ai_context".to_string(),
-                    serde_json::json!({"purpose": purpose, "session_id": session_id}),
-                );
+                let mut context = serde_json::json!({"purpose": purpose, "session_id": session_id});
+                // `task` rides inside the same object and only when there is
+                // already a `purpose` to ride with: the server requires both
+                // required fields or none, so a task sent on its own would
+                // turn a working query into a 400 rather than adding context.
+                if let Some(task) = args.get("task").and_then(Value::as_str) {
+                    let task = task.trim();
+                    if !task.is_empty() {
+                        context["task"] = Value::String(task.to_string());
+                    }
+                }
+                body.insert("ai_context".to_string(), context);
             }
         }
         Value::Object(body)
@@ -525,6 +533,53 @@ mod tests {
         let text = serde_json::to_string(&result.content).unwrap();
         assert!(text.contains("parameter_validation_error"), "{text}");
         assert!(text.contains("Missing required parameters"), "{text}");
+    }
+
+    /// `task` is the only field saying what a *run* of queries was for; a
+    /// ledger row is one statement, so without it a day of well-declared
+    /// purposes still summarizes as a list of lookups.
+    #[tokio::test]
+    async fn query_task_rides_along_inside_ai_context() {
+        let (handler, probe) = handler_with_probe();
+        handler
+            .do_call_tool(
+                "query",
+                args(json!({
+                    "sql": "select 1",
+                    "purpose": "count merged PRs",
+                    "task": "month-long delivery review"
+                })),
+                &HeaderMap::new(),
+            )
+            .await
+            .unwrap();
+        let seen = probe.take_seen();
+        assert_eq!(
+            seen[0].body["ai_context"]["purpose"],
+            json!("count merged PRs")
+        );
+        assert_eq!(
+            seen[0].body["ai_context"]["task"],
+            json!("month-long delivery review")
+        );
+    }
+
+    /// The server takes `ai_context` whole or not at all, so a task with no
+    /// purpose must not synthesize a partial object: that turns a query the
+    /// caller would have got an answer to into a 400.
+    #[tokio::test]
+    async fn a_task_without_a_purpose_does_not_build_a_partial_ai_context() {
+        let (handler, probe) = handler_with_probe();
+        handler
+            .do_call_tool(
+                "query",
+                args(json!({"sql": "select 1", "task": "month-long delivery review"})),
+                &HeaderMap::new(),
+            )
+            .await
+            .unwrap();
+        let seen = probe.take_seen();
+        assert_eq!(seen[0].body, json!({"sql": "select 1"}));
     }
 
     #[tokio::test]

@@ -108,7 +108,7 @@ and updates automatically when pipelines, jobs, or semantics reload.
 | `/pipeline/:name` | GET | Metadata for one pipeline. |
 | `/health/:name` | GET | Per-pipeline health check (includes upstream data-source status). |
 | `/:name/execute` | POST | Execute a pipeline by name. Body is the JSON param map. See [pipelines.md](pipelines.md). |
-| `/query` | POST | Execute one ad-hoc SQL statement. Body: `{ "sql": "...", "max_rows": 1000, "ai_context": { "purpose": "...", "session_id": "..." } }`. See [§ Ad-hoc queries](#ad-hoc-queries). |
+| `/query` | POST | Execute one ad-hoc SQL statement. Body: `{ "sql": "...", "max_rows": 1000, "ai_context": { "purpose": "...", "session_id": "...", "task": "..." } }`. See [§ Ad-hoc queries](#ad-hoc-queries). |
 | `/jobs` | GET | List all registered jobs with destinations. |
 | `/jobs/:name/run` | POST | Submit a new job run. Body is the JSON param map. See [jobs.md](jobs.md). |
 | `/jobs/runs` | GET | List recent runs; supports `?job=<name>&limit=N`. |
@@ -136,8 +136,13 @@ Request fields:
   be a JSON object carrying two required non-empty strings — `purpose`
   (≤ 2000 chars, why the query runs) and `session_id` (≤ 200 chars, groups
   queries from one agent session) — plus any free-form keys of the caller's
-  choosing. The whole object must serialize to ≤ 4096 bytes. Recorded for
-  observability; never executed. Any violation → `400
+  choosing. One such key is conventional: `task` (a string, why a *run* of
+  queries is happening — the larger piece of work a `purpose` serves, repeated
+  verbatim across it), which the daily brief reads. The server does not require
+  or specially validate `task`; it is subject only to the whole-object rules.
+  That object must serialize to ≤ 4096 bytes — reachable with a full `purpose`
+  and `task` together, so a caller setting both should budget for it. Recorded
+  for observability; never executed. Any violation → `400
   parameter_validation_error`. Omitting the field is valid; sending
   `"ai_context": null` is *not* — an explicit null is a present-but-malformed
   value and is rejected like any other non-object.

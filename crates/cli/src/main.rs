@@ -13,6 +13,7 @@ use commands::config::ConfigCmd;
 use commands::jobs::JobCmd;
 use commands::login::{LoginArgs, LogoutArgs};
 use commands::pipeline::PipelineCmd;
+use commands::query::ContextFlags;
 use config::ClientConfig;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -120,6 +121,16 @@ enum Commands {
         /// Requires --purpose, for the same reason.
         #[arg(long, value_name = "ID", requires = "purpose")]
         session_id: Option<String>,
+
+        /// The larger piece of work this query belongs to, repeated
+        /// verbatim on every query that serves it (sent as
+        /// ai_context.task). --purpose says why this one query; --task says
+        /// what the run of queries is for, which is the only thing that
+        /// lets a day of queries be summarized as work rather than as a
+        /// list of lookups. Requires --purpose: the server takes
+        /// ai_context whole, so a task alone has nothing to travel in.
+        #[arg(long, value_name = "TEXT", requires = "purpose")]
+        task: Option<String>,
     },
 
     /// Execute a named server pipeline and print the result.
@@ -271,7 +282,22 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             table,
             purpose,
             session_id,
-        } => commands::query::run(&client, sql, file, max_rows, table, purpose, session_id).await,
+            task,
+        } => {
+            commands::query::run(
+                &client,
+                sql,
+                file,
+                max_rows,
+                table,
+                ContextFlags {
+                    purpose,
+                    session_id,
+                    task,
+                },
+            )
+            .await
+        }
 
         Commands::Run {
             name,
@@ -389,6 +415,35 @@ mod tests {
                 "--all-workspaces"
             ])
             .is_err()
+        );
+        // `--task` rides inside `ai_context`, which the server takes whole or
+        // not at all, so a lone one has nothing valid to travel in. clap
+        // refuses it here rather than letting the flow build a partial object.
+        assert!(
+            super::Cli::try_parse_from([
+                "skardi",
+                "query",
+                "-e",
+                "select 1",
+                "--task",
+                "the September delivery review"
+            ])
+            .is_err()
+        );
+        assert!(
+            super::Cli::try_parse_from([
+                "skardi",
+                "query",
+                "-e",
+                "select 1",
+                "--purpose",
+                "count merged PRs",
+                "--session-id",
+                "sess-1",
+                "--task",
+                "the September delivery review"
+            ])
+            .is_ok()
         );
     }
 
