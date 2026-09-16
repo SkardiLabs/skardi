@@ -45,8 +45,13 @@ tables:
       next_cursor_path: "$.next_cursor"
       page_size_input: pageSize
       page_size: 100
-    # The empty query plus an object filter is Notion's spelling for "the
-    # complete listing the integration can see" — the state=all move.
+    # The empty query plus an object filter is Notion's spelling for
+    # "everything the integration can see, AS SEARCH REPORTS IT". Not an
+    # inventory: Notion documents that search may omit an accessible page,
+    # lag after a share, and change while paging, so a row's absence from a
+    # drained walk is not evidence that the page is gone. A consumer that
+    # removes on absence removes live pages; add on presence, and prove
+    # removal with a direct read.
     fixed_inputs:
       query: ""
       filter:
@@ -107,8 +112,7 @@ tables:
     columns:
       # The type-specific payload (paragraph/heading_1/...) lives under a
       # key named BY `type`, which a fixed relational mapping cannot
-      # address; content extraction belongs to a rendered-markdown table
-      # (notion.retrieve_page_markdown) as a follow-up.
+      # address; the page's TEXT is `page_markdown` below.
       - { name: id, path: id, type: utf8, nullable: false }
       - { name: type, path: type, type: utf8, nullable: true }
       - { name: created_time, path: created_time, type: timestamp_ms_utc, nullable: true }
@@ -116,3 +120,41 @@ tables:
       - { name: has_children, path: has_children, type: boolean, nullable: true }
       - { name: in_trash, path: in_trash, type: boolean, nullable: true }
       - { name: parent, path: parent, type: json, nullable: true }
+
+  # One row per PAGE, rendered as Markdown by Open Connector's normalized
+  # `notion.retrieve_page_markdown` (c5a77846+). The pack's first
+  # `row_shape: object` table for Notion, for the reason feishu's
+  # `document_content` is: a "read one thing" action answers with the row
+  # itself rather than a list, and there is no second page of a page's text.
+  # Its output schema DECLARES every field with `additionalProperties:
+  # false`, so — unlike every other notion table — these columns sit INSIDE
+  # the fingerprint gate: an upstream rename fails registration instead of
+  # surfacing as a null column at scan time.
+  page_markdown:
+    action: notion.retrieve_page_markdown
+    row_path: "$"
+    row_shape: object
+    fingerprint: d77029cf6920c55736345faf4807347632b54e355ddd2e48faff963bee6ecc23
+    pagination:
+      strategy: single_page
+    resources:
+      required: [pageId]
+    columns:
+      # Echoed from the INPUT by the action, so it is the binding's spelling
+      # and joins to it; Notion spells ids dashed or undashed in its own
+      # bodies.
+      - { name: page_id, path: pageId, type: utf8, nullable: false }
+      # Never null: the action coerces an empty render to "", so an empty
+      # corpus row is a real empty page rather than a fetch that half-failed.
+      - { name: markdown, path: markdown, type: utf8, nullable: false }
+      # A 200 is not a whole page. `truncated` fires past roughly 20,000
+      # blocks and is retryable by resubmitting the listed ids;
+      # `unknown_block_ids` (at most 100) ALSO covers unsupported block
+      # types, so it is non-empty on ordinary pages and is not on its own a
+      # partial-read signal. Read together.
+      - { name: truncated, path: truncated, type: boolean, nullable: false }
+      - { name: unknown_block_ids, path: unknownBlockIds, type: json, nullable: false }
+      # The markdown endpoint reports no revision; the action reads this off
+      # `GET /pages/{id}`. It is what lets a consumer window its ingest on
+      # the page's own clock instead of re-loading every page every run.
+      - { name: last_edited_time, path: lastEditedTime, type: timestamp_ms_utc, nullable: false }
