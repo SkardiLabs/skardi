@@ -499,6 +499,8 @@ impl OpenConnectorClient {
                 },
                 |status, body| OpenConnectorError::ActionExecutionFailed {
                     action_id: action_id.to_string(),
+                    status: Some(status.as_u16()),
+                    error_code: envelope_error_code(&body),
                     reason: terminal_reason(status, &body),
                 },
             )
@@ -514,6 +516,10 @@ impl OpenConnectorClient {
         if !envelope.success {
             return Err(OpenConnectorError::ActionExecutionFailed {
                 action_id: action_id.to_string(),
+                // No status: this is a 2xx whose envelope reports failure, so
+                // the HTTP code says nothing about what went wrong.
+                status: None,
+                error_code: envelope.error_code.clone(),
                 reason: envelope.failure_reason(),
             });
         }
@@ -1276,10 +1282,18 @@ mod tests {
             .execute("github.x", &serde_json::json!({}), None)
             .await
             .unwrap_err();
-        assert!(matches!(
-            err,
-            OpenConnectorError::ActionExecutionFailed { ref reason, .. } if reason.contains("502")
-        ));
+        assert!(
+            matches!(
+                err,
+                OpenConnectorError::ActionExecutionFailed {
+                    status: Some(502),
+                    ..
+                }
+            ),
+            "the status is a field, not something to recover from prose: {err}"
+        );
+        // And it is still in the message, because that is what a human reads.
+        assert!(err.to_string().contains("502"), "{err}");
         assert_eq!(
             gateway.requests().len(),
             1,
@@ -1331,5 +1345,104 @@ mod tests {
             ),
             "got {err}"
         );
+    }
+}
+
+/// The `errorCode` a failed gateway envelope carries, if the body is one.
+///
+/// Best-effort by construction: a terminal failure's body may be a proxy's
+/// HTML or nothing at all, and an absent code is a normal answer rather than a
+/// parse error. The status is the fact that always exists; this is the one
+/// that sharpens it.
+fn envelope_error_code(body: &str) -> Option<String> {
+    serde_json::from_str::<Value>(body)
+        .ok()?
+        .get("errorCode")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+#[cfg(test)]
+mod structured_failure_tests {
+    use super::*;
+    use crate::testing::{MockGateway, MockResponse, envelope_err};
+
+    fn client(gateway: &MockGateway) -> OpenConnectorClient {
+        OpenConnectorClient::new(&gateway.url, "t", std::time::Duration::from_secs(5))
+            .expect("client")
+    }
+
+    /// **The distinction cloud's syncer is built on.** A 403 on an ACL read is
+    /// a permanent property of the resource — the credential holds no sharing
+    /// right, and it will hold none next tick either — while a 5xx is the
+    /// gateway being unavailable. Those are opposite instructions to an
+    /// operator, and recovering them from a substring search is how they
+    /// silently swap.
+    #[tokio::test]
+    async fn a_forbidden_and_a_server_error_are_distinguishable_without_reading_prose() {
+        for code in [403u16, 404, 500, 502] {
+            let gateway = MockGateway::start(move |_| MockResponse::new(code, "{}")).await;
+            let err = client(&gateway)
+                .execute("x.y", &serde_json::json!({}), None)
+                .await
+                .unwrap_err();
+            match err {
+                OpenConnectorError::ActionExecutionFailed { status, .. } => {
+                    assert_eq!(status, Some(code), "status must survive as a field");
+                }
+                other => panic!("expected ActionExecutionFailed, got {other}"),
+            }
+        }
+    }
+
+    /// `action_not_allowed` on a 400 means the DEPLOYMENT's allowlist omits the
+    /// action. Without the code it reads as a broken credential, which is the
+    /// wrong thing to go and check.
+    #[tokio::test]
+    async fn the_gateway_error_code_survives_as_a_field() {
+        let gateway = MockGateway::start(|_| {
+            MockResponse::new(400, envelope_err("action_not_allowed", "nope").as_str())
+        })
+        .await;
+        let err = client(&gateway)
+            .execute("x.y", &serde_json::json!({}), None)
+            .await
+            .unwrap_err();
+        match err {
+            OpenConnectorError::ActionExecutionFailed {
+                status, error_code, ..
+            } => {
+                assert_eq!(status, Some(400));
+                assert_eq!(error_code.as_deref(), Some("action_not_allowed"));
+            }
+            other => panic!("expected ActionExecutionFailed, got {other}"),
+        }
+    }
+
+    /// A 2xx whose envelope reports failure carries NO status, deliberately:
+    /// the HTTP code says nothing about what went wrong, and reporting 200
+    /// would invite a consumer to classify it as success.
+    #[tokio::test]
+    async fn a_failed_envelope_under_2xx_reports_no_status() {
+        let gateway = MockGateway::start(|_| {
+            MockResponse::ok(envelope_err("provider_error", "upstream said no").as_str())
+        })
+        .await;
+        let err = client(&gateway)
+            .execute("x.y", &serde_json::json!({}), None)
+            .await
+            .unwrap_err();
+        match err {
+            OpenConnectorError::ActionExecutionFailed {
+                status, error_code, ..
+            } => {
+                assert_eq!(
+                    status, None,
+                    "a 2xx failure envelope has no meaningful status"
+                );
+                assert_eq!(error_code.as_deref(), Some("provider_error"));
+            }
+            other => panic!("expected ActionExecutionFailed, got {other}"),
+        }
     }
 }

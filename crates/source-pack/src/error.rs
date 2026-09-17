@@ -182,8 +182,34 @@ pub enum OpenConnectorError {
     InvalidActionId { action_id: String, reason: String },
 
     /// An action execution call returned a terminal (non-retryable) failure.
+    ///
+    /// `status` and `error_code` are carried STRUCTURED rather than only
+    /// rendered into `reason`, because consumers classify on them and prose is
+    /// not a contract. Two callers need it and one of them is this crate:
+    ///
+    ///   * cloud's rbac syncer distinguishes "the provider refused this
+    ///     folder's ACL" (403/404 — a permanent property of the folder, which
+    ///     it reports as its own failure class) from "the gateway was down"
+    ///     (5xx — retry next tick). Those are opposite instructions to an
+    ///     operator, and getting them from a substring search is how they
+    ///     silently swap;
+    ///   * `error_code == "action_not_allowed"` on a 400 means the deployment's
+    ///     allowlist omits the action, which reads like a broken credential
+    ///     unless it is named.
+    ///
+    /// `reason` stays for the message a human reads. It is no longer the only
+    /// place the facts live — this crate's own tests used to recover the status
+    /// with `reason.contains("502")`.
     #[error("Open Connector action '{action_id}' execution failed: {reason}")]
-    ActionExecutionFailed { action_id: String, reason: String },
+    ActionExecutionFailed {
+        action_id: String,
+        /// The gateway's HTTP status, or `None` when the failure was not an
+        /// HTTP response at all (a 2xx envelope reporting `success: false`).
+        status: Option<u16>,
+        /// The gateway envelope's `errorCode`, when it sent one.
+        error_code: Option<String>,
+        reason: String,
+    },
 
     /// Retries on 429 / transient 5xx / transport errors were exhausted.
     #[error("Open Connector {operation} failed after {attempts} attempt(s); last error: {reason}")]
