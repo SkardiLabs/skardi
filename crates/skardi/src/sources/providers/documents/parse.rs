@@ -90,10 +90,33 @@ impl Default for ParseOptions {
 }
 
 /// The default set of supported file globs.
+///
+/// The last three take the direct-ingest path in [`super::text`] and never
+/// reach liteparse, which cannot read them at all — see that module for why.
+/// They are listed here because a caller who asks for the defaults wants
+/// "everything this connector can read", and that now includes text.
 fn default_globs() -> Vec<String> {
     [
-        "*.pdf", "*.docx", "*.xlsx", "*.pptx", "*.doc", "*.xls", "*.ppt", "*.odt", "*.ods",
-        "*.odp", "*.png", "*.jpg", "*.jpeg", "*.tif", "*.tiff", "*.bmp", "*.gif",
+        "*.pdf",
+        "*.docx",
+        "*.xlsx",
+        "*.pptx",
+        "*.doc",
+        "*.xls",
+        "*.ppt",
+        "*.odt",
+        "*.ods",
+        "*.odp",
+        "*.png",
+        "*.jpg",
+        "*.jpeg",
+        "*.tif",
+        "*.tiff",
+        "*.bmp",
+        "*.gif",
+        "*.md",
+        "*.markdown",
+        "*.txt",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -181,12 +204,12 @@ fn lp_image_mode(mode: ImageMode) -> LpImageMode {
 }
 
 /// Stable id for a file derived from its relative path.
-fn doc_id_for(rel_path: &str) -> String {
+pub(super) fn doc_id_for(rel_path: &str) -> String {
     blake3::hash(rel_path.as_bytes()).to_hex().to_string()
 }
 
 /// File extension (lowercased) → coarse `file_type` label.
-fn file_type_for(path: &Path) -> String {
+pub(super) fn file_type_for(path: &Path) -> String {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -194,6 +217,12 @@ fn file_type_for(path: &Path) -> String {
         .to_ascii_lowercase();
     match ext.as_str() {
         "png" | "jpg" | "jpeg" | "tif" | "tiff" | "bmp" | "gif" => "image".to_string(),
+        // One format, one label. `.markdown` is a second spelling of the same
+        // thing, and a corpus holding both spellings under two `file_type`s
+        // would silently halve every `WHERE file_type = 'md'` written against
+        // it. The spelling survives in `path`, which is where a question about
+        // the original filename belongs.
+        "markdown" => "md".to_string(),
         other => other.to_string(),
     }
 }
@@ -625,13 +654,24 @@ fn parse_source_blocking(root: &str, opts: &ParseOptions) -> Result<Vec<ParsedPa
                 continue;
             }
         };
-        match runtime.block_on(parse_file(
-            &bytes,
-            &rel_path,
-            opts,
-            write_store.as_ref(),
-            &mut writes,
-        )) {
+        // Markdown and plain text are content already, so they take a path
+        // that never constructs a `LiteParse` — see `super::text`. Dispatched
+        // on the extension BEFORE the parser is built, because liteparse
+        // cannot read these formats at all: handed one, it sniffs the bytes as
+        // `PlainText`, renames the input `input.txt`, finds no conversion
+        // route for that extension, and fails the file.
+        let parsed = if super::text::is_text_path(&rel_path) {
+            super::text::parse_text(&bytes, &rel_path)
+        } else {
+            runtime.block_on(parse_file(
+                &bytes,
+                &rel_path,
+                opts,
+                write_store.as_ref(),
+                &mut writes,
+            ))
+        };
+        match parsed {
             Ok(mut page_rows) => {
                 ok_files += 1;
                 rows.append(&mut page_rows);
@@ -724,9 +764,17 @@ pub fn preflight(opts: &ParseOptions) -> Result<()> {
     // Office/ODF/image conversion needs LibreOffice (and ImageMagick for some
     // image inputs). Only relevant when the globs admit non-PDF inputs. Not
     // fatal: a PDF-only directory still works when LibreOffice is absent.
+    // Text is excluded as well as PDF: it is read directly and converts
+    // nothing, so a text-only source must not warn about a LibreOffice it has
+    // no use for.
     let needs_conversion = opts.include_globs.iter().any(|g| {
         let g = g.to_ascii_lowercase();
-        !(g.ends_with(".pdf") || g == "*" || g == "*.*")
+        !(g.ends_with(".pdf")
+            || g.ends_with(".md")
+            || g.ends_with(".markdown")
+            || g.ends_with(".txt")
+            || g == "*"
+            || g == "*.*")
     });
     if needs_conversion && !tool_available("soffice") && !tool_available("libreoffice") {
         tracing::warn!(
@@ -770,6 +818,106 @@ mod tests {
         assert!(rows.iter().all(|r| r.file_type == "pdf"));
         assert!(rows.iter().all(|r| !r.markdown.is_empty()));
         assert_eq!(rows[0].page, 1);
+    }
+
+    /// The direct-ingest path end to end, through the same entry point the
+    /// table uses — the dispatch, the globs and the row shape together.
+    ///
+    /// Worth having beside the unit tests in `text.rs`: those exercise the
+    /// chunker on strings, and this is the one that would fail if
+    /// `parse_source_blocking` stopped routing text away from liteparse.
+    #[test]
+    fn markdown_and_text_are_ingested_directly_beside_pdfs() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("readme.md"), b"# Title\n\nbody text\n").unwrap();
+        std::fs::write(dir.path().join("notes.markdown"), b"# Other\n\nmore\n").unwrap();
+        std::fs::write(dir.path().join("log.txt"), b"plain line one\n\nline two\n").unwrap();
+        let opts = ParseOptions {
+            include_globs: vec!["*.md".into(), "*.markdown".into(), "*.txt".into()],
+            ocr: OcrMode::Off,
+            ..ParseOptions::default()
+        };
+
+        let rows = parse_source(dir.path().to_str().unwrap(), &opts).unwrap();
+
+        assert_eq!(rows.len(), 3, "one section each: {rows:#?}");
+        let mut types: Vec<&str> = rows.iter().map(|r| r.file_type.as_str()).collect();
+        types.sort_unstable();
+        assert_eq!(types, ["md", "md", "txt"], "`.markdown` reports `md`");
+        assert!(rows.iter().all(|r| r.page == 1));
+        assert!(rows.iter().all(|r| r.tables_json == "[]"));
+        assert!(rows.iter().all(|r| r.page_image_ref.is_none()));
+        // The body is the file verbatim — nothing was reconstructed.
+        let readme = rows.iter().find(|r| r.path == "readme.md").unwrap();
+        assert_eq!(readme.markdown, "# Title\n\nbody text\n");
+    }
+
+    /// The failure this whole path exists to avoid: liteparse cannot read
+    /// text, so a `.md` reaching `parse_file` fails, and with one file in the
+    /// source the wholesale-failure guard makes that a hard error.
+    ///
+    /// Asserted from the other side — the file parses and the scan succeeds —
+    /// because a test that pinned the old error would have to be deleted to
+    /// make this change, rather than proving it.
+    #[test]
+    fn a_text_only_source_scans_successfully_where_liteparse_would_hard_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("only.md"), b"# One\n\njust this\n").unwrap();
+        let opts = ParseOptions {
+            include_globs: vec!["*.md".into()],
+            ocr: OcrMode::Off,
+            ..ParseOptions::default()
+        };
+
+        let rows = parse_source(dir.path().to_str().unwrap(), &opts).unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    /// A text file that cannot be ingested is a per-file skip like any other,
+    /// and — as the only file — trips the wholesale-failure guard rather than
+    /// returning an empty corpus.
+    #[test]
+    fn a_non_utf8_text_file_is_a_skip_and_the_lone_file_hard_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("latin.txt"), b"caf\xe9 notes").unwrap();
+        let opts = ParseOptions {
+            include_globs: vec!["*.txt".into()],
+            ocr: OcrMode::Off,
+            ..ParseOptions::default()
+        };
+
+        let err = parse_source(dir.path().to_str().unwrap(), &opts).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("failed to fetch/parse"),
+            "expected the wholesale-failure guard: {err:#}"
+        );
+    }
+
+    /// The defaults admit text, so a caller who asks for "everything this
+    /// connector reads" gets it — and `file_type_for` folds the second
+    /// spelling.
+    #[test]
+    fn the_default_globs_admit_text_and_markdown_has_one_file_type() {
+        let globs = default_globs();
+        for expected in ["*.md", "*.markdown", "*.txt"] {
+            assert!(globs.contains(&expected.to_string()), "{expected} missing");
+        }
+        assert_eq!(file_type_for(Path::new("a.markdown")), "md");
+        assert_eq!(file_type_for(Path::new("a.md")), "md");
+        assert_eq!(file_type_for(Path::new("a.txt")), "txt");
+        assert_eq!(file_type_for(Path::new("a.pdf")), "pdf");
+    }
+
+    /// Text converts nothing, so a text-only source must not be told it needs
+    /// a LibreOffice it has no use for.
+    #[test]
+    fn preflight_does_not_want_libreoffice_for_a_text_only_source() {
+        let opts = ParseOptions {
+            include_globs: vec!["*.md".into(), "*.txt".into()],
+            ocr: OcrMode::Off,
+            ..ParseOptions::default()
+        };
+        assert!(preflight(&opts).is_ok());
     }
 
     #[test]
