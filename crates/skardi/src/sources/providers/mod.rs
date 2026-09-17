@@ -46,13 +46,19 @@ pub enum DatasetEntry {
 /// `sqlite_knn`, `sqlite_fts`, `seekdb_knn`, and `seekdb_fts` table functions.
 pub type DatasetRegistry = Arc<RwLock<HashMap<String, DatasetEntry>>>;
 
-/// Wrapper working around a `datafusion-table-providers` 0.10.1 bug shared by
-/// the ClickHouse and Flight (InfluxDB) providers: when DataFusion requests an
-/// **empty** projection (e.g. `SELECT count(*)`), the inner table emits
-/// batches whose width disagrees with the advertised zero-column schema —
-/// ClickHouse's unparsed SQL still selects a column, and the Flight provider's
-/// `enforce_schema` returns the original full-width batch — so execution
-/// aborts downstream.
+/// Wrapper working around a `datafusion-table-providers` 0.10.1 bug: when
+/// DataFusion requests an **empty** projection (e.g. `SELECT count(*)`), the
+/// inner table emits batches whose width disagrees with the advertised
+/// zero-column schema, so execution aborts downstream with
+/// `Different number of fields: (physical) 1 vs (logical) 0`.
+///
+/// Every provider in that crate we build on has the defect, by three separate
+/// routes: ClickHouse's unparsed SQL still selects a column; the Flight
+/// (InfluxDB) provider's `enforce_schema` returns the original full-width
+/// batch; and `SqlTable` — the generic SQL provider behind our Postgres and
+/// SeekDB sources — unparses an empty projection as `SELECT 1` and reports a
+/// one-column Int64 schema for it (`sql_provider_datafusion::project_schema_safe`).
+/// Anything built on those tables must go through this wrapper.
 ///
 /// We intercept the empty-projection case: scan a single real column through
 /// the inner table, then strip it back to zero columns with a
@@ -86,6 +92,14 @@ impl TableProvider for CountSafeTable {
     // the optimizer apart from the count(*) interception below.
     fn statistics(&self) -> Option<datafusion::common::Statistics> {
         self.inner.statistics()
+    }
+
+    // Read-write providers stack on top of this one and forward `constraints`
+    // to whatever they hold as their read provider, so dropping the inner
+    // table's constraints here would silently disarm the primary-key handling
+    // one layer up.
+    fn constraints(&self) -> Option<&datafusion::common::Constraints> {
+        self.inner.constraints()
     }
 
     fn supports_filters_pushdown(
@@ -171,7 +185,170 @@ pub(crate) fn is_pushable_binary_filter(expr: &datafusion::logical_expr::Expr) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::arrow::array::{Int64Array, RecordBatch, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use datafusion::catalog::Session;
+    use datafusion::common::Result as DataFusionResult;
+    use datafusion::datasource::MemTable;
+    use datafusion::logical_expr::{Expr, TableType};
+    use datafusion::physical_plan::ExecutionPlan;
+    use datafusion::prelude::SessionContext;
+
+    /// Stands in for `datafusion-table-providers`' `SqlTable` in the one
+    /// respect that matters here: an EMPTY projection is unparsed as
+    /// `SELECT 1`, so the plan it hands back carries a single Int64 column
+    /// while the logical scan above it has none. Every other projection
+    /// behaves normally.
+    ///
+    /// This reproduces the real defect without a database, which is the
+    /// point — the live Postgres suite that also covers it is `#[ignore]`d
+    /// and only runs where CI has a server.
+    #[derive(Debug)]
+    struct EmptyProjectionReturnsOneColumn {
+        table: Arc<MemTable>,
+        row_count: usize,
+    }
+
+    impl EmptyProjectionReturnsOneColumn {
+        fn with_rows(n: usize) -> Self {
+            let schema: SchemaRef = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("name", DataType::Utf8, true),
+            ]));
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from((0..n as i64).collect::<Vec<_>>())),
+                    Arc::new(StringArray::from(vec!["row"; n])),
+                ],
+            )
+            .expect("fixture batch");
+            Self {
+                table: Arc::new(MemTable::try_new(schema, vec![vec![batch]]).expect("memtable")),
+                row_count: n,
+            }
+        }
+    }
+
+    const FIXTURE_ROWS: usize = 7;
+
+    #[async_trait::async_trait]
+    impl TableProvider for EmptyProjectionReturnsOneColumn {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn schema(&self) -> SchemaRef {
+            self.table.schema()
+        }
+
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+
+        async fn scan(
+            &self,
+            state: &dyn Session,
+            projection: Option<&Vec<usize>>,
+            filters: &[Expr],
+            limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            match projection {
+                Some(p) if p.is_empty() => {
+                    let one: SchemaRef =
+                        Arc::new(Schema::new(vec![Field::new("1", DataType::Int64, true)]));
+                    let batch = RecordBatch::try_new(
+                        Arc::clone(&one),
+                        vec![Arc::new(Int64Array::from(vec![1i64; self.row_count]))],
+                    )?;
+                    MemTable::try_new(one, vec![vec![batch]])?
+                        .scan(state, None, &[], None)
+                        .await
+                }
+                _ => self.table.scan(state, projection, filters, limit).await,
+            }
+        }
+    }
+
+    /// The defect this wrapper exists for, pinned so it cannot be mistaken
+    /// for a test that passes because nothing happens.
+    #[tokio::test]
+    async fn count_star_on_the_bare_table_fails_with_a_width_mismatch() {
+        let ctx = SessionContext::new();
+        ctx.register_table(
+            "t",
+            Arc::new(EmptyProjectionReturnsOneColumn::with_rows(FIXTURE_ROWS)),
+        )
+        .expect("register");
+
+        let err = ctx
+            .sql("SELECT count(*) FROM t")
+            .await
+            .expect("the statement PLANS — only execution fails")
+            .collect()
+            .await
+            .expect_err("an empty projection must break the bare table");
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("physical") && msg.contains("logical"),
+            "expected the plan/exec schema mismatch, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn count_star_through_count_safe_table_returns_the_row_count() {
+        let ctx = SessionContext::new();
+        ctx.register_table(
+            "t",
+            Arc::new(CountSafeTable {
+                inner: Arc::new(EmptyProjectionReturnsOneColumn::with_rows(FIXTURE_ROWS)),
+            }),
+        )
+        .expect("register");
+
+        let batches = ctx
+            .sql("SELECT count(*) FROM t")
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect("an empty projection must survive the wrapper");
+        let counted = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("count(*) is Int64")
+            .value(0);
+        assert_eq!(counted, FIXTURE_ROWS as i64);
+    }
+
+    /// The interception is confined to the empty projection: an ordinary
+    /// `SELECT col` must still reach the inner table untouched, columns and
+    /// cardinality intact.
+    #[tokio::test]
+    async fn the_wrapper_leaves_ordinary_projections_alone() {
+        let ctx = SessionContext::new();
+        ctx.register_table(
+            "t",
+            Arc::new(CountSafeTable {
+                inner: Arc::new(EmptyProjectionReturnsOneColumn::with_rows(FIXTURE_ROWS)),
+            }),
+        )
+        .expect("register");
+
+        let batches = ctx
+            .sql("SELECT name FROM t")
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect("collect");
+        assert_eq!(batches[0].num_columns(), 1);
+        assert_eq!(
+            batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+            FIXTURE_ROWS
+        );
+    }
 
     #[test]
     fn narrowest_column_index_prefers_narrowest_fixed_width() {

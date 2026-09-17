@@ -3,7 +3,7 @@ use crate::sources::hierarchy::{
     HierarchyLevel, SourceLabel, build_catalog, parse_allowed_schemas, retry_with_timeout,
 };
 use crate::sources::providers::sqlx::pg::knn_table_function::{PgKnnEntry, fetch_table_columns};
-use crate::sources::providers::{DatasetEntry, DatasetRegistry};
+use crate::sources::providers::{CountSafeTable, DatasetEntry, DatasetRegistry};
 use anyhow::{Context, Result};
 use arrow::array::{RecordBatch, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -351,10 +351,19 @@ async fn build_postgres_table_provider(
 
     let dyn_pool: Arc<DynPostgresConnectionPool> =
         Arc::clone(read_pool) as Arc<DynPostgresConnectionPool>;
-    let read_provider: Arc<dyn TableProvider> = Arc::new(
-        SqlTable::new_with_schema("postgres", &dyn_pool, schema, table_reference.clone())
-            .with_dialect(Arc::new(PostgreSqlDialect {})),
-    );
+    // `SqlTable` unparses an EMPTY projection — what DataFusion asks for on an
+    // ungrouped `count(*)` — as `SELECT 1`, and reports a one-column Int64
+    // schema for it while the logical scan has no columns at all. The plan
+    // then fails to execute with `(physical) 1 vs (logical) 0`. Wrapping here,
+    // rather than inside `SqlxPostgresTableProvider`, covers BOTH
+    // registrations: the read-only one returns this provider directly, and the
+    // read-write one delegates its `scan` to it.
+    let read_provider: Arc<dyn TableProvider> = Arc::new(CountSafeTable {
+        inner: Arc::new(
+            SqlTable::new_with_schema("postgres", &dyn_pool, schema, table_reference.clone())
+                .with_dialect(Arc::new(PostgreSqlDialect {})),
+        ),
+    });
 
     if !read_write {
         return Ok(read_provider);
@@ -1948,6 +1957,64 @@ mod tests {
 
         let batches = query_all(&ctx, "SELECT id FROM users LIMIT 2").await;
         assert_eq!(total_rows(&batches), 2);
+    }
+
+    /// An ungrouped `count(*)` is the one query shape that asks the scan for
+    /// no columns at all, and it used to be the one shape a Postgres source
+    /// could not answer. The assertion is against `count(id)` rather than a
+    /// literal, because `id` is `NOT NULL` in the fixture, so the two must
+    /// agree whatever the fixture's size — and `count(id)` is exactly the
+    /// workaround users were told to write instead.
+    #[tokio::test]
+    #[ignore]
+    async fn count_star_matches_count_of_a_not_null_column() {
+        let mut ctx = SessionContext::new();
+        register_ci_table(&mut ctx, "users").await;
+
+        let star = query_all(&ctx, "SELECT count(*) FROM users").await;
+        let column = query_all(&ctx, "SELECT count(id) FROM users").await;
+        assert_eq!(scalar_count(&star), scalar_count(&column));
+        assert!(
+            scalar_count(&star) >= 3,
+            "the fixture seeds at least 3 rows"
+        );
+    }
+
+    /// The same query against a read-only registration, which returns the
+    /// read provider directly instead of going through
+    /// [`SqlxPostgresTableProvider`]. Both paths have to be covered, and
+    /// they are covered by the same wrapper only because it sits on the read
+    /// provider itself.
+    #[tokio::test]
+    #[ignore]
+    async fn count_star_works_against_a_read_only_registration() {
+        let mut ctx = SessionContext::new();
+        register_ci_table_read_only(&mut ctx, "users").await;
+
+        let star = query_all(&ctx, "SELECT count(*) FROM users").await;
+        let column = query_all(&ctx, "SELECT count(id) FROM users").await;
+        assert_eq!(scalar_count(&star), scalar_count(&column));
+    }
+
+    /// A `count(*)` narrowed by a predicate still has an empty projection,
+    /// and the filter has to survive the wrapper's detour through one column.
+    #[tokio::test]
+    #[ignore]
+    async fn count_star_still_honours_a_filter() {
+        let mut ctx = SessionContext::new();
+        register_ci_table(&mut ctx, "users").await;
+
+        let filtered = query_all(&ctx, "SELECT count(*) FROM users WHERE id = 1").await;
+        assert_eq!(scalar_count(&filtered), 1);
+    }
+
+    fn scalar_count(batches: &[RecordBatch]) -> i64 {
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("count() is Int64")
+            .value(0)
     }
 
     // ─── Insert test (integration) ──────────────────────────────────────
