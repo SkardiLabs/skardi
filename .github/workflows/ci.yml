@@ -230,6 +230,15 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Check the package for errors
         run: cargo check --all
+      - name: The source pack stays importable by a syncer
+        # `skardi-source-pack` exists so the engine, cloud's ETL runner
+        # and cloud's rbac syncer share one Open Connector client. Two of
+        # those three cannot carry DataFusion or Arrow, so a transitive
+        # dependency on either removes the crate's reason to exist —
+        # silently, since nobody adds them on purpose. The script asks the
+        # resolved tree rather than the manifest, and carries its own
+        # positive control so a broken probe cannot pass.
+        run: ./scripts/assert_pack_boundary.sh
       - name: Execute rust tests
         run: cargo llvm-cov --no-report nextest --all-features
       - name: Execute doc tests
@@ -239,7 +248,13 @@ jobs:
         # doctests) in this job rather than Docs, because `--all-features`
         # links PDFium and only this job carries the pdfium-rs cache
         # arrangement above.
-        run: cargo test --doc -p skardi --all-features
+        # `-p skardi -p skardi-source-pack`: the pack carries doc examples
+        # too, and they are the only thing that caught five stale
+        # `use skardi::util::…` paths when its modules moved out of the
+        # engine — `cargo check` and the unit tests both passed. Naming
+        # only `skardi` here would have let them rot exactly as the
+        # comment above warns.
+        run: cargo test --doc -p skardi -p skardi-source-pack --all-features
 
       - name: Install integration test dependencies
         run: |
