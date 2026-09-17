@@ -15,16 +15,16 @@
 
 use serde_json::Value;
 
-use super::error::OpenConnectorError;
-use super::json_to_arrow::{ColumnSpec, FieldType};
-use super::row_path::RowPath;
+use crate::error::OpenConnectorError;
+use crate::row_path::RowPath;
+use crate::schema::{ColumnSpec, FieldType};
 
 /// Derive the raw-scan columns for `action_id` from its discovered output
 /// schema, at the row array located by `row_path`.
 ///
 /// Columns are sorted by name so the derived Arrow schema does not depend on
 /// the gateway's property serialization order.
-pub(crate) fn derive_raw_columns(
+pub fn derive_raw_columns(
     action_id: &str,
     output_schema: Option<&Value>,
     row_path: &RowPath,

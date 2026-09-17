@@ -69,10 +69,15 @@ pub mod mock_http;
 /// number, cursor, explicit has-more, keyset, single page, and split-action
 /// continuation.
 pub mod pagination;
+/// What a provider's gateway actually answered, before any declaration is
+/// applied to it.
+pub mod raw_schema;
 /// Where a provider's rows live inside its response body.
 pub mod row_path;
 /// The row shape a provider declares; the engine converts.
 pub mod schema;
+/// A source pack: the tables a provider offers and how each is read.
+pub mod source_pack;
 #[cfg(feature = "testing")]
 pub mod testing;
 /// The character bound that keeps a provider's error body from becoming a log

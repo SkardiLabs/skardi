@@ -968,7 +968,7 @@ mod tests {
     use crate::sources::providers::open_connector::source_pack::SourcePackRegistry;
 
     /// Every registered asset parses AND passes the same structural
-    /// checks binding performs. Driven off `SourcePackRegistry::builtins()`
+    /// checks binding performs. Driven off `crate::sources::providers::open_connector::builtin_pack_registry()`
     /// rather than a hand-listed roster: the roster construct had already
     /// drifted for a full milestone (`discord.yaml` shipped in 5.6
     /// unlisted), and whatever registration sees, this test now sees —
@@ -976,8 +976,8 @@ mod tests {
     /// registry name-list test's pin, not this one's.
     #[test]
     fn builtin_assets_parse_and_validate() {
-        let registry =
-            SourcePackRegistry::builtins().expect("every embedded asset parses and validates");
+        let registry = crate::sources::providers::open_connector::builtin_pack_registry()
+            .expect("every embedded asset parses and validates");
         for pack in registry.packs() {
             // parse_pack rejects an empty `tables` today; this stays as
             // the second layer should that rejection ever move.

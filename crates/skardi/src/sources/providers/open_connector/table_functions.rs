@@ -117,7 +117,7 @@ pub fn register_open_connector_udtfs(
     ctx: &SessionContext,
     gateways: OpenConnectorGateways,
 ) -> Result<(), OpenConnectorError> {
-    let packs = SourcePackRegistry::builtins()?;
+    let packs = super::builtin_pack_registry()?;
     ctx.register_udtf(
         "open_connector_query",
         Arc::new(OpenConnectorQueryFunction::new(

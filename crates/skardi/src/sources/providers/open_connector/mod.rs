@@ -47,9 +47,11 @@ pub mod filters;
 pub mod json_to_arrow;
 pub mod packs;
 pub use skardi_source_pack::pagination;
-mod raw_schema;
+pub use skardi_source_pack::raw_schema;
 pub use skardi_source_pack::row_path;
-pub mod source_pack;
+pub mod builtin_packs;
+pub use builtin_packs::builtin_pack_registry;
+pub use skardi_source_pack::source_pack;
 pub mod table;
 pub mod table_functions;
 
@@ -179,7 +181,7 @@ pub async fn register_open_connector_tables(
 
     // Resolve bindings to pack table definitions first, so discovery covers
     // the allowlist *and* every action a bound table needs.
-    let pack_registry = SourcePackRegistry::builtins()?;
+    let pack_registry = builtin_pack_registry()?;
     let mut action_ids = config.raw_action_allowlist.clone();
     for binding in &config.bindings {
         let pack = pack_registry.require(&binding.source_pack)?;
