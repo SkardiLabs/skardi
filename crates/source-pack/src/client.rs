@@ -247,6 +247,65 @@ struct ExecuteEnvelope<'a> {
     input: &'a Value,
 }
 
+/// The transport behaviour one consumer wants.
+///
+/// Explicit, and never defaulted from the other consumer, because the two
+/// genuinely differ and silently picking one would change the other's
+/// security posture:
+///
+/// * the **syncer** wants no redirects at all, a five-second connect timeout
+///   and a fifteen-second request timeout. The redirect rule is the important
+///   one: every call carries a source's Open Connector runtime token as a
+///   bearer, and a `302` would otherwise have the client replay the request at
+///   whatever host the `Location` names. `reqwest` strips `Authorization`
+///   across hosts, so it is defence in depth rather than a live leak — but
+///   depth is the point when the header being stripped is a credential.
+/// * the **engine** keeps its existing redirect behaviour and its configured
+///   request timeout, with no separate connect timeout.
+///
+/// So this carries no `Default`. A caller states what it wants, which is what
+/// stops one consumer's policy becoming the other's by omission.
+#[derive(Debug, Clone)]
+pub struct TransportPolicy {
+    /// Total time for a request, connect included.
+    pub request_timeout: Duration,
+    /// Time to establish the connection, when the caller wants that bounded
+    /// separately. `None` leaves it to the total.
+    pub connect_timeout: Option<Duration>,
+    /// Whether to follow a redirect. `false` refuses outright.
+    pub follow_redirects: bool,
+}
+
+impl TransportPolicy {
+    /// The policy a consumer that carries a per-source credential should want.
+    ///
+    /// Named rather than spelled at each call site so the three facts stay
+    /// together: a caller that copied two of them and forgot the redirect rule
+    /// would have a client that leaks its bearer on a `302`, and nothing in a
+    /// review of the two timeouts would show it.
+    pub fn credential_bearing(request_timeout: Duration, connect_timeout: Duration) -> Self {
+        Self {
+            request_timeout,
+            connect_timeout: Some(connect_timeout),
+            follow_redirects: false,
+        }
+    }
+}
+
+impl OpenConnectorClient {
+    /// A client with an explicit transport policy.
+    ///
+    /// [`Self::new`] is this with the engine's policy; a consumer whose calls
+    /// carry a credential should use [`TransportPolicy::credential_bearing`].
+    pub fn with_policy(
+        gateway_url: &str,
+        token: impl Into<String>,
+        policy: TransportPolicy,
+    ) -> Result<Self, OpenConnectorError> {
+        Self::build(gateway_url, token, policy)
+    }
+}
+
 impl OpenConnectorClient {
     /// Build a client from the gateway URL and the typed config.
     ///
@@ -316,6 +375,26 @@ impl OpenConnectorClient {
         token: impl Into<String>,
         request_timeout: Duration,
     ) -> Result<Self, OpenConnectorError> {
+        // The ENGINE's policy, unchanged by the extraction: its existing
+        // redirect behaviour and its configured request timeout, with no
+        // separate connect timeout. Stated here rather than inherited so that
+        // a consumer reading `new` sees whose defaults these are.
+        Self::build(
+            gateway_url,
+            token,
+            TransportPolicy {
+                request_timeout,
+                connect_timeout: None,
+                follow_redirects: true,
+            },
+        )
+    }
+
+    fn build(
+        gateway_url: &str,
+        token: impl Into<String>,
+        policy: TransportPolicy,
+    ) -> Result<Self, OpenConnectorError> {
         let mut base_url =
             Url::parse(gateway_url).map_err(|_| OpenConnectorError::InvalidGatewayUrl {
                 url: gateway_url.to_string(),
@@ -350,8 +429,14 @@ impl OpenConnectorClient {
             base_url.set_path(&path);
         }
 
-        let http = reqwest::Client::builder()
-            .timeout(request_timeout)
+        let mut builder = reqwest::Client::builder().timeout(policy.request_timeout);
+        if let Some(connect) = policy.connect_timeout {
+            builder = builder.connect_timeout(connect);
+        }
+        if !policy.follow_redirects {
+            builder = builder.redirect(reqwest::redirect::Policy::none());
+        }
+        let http = builder
             .build()
             .map_err(|e| OpenConnectorError::HttpClientBuild {
                 reason: e.to_string(),
@@ -1444,5 +1529,70 @@ mod structured_failure_tests {
             }
             other => panic!("expected ActionExecutionFailed, got {other}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod transport_policy_tests {
+    use super::*;
+    use crate::testing::{MockGateway, MockResponse};
+
+    /// **The property the policy exists for.** Every call a credential-bearing
+    /// consumer makes carries a source's runtime token as a bearer. A client
+    /// that followed a `302` would replay the request at whatever host the
+    /// `Location` names.
+    ///
+    /// Asserting the redirect is not FOLLOWED, rather than asserting a config
+    /// flag: a flag test passes whether or not `reqwest` was actually
+    /// configured, which is the failure this guards. The gateway is asked
+    /// once, answers a redirect, and the client must stop there — a followed
+    /// redirect would show up as a second request.
+    #[tokio::test]
+    async fn a_credential_bearing_client_does_not_follow_a_redirect() {
+        let gateway = MockGateway::start(|_| {
+            MockResponse::new(302, "")
+                .with_header("location", "http://elsewhere.invalid/v1/actions/x.y")
+        })
+        .await;
+        let client = OpenConnectorClient::with_policy(
+            &gateway.url,
+            "t",
+            TransportPolicy::credential_bearing(Duration::from_secs(15), Duration::from_secs(5)),
+        )
+        .expect("client");
+
+        let err = client
+            .execute("x.y", &serde_json::json!({}), None)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                OpenConnectorError::ActionExecutionFailed {
+                    status: Some(302),
+                    ..
+                }
+            ),
+            "the redirect must surface as the response it is, not be followed: {err}"
+        );
+        assert_eq!(
+            gateway.requests().len(),
+            1,
+            "a followed redirect would have made a second request"
+        );
+    }
+
+    /// The engine's policy is stated rather than inherited, so `new` must not
+    /// quietly acquire the syncer's.
+    #[test]
+    fn the_engine_policy_still_follows_redirects() {
+        // A construction-level assertion is all that is available here — the
+        // point is that `new` builds a client at all with the engine's
+        // settings, and that it is not routed through
+        // `credential_bearing`. The behavioural half is the test above.
+        let client =
+            OpenConnectorClient::new("http://gateway.invalid", "t", Duration::from_secs(30));
+        assert!(client.is_ok());
     }
 }

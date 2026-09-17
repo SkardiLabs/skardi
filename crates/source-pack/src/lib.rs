@@ -84,6 +84,6 @@ pub mod testing;
 /// flood.
 pub mod text;
 
-pub use client::OpenConnectorClient;
+pub use client::{OpenConnectorClient, TransportPolicy};
 pub use config::OpenConnectorConfig;
 pub use error::OpenConnectorError;
