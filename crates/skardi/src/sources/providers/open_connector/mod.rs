@@ -34,8 +34,8 @@
 
 pub mod action_registry;
 pub mod cache;
-pub mod client;
-pub mod config;
+pub use skardi_source_pack::client;
+pub use skardi_source_pack::config;
 // `error` now lives in `skardi-source-pack`, so the syncer and the ETL
 // runner can name the same failures without importing a query planner.
 // Re-exported rather than re-declared: every existing `super::error::…`

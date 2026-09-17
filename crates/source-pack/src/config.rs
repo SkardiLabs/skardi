@@ -31,11 +31,16 @@
 //!         - pull_requests
 //! ```
 
+// `pub` rather than `pub(crate)`: these items were crate-visible when they
+// lived in the engine, and their audience has not changed — the engine's
+// exec, action registry and pack suites. It is now a different crate, and
+// a facade whose facade is private is not one.
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 
-use super::error::OpenConnectorError;
+use crate::error::OpenConnectorError;
 
 /// Default timeout for a single gateway HTTP request.
 const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 30;
@@ -69,11 +74,11 @@ fn default_cache_max_bytes() -> u64 {
 }
 
 fn default_max_response_bytes() -> u64 {
-    super::client::DEFAULT_MAX_RESPONSE_BYTES as u64
+    crate::client::DEFAULT_MAX_RESPONSE_BYTES as u64
 }
 
 fn default_max_attempts() -> u32 {
-    super::client::MAX_ATTEMPTS
+    crate::client::MAX_ATTEMPTS
 }
 
 /// Typed configuration for `type: open_connector` data sources.
@@ -88,7 +93,7 @@ fn default_max_attempts() -> u32 {
 ///
 /// # Example
 /// ```
-/// use skardi::sources::providers::open_connector::OpenConnectorConfig;
+/// use skardi_source_pack::OpenConnectorConfig;
 ///
 /// let yaml = r#"
 /// runtime_token_env: OPEN_CONNECTOR_TOKEN
@@ -240,7 +245,7 @@ impl OpenConnectorConfig {
 /// either one escapes the `/v1/actions/` namespace onto a misrouted endpoint.
 /// Shared by config validation (early error on `raw_action_allowlist`) and
 /// the client boundary (defense in depth for UDTF-supplied IDs).
-pub(crate) fn validate_action_id(action_id: &str) -> Result<(), OpenConnectorError> {
+pub fn validate_action_id(action_id: &str) -> Result<(), OpenConnectorError> {
     let reason = if action_id.contains('/') {
         Some("must not contain '/'")
     } else if action_id == "." || action_id == ".." {

@@ -43,6 +43,29 @@
 //! Rust client and the interpretation of what OC returns; it does not move OC's
 //! OAuth broker or its provider action implementations.
 
+/// The Open Connector data-source configuration: which gateway, which
+/// connection alias, and which action each bound table reads.
+/// The Open Connector HTTP client: one action call, its retries, and the
+/// gateway envelope it unwraps.
+pub mod client;
+pub mod config;
 pub mod error;
+/// HTTP client behaviour shared by every caller: `Retry-After` parsing and the
+/// jitter a retry waits. Lives here rather than in the engine because the pack
+/// is what makes the requests, and the engine re-exports it for its own
+/// non-SaaS callers (`rss`, the model clients).
+pub mod http;
+/// Canonical JSON and its hash — how an action's identity is computed — plus
+/// the value-kind names used in error messages.
+pub mod json;
+/// The character bound that keeps a provider's error body from becoming a log
+/// flood.
+pub mod text;
+#[cfg(feature = "testing")]
+pub mod mock_http;
+#[cfg(feature = "testing")]
+pub mod testing;
 
+pub use client::OpenConnectorClient;
+pub use config::OpenConnectorConfig;
 pub use error::OpenConnectorError;

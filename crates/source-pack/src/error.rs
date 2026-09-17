@@ -11,7 +11,7 @@ use thiserror::Error;
 ///
 /// # Example
 /// ```
-/// use skardi::sources::providers::open_connector::{OpenConnectorConfig, OpenConnectorError};
+/// use skardi_source_pack::{OpenConnectorConfig, OpenConnectorError};
 ///
 /// // A config with no bindings is valid; one with a duplicate binding name is not.
 /// let yaml = r#"

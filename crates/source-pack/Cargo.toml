@@ -28,9 +28,22 @@ license.workspace = true
 # way.
 [dependencies]
 anyhow = { workspace = true }
+# For `json::blake3_hex`, which computes an action registry entry's identity.
+blake3 = "1"
 async-trait = { workspace = true }
 chrono = { version = "0.4", features = ["serde"] }
+# For the client's streaming body read, which bounds a response by bytes
+# rather than buffering it whole.
+futures = { workspace = true }
+# For encoding an action id into the request path.
+percent-encoding = "2.3"
+# For `http::parse_retry_after`: `Retry-After` may be an HTTP-date rather than
+# a delta-seconds count, and this parses that form.
+httpdate = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+# The runtime token never becomes a printable String — see the crate doc's
+# boundary note: this is the credential every action call carries.
+secrecy = "0.10"
 serde = { workspace = true }
 # `preserve_order` for the same reason the engine pins it: an action's input
 # object order is part of its identity, and a re-sorted object changes the
@@ -44,5 +57,12 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
 
+[features]
+# Test support the ENGINE also consumes — the mock gateway and the
+# envelope builders. A feature rather than `#[cfg(test)]` because a
+# `cfg(test)` module cannot be seen across a crate boundary.
+testing = []
+
 [dev-dependencies]
+skardi-source-pack = { path = ".", features = ["testing"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

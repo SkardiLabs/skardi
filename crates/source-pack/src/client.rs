@@ -41,6 +41,11 @@
 //!   suffix, and a named connection is selected with the
 //!   `x-oo-connector-alias` header.
 
+// `pub` rather than `pub(crate)`: these items were crate-visible when they
+// lived in the engine, and their audience has not changed — the engine's
+// exec, action registry and pack suites. It is now a different crate, and
+// a facade whose facade is private is not one.
+
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -51,10 +56,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use url::Url;
 
-use super::config::{OpenConnectorConfig, validate_action_id};
-use super::error::OpenConnectorError;
-use crate::util::http::{clock_jitter_nanos, parse_retry_after};
-use crate::util::text::truncate_chars;
+use crate::config::{OpenConnectorConfig, validate_action_id};
+use crate::error::OpenConnectorError;
+use crate::http::{clock_jitter_nanos, parse_retry_after};
+use crate::text::truncate_chars;
 
 /// Health endpoint path (relative to the gateway base URL).
 const HEALTH_PATH: &str = "v1/health";
@@ -70,11 +75,11 @@ const CONNECTION_ALIAS_HEADER: &str = "x-oo-connector-alias";
 /// Maximum attempts for one call (including the first) before
 /// [`OpenConnectorError::RetriesExhausted`] is raised. Also the serde
 /// default for `OpenConnectorConfig::max_attempts`.
-pub(crate) const MAX_ATTEMPTS: u32 = 3;
+pub const MAX_ATTEMPTS: u32 = 3;
 
 /// Default bound on decoded response bodies (16 MiB). Also the serde
 /// default for `OpenConnectorConfig::max_response_bytes`.
-pub(crate) const DEFAULT_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Bytes read of a terminal error body — plenty for the 512-char message
 /// `terminal_reason` keeps, without buffering a worst-case 16 MiB error page.
@@ -253,11 +258,9 @@ impl OpenConnectorClient {
     ///
     /// # Example
     /// ```no_run
-    /// use skardi::sources::providers::open_connector::{
-    ///     OpenConnectorClient, OpenConnectorConfig,
-    /// };
+    /// use skardi_source_pack::{OpenConnectorClient, OpenConnectorConfig};
     ///
-    /// # async fn example() -> Result<(), skardi::sources::providers::open_connector::OpenConnectorError> {
+    /// # async fn example() -> Result<(), skardi_source_pack::OpenConnectorError> {
     /// let config: OpenConnectorConfig =
     ///     serde_yaml::from_str("runtime_token_env: OPEN_CONNECTOR_TOKEN").unwrap();
     /// let client = OpenConnectorClient::from_config("http://open-connector:3000", &config)?;
@@ -308,7 +311,7 @@ impl OpenConnectorClient {
     /// Build a client from explicit parts. Kept crate-private so production
     /// construction always goes through the validated config; tests use it to
     /// inject tokens and short timeouts without touching the environment.
-    pub(crate) fn new(
+    pub fn new(
         gateway_url: &str,
         token: impl Into<String>,
         request_timeout: Duration,
@@ -465,9 +468,9 @@ impl OpenConnectorClient {
     /// default-deny gating lives one layer up — `ActionRegistry::load` admits
     /// only explicitly allowlisted, locally-executable actions, and the scan
     /// engine / UDTFs check membership before calling this. Keeping the
-    /// method `pub(crate)` makes that gating structurally un-bypassable from
+    /// method `pub` makes that gating structurally un-bypassable from
     /// outside the crate.
-    pub(crate) async fn execute(
+    pub async fn execute(
         &self,
         action_id: &str,
         input: &Value,
@@ -712,7 +715,7 @@ fn backoff(attempt: u32) -> Duration {
 /// Parse a `Retry-After` header (integer-seconds form), capped at
 /// [`MAX_RETRY_WAIT`]. HTTP-date form is ignored.
 /// Parse a `Retry-After` header, capped at [`MAX_RETRY_WAIT`]. Shared
-/// parsing lives in [`crate::util::http::parse_retry_after`]; only the cap
+/// parsing lives in [`crate::http::parse_retry_after`]; only the cap
 /// is Open Connector-specific.
 fn retry_after(response: &Response) -> Option<Duration> {
     parse_retry_after(response).map(|wait| wait.min(MAX_RETRY_WAIT))
@@ -721,7 +724,7 @@ fn retry_after(response: &Response) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sources::providers::open_connector::testutil::{
+    use crate::testing::{
         MockGateway, MockResponse, RecordedRequest, discovery_ok, envelope_err, envelope_ok,
     };
     use std::sync::Arc;

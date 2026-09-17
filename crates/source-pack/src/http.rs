@@ -5,6 +5,11 @@
 //! taxonomy, and forcing one shape over them would degrade all of them.
 //! The retry *primitives* — header parsing and the like — live here once.
 
+// `pub` rather than `pub(crate)`: these items were crate-visible when they
+// lived in the engine, and their audience has not changed — the engine's
+// exec, action registry and pack suites. It is now a different crate, and
+// a facade whose facade is private is not one.
+
 use std::time::Duration;
 
 /// Parse a `Retry-After` response header, in either of its two legal forms:
@@ -28,7 +33,7 @@ use std::time::Duration;
 /// # Example
 /// ```
 /// # async fn example(resp: reqwest::Response) {
-/// use skardi::util::http::parse_retry_after;
+/// use skardi_source_pack::http::parse_retry_after;
 /// use std::time::Duration;
 ///
 /// let wait = parse_retry_after(&resp).unwrap_or(Duration::from_secs(2));
@@ -59,7 +64,13 @@ pub fn parse_retry_after(response: &reqwest::Response) -> Option<Duration> {
 /// own spread (the Open Connector client adds a flat 0–100ms; the rss
 /// fetcher spreads ±50% of the base, per its spec), the same way the loops
 /// themselves stay with their callers per this module's doc.
-pub(crate) fn clock_jitter_nanos() -> u64 {
+///
+/// `pub` rather than `pub`, and the change is a consequence of the move
+/// rather than a widening of intent: inside the engine, `pub` reached
+/// both callers — the Open Connector client and the rss fetcher. From here it
+/// would reach neither, and the rss fetcher is not going to move into an Open
+/// Connector facade. The audience is the same two call sites it always had.
+pub fn clock_jitter_nanos() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| u64::from(d.subsec_nanos()))
