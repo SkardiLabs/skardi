@@ -48,6 +48,9 @@
 /// The Open Connector HTTP client: one action call, its retries, and the
 /// gateway envelope it unwraps.
 pub mod client;
+/// The action catalog: what the gateway says an action takes and returns,
+/// and the identity a discovered action is cached under.
+pub mod action_registry;
 pub mod config;
 pub mod error;
 /// HTTP client behaviour shared by every caller: `Retry-After` parsing and the
@@ -58,6 +61,12 @@ pub mod http;
 /// Canonical JSON and its hash — how an action's identity is computed — plus
 /// the value-kind names used in error messages.
 pub mod json;
+/// One shared paging executor for every strategy a provider uses — page
+/// number, cursor, explicit has-more, keyset, single page, and split-action
+/// continuation.
+pub mod pagination;
+/// Where a provider's rows live inside its response body.
+pub mod row_path;
 /// The character bound that keeps a provider's error body from becoming a log
 /// flood.
 pub mod text;

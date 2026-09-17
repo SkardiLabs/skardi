@@ -32,7 +32,7 @@
 //!
 //! See `docs/superpowers/specs/2026-07-11-open-connector-integration-design.md`.
 
-pub mod action_registry;
+pub use skardi_source_pack::action_registry;
 pub mod cache;
 pub use skardi_source_pack::client;
 pub use skardi_source_pack::config;
@@ -46,9 +46,9 @@ pub mod exec;
 pub mod filters;
 pub mod json_to_arrow;
 pub mod packs;
-pub mod pagination;
+pub use skardi_source_pack::pagination;
 mod raw_schema;
-pub mod row_path;
+pub use skardi_source_pack::row_path;
 pub mod source_pack;
 pub mod table;
 pub mod table_functions;

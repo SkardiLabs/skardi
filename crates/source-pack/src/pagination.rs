@@ -9,8 +9,8 @@ use std::collections::HashSet;
 
 use serde_json::{Map, Value};
 
-use super::error::OpenConnectorError;
-use super::row_path::{RowPath, json_kind};
+use crate::error::OpenConnectorError;
+use crate::row_path::{RowPath, json_kind};
 
 /// How a cursor-paginated table continues past its first page, when the
 /// provider does not accept the cursor on the action that started the

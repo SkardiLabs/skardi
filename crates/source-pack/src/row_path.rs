@@ -13,9 +13,12 @@
 //! [`RowPath::parse`], so the array contract stays exactly as strict as it
 //! was for every table that locates a row array.
 
+// `pub` rather than `pub(crate)`: same audience as before — the engine's
+// exec and its pack suites — but now across a crate line.
+
 use serde_json::Value;
 
-use super::error::OpenConnectorError;
+use crate::error::OpenConnectorError;
 
 /// A parsed row path (`$.key[.key…]`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,7 +33,7 @@ impl RowPath {
     ///
     /// # Example
     /// ```
-    /// use skardi::sources::providers::open_connector::row_path::RowPath;
+    /// use skardi_source_pack::row_path::RowPath;
     ///
     /// let path = RowPath::parse("$.data.items").unwrap();
     /// assert_eq!(path.as_str(), "$.data.items");
@@ -70,7 +73,7 @@ impl RowPath {
     ///
     /// # Example
     /// ```
-    /// use skardi::sources::providers::open_connector::row_path::RowPath;
+    /// use skardi_source_pack::row_path::RowPath;
     ///
     /// let path = RowPath::parse_object_root("$").unwrap();
     /// assert_eq!(path.as_str(), "$");
@@ -99,7 +102,7 @@ impl RowPath {
     /// "this document has no content".
     ///
     /// ```
-    /// use skardi::sources::providers::open_connector::row_path::RowPath;
+    /// use skardi_source_pack::row_path::RowPath;
     /// use serde_json::json;
     ///
     /// let path = RowPath::parse_object_root("$").unwrap();
@@ -189,8 +192,8 @@ impl RowPath {
 
 /// Short human-readable kind of a JSON value, for error messages —
 /// the shared repo-wide vocabulary, in this module's String shape.
-pub(crate) fn json_kind(value: &Value) -> String {
-    crate::util::json::json_kind(value).to_string()
+pub fn json_kind(value: &Value) -> String {
+    crate::json::json_kind(value).to_string()
 }
 
 #[cfg(test)]
