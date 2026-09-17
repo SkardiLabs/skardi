@@ -184,7 +184,9 @@ mod tests {
     };
     use crate::sources::providers::open_connector::json_to_arrow::{FieldMapping, FieldType};
     use crate::sources::providers::open_connector::pagination::PaginationStrategy;
-    use datafusion::logical_expr::Operator;
+    // A `FilterMapping`'s operator is the pack's declaration, not
+    // DataFusion's — this test builds a mapping, not an expression.
+    use skardi_source_pack::filters::Operator;
 
     fn offline_client() -> Arc<OpenConnectorClient> {
         Arc::new(

@@ -31,11 +31,13 @@
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
-use datafusion::logical_expr::Operator;
 use serde::Deserialize;
 
 use crate::sources::providers::open_connector::error::OpenConnectorError;
-use crate::sources::providers::open_connector::filters::{Fidelity, FilterMapping, ValueFormat};
+// `Operator` here is the pack's neutral declaration, not DataFusion's.
+// The loader reads YAML and writes declarations; nothing about that needs
+// a query planner, and it used to convert to DataFusion's on the way in
+// for no reason other than where the type happened to live.
 use crate::sources::providers::open_connector::json_to_arrow::RowConverter;
 use crate::sources::providers::open_connector::json_to_arrow::{FieldMapping, FieldType};
 use crate::sources::providers::open_connector::pagination::{
@@ -45,6 +47,7 @@ use crate::sources::providers::open_connector::row_path::RowPath;
 use crate::sources::providers::open_connector::source_pack::{
     FixedValue, RowShape, SourcePack, SourcePackTable,
 };
+use skardi_source_pack::filters::{Fidelity, FilterMapping, Operator, ValueFormat};
 
 /// Parse an embedded pack asset, memoized in `cell`.
 ///

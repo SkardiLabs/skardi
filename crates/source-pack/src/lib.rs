@@ -43,16 +43,18 @@
 //! Rust client and the interpretation of what OC returns; it does not move OC's
 //! OAuth broker or its provider action implementations.
 
+/// The action catalog: what the gateway says an action takes and returns,
+/// and the identity a discovered action is cached under.
+pub mod action_registry;
 /// The Open Connector data-source configuration: which gateway, which
 /// connection alias, and which action each bound table reads.
 /// The Open Connector HTTP client: one action call, its retries, and the
 /// gateway envelope it unwraps.
 pub mod client;
-/// The action catalog: what the gateway says an action takes and returns,
-/// and the identity a discovered action is cached under.
-pub mod action_registry;
 pub mod config;
 pub mod error;
+/// The filter vocabulary a provider declares; the engine translates.
+pub mod filters;
 /// HTTP client behaviour shared by every caller: `Retry-After` parsing and the
 /// jitter a retry waits. Lives here rather than in the engine because the pack
 /// is what makes the requests, and the engine re-exports it for its own
@@ -61,19 +63,21 @@ pub mod http;
 /// Canonical JSON and its hash — how an action's identity is computed — plus
 /// the value-kind names used in error messages.
 pub mod json;
+#[cfg(feature = "testing")]
+pub mod mock_http;
 /// One shared paging executor for every strategy a provider uses — page
 /// number, cursor, explicit has-more, keyset, single page, and split-action
 /// continuation.
 pub mod pagination;
 /// Where a provider's rows live inside its response body.
 pub mod row_path;
+/// The row shape a provider declares; the engine converts.
+pub mod schema;
+#[cfg(feature = "testing")]
+pub mod testing;
 /// The character bound that keeps a provider's error body from becoming a log
 /// flood.
 pub mod text;
-#[cfg(feature = "testing")]
-pub mod mock_http;
-#[cfg(feature = "testing")]
-pub mod testing;
 
 pub use client::OpenConnectorClient;
 pub use config::OpenConnectorConfig;

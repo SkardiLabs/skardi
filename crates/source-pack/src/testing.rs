@@ -11,9 +11,7 @@
 //! reason: the audience is unchanged — this crate's client tests and the
 //! engine's pack suites — but they are no longer the same crate.
 
-pub use crate::mock_http::{
-    MockHttpServer as MockGateway, MockResponse, RecordedRequest,
-};
+pub use crate::mock_http::{MockHttpServer as MockGateway, MockResponse, RecordedRequest};
 
 impl MockResponse {
     /// `200 OK` with a JSON body.
@@ -60,4 +58,3 @@ pub fn discovery_ok(
         r#"{{"inputSchema":{input_schema},"outputSchema":{output_schema},"execution":{{"locallyExecutable":{locally_executable}{read_only}}}}}"#
     ))
 }
-

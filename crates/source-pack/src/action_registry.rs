@@ -189,9 +189,7 @@ pub fn fingerprint_schema(output_schema: Option<&Value>) -> String {
 mod tests {
     use super::*;
     use crate::client::OpenConnectorClient;
-    use crate::testing::{
-        MockGateway, MockResponse, discovery_ok, envelope_ok,
-    };
+    use crate::testing::{MockGateway, MockResponse, discovery_ok, envelope_ok};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
