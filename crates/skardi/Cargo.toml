@@ -69,6 +69,9 @@ rss = [
 ]
 
 [dependencies]
+# The shared SaaS connector runtime. A path dependency within this
+# revision, which is how cloud pins the engine and the pack to one commit.
+skardi-source-pack = { path = "../source-pack" }
 # engine
 anyhow = { workspace = true }
 async-trait = { workspace = true }

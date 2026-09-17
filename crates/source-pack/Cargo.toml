@@ -1,0 +1,48 @@
+[package]
+name = "skardi-source-pack"
+version.workspace = true
+edition.workspace = true
+description = "Executable SaaS connector runtime: requests, pagination, and response interpretation, shared by the engine and by cloud"
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+
+# **The dependency boundary is the point of this crate, not a side effect.**
+#
+# Three consumers read SaaS sources today and each grew its own client and its
+# own paging loop: the engine (for SQL over a SaaS table), skardi-etl (for
+# content ingest) and skardi-rbac (for ACL snapshots). The two cloud crates
+# cannot depend on the engine to stop duplicating, because the engine drags in
+# DataFusion and Arrow — a syncer that mirrors an ACL has no business compiling
+# a query planner.
+#
+# So the rule for this manifest: **nothing here may pull in DataFusion, Arrow,
+# skardi, skardi-rbac, SQLx, Kubernetes or SpiceDB, transitively included.**
+# That is what makes the crate importable by a syncer. It is a boundary rather
+# than a binary-size target, and the moment one of those appears the reason the
+# crate exists is gone.
+#
+# What it may depend on: async and HTTP, JSON and serialization, secret
+# wrappers, time. The list below is deliberately short and should stay that
+# way.
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+chrono = { version = "0.4", features = ["serde"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+serde = { workspace = true }
+# `preserve_order` for the same reason the engine pins it: an action's input
+# object order is part of its identity, and a re-sorted object changes the
+# request this crate sends.
+serde_json = { workspace = true, features = ["preserve_order"] }
+serde_yaml = { workspace = true }
+# Declared directly, matching how the engine crate declares it: this repo
+# keeps `thiserror` per-crate rather than in `[workspace.dependencies]`.
+thiserror = "2.0"
+tokio = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

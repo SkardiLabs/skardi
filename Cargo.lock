@@ -9754,6 +9754,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "skardi-source-pack",
  "sqlx",
  "tempfile",
  "text-splitter",
@@ -9867,6 +9868,23 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "skardi-source-pack"
+version = "0.5.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "url",
 ]
 
 [[package]]

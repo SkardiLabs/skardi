@@ -36,7 +36,12 @@ pub mod action_registry;
 pub mod cache;
 pub mod client;
 pub mod config;
-mod error;
+// `error` now lives in `skardi-source-pack`, so the syncer and the ETL
+// runner can name the same failures without importing a query planner.
+// Re-exported rather than re-declared: every existing `super::error::…`
+// and `open_connector::OpenConnectorError` path keeps resolving, which is
+// what makes this move reviewable — the diff is the move, not a rename of
+// every call site.
 pub mod exec;
 pub mod filters;
 pub mod json_to_arrow;
@@ -54,7 +59,8 @@ pub(crate) mod testutil;
 pub use action_registry::{ActionMetadata, ActionRegistry};
 pub use client::OpenConnectorClient;
 pub use config::{OpenConnectorBinding, OpenConnectorConfig};
-pub use error::OpenConnectorError;
+pub use skardi_source_pack::error;
+pub use skardi_source_pack::error::OpenConnectorError;
 pub use source_pack::{FixedValue, SourcePack, SourcePackRegistry, SourcePackTable};
 pub use table::OpenConnectorTableProvider;
 pub use table_functions::{GatewayHandle, OpenConnectorGateways, register_open_connector_udtfs};
