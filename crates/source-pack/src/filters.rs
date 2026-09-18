@@ -5,7 +5,7 @@
 //! renders. Turning a SQL predicate into that input is the ENGINE's half,
 //! because only the engine has a `datafusion::logical_expr::Expr` to turn.
 //!
-//! [`Operator`] is why the split had to be made explicit. It was
+//! [`Operator`](crate::filters::Operator) is why the split had to be made explicit. It was
 //! `datafusion::logical_expr::Operator` — the single genuine type-level
 //! coupling in the whole Open Connector module — and a syncer cannot carry a
 //! query planner to name three comparison operators. The neutral enum already

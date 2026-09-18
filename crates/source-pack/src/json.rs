@@ -1,5 +1,5 @@
 //! Canonical JSON helpers shared by fingerprinting and cache keys —
-//! plus [`json_kind`], the one kind-vocabulary for error messages.
+//! plus [`json_kind`](crate::row_path::json_kind), the one kind-vocabulary for error messages.
 
 use serde_json::Value;
 

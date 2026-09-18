@@ -1,7 +1,7 @@
 //! What a provider's rows look like, as a DECLARATION.
 //!
 //! These types were already neutral when they lived in `json_to_arrow.rs`:
-//! [`FieldType`]'s variants describe JSON shapes and name Arrow only in their
+//! [`FieldType`](crate::schema::FieldType)'s variants describe JSON shapes and name Arrow only in their
 //! prose. They looked coupled because they sat beside the conversion, not
 //! because they carried an Arrow type. Separating them is what lets a syncer
 //! read a provider's rows without linking a columnar format it will never

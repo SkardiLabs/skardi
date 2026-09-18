@@ -53,7 +53,7 @@ serde_yaml = { workspace = true }
 # Declared directly, matching how the engine crate declares it: this repo
 # keeps `thiserror` per-crate rather than in `[workspace.dependencies]`.
 thiserror = "2.0"
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
 tracing = { workspace = true }
 url = { workspace = true }
 

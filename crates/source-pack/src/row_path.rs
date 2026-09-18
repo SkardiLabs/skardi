@@ -9,8 +9,8 @@
 //! Root `$` is a separate, narrower case: it is accepted ONLY when a table
 //! declares `row_shape: object`, for actions whose whole response IS the
 //! single row (a point read such as `feishu.get_document_content`). It is
-//! parsed through [`RowPath::parse_object_root`], never through
-//! [`RowPath::parse`], so the array contract stays exactly as strict as it
+//! parsed through [`RowPath::parse_object_root`](crate::row_path::RowPath::parse_object_root), never through
+//! [`RowPath::parse`](crate::row_path::RowPath::parse), so the array contract stays exactly as strict as it
 //! was for every table that locates a row array.
 
 // `pub` rather than `pub(crate)`: same audience as before — the engine's

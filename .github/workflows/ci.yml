@@ -53,7 +53,13 @@ jobs:
         # pass cannot see feature-gated modules, so their rustdoc warnings
         # (private_intra_doc_links, say) would sail through CI and surface
         # as broken links on docs.rs.
-        run: cargo doc --no-deps -p skardi --all-features
+        # `-p skardi-source-pack` as well: the pack's rustdoc had never been
+        # gated, and four broken intra-doc links survived the extraction into
+        # it unnoticed. Every module there is documented twice — a summary on
+        # the `pub mod` in lib.rs plus the module's own `//!` — and rustdoc
+        # resolves the merged text in LIB.RS's scope, so a module-local name
+        # silently fails to link while a crate-root re-export resolves.
+        run: cargo doc --no-deps -p skardi -p skardi-source-pack --all-features
 
   test:
     name: Test

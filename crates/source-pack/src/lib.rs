@@ -74,6 +74,9 @@ pub mod pagination;
 pub mod raw_schema;
 /// Where a provider's rows live inside its response body.
 pub mod row_path;
+/// The paginated action walk shared by the engine's table scans, the ETL's
+/// folder listings and the rbac syncer's ACL enumerations.
+pub mod scan;
 /// The row shape a provider declares; the engine converts.
 pub mod schema;
 /// A source pack: the tables a provider offers and how each is read.
