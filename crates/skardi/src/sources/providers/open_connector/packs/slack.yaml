@@ -46,6 +46,22 @@ tables:
       page_size_input: limit
       cursor_input: cursor
       next_cursor_path: "$.nextCursor"
+      # The AUTHORITATIVE end-of-collection signal, and declaring it is not
+      # belt-and-braces. The committed contract says `hasMore` is "whether
+      # more messages are available beyond this page" and `nextCursor` is
+      # "the cursor for the next page, or an empty string when this is the
+      # last page" — so `hasMore: true` with an empty cursor is a state the
+      # response is allowed to express, and reading the empty cursor as
+      # end-of-collection caches a silently truncated channel history.
+      # `paginate` consults this FIRST, and a missing cursor while it is true
+      # becomes a hard error rather than a quiet stop.
+      #
+      # ONLY this table. `list_conversations`, `list_users` and `list_files`
+      # do not declare `hasMore` in their committed contracts, and a pack
+      # that names a signal the response lacks fails the scan outright
+      # (`PaginationHasMoreInvalid { found: "absent" }`) — declaring it
+      # there "for symmetry" would break three working tables.
+      has_more_path: "$.hasMore"
       page_size: 999
     resources:
       required: [channelId]

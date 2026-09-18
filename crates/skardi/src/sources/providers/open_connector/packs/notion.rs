@@ -20,13 +20,17 @@
 //!   is complete on the null-cursor spelling the API documents; a
 //!   repeated cursor fails as `PaginationLoop`, a non-string cursor as
 //!   `PaginationCursorInvalid` — never a silent truncation.
-//! - **`pages` and `data_sources` are the complete visible listing** via
-//!   `notion.search` with the empty required `query` pinned to `""` and
-//!   an object `filter` pin (`{property: object, value: page |
-//!   data_source}`) — the `state=all` move, and the reason
+//! - **`pages` and `data_sources` are everything the integration can see,
+//!   AS SEARCH REPORTS IT** via `notion.search` with the empty required
+//!   `query` pinned to `""` and an object `filter` pin (`{property:
+//!   object, value: page | data_source}`) — and the reason
 //!   `FixedValue::Json` exists: the search filter is an object, which no
-//!   scalar fixed input could express. Visibility is exactly what the
-//!   Open Connector integration has been shared with.
+//!   scalar fixed input could express. Visibility is what the integration
+//!   has been shared with, but a drained walk is NOT an inventory: Notion
+//!   documents that search may omit an accessible page, lag after a share,
+//!   and change while paging. A consumer must add on presence and prove
+//!   removal with a direct read; one that removes on absence from this
+//!   listing removes live pages.
 //! - **No filter pushdown anywhere.** `notion.search`'s only narrowing
 //!   input is the free-text relevance `query`, which no SQL predicate
 //!   maps to faithfully; `list_users` / `list_block_children` declare no
@@ -40,7 +44,10 @@
 //!   static-schema tables only, and documents the rows table as absent.
 //!   `block_children` likewise excludes the type-specific payload (it
 //!   lives under a key named BY `type`, unaddressable by a fixed
-//!   mapping); rendered content belongs to a future markdown table.
+//!   mapping); the page's text is `page_markdown`, one rendered row per
+//!   page off Open Connector's normalized `retrieve_page_markdown`, and
+//!   the only notion table whose columns are fully inside the fingerprint
+//!   gate because that action's output schema declares them.
 //! - **`users` excludes `person.email`** (and the raw `person`/`bot`
 //!   objects): capability-gated on the integration and privacy-sensitive
 //!   — same call the Slack pack made.
@@ -125,6 +132,8 @@ mod tests {
             include_str!("fixtures/notion/contracts/search.json")
         } else if path.ends_with("notion.list_block_children") {
             include_str!("fixtures/notion/contracts/list_block_children.json")
+        } else if path.ends_with("notion.retrieve_page_markdown") {
+            include_str!("fixtures/notion/contracts/retrieve_page_markdown.json")
         } else {
             r#"{"type": "object"}"#
         };
@@ -295,6 +304,10 @@ mod tests {
                 "block_children",
                 include_str!("fixtures/notion/contracts/list_block_children.json"),
             ),
+            (
+                "page_markdown",
+                include_str!("fixtures/notion/contracts/retrieve_page_markdown.json"),
+            ),
         ];
         let mut mismatches = Vec::new();
         for (short, contract) in contracts {
@@ -369,15 +382,36 @@ mod tests {
                 "fingerprint coverage changed for {short}"
             );
         }
+
+        // `page_markdown` is the exception, and the reason is worth stating:
+        // it is the only notion action whose output schema DECLARES its
+        // fields (`additionalProperties: false`, all five required) rather
+        // than handing back a loose object. So its columns sit INSIDE the
+        // fingerprint gate — an upstream rename fails registration instead
+        // of surfacing as a null column at scan time — which is the property
+        // a consumer ingesting the page text has to be able to rely on.
+        let markdown = table("page_markdown");
+        assert!(
+            fingerprint_uncovered_columns(
+                include_str!("fixtures/notion/contracts/retrieve_page_markdown.json"),
+                markdown.row_path,
+                markdown.fields,
+            )
+            .is_empty(),
+            "page_markdown's columns are covered by its strict contract"
+        );
     }
 
     // ── Integration: the pack against a mock gateway, end to end. ───────
 
     fn notion_config(token_env: &str, tables: &str) -> OpenConnectorConfig {
-        // blockId is declared only by block_children; sending it to a
-        // binding without that table trips the undeclared-resource guard.
+        // Resources are declared only where a table requires them; sending
+        // one to a binding without that table trips the undeclared-resource
+        // guard. `blockId` is block_children's, `pageId` is page_markdown's.
         let resource = if tables.contains("block_children") {
             "resource: { blockId: b-root }"
+        } else if tables.contains("page_markdown") {
+            "resource: { pageId: 7b2e4c1a-9d3f-4e5b-8a6c-1f2d3e4b5a60 }"
         } else {
             ""
         };
@@ -476,6 +510,91 @@ bindings:
             keys.sort_unstable();
             assert_eq!(keys, expected_keys, "page {} input keys", page + 1);
         }
+    }
+
+    /// `page_markdown` is one page as one row: the binding's `pageId`
+    /// reaches the action, no cursor is sent, and every one of the five
+    /// declared columns arrives non-null. The fixture is the row the
+    /// normalized action constructs (Open Connector c5a77846), with a
+    /// synthetic id.
+    #[tokio::test]
+    async fn page_markdown_reads_one_page_as_a_single_row() {
+        let row = include_str!("fixtures/notion/page_markdown.json");
+        let gateway = MockGateway::start(move |req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                return notion_discovery(&req.path);
+            }
+            if req.method == "POST" && req.path == "/v1/actions/notion.retrieve_page_markdown" {
+                let body: Value = serde_json::from_str(&req.body).unwrap_or_default();
+                // The binding's coordinate reaches the action under the key
+                // the action declares, and a cursor does not: a single-object
+                // table declares no pagination, so a startCursor here would
+                // mean the scan asked for page two of a page's text.
+                assert_eq!(
+                    body["input"]["pageId"],
+                    Value::from("7b2e4c1a-9d3f-4e5b-8a6c-1f2d3e4b5a60")
+                );
+                assert!(
+                    body["input"].get("startCursor").is_none(),
+                    "a single-row table must not paginate: {}",
+                    req.body
+                );
+                return MockResponse::ok(&envelope_ok(row));
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+        let (_gateway, ctx) = setup_with_gateway(
+            gateway,
+            "SKARDI_TEST_OC_NOTION_PAGE_MARKDOWN",
+            "page_markdown",
+        )
+        .await;
+
+        let batches = collect(
+            &ctx,
+            "SELECT page_id, markdown, truncated, unknown_block_ids, last_edited_time \
+             FROM saas.ws.page_markdown",
+        )
+        .await;
+        assert_eq!(
+            column_values(&batches, "page_id"),
+            vec!["7b2e4c1a-9d3f-4e5b-8a6c-1f2d3e4b5a60"]
+        );
+        let text = column_values(&batches, "markdown");
+        assert_eq!(text.len(), 1, "one page is one row");
+        assert!(
+            text[0].contains("the pipeline worked end to end"),
+            "the page's rendered text reaches the row verbatim"
+        );
+        assert!(
+            text[0].starts_with("# "),
+            "it is Markdown, not block structure: {}",
+            &text[0][..text[0].len().min(40)]
+        );
+        // Typed, not stringified: the partial-read flag is a real boolean and
+        // the revision a real timestamp, which is what lets a consumer window
+        // on it — a Utf8 rendering would have passed with the wrong types.
+        let batch = batches
+            .iter()
+            .find(|b| b.num_rows() > 0)
+            .expect("one row arrived");
+        assert!(!boolean(batch, "truncated").value(0));
+        assert_eq!(column_values(&batches, "unknown_block_ids"), vec!["[]"]);
+        let edited: &TimestampMillisecondArray = batch
+            .column_by_name("last_edited_time")
+            .expect("column")
+            .as_any()
+            .downcast_ref()
+            .expect("timestamp_ms_utc column");
+        assert_eq!(
+            edited.value(0),
+            1789497731000,
+            "2026-09-15T18:42:11Z in millis"
+        );
     }
 
     #[tokio::test]

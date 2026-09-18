@@ -1,0 +1,47 @@
+{
+  "type": "object",
+  "properties": {
+    "object": {
+      "type": "string",
+      "description": "Notion's object tag for the rendered result."
+    },
+    "id": {
+      "type": "string",
+      "description": "The id Notion echoes for the rendered page, in Notion's own spelling."
+    },
+    "markdown": {
+      "type": "string",
+      "description": "The page rendered as enhanced Markdown. An empty string for a page with no content."
+    },
+    "truncated": {
+      "type": "boolean",
+      "description": "Whether the render stopped short of the whole page (Notion renders roughly 20,000 blocks at most). Resubmit the ids in unknown_block_ids to fetch what was left out."
+    },
+    "unknown_block_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "description": "A block id."
+      },
+      "description": "Blocks rendered as <unknown>: truncated subtrees, children this grant cannot read, and unsupported block types. Non-empty on many complete pages, so not on its own a sign of a partial render."
+    },
+    "pageId": {
+      "type": "string",
+      "description": "The page or block id the render was requested for, exactly as given in the input. Notion may spell an id dashed or undashed in its own body, so a consumer joining rows to bindings needs the spelling it asked with."
+    },
+    "lastEditedTime": {
+      "type": "string",
+      "description": "When the page or block was last edited, read from its own object — the markdown response carries no revision.",
+      "format": "date-time"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "markdown",
+    "truncated",
+    "unknown_block_ids",
+    "pageId",
+    "lastEditedTime"
+  ],
+  "description": "A Notion page rendered as Markdown, with its revision and how complete the render was."
+}
