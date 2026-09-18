@@ -13,6 +13,25 @@
 # transitive one is invisible, which is why this asks the resolved dependency
 # TREE rather than reading `Cargo.toml`.
 #
+# WHAT THIS DOES NOT CHECK, and where the other half is verified.
+#
+# Tree purity is one of two properties the crate needs. The other is that its
+# manifest DECLARES every feature it uses: inside this workspace cargo unifies
+# features across all members, so the pack can call `tokio::time::timeout_at`
+# while declaring no `time` feature and compile perfectly here — then fail in
+# cloud, which has no such member to borrow it from. That exact bug existed
+# and was found by building the pack from a throwaway crate outside the
+# workspace:
+#
+#   a crate whose ONLY dependencies are `skardi-source-pack` and `serde_json`
+#   (no tokio, no reqwest), binding an `ActionScan` and a `TransportPolicy`
+#
+# That is not run here. It needs a cold target directory to mean anything —
+# a shared one hides the failure behind cached artifacts — and a cold build of
+# reqwest's TLS stack is minutes. Cloud's own build is the standing check, so a
+# missing feature surfaces there rather than never. Run the throwaway crate by
+# hand when changing what the pack imports.
+#
 # Run it anywhere:  ./scripts/assert_pack_boundary.sh
 set -uo pipefail
 
