@@ -807,6 +807,21 @@ mod tests {
 /// means no pushdown, which is always safe — DataFusion re-evaluates the
 /// predicate. Guessing a near-match would be a wrong `Exact` claim, and a
 /// wrong `Exact` claim silently drops rows.
+///
+/// # Examples
+///
+/// ```
+/// use skardi::sources::providers::open_connector::filters::declared_operator;
+/// use skardi_source_pack::filters::Operator;
+/// use datafusion::logical_expr::Operator as SqlOperator;
+///
+/// assert_eq!(declared_operator(SqlOperator::Eq), Some(Operator::Eq));
+///
+/// // `None` is the important answer: a pack declares only the comparisons it
+/// // can push down, and anything else must stay a DataFusion filter rather
+/// // than be approximated by a near-match.
+/// assert_eq!(declared_operator(SqlOperator::Lt), None);
+/// ```
 pub fn declared_operator(operator: SqlOperator) -> Option<Operator> {
     match operator {
         SqlOperator::Eq => Some(Operator::Eq),

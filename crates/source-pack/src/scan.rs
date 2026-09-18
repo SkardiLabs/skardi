@@ -175,6 +175,15 @@ impl ActionScan {
         row_path: &str,
         bounds: ScanBounds,
     ) -> Result<Self, OpenConnectorError> {
+        // The resource carries the listing's SCOPE, so a non-object is
+        // refused here rather than defaulted away at request time. See
+        // `OpenConnectorError::ScanResourceNotObject`.
+        if !resource.is_object() {
+            return Err(OpenConnectorError::ScanResourceNotObject {
+                table: target.table_id.to_string(),
+                found: crate::row_path::json_kind(&resource),
+            });
+        }
         let parsed_row_path = match target.row_shape {
             RowShape::Array => RowPath::parse(row_path)?,
             RowShape::Object => RowPath::parse_object_root(row_path)?,
@@ -265,7 +274,14 @@ impl ActionScan {
             self.pagination.apply_cursor_only(&mut input);
             input
         } else {
-            let mut input = self.resource.as_object().cloned().unwrap_or_default();
+            // Checked at construction (`ScanResourceNotObject`), so this
+            // cannot be a silent default: the scope the caller asked for is
+            // either here or the scan never bound.
+            let mut input = self
+                .resource
+                .as_object()
+                .cloned()
+                .expect("resource is an object, refused at construction otherwise");
             for (field, value) in self.target.fixed_inputs {
                 input.insert((*field).to_string(), value.to_json());
             }
@@ -476,6 +492,45 @@ mod tests {
             }))
             .expect("serializable"),
         )
+    }
+
+    /// **A resource that is not an object is refused, never coerced.**
+    ///
+    /// It carries the listing's SCOPE — which folder, which repository — so
+    /// reading a `null` or an array as "no resource inputs" would send the
+    /// action its UNSCOPED form: the caller asked about one folder and the
+    /// request asks about everything the credential can see. Worst possible
+    /// default for the ACL enumerations this crate exists to serve.
+    ///
+    /// Inside the engine this was an `expect` justified by "registration
+    /// always builds `Value::Object`". That justification does not travel to
+    /// a syncer, which hand-builds its resource.
+    #[tokio::test]
+    async fn a_non_object_resource_is_refused_at_bind_time() {
+        let gateway = MockGateway::start(|_| page_of(&[1], None)).await;
+        let client = Arc::new(
+            OpenConnectorClient::new(&gateway.url, "t", Duration::from_secs(5)).expect("client"),
+        );
+        for bad in [json!(null), json!([1, 2]), json!("folder-1"), json!(7)] {
+            let err = ActionScan::new(
+                Arc::clone(&client),
+                target(cursor_pagination(AbsentCursor::EndsTheScan)),
+                None,
+                bad.clone(),
+                Vec::new(),
+                "$.items",
+                bounds(10),
+            )
+            .expect_err("a non-object resource must not bind");
+            assert!(
+                matches!(err, OpenConnectorError::ScanResourceNotObject { .. }),
+                "{bad} must be refused by name, got {err}"
+            );
+        }
+        assert!(
+            gateway.requests().is_empty(),
+            "nothing may reach the gateway when the scope was rejected"
+        );
     }
 
     /// The whole point: one call replaces a hand-written `for page in 1..`.

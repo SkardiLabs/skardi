@@ -555,6 +555,31 @@ impl OpenConnectorClient {
     /// engine / UDTFs check membership before calling this. Keeping the
     /// method `pub` makes that gating structurally un-bypassable from
     /// outside the crate.
+    /// # This is a transport, not a capability gate
+    ///
+    /// `execute` validates the action id SYNTACTICALLY (a namespace-escape
+    /// guard) and nothing more. It does not check registry membership and it
+    /// does not check `read_only`, so a caller can name any action the
+    /// deployment will run. That is deliberate, and worth stating because the
+    /// absence is easy to mistake for a guarantee:
+    ///
+    /// * the authoritative gate is SERVER-side — Open Connector's
+    ///   `OOMOL_CONNECT_ALLOWED_ACTIONS`, which answers `400
+    ///   action_not_allowed` for anything outside it. A client-side check
+    ///   cannot be the boundary, because the client is the thing being
+    ///   constrained;
+    /// * the engine adds its own gate ABOVE this one, where it is needed:
+    ///   `open_connector_scan` lets a user's SQL name an arbitrary action, so
+    ///   planning refuses anything outside a default-deny allowlist and
+    ///   anything the discovered metadata does not classify `read_only:
+    ///   true` (`RawActionNotAllowlisted` / `RawActionMutating` /
+    ///   `RawActionReadOnlyUnknown`). Pack-declared tables are gated at
+    ///   registration instead.
+    ///
+    /// A consumer whose action ids come from somewhere a user can influence
+    /// must add a gate of its own; one whose action ids are compile-time
+    /// constants — every syncer here — is already as constrained as its
+    /// source code.
     pub async fn execute(
         &self,
         action_id: &str,

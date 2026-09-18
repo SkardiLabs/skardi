@@ -32,7 +32,32 @@ use super::row_path::RowPath;
 /// Arrow mapping is not a property of the declaration, it is something
 /// this crate does to it — and the syncer that reads the same declaration
 /// never performs it.
-
+///
+/// # Examples
+///
+/// ```
+/// use skardi::sources::providers::open_connector::json_to_arrow::arrow_type;
+/// use skardi_source_pack::schema::FieldType;
+/// use arrow::datatypes::{DataType, TimeUnit};
+///
+/// assert_eq!(arrow_type(&FieldType::Int64), DataType::Int64);
+/// // The declared types name the WIRE encoding; Arrow has one timestamp type
+/// // for all of them. That many-to-one is the reason this mapping is the
+/// // engine's to make and not a property of the declaration: a pack says how
+/// // the provider spells a timestamp, not how it is stored.
+/// let millis = DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()));
+/// assert_eq!(arrow_type(&FieldType::TimestampMillisUtc), millis);
+/// assert_eq!(arrow_type(&FieldType::TimestampSecondsStringUtc), millis);
+/// ```
+///
+/// ```
+/// # use skardi::sources::providers::open_connector::json_to_arrow::arrow_type;
+/// # use skardi_source_pack::schema::FieldType;
+/// # use arrow::datatypes::DataType;
+/// // `Json` is carried as text: the engine does not parse a provider's nested
+/// // object into a struct type it would then have to keep in sync.
+/// assert_eq!(arrow_type(&FieldType::Json), DataType::Utf8);
+/// ```
 pub fn arrow_type(field_type: &FieldType) -> DataType {
     match field_type {
         FieldType::Boolean => DataType::Boolean,

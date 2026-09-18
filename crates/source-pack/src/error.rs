@@ -266,6 +266,25 @@ pub enum OpenConnectorError {
     )]
     InvalidActionId { action_id: String, reason: String },
 
+    /// A scan was bound with a `resource` that is not a JSON object.
+    ///
+    /// Refused rather than coerced. The resource carries the SCOPE of the
+    /// listing — which folder, which repository — and silently reading a
+    /// `null`, an array or a scalar as "no resource inputs" would send the
+    /// action its unscoped form. For an ACL enumeration that is the worst
+    /// possible default: the caller asked about one folder and the request
+    /// asks about whatever the credential can see.
+    ///
+    /// Inside the engine this was an `expect` justified by "registration
+    /// always builds `Value::Object`". That justification does not travel: a
+    /// syncer hand-builds its resource, so the invariant has to be checked
+    /// rather than assumed.
+    #[error(
+        "Open Connector scan for '{table}' was given a {found} resource; \
+         it must be a JSON object of action inputs"
+    )]
+    ScanResourceNotObject { table: String, found: String },
+
     /// An action execution call returned a terminal (non-retryable) failure.
     ///
     /// `status` and `error_code` are carried STRUCTURED rather than only

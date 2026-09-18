@@ -29,6 +29,18 @@ use super::packs;
 /// [`OpenConnectorError::SourcePackAssetInvalid`] when an embedded asset fails
 /// to parse or validate — a build defect surfaced as a registration
 /// diagnostic.
+///
+/// # Examples
+///
+/// ```
+/// use skardi::sources::providers::open_connector::builtin_pack_registry;
+///
+/// // Parsing and validating every shipped asset is a BUILD property, so this
+/// // failing is a defect rather than a runtime condition to handle.
+/// let registry = builtin_pack_registry().expect("the shipped packs are valid");
+/// assert!(registry.get("github").is_some(), "github ships in this build");
+/// assert!(registry.get("no_such_provider").is_none());
+/// ```
 pub fn builtin_pack_registry() -> Result<SourcePackRegistry, OpenConnectorError> {
     Ok(SourcePackRegistry::from_packs([
         packs::mock::pack()?,
