@@ -293,6 +293,18 @@ pub enum OpenConnectorError {
         status: Option<u16>,
         /// The gateway envelope's `errorCode`, when it sent one.
         error_code: Option<String>,
+        /// The gateway envelope's `message`, when it sent one.
+        ///
+        /// Provider-influenced text, and carried as a field precisely so a
+        /// consumer can DECIDE about it rather than have it folded into
+        /// `reason` where the only options are print-it-all or lose it.
+        /// cloud's rbac syncer needs both halves of that choice at once: its
+        /// GitHub connector must never let this reach `sync_jobs.error` (a
+        /// measured 403 quotes an organization's OAuth policy prose), while
+        /// its OneDrive connector branches on it, because Graph spells
+        /// `accessDenied` and `itemNotFound` here and those mean "this folder
+        /// cannot be governed" rather than "the gateway failed".
+        message: Option<String>,
         /// The action id the gateway ECHOED in `meta.actionId`, when it
         /// answered with a gateway envelope at all.
         ///

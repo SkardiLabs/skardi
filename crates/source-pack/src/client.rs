@@ -586,6 +586,7 @@ impl OpenConnectorClient {
                     action_id: action_id.to_string(),
                     status: Some(status.as_u16()),
                     error_code: envelope_error_code(&body),
+                    message: envelope_message(&body),
                     echoed_action_id: envelope_action_id(&body),
                     reason: terminal_reason(status, &body),
                 },
@@ -606,6 +607,7 @@ impl OpenConnectorClient {
                 // the HTTP code says nothing about what went wrong.
                 status: None,
                 error_code: envelope.error_code.clone(),
+                message: envelope.message.clone(),
                 echoed_action_id: envelope_action_id(&text),
                 reason: envelope.failure_reason(),
             });
@@ -1540,6 +1542,16 @@ fn envelope_error_code(body: &str) -> Option<String> {
 /// Best-effort for the same reason as [`envelope_error_code`], and absence is
 /// the answer that matters here: a body with no `meta.actionId` is not this
 /// gateway refusing an action, it is something else answering entirely.
+fn envelope_message(body: &str) -> Option<String> {
+    serde_json::from_str::<Value>(body)
+        .ok()?
+        .get("message")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// The action id the gateway echoed at `meta.actionId`, when the body is a
+/// gateway envelope carrying one.
 fn envelope_action_id(body: &str) -> Option<String> {
     serde_json::from_str::<Value>(body)
         .ok()?
