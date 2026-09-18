@@ -179,7 +179,7 @@ mod tests {
     use crate::sources::hierarchy::HierarchyLevel;
     use crate::sources::providers::open_connector::action_registry::fingerprint_schema;
     use crate::sources::providers::open_connector::json_to_arrow::{FieldType, RowConverter};
-    use crate::sources::providers::open_connector::pagination::PaginationStrategy;
+    use crate::sources::providers::open_connector::pagination::{AbsentCursor, PaginationStrategy};
     use crate::sources::providers::open_connector::row_path::RowPath;
     use crate::sources::providers::open_connector::source_pack::SourcePackTable;
     use crate::sources::providers::open_connector::testutil::{
@@ -1161,6 +1161,7 @@ mod tests {
                     page_size_param,
                     page_size,
                     has_more_path,
+                    absent_cursor,
                 } => {
                     assert_eq!(cursor_param, "nextLink", "{short}");
                     assert_eq!(next_cursor_path, "$.nextLink", "{short}");
@@ -1176,6 +1177,21 @@ mod tests {
                     // Phase 4 confirmed real terminal pages return an
                     // explicit null on both actions.
                     assert!(has_more_path.is_none(), "{short}");
+                    // What this pack declares TODAY, pinned rather than
+                    // endorsed. The phase-4 note above records that Graph
+                    // sends `nextLink` on EVERY page and ends with an
+                    // explicit null — which is the case for
+                    // `AbsentCursor::IsDrift`, since under `EndsTheScan` a
+                    // response that dropped the key would be read as a
+                    // finished listing and silently truncate the table.
+                    // Cloud's ETL reached the opposite conclusion for the
+                    // same wire (`folder_dialect`'s
+                    // `an_absent_cursor_is_done_for_drive_and_drift_for_one_drive`).
+                    // Flipping it is a behaviour change on a live table and
+                    // wants its own re-measurement, not a comment read
+                    // second-hand — so it is left as it was and stated here
+                    // instead of quietly carried over.
+                    assert_eq!(absent_cursor, AbsentCursor::EndsTheScan, "{short}");
                 }
                 other => panic!("{short} must paginate by cursor, got {other:?}"),
             }

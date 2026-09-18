@@ -370,6 +370,7 @@ mod tests {
                 page_size_param: Some("limit"),
                 page_size: 10,
                 has_more_path: Some("$.hasMore"),
+                absent_cursor: AbsentCursor::EndsTheScan,
             },
             expected_fingerprint: Some("aa"),
             continuation: Some(CursorContinuation {

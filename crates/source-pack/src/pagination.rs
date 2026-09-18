@@ -58,6 +58,40 @@ pub struct CursorContinuation {
     pub cursor_only: bool,
 }
 
+/// What an ABSENT cursor KEY means for one action.
+///
+/// A fact about the action's output contract, not a consumer preference —
+/// which is why it is declared per action rather than chosen per caller.
+/// Providers genuinely differ: Google Drive omits `nextPageToken` entirely
+/// on the final page, while Microsoft Graph emits `nextLink` on EVERY page
+/// and spells the end as an explicit `null` (both measured — Drive in this
+/// crate's packs, Graph in the OneDrive pack's phase-4 live pass).
+///
+/// It exists because the difference was already being encoded by hand, in
+/// two places, by two components that could not share it: cloud's ETL
+/// carries a `folder_dialect` whose test is literally named
+/// `an_absent_cursor_is_done_for_drive_and_drift_for_one_drive`, and
+/// cloud's rbac syncer open-codes the same refusal in its Slack membership
+/// walk. Both reached for it for the same reason, and it is not a query
+/// engine's reason: a truncated SQL result is a wrong answer, but a
+/// truncated MEMBER list is a revocation. Neither could say it here, so
+/// both said it themselves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbsentCursor {
+    /// The provider omits the key on the final page, so its absence IS the
+    /// end of the collection. The long-standing behaviour, and what every
+    /// pack declared before this existed.
+    EndsTheScan,
+    /// The action emits the key on every page and spells the end as `null`
+    /// or `""`, so an absent key is contract drift.
+    ///
+    /// Refusing is the safe half of the trade: stopping quietly on a key
+    /// the contract says is always there reports a PREFIX of the collection
+    /// as if it were the whole of it, and no caller can tell. `null` and
+    /// `""` still terminate normally — only absence is drift.
+    IsDrift,
+}
+
 /// How a source-pack table paginates.
 #[derive(Debug, Clone, Copy)]
 pub enum PaginationStrategy {
@@ -121,6 +155,11 @@ pub enum PaginationStrategy {
         /// absent, the cursor's null/empty/missing spellings terminate as
         /// before.
         has_more_path: Option<&'static str>,
+        /// What an absent cursor KEY means for this action. See
+        /// [`AbsentCursor`]; [`AbsentCursor::EndsTheScan`] is the
+        /// pre-existing behaviour and what every YAML-declared pack gets
+        /// until it says otherwise.
+        absent_cursor: AbsentCursor,
     },
     /// Keyset pagination: the provider emits NO pagination envelope at all
     /// — the next request's cursor is a field of the previous page's LAST
@@ -455,7 +494,8 @@ impl Pagination {
                 }
                 Ok(more)
             }
-            PaginationStrategy::Cursor { .. } => {
+            PaginationStrategy::Cursor { absent_cursor, .. } => {
+                let absent_cursor = *absent_cursor;
                 // The authoritative has-more signal, when the pack declares
                 // one, is consulted FIRST: some providers return a non-empty
                 // cursor on the final page (Feishu wiki spaces answer
@@ -508,9 +548,22 @@ impl Pagination {
                             found: json_kind(other),
                         });
                     }
-                    // An entirely absent cursor (any missing segment) is the
-                    // omitted end-of-collection spelling.
-                    Err(OpenConnectorError::RowPathNotFound { .. }) => None,
+                    // An absent cursor (any missing segment) means whatever
+                    // the action's contract says it means — the end of the
+                    // collection for a provider that omits the key, drift for
+                    // one that always sends it.
+                    Err(OpenConnectorError::RowPathNotFound { .. }) => match absent_cursor {
+                        AbsentCursor::EndsTheScan => None,
+                        AbsentCursor::IsDrift => {
+                            return Err(OpenConnectorError::PaginationCursorInvalid {
+                                path: path.as_str().to_string(),
+                                page: self.page,
+                                found: "absent, but this action sends the cursor key on \
+                                        every page and spells the end as null"
+                                    .to_string(),
+                            });
+                        }
+                    },
                     // Structural failures — traversing through a non-object —
                     // are drift and propagate as themselves.
                     Err(e) => return Err(e),
@@ -670,6 +723,7 @@ mod tests {
             page_size_param: Some("limit"),
             page_size: 50,
             has_more_path: None,
+            absent_cursor: AbsentCursor::EndsTheScan,
         })
         .unwrap()
     }
@@ -846,6 +900,7 @@ mod tests {
             page_size_param: None,
             page_size: 50,
             has_more_path: None,
+            absent_cursor: AbsentCursor::EndsTheScan,
         })
         .unwrap_err();
         assert!(matches!(err, OpenConnectorError::InvalidRowPath { .. }));
@@ -859,6 +914,7 @@ mod tests {
             page_size_param: None,
             page_size: 50,
             has_more_path: None,
+            absent_cursor: AbsentCursor::EndsTheScan,
         };
         assert!(matches!(
             bad.validate(),
@@ -1034,6 +1090,7 @@ mod tests {
             page_size_param: None,
             page_size: 50,
             has_more_path: None,
+            absent_cursor: AbsentCursor::EndsTheScan,
         })
         .unwrap();
         let err = pagination
@@ -1052,6 +1109,7 @@ mod tests {
             page_size_param: None,
             page_size: 50,
             has_more_path: None,
+            absent_cursor: AbsentCursor::EndsTheScan,
         })
         .unwrap();
         assert!(!pagination.advance(&json!({"other": 1}), 50, None).unwrap());
@@ -1065,6 +1123,7 @@ mod tests {
             page_size_param: Some("pageSize"),
             page_size: 50,
             has_more_path: Some("$.hasMore"),
+            absent_cursor: AbsentCursor::EndsTheScan,
         })
         .unwrap()
     }
@@ -1371,5 +1430,91 @@ mod tests {
                 .advance(&json!({"next_cursor": null}), 10, None)
                 .unwrap()
         );
+    }
+}
+
+#[cfg(test)]
+mod absent_cursor_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn paginator(absent_cursor: AbsentCursor) -> Pagination {
+        Pagination::new(PaginationStrategy::Cursor {
+            cursor_param: "cursor",
+            next_cursor_path: "$.next_cursor",
+            page_size_param: Some("limit"),
+            page_size: 50,
+            has_more_path: None,
+            absent_cursor,
+        })
+        .expect("valid strategy")
+    }
+
+    /// The long-standing behaviour, kept: a provider that OMITS the key on
+    /// its last page ends the scan by omitting it.
+    #[test]
+    fn an_absent_cursor_ends_the_scan_when_the_action_omits_it() {
+        let mut p = paginator(AbsentCursor::EndsTheScan);
+        let more = p
+            .advance(&json!({ "items": [] }), 1, None)
+            .expect("absence is a normal terminator here");
+        assert!(!more, "the scan must end");
+    }
+
+    /// The new half. An action that sends the key on every page has not
+    /// ended its collection by dropping it — it has broken its contract, and
+    /// stopping here would report a PREFIX as the whole.
+    #[test]
+    fn an_absent_cursor_is_drift_when_the_action_always_sends_it() {
+        let mut p = paginator(AbsentCursor::IsDrift);
+        let err = p
+            .advance(&json!({ "items": [] }), 1, None)
+            .expect_err("an absent key contradicts this action's contract");
+        assert!(
+            matches!(err, OpenConnectorError::PaginationCursorInvalid { .. }),
+            "drift must name the cursor, got {err:?}"
+        );
+    }
+
+    /// **The discriminating case, and the reason the two tests above are not
+    /// enough.** `IsDrift` must refuse an ABSENT key while still accepting
+    /// the contract's own end-of-collection spelling. A rule that simply
+    /// errored on "no usable cursor" would pass both tests above and then
+    /// fail every real terminal page — Graph ends `nextLink` as an explicit
+    /// `null`, so such a rule would turn every completed OneDrive listing
+    /// into a failure.
+    #[test]
+    fn a_null_cursor_still_terminates_under_the_strict_contract() {
+        let mut p = paginator(AbsentCursor::IsDrift);
+        let more = p
+            .advance(&json!({ "items": [], "next_cursor": null }), 1, None)
+            .expect("null is this contract's end-of-collection spelling");
+        assert!(!more, "a null cursor ends the scan, it is not drift");
+    }
+
+    /// And the empty string, the other in-band terminator, for the same
+    /// reason.
+    #[test]
+    fn an_empty_cursor_still_terminates_under_the_strict_contract() {
+        let mut p = paginator(AbsentCursor::IsDrift);
+        let more = p
+            .advance(&json!({ "items": [], "next_cursor": "" }), 1, None)
+            .expect("an empty cursor terminates");
+        assert!(!more, "an empty cursor ends the scan, it is not drift");
+    }
+
+    /// A usable cursor is unaffected by the declaration — the strict
+    /// contract changes only what ABSENCE means, not how a real page
+    /// continues.
+    #[test]
+    fn a_usable_cursor_continues_under_either_declaration() {
+        for decl in [AbsentCursor::EndsTheScan, AbsentCursor::IsDrift] {
+            let mut p = paginator(decl);
+            let more = p
+                .advance(&json!({ "items": [], "next_cursor": "abc" }), 1, None)
+                .expect("a usable cursor continues");
+            assert!(more, "{decl:?} must continue on a real cursor");
+            assert_eq!(p.page(), 2, "{decl:?} must advance the page");
+        }
     }
 }

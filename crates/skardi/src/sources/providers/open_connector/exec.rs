@@ -653,6 +653,7 @@ mod tests {
     use super::*;
     use crate::sources::providers::open_connector::json_to_arrow::{FieldMapping, FieldType};
     use crate::sources::providers::open_connector::packs::mock;
+    use crate::sources::providers::open_connector::pagination::AbsentCursor;
     use crate::sources::providers::open_connector::testutil::{
         CapturedEvent, MockGateway, MockResponse, RecordedRequest, capture_events, envelope_ok,
     };
@@ -743,6 +744,7 @@ mod tests {
                 page_size_param: Some("limit"),
                 page_size: 2,
                 has_more_path: Some("$.hasMore"),
+                absent_cursor: AbsentCursor::EndsTheScan,
             },
             required_resources: &[],
             optional_resources: &["path"],

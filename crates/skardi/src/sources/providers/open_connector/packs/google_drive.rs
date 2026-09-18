@@ -157,7 +157,7 @@ mod tests {
     use crate::sources::hierarchy::HierarchyLevel;
     use crate::sources::providers::open_connector::action_registry::fingerprint_schema;
     use crate::sources::providers::open_connector::json_to_arrow::RowConverter;
-    use crate::sources::providers::open_connector::pagination::PaginationStrategy;
+    use crate::sources::providers::open_connector::pagination::{AbsentCursor, PaginationStrategy};
     use crate::sources::providers::open_connector::row_path::RowPath;
     use crate::sources::providers::open_connector::source_pack::{FixedValue, SourcePackTable};
     use crate::sources::providers::open_connector::testutil::{
@@ -1011,6 +1011,7 @@ mod tests {
                     page_size_param,
                     page_size: declared,
                     has_more_path,
+                    absent_cursor,
                 } => {
                     assert_eq!(cursor_param, "pageToken", "{short}");
                     assert_eq!(next_cursor_path, "$.nextPageToken", "{short}");
@@ -1020,6 +1021,9 @@ mod tests {
                     // credentials; 1001/101/0 each 400).
                     assert_eq!(declared, page_size, "{short}");
                     assert!(has_more_path.is_none(), "{short}");
+                    // Drive OMITS `nextPageToken` on the final page, so its
+                    // absence is the end of the collection rather than drift.
+                    assert_eq!(absent_cursor, AbsentCursor::EndsTheScan, "{short}");
                 }
                 other => panic!("{short} must paginate by cursor, got {other:?}"),
             }

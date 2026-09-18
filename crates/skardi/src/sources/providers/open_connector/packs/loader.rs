@@ -41,7 +41,7 @@ use crate::sources::providers::open_connector::error::OpenConnectorError;
 use crate::sources::providers::open_connector::json_to_arrow::RowConverter;
 use crate::sources::providers::open_connector::json_to_arrow::{FieldMapping, FieldType};
 use crate::sources::providers::open_connector::pagination::{
-    CursorContinuation, PaginationStrategy,
+    AbsentCursor, CursorContinuation, PaginationStrategy,
 };
 use crate::sources::providers::open_connector::row_path::RowPath;
 use crate::sources::providers::open_connector::source_pack::{
@@ -766,6 +766,14 @@ impl PaginationDoc {
                     page_size_param: page_size_input.map(leak_str),
                     page_size,
                     has_more_path: has_more_path.map(leak_str),
+                    // Every YAML-declared pack keeps the behaviour it has
+                    // today. `AbsentCursor::IsDrift` is a MEASUREMENT — that
+                    // the action sends its cursor key on every page and
+                    // spells the end as null — and no pack asset carries
+                    // that measurement yet, so there is no YAML key to read
+                    // it from. One goes in when a provider's terminal page
+                    // has actually been observed, not before.
+                    absent_cursor: AbsentCursor::EndsTheScan,
                 },
                 continuation.map(|doc| CursorContinuation {
                     action_id: doc.action.map_or(table_action, leak_str),
