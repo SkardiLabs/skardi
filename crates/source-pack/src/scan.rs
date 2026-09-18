@@ -40,6 +40,35 @@ use crate::pagination::{CursorContinuation, Pagination, PaginationStrategy};
 use crate::row_path::RowPath;
 use crate::source_pack::{FixedValue, RowShape, SourcePackTable};
 
+/// How pages 2..N are requested, when they differ from page one.
+///
+/// The two facts a WALK needs out of [`CursorContinuation`], which carries a
+/// third — `expected_fingerprint` — that only registration uses. Splitting them
+/// is not tidiness: a consumer building a `ScanTarget` by hand registers no
+/// pack table, so a mandatory fingerprint field would force it to invent a
+/// value that nothing checks and that reads, to the next person, like a pin
+/// that is being enforced. cloud's rbac syncer is exactly that consumer —
+/// OneDrive's ACL action continues through ITSELF while accepting only
+/// `nextLink` on pages 2..N.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanContinuation {
+    /// Action serving pages 2..N. Spelled even when it equals the table's own
+    /// action, so a same-action continuation still names itself.
+    pub action_id: &'static str,
+    /// Whether pages 2..N carry ONLY the cursor. Required whenever the
+    /// continuation action's schema accepts nothing else.
+    pub cursor_only: bool,
+}
+
+impl From<CursorContinuation> for ScanContinuation {
+    fn from(c: CursorContinuation) -> Self {
+        Self {
+            action_id: c.action_id,
+            cursor_only: c.cursor_only,
+        }
+    }
+}
+
 /// Everything about WHAT is being scanned, as opposed to how far the scan has
 /// got. Bound once, then immutable for the walk.
 #[derive(Debug, Clone)]
@@ -62,10 +91,10 @@ pub struct ScanTarget {
     /// cache key, and travels with the target so the two cannot disagree
     /// about which pack a cached result came from.
     pub source_pack_version: u32,
-    /// Split-action cursor continuation (see [`CursorContinuation`]); `None`
-    /// for raw scans and for every table whose provider accepts the cursor on
-    /// its own action.
-    pub continuation: Option<CursorContinuation>,
+    /// How pages 2..N are requested, when they differ (see
+    /// [`ScanContinuation`]); `None` for raw scans and for every table whose
+    /// provider accepts the cursor alongside the original inputs.
+    pub continuation: Option<ScanContinuation>,
     /// Whether the row path locates an array of rows or a single row object
     /// (see [`RowShape`]). Carried on the target rather than passed alongside
     /// it: this is the per-table response contract, exactly like `pagination`
@@ -83,7 +112,7 @@ impl ScanTarget {
             error_path: table.error_path,
             fixed_inputs: table.fixed_inputs,
             source_pack_version,
-            continuation: table.continuation,
+            continuation: table.continuation.map(ScanContinuation::from),
             row_shape: table.row_shape,
         }
     }
