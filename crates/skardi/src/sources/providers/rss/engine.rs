@@ -1200,7 +1200,7 @@ mod tests {
     use crate::sources::providers::rss::config::{FeedSubscription, inline_config};
     use crate::sources::providers::rss::egress::{AllowAll, EgressReason};
     use crate::sources::providers::rss::testutil::{
-        MockFeedServer, MockResponse, RSS2_MINIMAL, str_col, str_opt_col,
+        MockFeedServer, MockResponse, MockResponseExt, RSS2_MINIMAL, str_col, str_opt_col,
     };
 
     /// Test-only denying policy: refuses exactly the listed addresses, allows

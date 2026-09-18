@@ -48,9 +48,7 @@ pub fn builtin_pack_registry() -> Result<SourcePackRegistry, OpenConnectorError>
 #[cfg(test)]
 mod tests {
     use super::super::*;
-    use skardi_source_pack::filters::*;
     use skardi_source_pack::pagination::*;
-    use skardi_source_pack::schema::*;
     use skardi_source_pack::source_pack::*;
 
     #[test]

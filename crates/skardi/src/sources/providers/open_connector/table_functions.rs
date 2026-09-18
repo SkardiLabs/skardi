@@ -141,7 +141,7 @@ pub struct OpenConnectorQueryFunction {
 
 impl OpenConnectorQueryFunction {
     /// Build the function over the shared gateway map and a validated
-    /// pack registry (see [`SourcePackRegistry::builtins`]).
+    /// pack registry (see [`builtin_pack_registry`](super::builtin_pack_registry)).
     pub fn new(gateways: OpenConnectorGateways, packs: SourcePackRegistry) -> Self {
         Self { gateways, packs }
     }

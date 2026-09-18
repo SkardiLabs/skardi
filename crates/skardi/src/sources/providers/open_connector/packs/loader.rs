@@ -965,7 +965,6 @@ enum FormatDoc {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sources::providers::open_connector::source_pack::SourcePackRegistry;
 
     /// Every registered asset parses AND passes the same structural
     /// checks binding performs. Driven off `crate::sources::providers::open_connector::builtin_pack_registry()`
