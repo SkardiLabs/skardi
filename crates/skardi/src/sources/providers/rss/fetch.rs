@@ -725,9 +725,7 @@ fn find_egress_denied(err: &reqwest::Error) -> Option<EgressDenied> {
 mod tests {
     use super::*;
     use crate::sources::providers::rss::egress::{EgressPolicy, EgressReason};
-    use crate::sources::providers::rss::testutil::{
-        MockFeedServer, MockResponse, MockResponseExt,
-    };
+    use crate::sources::providers::rss::testutil::{MockFeedServer, MockResponse, MockResponseExt};
     use std::process::Command;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
