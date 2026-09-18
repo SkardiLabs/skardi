@@ -57,7 +57,7 @@ use serde_json::Value;
 use url::Url;
 
 use crate::config::{OpenConnectorConfig, validate_action_id};
-use crate::error::OpenConnectorError;
+use crate::error::{LastAttempt, OpenConnectorError, TransportFailure};
 use crate::http::{clock_jitter_nanos, parse_retry_after};
 use crate::text::truncate_chars;
 
@@ -642,6 +642,10 @@ impl OpenConnectorClient {
         terminal_error: impl Fn(StatusCode, String) -> OpenConnectorError,
     ) -> Result<Response, OpenConnectorError> {
         let mut last_reason = String::new();
+        // Seeded with the shape a zero-attempt client would report. Overwritten
+        // by the first attempt that fails; `max_attempts` is at least one, so
+        // no caller can observe the seed.
+        let mut last_attempt = LastAttempt::Transport(TransportFailure::Network);
         for attempt in 1..=self.max_attempts {
             let request = build().bearer_auth(self.token.expose_secret());
             match request.send().await {
@@ -649,6 +653,7 @@ impl OpenConnectorClient {
                 Ok(response) => {
                     let status = response.status();
                     if policy.allows_status_retry(status) {
+                        last_attempt = LastAttempt::Status(status.as_u16());
                         last_reason = format!("HTTP {}", status.as_u16());
                         if attempt < self.max_attempts {
                             let wait = retry_after(&response).unwrap_or_else(|| backoff(attempt));
@@ -679,6 +684,8 @@ impl OpenConnectorClient {
                             reason: e.to_string(),
                         });
                     }
+                    let transport = TransportFailure::of(&e);
+                    last_attempt = LastAttempt::Transport(transport);
                     last_reason = e.to_string();
                     // A transport error on a non-idempotent call is ambiguous:
                     // the request may have reached the gateway and the action
@@ -686,6 +693,7 @@ impl OpenConnectorClient {
                     if policy == RetryPolicy::NonIdempotent {
                         return Err(OpenConnectorError::NonIdempotentAmbiguousFailure {
                             operation: operation.to_string(),
+                            transport,
                             reason: last_reason,
                         });
                     }
@@ -705,6 +713,7 @@ impl OpenConnectorClient {
         Err(OpenConnectorError::RetriesExhausted {
             operation: operation.to_string(),
             attempts: self.max_attempts,
+            last_attempt,
             reason: last_reason,
         })
     }
@@ -909,6 +918,82 @@ mod tests {
             ),
             "got {err}"
         );
+    }
+
+    /// **The distinction that was prose.** A retry budget spent on a gateway
+    /// that kept answering 503 and one spent on a gateway that was never
+    /// reachable are different operational facts — restart it versus find it —
+    /// and `RetriesExhausted` used to render both into one `reason` string.
+    #[tokio::test]
+    async fn exhausted_retries_name_the_transport_that_never_answered() {
+        let client = OpenConnectorClient::new(
+            "http://127.0.0.1:1",
+            "test-token",
+            Duration::from_millis(200),
+        )
+        .expect("build client")
+        .with_max_attempts(2);
+
+        let err = client.health().await.unwrap_err();
+
+        match err {
+            OpenConnectorError::RetriesExhausted { last_attempt, .. } => assert_eq!(
+                last_attempt,
+                LastAttempt::Transport(TransportFailure::Connect),
+                "nothing was listening, so the connection was never made"
+            ),
+            other => panic!("expected RetriesExhausted, got {other}"),
+        }
+    }
+
+    /// The other half, and the reason the field is an enum rather than an
+    /// always-transport value: a gateway that ANSWERS every attempt with a
+    /// retryable status exhausts the same budget, and must not be reported as
+    /// unreachable.
+    #[tokio::test]
+    async fn exhausted_retries_name_the_status_that_kept_coming_back() {
+        let gateway = MockGateway::start(|_| MockResponse::new(503, "down")).await;
+
+        let err = test_client(&gateway, 2).health().await.unwrap_err();
+
+        match err {
+            OpenConnectorError::RetriesExhausted { last_attempt, .. } => assert_eq!(
+                last_attempt,
+                LastAttempt::Status(503),
+                "the gateway answered every time; it was not a transport failure"
+            ),
+            other => panic!("expected RetriesExhausted, got {other}"),
+        }
+    }
+
+    /// A non-idempotent call cannot be re-sent, but WHY it failed still
+    /// narrows what happened: a `Connect` failure never reached the gateway,
+    /// so the action cannot have run, while a `Timeout` may have executed it.
+    /// The variant's name says the outcome is ambiguous; this field says how
+    /// ambiguous.
+    #[tokio::test]
+    async fn an_ambiguous_execute_names_its_transport_failure() {
+        let client = OpenConnectorClient::new(
+            "http://127.0.0.1:1",
+            "test-token",
+            Duration::from_millis(200),
+        )
+        .expect("build client")
+        .with_max_attempts(2);
+
+        let err = client
+            .execute("x.y", &serde_json::json!({}), None)
+            .await
+            .unwrap_err();
+
+        match err {
+            OpenConnectorError::NonIdempotentAmbiguousFailure { transport, .. } => assert_eq!(
+                transport,
+                TransportFailure::Connect,
+                "the request never reached the gateway, so nothing executed"
+            ),
+            other => panic!("expected NonIdempotentAmbiguousFailure, got {other}"),
+        }
     }
 
     #[tokio::test]

@@ -2,6 +2,91 @@
 
 use thiserror::Error;
 
+/// Why a request never produced a response.
+///
+/// Carried as a FIELD, for the third time in this crate and the same reason
+/// each time: a consumer classifies on it, and prose is not a contract. The
+/// five cases are the ones cloud's rbac syncer already separates by hand
+/// (`connectors::http::transport_class`), and they are separated because they
+/// are different instructions — `Connect` says the gateway is not there,
+/// `Timeout` says it is there and not answering in time, `Body` says it
+/// answered with something unreadable. An operator does a different thing for
+/// each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportFailure {
+    /// The request outlived its timeout.
+    Timeout,
+    /// The connection was never established.
+    Connect,
+    /// The response body could not be read or decoded.
+    Body,
+    /// The request itself could not be sent.
+    Request,
+    /// Anything else the transport reported.
+    Network,
+}
+
+impl TransportFailure {
+    /// Classify a `reqwest` failure.
+    ///
+    /// Order matters: `is_request` is true for most of the others too, so the
+    /// specific predicates are asked first and it acts as the fallback before
+    /// `Network`.
+    pub fn of(error: &reqwest::Error) -> Self {
+        if error.is_timeout() {
+            Self::Timeout
+        } else if error.is_connect() {
+            Self::Connect
+        } else if error.is_body() || error.is_decode() {
+            Self::Body
+        } else if error.is_request() {
+            Self::Request
+        } else {
+            Self::Network
+        }
+    }
+
+    /// The stable token an operator greps for.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Connect => "connect",
+            Self::Body => "body",
+            Self::Request => "request",
+            Self::Network => "network",
+        }
+    }
+}
+
+impl std::fmt::Display for TransportFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// How the final attempt of a retried call failed.
+///
+/// `RetriesExhausted` conflated two very different endings — the gateway
+/// answering 503 every time, and the gateway never answering at all — into one
+/// prose `reason`. They are exactly one of the two, so this is an enum rather
+/// than a pair of `Option`s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LastAttempt {
+    /// The gateway answered, with this status, and the status was retryable.
+    Status(u16),
+    /// The gateway never answered.
+    Transport(TransportFailure),
+}
+
+impl std::fmt::Display for LastAttempt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Status(code) => write!(f, "HTTP {code}"),
+            Self::Transport(kind) => write!(f, "transport {kind}"),
+        }
+    }
+}
+
 /// Errors surfaced while validating or registering an Open Connector gateway
 /// data source.
 ///
@@ -233,6 +318,11 @@ pub enum OpenConnectorError {
     RetriesExhausted {
         operation: String,
         attempts: u32,
+        /// How the final attempt failed. See [`LastAttempt`] — a retry budget
+        /// spent on 503s and one spent on a gateway that was never reachable
+        /// are different operational facts, and they used to be the same
+        /// string.
+        last_attempt: LastAttempt,
         reason: String,
     },
 
@@ -245,7 +335,15 @@ pub enum OpenConnectorError {
          not retried because the request may have reached the gateway and \
          re-execution is not safe"
     )]
-    NonIdempotentAmbiguousFailure { operation: String, reason: String },
+    NonIdempotentAmbiguousFailure {
+        operation: String,
+        /// Which transport failure it was. Ambiguity is about whether the
+        /// action RAN, not about what went wrong on the wire: a `Connect`
+        /// failure did not reach the gateway and so cannot have executed
+        /// anything, while a `Timeout` may well have.
+        transport: TransportFailure,
+        reason: String,
+    },
 
     /// The provider reported an in-band error inside an otherwise
     /// successful response envelope — Slack's HTTP-200 `ok: false` +
