@@ -586,6 +586,7 @@ impl OpenConnectorClient {
                     action_id: action_id.to_string(),
                     status: Some(status.as_u16()),
                     error_code: envelope_error_code(&body),
+                    echoed_action_id: envelope_action_id(&body),
                     reason: terminal_reason(status, &body),
                 },
             )
@@ -605,6 +606,7 @@ impl OpenConnectorClient {
                 // the HTTP code says nothing about what went wrong.
                 status: None,
                 error_code: envelope.error_code.clone(),
+                echoed_action_id: envelope_action_id(&text),
                 reason: envelope.failure_reason(),
             });
         }
@@ -1447,6 +1449,21 @@ fn envelope_error_code(body: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The action id the gateway echoed at `meta.actionId`, when the body is a
+/// gateway envelope carrying one.
+///
+/// Best-effort for the same reason as [`envelope_error_code`], and absence is
+/// the answer that matters here: a body with no `meta.actionId` is not this
+/// gateway refusing an action, it is something else answering entirely.
+fn envelope_action_id(body: &str) -> Option<String> {
+    serde_json::from_str::<Value>(body)
+        .ok()?
+        .get("meta")?
+        .get("actionId")?
+        .as_str()
+        .map(str::to_owned)
+}
+
 #[cfg(test)]
 mod structured_failure_tests {
     use super::*;
@@ -1477,6 +1494,74 @@ mod structured_failure_tests {
                 }
                 other => panic!("expected ActionExecutionFailed, got {other}"),
             }
+        }
+    }
+
+    /// **The discriminator between Open Connector's two 404s.** A build that
+    /// does not define the action answers a GATEWAY envelope, echoing the
+    /// action under test at `meta.actionId`.
+    #[tokio::test]
+    async fn an_undefined_action_echoes_the_action_it_was_asked_for() {
+        let gateway = MockGateway::start(|_| {
+            MockResponse::new(
+                404,
+                r#"{"success":false,"message":"no such action","data":null,
+                    "errorCode":"invalid_input","meta":{"actionId":"x.y"}}"#,
+            )
+        })
+        .await;
+        let err = client(&gateway)
+            .execute("x.y", &serde_json::json!({}), None)
+            .await
+            .unwrap_err();
+        match err {
+            OpenConnectorError::ActionExecutionFailed {
+                status,
+                echoed_action_id,
+                ..
+            } => {
+                assert_eq!(status, Some(404));
+                assert_eq!(
+                    echoed_action_id.as_deref(),
+                    Some("x.y"),
+                    "the gateway named the action it could not run"
+                );
+            }
+            other => panic!("expected ActionExecutionFailed, got {other}"),
+        }
+    }
+
+    /// **The other 404, and the reason the field exists at all.** A base URL
+    /// pointing at the wrong service answers THAT service's 404 — a
+    /// differently shaped body with no `meta` — and it must not be readable as
+    /// "this action is undefined", which would send an operator to the
+    /// connector catalog for a deployment problem.
+    ///
+    /// Same status, and close enough in shape to fool a substring search: the
+    /// echoed id is the only thing that separates them, which is why asserting
+    /// `None` here asserts a behaviour rather than an absence.
+    #[tokio::test]
+    async fn a_404_from_another_service_echoes_nothing() {
+        let gateway =
+            MockGateway::start(|_| MockResponse::new(404, r#"{"error":{"code":"not_found"}}"#))
+                .await;
+        let err = client(&gateway)
+            .execute("x.y", &serde_json::json!({}), None)
+            .await
+            .unwrap_err();
+        match err {
+            OpenConnectorError::ActionExecutionFailed {
+                status,
+                echoed_action_id,
+                ..
+            } => {
+                assert_eq!(status, Some(404));
+                assert_eq!(
+                    echoed_action_id, None,
+                    "a body with no gateway envelope must not look like a refusal from one"
+                );
+            }
+            other => panic!("expected ActionExecutionFailed, got {other}"),
         }
     }
 

@@ -208,6 +208,23 @@ pub enum OpenConnectorError {
         status: Option<u16>,
         /// The gateway envelope's `errorCode`, when it sent one.
         error_code: Option<String>,
+        /// The action id the gateway ECHOED in `meta.actionId`, when it
+        /// answered with a gateway envelope at all.
+        ///
+        /// Distinct from `action_id`, which is what the caller ASKED for, and
+        /// the difference is the whole point: it is the only thing that
+        /// separates Open Connector's two 404s. A build that does not define
+        /// the action answers a gateway envelope echoing the action under
+        /// test; a base URL pointing at the wrong service answers that
+        /// service's own 404, a differently shaped body with no `meta` at
+        /// all. Without this field the two are indistinguishable, and a
+        /// misconfigured URL gets reported as a missing action — sending the
+        /// operator to the connector catalog for what is a deployment
+        /// problem.
+        ///
+        /// `None` therefore carries information rather than merely missing:
+        /// it means no gateway envelope came back.
+        echoed_action_id: Option<String>,
         reason: String,
     },
 
