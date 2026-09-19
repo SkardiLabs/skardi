@@ -235,6 +235,23 @@ jobs:
       - name: Check code format
         run: cargo fmt --all -- --check
       - name: Check the package for errors
+        # `--all`, deliberately NOT `--all-targets`: this step compiles the
+        # libraries and binaries, and nothing under `#[cfg(test)]`. Read the
+        # job name and you will assume otherwise, so: **a green Check is not
+        # evidence that the tree compiles.** Only the nextest job below is
+        # equivalent to `--all-targets`, and a break confined to test code
+        # therefore shows up as a red Test job, which reads like a flaky
+        # test rather than a compile error.
+        #
+        # Widening it here is not the fix — it would double this job's cost
+        # to duplicate what nextest already does before it runs anything.
+        # The point is to stop the name being read as a stronger claim than
+        # it makes, which this PR has three instances of: extracting a crate
+        # moves code out from under whatever was watching it, and each
+        # instrument has to be re-aimed separately. Five stale
+        # `use skardi::util::…` paths survived this step AND the unit suite
+        # and were caught only by the doctest step below; a `#[cfg(test)]`
+        # allowlist entry survived it and was caught only by `--all-targets`.
         run: cargo check --all
       - name: The source pack stays importable by a syncer
         # `skardi-source-pack` exists so the engine, cloud's ETL runner
