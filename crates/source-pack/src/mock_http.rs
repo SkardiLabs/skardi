@@ -30,26 +30,26 @@ use tokio::task::JoinHandle;
 
 /// One request observed by the mock server.
 #[derive(Debug, Clone)]
-pub(crate) struct RecordedRequest {
+pub struct RecordedRequest {
     /// HTTP method (`GET`, `POST`, …).
-    pub(crate) method: String,
+    pub method: String,
     /// Request path including any query string.
-    pub(crate) path: String,
+    pub path: String,
     /// Request body as UTF-8 lossy text (empty for the GETs the rss
     /// fetcher sends; the gateway suites assert on their POST payloads).
-    pub(crate) body: String,
+    pub body: String,
     headers: HashMap<String, String>,
 }
 
 impl RecordedRequest {
     /// Look up a header by name (case-insensitive).
-    pub(crate) fn header(&self, name: &str) -> Option<String> {
+    pub fn header(&self, name: &str) -> Option<String> {
         self.headers.get(&name.to_ascii_lowercase()).cloned()
     }
 }
 
 /// A canned response the handler returns for a request.
-pub(crate) struct MockResponse {
+pub struct MockResponse {
     status: u16,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
@@ -60,7 +60,7 @@ pub(crate) struct MockResponse {
 impl MockResponse {
     /// Any status with a raw byte body and no headers. Bodies are bytes
     /// rather than text so a gzip fixture can be served without a detour.
-    pub(crate) fn new(status: u16, body: impl Into<Vec<u8>>) -> Self {
+    pub fn new(status: u16, body: impl Into<Vec<u8>>) -> Self {
         Self {
             status,
             headers: Vec::new(),
@@ -73,19 +73,19 @@ impl MockResponse {
     /// A bare status with an empty body and no headers — the starting point
     /// for redirects (chain `.with_header("location", …)`), `304`, and
     /// 4xx/5xx responses.
-    pub(crate) fn status(status: u16) -> Self {
+    pub fn status(status: u16) -> Self {
         Self::new(status, Vec::new())
     }
 
     /// Attach an extra response header.
-    pub(crate) fn with_header(mut self, name: &str, value: &str) -> Self {
+    pub fn with_header(mut self, name: &str, value: &str) -> Self {
         self.headers.push((name.to_string(), value.to_string()));
         self
     }
 
     /// Delay writing the response by `delay`, simulating a slow upstream
     /// for a client's timeout tests.
-    pub(crate) fn with_delay(mut self, delay: Duration) -> Self {
+    pub fn with_delay(mut self, delay: Duration) -> Self {
         self.delay = Some(delay);
         self
     }
@@ -95,7 +95,7 @@ impl MockResponse {
     /// simulating an upstream that dies mid-transfer. The declared/actual
     /// length mismatch is what makes the client see a body-read error
     /// rather than mistaking the prefix for a short-but-complete response.
-    pub(crate) fn with_truncated_body(mut self, sent_bytes: usize) -> Self {
+    pub fn with_truncated_body(mut self, sent_bytes: usize) -> Self {
         self.truncate_body_at = Some(sent_bytes);
         self
     }
@@ -109,9 +109,9 @@ type Handler = Arc<dyn Fn(&RecordedRequest) -> MockResponse + Send + Sync>;
 /// [`MockHttpServer::url`]: the two consolidated suites grew the two styles
 /// independently, and rewriting either's call sites would be churn for no
 /// behavior.
-pub(crate) struct MockHttpServer {
+pub struct MockHttpServer {
     /// Base URL (`http://127.0.0.1:<port>`, no trailing slash).
-    pub(crate) url: String,
+    pub url: String,
     requests: Arc<Mutex<Vec<RecordedRequest>>>,
     accept_loop: JoinHandle<()>,
 }
@@ -120,7 +120,7 @@ impl MockHttpServer {
     /// Start a server on an ephemeral localhost port. `handler` is invoked
     /// for every request and may hold state (e.g. an `AtomicUsize` counting
     /// calls to script a retry sequence).
-    pub(crate) async fn start(
+    pub async fn start(
         handler: impl Fn(&RecordedRequest) -> MockResponse + Send + Sync + 'static,
     ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -157,12 +157,12 @@ impl MockHttpServer {
 
     /// Base URL for this server (`http://127.0.0.1:<port>`, no trailing
     /// slash).
-    pub(crate) fn url(&self) -> String {
+    pub fn url(&self) -> String {
         self.url.clone()
     }
 
     /// All requests observed so far, in arrival order.
-    pub(crate) fn requests(&self) -> Vec<RecordedRequest> {
+    pub fn requests(&self) -> Vec<RecordedRequest> {
         self.requests
             .lock()
             .unwrap_or_else(|p| p.into_inner())

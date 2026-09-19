@@ -12,81 +12,14 @@ use std::collections::HashSet;
 
 use chrono::{DateTime, SecondsFormat};
 use datafusion::common::ScalarValue;
-use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
+use datafusion::logical_expr::{Expr, Operator as SqlOperator, TableProviderFilterPushDown};
+
+// The DECLARATIONS now live in the pack; what stays here is the
+// translation — the half that needs an `Expr`. `SqlOperator` is
+// DataFusion's; `Operator` is the pack's neutral one a mapping declares,
+// and `sql_operator` below is the single place the two meet.
 use serde_json::Value;
-
-/// How faithfully a mapping's provider input represents the SQL predicate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Fidelity {
-    /// The provider filter is exactly the SQL predicate; DataFusion does not
-    /// re-evaluate it, so a wrong `Exact` claim silently drops rows.
-    Exact,
-    /// The provider filter is conservative: it may return *more* rows than
-    /// the predicate allows (fuzzy semantics, coarser timestamp granularity),
-    /// and DataFusion reapplies the predicate locally. A mapping may only be
-    /// `Inexact` if the provider can never return **fewer** matching rows —
-    /// rows the provider drops are unrecoverable, re-filtering or not.
-    Inexact,
-}
-
-/// How a mapping's literal renders into the provider input. Timestamps are
-/// the polymorphic case: JSON has no timestamp type and providers disagree
-/// — GitHub's `since` takes RFC 3339, Slack-style inputs take epoch
-/// seconds. Making the format part of the mapping keeps a future pack from
-/// silently sending the wrong spelling. Non-timestamp scalars render
-/// identically under every format, so `Verbatim` exists to *say* that no
-/// timestamp spelling applies rather than lean on that coincidence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ValueFormat {
-    /// The literal's natural JSON rendering, for non-timestamp inputs
-    /// (strings, numbers, booleans). A timestamp literal reaching a
-    /// Verbatim mapping does NOT translate — the mapping never declared a
-    /// timestamp spelling, and guessing one risks sending the wrong
-    /// format, so the predicate stays local instead.
-    Verbatim,
-    /// Timestamps render as RFC 3339 UTC strings (`2026-01-01T00:00:00Z`).
-    Rfc3339,
-    /// Timestamps render as whole epoch seconds, flooring sub-second
-    /// precision. Flooring widens a *lower* bound (a superset — safe under
-    /// [`Fidelity::Inexact`] re-filtering); for an upper-bound provider
-    /// parameter it would narrow the fetch and drop rows, so epoch-seconds
-    /// mappings are for lower-bound inputs (`ts_from`-style) only — the
-    /// pack loader REJECTS any other operator (and any fidelity but
-    /// Inexact) at load time. Pre-epoch instants clamp to `0`: still a
-    /// lower-bound superset, and providers with unsigned epoch inputs
-    /// (Feishu 400s a `-` sign) never see a negative.
-    EpochSeconds,
-    /// [`ValueFormat::EpochSeconds`] rendered as a JSON *string* of decimal
-    /// digits, for providers whose strict input schemas type their epoch
-    /// inputs as strings (Feishu's `startTime`, `minLength: 1`) — a JSON
-    /// number there is a hard 400. Same flooring semantics, so the same
-    /// lower-bound-only rule applies.
-    EpochSecondsString,
-}
-
-/// One allowlisted pushdown rule: `column <operator> literal` → `input_field: literal`.
-///
-/// Exactly one operator per mapping, on purpose: a single
-/// `(input_field, literal)` pair can only faithfully represent one operator's
-/// semantics. Listing several operators against one input field lets two
-/// operators with *different* semantics (e.g. `>` vs `>=` against a
-/// strictly-greater input) both be classified Exact — and the wrong one
-/// silently drops rows DataFusion never reapplies. If a provider input is
-/// exact for two operators, declare two mappings.
-#[derive(Debug, Clone, Copy)]
-pub struct FilterMapping {
-    /// Arrow column name the predicate references.
-    pub column: &'static str,
-    /// The comparison operator this mapping accepts.
-    pub operator: Operator,
-    /// Action input field the translated value is written to.
-    pub input_field: &'static str,
-    /// Whether the provider input represents the predicate exactly or
-    /// conservatively (see [`Fidelity`]).
-    pub fidelity: Fidelity,
-    /// How the literal renders into the provider input (see [`ValueFormat`]).
-    pub value_format: ValueFormat,
-}
+pub use skardi_source_pack::filters::{Fidelity, FilterMapping, Operator, ValueFormat};
 
 /// Outcome of translating the scan's filters.
 #[derive(Debug, Default)]
@@ -170,9 +103,14 @@ fn translate_one(filter: &Expr, mappings: &[FilterMapping]) -> Option<(String, V
         _ => return None,
     };
 
-    let mapping = mappings
-        .iter()
-        .find(|mapping| mapping.column == column.name && mapping.operator == operator)?;
+    let mapping = mappings.iter().find(|mapping| {
+        // The one place the two operator vocabularies meet: the
+        // predicate's is DataFusion's, the mapping's is the pack's
+        // neutral declaration. An operator no pack declares yields
+        // `None` and simply does not push down, which is always
+        // safe — DataFusion re-evaluates what we do not translate.
+        mapping.column == column.name && declared_operator(operator) == Some(mapping.operator)
+    })?;
 
     let value = scalar_to_json(&literal, mapping.value_format)?;
     Some((mapping.input_field.to_string(), value, mapping.fidelity))
@@ -332,7 +270,7 @@ mod tests {
     fn gt(column: &str, value: i64) -> Expr {
         Expr::BinaryExpr(BinaryExpr::new(
             Box::new(col(column)),
-            Operator::Gt,
+            SqlOperator::Gt,
             Box::new(lit(value)),
         ))
     }
@@ -356,7 +294,7 @@ mod tests {
         // the input that faithfully represents THIS operator.
         let filter = Expr::BinaryExpr(BinaryExpr::new(
             Box::new(col("value")),
-            Operator::GtEq,
+            SqlOperator::GtEq,
             Box::new(lit(10)),
         ));
         let translated = translate_filters(&[filter], MAPPINGS);
@@ -375,38 +313,44 @@ mod tests {
         // The scenario behind one-operator-per-mapping: Gt → min_value and
         // Lt → max_value on the SAME column must both resolve — resolution
         // is by (column, operator), so the second mapping is reachable.
+        //
+        // It used to use `Gt` and `Lt`. `Lt` is not in the YAML asset grammar
+        // — `OpDoc` is eq/gt/gt_eq — so no pack could ever have declared that
+        // mapping: the engine's type was wider than the format it loads, and
+        // the neutral `Operator` closes the gap. Two operators a pack CAN
+        // declare prove the same thing.
         const RANGE: &[FilterMapping] = &[
             FilterMapping {
                 column: "value",
                 operator: Operator::Gt,
-                input_field: "min_value",
+                input_field: "after_value",
                 fidelity: Fidelity::Exact,
                 value_format: ValueFormat::Rfc3339,
             },
             FilterMapping {
                 column: "value",
-                operator: Operator::Lt,
-                input_field: "max_value",
+                operator: Operator::GtEq,
+                input_field: "from_value",
                 fidelity: Fidelity::Exact,
                 value_format: ValueFormat::Rfc3339,
             },
         ];
         let gt = Expr::BinaryExpr(BinaryExpr::new(
             Box::new(col("value")),
-            Operator::Gt,
+            SqlOperator::Gt,
             Box::new(lit(1)),
         ));
-        let lt = Expr::BinaryExpr(BinaryExpr::new(
+        let gt_eq = Expr::BinaryExpr(BinaryExpr::new(
             Box::new(col("value")),
-            Operator::Lt,
+            SqlOperator::GtEq,
             Box::new(lit(5)),
         ));
-        let translated = translate_filters(&[gt, lt], RANGE);
+        let translated = translate_filters(&[gt, gt_eq], RANGE);
         assert_eq!(
             translated.inputs,
             vec![
-                ("min_value".to_string(), Value::from(1)),
-                ("max_value".to_string(), Value::from(5)),
+                ("after_value".to_string(), Value::from(1)),
+                ("from_value".to_string(), Value::from(5)),
             ]
         );
         assert_eq!(
@@ -443,7 +387,7 @@ mod tests {
     fn literal_on_left_is_normalized() {
         let filter = Expr::BinaryExpr(BinaryExpr::new(
             Box::new(lit(10)),
-            Operator::Lt,
+            SqlOperator::Lt,
             Box::new(col("value")),
         ));
         let translated = translate_filters(&[filter], MAPPINGS);
@@ -469,7 +413,7 @@ mod tests {
     fn string_and_float_and_bool_literals_translate() {
         let name_eq = Expr::BinaryExpr(BinaryExpr::new(
             Box::new(col("name")),
-            Operator::Eq,
+            SqlOperator::Eq,
             Box::new(lit("widget")),
         ));
         let translated = translate_filters(&[name_eq], MAPPINGS);
@@ -487,7 +431,7 @@ mod tests {
         ] {
             let name_eq = Expr::BinaryExpr(BinaryExpr::new(
                 Box::new(col("name")),
-                Operator::Eq,
+                SqlOperator::Eq,
                 Box::new(Expr::Literal(scalar, None)),
             ));
             let translated = translate_filters(&[name_eq], MAPPINGS);
@@ -522,7 +466,7 @@ mod tests {
         // — so a provider returning a superset can never leak wrong rows.
         let filter = Expr::BinaryExpr(BinaryExpr::new(
             Box::new(col("updated_at")),
-            Operator::GtEq,
+            SqlOperator::GtEq,
             Box::new(lit("2026-01-01T00:00:00Z")),
         ));
         let translated = translate_filters(&[filter], MAPPINGS);
@@ -549,7 +493,7 @@ mod tests {
         ] {
             let filter = Expr::BinaryExpr(BinaryExpr::new(
                 Box::new(col("updated_at")),
-                Operator::GtEq,
+                SqlOperator::GtEq,
                 Box::new(Expr::Literal(scalar, None)),
             ));
             let translated = translate_filters(&[filter], MAPPINGS);
@@ -562,7 +506,7 @@ mod tests {
         // Sub-second precision is preserved, not truncated away.
         let filter = Expr::BinaryExpr(BinaryExpr::new(
             Box::new(col("updated_at")),
-            Operator::GtEq,
+            SqlOperator::GtEq,
             Box::new(Expr::Literal(
                 ScalarValue::TimestampMillisecond(Some(epoch_ms + 250), None),
                 None,
@@ -585,7 +529,7 @@ mod tests {
         // timestamp type.
         let filter = Expr::BinaryExpr(BinaryExpr::new(
             Box::new(col("updated_at")),
-            Operator::GtEq,
+            SqlOperator::GtEq,
             Box::new(Expr::Cast(Cast::new(
                 Box::new(lit("2026-01-01T00:00:00Z")),
                 DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
@@ -606,7 +550,7 @@ mod tests {
         // Exact pushdown with a wrongly-typed provider input.
         let filter = Expr::BinaryExpr(BinaryExpr::new(
             Box::new(col("value")),
-            Operator::Gt,
+            SqlOperator::Gt,
             Box::new(Expr::TryCast(TryCast::new(
                 Box::new(lit("10")),
                 DataType::Float64,
@@ -634,7 +578,7 @@ mod tests {
         // evaluates locally) — never push a garbled value.
         let filter = Expr::BinaryExpr(BinaryExpr::new(
             Box::new(col("updated_at")),
-            Operator::GtEq,
+            SqlOperator::GtEq,
             Box::new(Expr::Cast(Cast::new(
                 Box::new(lit("not a timestamp")),
                 timestamp.clone(),
@@ -654,7 +598,7 @@ mod tests {
                 Box::new(col("updated_at")),
                 timestamp,
             ))),
-            Operator::GtEq,
+            SqlOperator::GtEq,
             Box::new(lit("2026-01-01T00:00:00Z")),
         ));
         let translated = translate_filters(&[filter], MAPPINGS);
@@ -681,7 +625,7 @@ mod tests {
         ] {
             let filter = Expr::BinaryExpr(BinaryExpr::new(
                 Box::new(col("created")),
-                Operator::GtEq,
+                SqlOperator::GtEq,
                 Box::new(Expr::Literal(scalar, None)),
             ));
             let translated = translate_filters(&[filter], MAPPINGS);
@@ -739,7 +683,7 @@ mod tests {
         // lower bounds these formats are restricted to.
         let filter = Expr::BinaryExpr(BinaryExpr::new(
             Box::new(col("create_time")),
-            Operator::GtEq,
+            SqlOperator::GtEq,
             Box::new(Expr::Literal(
                 ScalarValue::TimestampMillisecond(Some(-157_766_400_000), Some("UTC".into())),
                 None,
@@ -774,7 +718,7 @@ mod tests {
         ] {
             let filter = Expr::BinaryExpr(BinaryExpr::new(
                 Box::new(col("create_time")),
-                Operator::GtEq,
+                SqlOperator::GtEq,
                 Box::new(Expr::Literal(scalar, None)),
             ));
             let translated = translate_filters(&[filter], MAPPINGS);
@@ -816,7 +760,7 @@ mod tests {
         }];
         let filter = Expr::BinaryExpr(BinaryExpr::new(
             Box::new(col("created")),
-            Operator::GtEq,
+            SqlOperator::GtEq,
             Box::new(Expr::Literal(
                 ScalarValue::TimestampMillisecond(Some(1_767_225_600_000), Some("UTC".into())),
                 None,
@@ -848,5 +792,41 @@ mod tests {
                 TableProviderFilterPushDown::Unsupported
             ]
         );
+    }
+}
+
+/// The declared operator a DataFusion one corresponds to, or `None` when the
+/// predicate is something no provider declares.
+///
+/// The only place the two vocabularies meet. A pack declares
+/// [`skardi_source_pack::filters::Operator`] because a syncer must be able to
+/// read a pack without a query planner; this function is how the engine asks
+/// "is this `Expr`'s operator the one that mapping accepts".
+///
+/// Returning `None` rather than a fallback is deliberate: an unmapped operator
+/// means no pushdown, which is always safe — DataFusion re-evaluates the
+/// predicate. Guessing a near-match would be a wrong `Exact` claim, and a
+/// wrong `Exact` claim silently drops rows.
+///
+/// # Examples
+///
+/// ```
+/// use skardi::sources::providers::open_connector::filters::declared_operator;
+/// use skardi_source_pack::filters::Operator;
+/// use datafusion::logical_expr::Operator as SqlOperator;
+///
+/// assert_eq!(declared_operator(SqlOperator::Eq), Some(Operator::Eq));
+///
+/// // `None` is the important answer: a pack declares only the comparisons it
+/// // can push down, and anything else must stay a DataFusion filter rather
+/// // than be approximated by a near-match.
+/// assert_eq!(declared_operator(SqlOperator::Lt), None);
+/// ```
+pub fn declared_operator(operator: SqlOperator) -> Option<Operator> {
+    match operator {
+        SqlOperator::Eq => Some(Operator::Eq),
+        SqlOperator::Gt => Some(Operator::Gt),
+        SqlOperator::GtEq => Some(Operator::GtEq),
+        _ => None,
     }
 }

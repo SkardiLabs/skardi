@@ -32,19 +32,26 @@
 //!
 //! See `docs/superpowers/specs/2026-07-11-open-connector-integration-design.md`.
 
-pub mod action_registry;
+pub use skardi_source_pack::action_registry;
 pub mod cache;
-pub mod client;
-pub mod config;
-mod error;
+pub use skardi_source_pack::client;
+pub use skardi_source_pack::config;
+// `error` now lives in `skardi-source-pack`, so the syncer and the ETL
+// runner can name the same failures without importing a query planner.
+// Re-exported rather than re-declared: every existing `super::error::…`
+// and `open_connector::OpenConnectorError` path keeps resolving, which is
+// what makes this move reviewable — the diff is the move, not a rename of
+// every call site.
 pub mod exec;
 pub mod filters;
 pub mod json_to_arrow;
 pub mod packs;
-pub mod pagination;
-mod raw_schema;
-pub mod row_path;
-pub mod source_pack;
+pub use skardi_source_pack::pagination;
+pub use skardi_source_pack::raw_schema;
+pub use skardi_source_pack::row_path;
+pub mod builtin_packs;
+pub use builtin_packs::builtin_pack_registry;
+pub use skardi_source_pack::source_pack;
 pub mod table;
 pub mod table_functions;
 
@@ -54,7 +61,8 @@ pub(crate) mod testutil;
 pub use action_registry::{ActionMetadata, ActionRegistry};
 pub use client::OpenConnectorClient;
 pub use config::{OpenConnectorBinding, OpenConnectorConfig};
-pub use error::OpenConnectorError;
+pub use skardi_source_pack::error;
+pub use skardi_source_pack::error::OpenConnectorError;
 pub use source_pack::{FixedValue, SourcePack, SourcePackRegistry, SourcePackTable};
 pub use table::OpenConnectorTableProvider;
 pub use table_functions::{GatewayHandle, OpenConnectorGateways, register_open_connector_udtfs};
@@ -173,7 +181,7 @@ pub async fn register_open_connector_tables(
 
     // Resolve bindings to pack table definitions first, so discovery covers
     // the allowlist *and* every action a bound table needs.
-    let pack_registry = SourcePackRegistry::builtins()?;
+    let pack_registry = builtin_pack_registry()?;
     let mut action_ids = config.raw_action_allowlist.clone();
     for binding in &config.bindings {
         let pack = pack_registry.require(&binding.source_pack)?;
@@ -216,13 +224,36 @@ pub async fn register_open_connector_tables(
         // `OpenConnectorTableProvider::new`), so a key no table consumes is
         // dead configuration — most likely a typo — and fails loudly here
         // instead of being silently dropped from every request.
-        for key in binding.resource.keys() {
-            if !tables.iter().any(|table| table.declares_resource(key)) {
-                return Err(OpenConnectorError::UnknownResourceKey {
-                    binding: binding.name.clone(),
-                    key: key.clone(),
+        //
+        // That premise assumes the binding's resource keys are consumed BY
+        // A BOUND TABLE. A staging-only binding (Google Drive, Dropbox)
+        // binds none: its resource keys exist for a staging step outside
+        // this process, which uses them (plus the connection string and
+        // alias) to download file bytes into an object store the engine
+        // later reads through a `documents` data source. There is no bound
+        // table here to check them against, so skip the check rather than
+        // reject every key.
+        if tables.is_empty() {
+            // An empty `tables` list used to mean exactly one thing: a
+            // typo, caught right here by the check we just skipped. It now
+            // means one of two things — that, or a deliberate staging-only
+            // binding — and this process has no way to tell them apart, so
+            // say so at registration time instead of staying silent.
+            tracing::info!(
+                gateway = %name,
+                binding = %binding.name,
+                "Open Connector binding declares no tables; treating it as \
+                 staging-only and scanning nothing through Open Connector"
+            );
+        } else {
+            for key in binding.resource.keys() {
+                if !tables.iter().any(|table| table.declares_resource(key)) {
+                    return Err(OpenConnectorError::UnknownResourceKey {
+                        binding: binding.name.clone(),
+                        key: key.clone(),
+                    }
+                    .into());
                 }
-                .into());
             }
         }
     }
@@ -530,6 +561,154 @@ bindings:
         );
     }
 
+    const TOKEN_ENV_STAGING_NO_TABLES: &str = "SKARDI_TEST_OC_REGISTER_STAGING_NO_TABLES";
+    const TOKEN_ENV_STAGING_WITH_RESOURCE: &str = "SKARDI_TEST_OC_REGISTER_STAGING_WITH_RESOURCE";
+    const TOKEN_ENV_UNKNOWN_RESOURCE_KEY: &str = "SKARDI_TEST_OC_REGISTER_UNKNOWN_RESOURCE_KEY";
+
+    /// A gateway that only answers health checks. Enough for every test
+    /// below: each either succeeds without binding a table (no discovery
+    /// is ever attempted for an empty action-id list) or fails inside the
+    /// earlier, purely local resource-key check — neither path reaches
+    /// action discovery.
+    fn health_only_gateway_handler(req: &RecordedRequest) -> MockResponse {
+        if req.method == "GET" && req.path == "/v1/health" {
+            return MockResponse::ok("{}");
+        }
+        MockResponse::new(404, "{}")
+    }
+
+    #[tokio::test]
+    async fn register_accepts_binding_with_tables_key_omitted() {
+        // The `tables:` key is absent entirely, not just empty — the shape
+        // a generated staging-only binding takes (skardi-global emits this
+        // config in SQL and simply has nothing to put there). Registration
+        // must reach the end (an empty schema in the catalog), not fail on
+        // a parse error or a phantom unknown-resource-key rejection.
+        let gateway = MockGateway::start(health_only_gateway_handler).await;
+        let config: OpenConnectorConfig = serde_yaml::from_str(&format!(
+            r#"
+runtime_token_env: {TOKEN_ENV_STAGING_NO_TABLES}
+bindings:
+  - name: staging
+    source_pack: dropbox
+"#
+        ))
+        .expect("parse config");
+
+        unsafe {
+            std::env::set_var(TOKEN_ENV_STAGING_NO_TABLES, "test-token");
+        }
+        let mut ctx = SessionContext::new();
+        let result = register_open_connector_tables(
+            &mut ctx,
+            "saas",
+            &gateway.url,
+            Some(&config),
+            false,
+            HierarchyLevel::Catalog,
+            None,
+        )
+        .await;
+        unsafe {
+            std::env::remove_var(TOKEN_ENV_STAGING_NO_TABLES);
+        }
+
+        result.expect("a table-less binding must register");
+    }
+
+    #[tokio::test]
+    async fn register_accepts_staging_only_binding_with_resource_keys() {
+        // The bug this change fixes, reproduced directly: a binding with
+        // resource keys a staging step needs (connection string, alias,
+        // resource) but no bound table to check them against. Before this
+        // change, EVERY resource key failed as UnknownResourceKey, because
+        // the check ran unconditionally against an always-empty
+        // bound-table list.
+        let gateway = MockGateway::start(health_only_gateway_handler).await;
+        let config: OpenConnectorConfig = serde_yaml::from_str(&format!(
+            r#"
+runtime_token_env: {TOKEN_ENV_STAGING_WITH_RESOURCE}
+bindings:
+  - name: staging
+    source_pack: dropbox
+    connection_alias: work
+    resource: {{ account_id: "dbid:AABBCC" }}
+    tables: []
+"#
+        ))
+        .expect("parse config");
+
+        unsafe {
+            std::env::set_var(TOKEN_ENV_STAGING_WITH_RESOURCE, "test-token");
+        }
+        let mut ctx = SessionContext::new();
+        let result = register_open_connector_tables(
+            &mut ctx,
+            "saas",
+            &gateway.url,
+            Some(&config),
+            false,
+            HierarchyLevel::Catalog,
+            None,
+        )
+        .await;
+        unsafe {
+            std::env::remove_var(TOKEN_ENV_STAGING_WITH_RESOURCE);
+        }
+
+        result.expect("resource keys on a table-less binding must not be rejected as unknown");
+    }
+
+    #[tokio::test]
+    async fn register_rejects_unknown_resource_key_when_binding_has_tables() {
+        // The relaxation above must stay narrow: a binding that DOES bind a
+        // table still rejects a resource key no table declares — most
+        // likely a typo, and still load-bearing. The mock pack's `items`
+        // table declares only `workspace`.
+        let gateway = MockGateway::start(health_only_gateway_handler).await;
+        let config: OpenConnectorConfig = serde_yaml::from_str(&format!(
+            r#"
+runtime_token_env: {TOKEN_ENV_UNKNOWN_RESOURCE_KEY}
+bindings:
+  - name: ws
+    source_pack: mock
+    resource: {{ workspace: demo, bogus: nope }}
+    tables: [items]
+"#
+        ))
+        .expect("parse config");
+
+        unsafe {
+            std::env::set_var(TOKEN_ENV_UNKNOWN_RESOURCE_KEY, "test-token");
+        }
+        let mut ctx = SessionContext::new();
+        let result = register_open_connector_tables(
+            &mut ctx,
+            "saas",
+            &gateway.url,
+            Some(&config),
+            false,
+            HierarchyLevel::Catalog,
+            None,
+        )
+        .await;
+        unsafe {
+            std::env::remove_var(TOKEN_ENV_UNKNOWN_RESOURCE_KEY);
+        }
+
+        let err = result
+            .unwrap_err()
+            .downcast::<OpenConnectorError>()
+            .unwrap();
+        assert!(
+            matches!(
+                err,
+                OpenConnectorError::UnknownResourceKey { ref binding, ref key }
+                    if binding == "ws" && key == "bogus"
+            ),
+            "got {err}"
+        );
+    }
     #[tokio::test]
     async fn register_builds_queryable_catalog_with_mock_pack() {
         let gateway = MockGateway::start(|req| mock_gateway_handler(req, 5)).await;

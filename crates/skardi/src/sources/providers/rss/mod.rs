@@ -347,7 +347,7 @@ mod tests {
     use crate::sources::providers::rss::config::inline_config;
     use crate::sources::providers::rss::schema::{feeds_schema, items_schema};
     use crate::sources::providers::rss::testutil::{
-        MockFeedServer, MockResponse, RSS2_MINIMAL, feed_urls, str_col,
+        MockFeedServer, MockResponse, MockResponseExt, RSS2_MINIMAL, feed_urls, str_col,
     };
     use arrow::array::RecordBatch;
 

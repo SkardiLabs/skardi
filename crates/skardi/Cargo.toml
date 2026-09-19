@@ -69,6 +69,9 @@ rss = [
 ]
 
 [dependencies]
+# The shared SaaS connector runtime. A path dependency within this
+# revision, which is how cloud pins the engine and the pack to one commit.
+skardi-source-pack = { path = "../source-pack" }
 # engine
 anyhow = { workspace = true }
 async-trait = { workspace = true }
@@ -172,6 +175,8 @@ uuid = { workspace = true }
 datafusion-functions-json = "0.52"
 
 [dev-dependencies]
+# The pack's gateway mock, which this crate's pack suites use.
+skardi-source-pack = { path = "../source-pack", features = ["testing"] }
 tokio-test = "0.4"
 # Parametric test cases, per AGENTS.md's testing standards. The workspace
 # already pins it; `crates/cli` was simply the first consumer.

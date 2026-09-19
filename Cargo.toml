@@ -12,7 +12,8 @@ members = [ "crates/cli",
             "crates/mcp-core",
             "crates/skardi",
             "crates/query-audit",
-            "crates/server"]
+            "crates/server",
+            "crates/source-pack"]
 
 resolver = "2"
 

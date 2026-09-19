@@ -53,7 +53,13 @@ jobs:
         # pass cannot see feature-gated modules, so their rustdoc warnings
         # (private_intra_doc_links, say) would sail through CI and surface
         # as broken links on docs.rs.
-        run: cargo doc --no-deps -p skardi --all-features
+        # `-p skardi-source-pack` as well: the pack's rustdoc had never been
+        # gated, and four broken intra-doc links survived the extraction into
+        # it unnoticed. Every module there is documented twice — a summary on
+        # the `pub mod` in lib.rs plus the module's own `//!` — and rustdoc
+        # resolves the merged text in LIB.RS's scope, so a module-local name
+        # silently fails to link while a crate-root re-export resolves.
+        run: cargo doc --no-deps -p skardi -p skardi-source-pack --all-features
 
   test:
     name: Test
@@ -229,7 +235,33 @@ jobs:
       - name: Check code format
         run: cargo fmt --all -- --check
       - name: Check the package for errors
+        # `--all`, deliberately NOT `--all-targets`: this step compiles the
+        # libraries and binaries, and nothing under `#[cfg(test)]`. Read the
+        # job name and you will assume otherwise, so: **a green Check is not
+        # evidence that the tree compiles.** Only the nextest job below is
+        # equivalent to `--all-targets`, and a break confined to test code
+        # therefore shows up as a red Test job, which reads like a flaky
+        # test rather than a compile error.
+        #
+        # Widening it here is not the fix — it would double this job's cost
+        # to duplicate what nextest already does before it runs anything.
+        # The point is to stop the name being read as a stronger claim than
+        # it makes, which this PR has three instances of: extracting a crate
+        # moves code out from under whatever was watching it, and each
+        # instrument has to be re-aimed separately. Five stale
+        # `use skardi::util::…` paths survived this step AND the unit suite
+        # and were caught only by the doctest step below; a `#[cfg(test)]`
+        # allowlist entry survived it and was caught only by `--all-targets`.
         run: cargo check --all
+      - name: The source pack stays importable by a syncer
+        # `skardi-source-pack` exists so the engine, cloud's ETL runner
+        # and cloud's rbac syncer share one Open Connector client. Two of
+        # those three cannot carry DataFusion or Arrow, so a transitive
+        # dependency on either removes the crate's reason to exist —
+        # silently, since nobody adds them on purpose. The script asks the
+        # resolved tree rather than the manifest, and carries its own
+        # positive control so a broken probe cannot pass.
+        run: ./scripts/assert_pack_boundary.sh
       - name: Execute rust tests
         run: cargo llvm-cov --no-report nextest --all-features
       - name: Execute doc tests
@@ -239,7 +271,13 @@ jobs:
         # doctests) in this job rather than Docs, because `--all-features`
         # links PDFium and only this job carries the pdfium-rs cache
         # arrangement above.
-        run: cargo test --doc -p skardi --all-features
+        # `-p skardi -p skardi-source-pack`: the pack carries doc examples
+        # too, and they are the only thing that caught five stale
+        # `use skardi::util::…` paths when its modules moved out of the
+        # engine — `cargo check` and the unit tests both passed. Naming
+        # only `skardi` here would have let them rot exactly as the
+        # comment above warns.
+        run: cargo test --doc -p skardi -p skardi-source-pack --all-features
 
       - name: Install integration test dependencies
         run: |

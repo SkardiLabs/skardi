@@ -117,7 +117,7 @@ pub fn register_open_connector_udtfs(
     ctx: &SessionContext,
     gateways: OpenConnectorGateways,
 ) -> Result<(), OpenConnectorError> {
-    let packs = SourcePackRegistry::builtins()?;
+    let packs = super::builtin_pack_registry()?;
     ctx.register_udtf(
         "open_connector_query",
         Arc::new(OpenConnectorQueryFunction::new(
@@ -141,7 +141,7 @@ pub struct OpenConnectorQueryFunction {
 
 impl OpenConnectorQueryFunction {
     /// Build the function over the shared gateway map and a validated
-    /// pack registry (see [`SourcePackRegistry::builtins`]).
+    /// pack registry (see [`builtin_pack_registry`](super::builtin_pack_registry)).
     pub fn new(gateways: OpenConnectorGateways, packs: SourcePackRegistry) -> Self {
         Self { gateways, packs }
     }

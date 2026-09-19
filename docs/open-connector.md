@@ -265,6 +265,60 @@ JOIN 'labels.csv' l ON i.id = l.id;
   enforcement boundary — and the live one during the staleness window
   above.
 
+## The runtime is a separate crate
+
+Everything above the SQL layer — the gateway client, its retry and transport
+policy, the response envelope, action discovery and fingerprinting, row paths,
+pagination and the page walk itself — lives in `skardi-source-pack`, which the
+`skardi` crate depends on rather than contains.
+
+It is split out because the engine is not its only consumer. Skardi Cloud's
+ETL runner and its RBAC syncer talk to the same gateway, run the same
+paginated walks against the same actions, and **cannot depend on the engine**:
+a process that mirrors an access-control list has no business compiling
+DataFusion and Arrow to do it. Before the split each of them carried its own
+copy of the client and its own page loop, which is how two of them ended up
+disagreeing about what an absent pagination cursor means on the same provider.
+
+The boundary is enforced, not merely intended: `scripts/assert_pack_boundary.sh`
+asks the resolved dependency tree — not the manifest, because nobody adds
+`datafusion` on purpose, they add a crate that happens to pull it in — and
+fails if `datafusion`, `arrow`, `sqlx`, `kube` or `k8s-openapi` appear
+anywhere beneath the pack. It carries a positive control so a broken probe
+cannot report a pass.
+
+What stays in `skardi` is what genuinely needs Arrow or DataFusion:
+
+| in the pack | in the engine |
+| --- | --- |
+| which filters an action supports | translating a DataFusion `Expr` into action input |
+| a field's declared wire type | mapping that type to an Arrow `DataType` |
+| the page walk, producing JSON rows | converting rows to `RecordBatch`, projection, LIMIT |
+| the scan's page budget and deadline | the scan cache, keyed on the Arrow schema |
+
+### What the client does not gate
+
+`OpenConnectorClient::execute` and the `ActionScan` walk validate an action id
+**syntactically** — a namespace-escape guard — and nothing else. They check
+neither registry membership nor the read-only classification, and that is
+worth stating plainly because an absence is easy to mistake for a guarantee.
+
+The gates live where they can be enforced:
+
+- Open Connector's own `OOMOL_CONNECT_ALLOWED_ACTIONS` is the authoritative
+  one, server-side, answering `400 action_not_allowed`. A client-side check
+  cannot be the boundary, because the client is the thing being constrained.
+- `open_connector_scan` adds Skardi's gate above the client, where a user's
+  SQL can name an arbitrary action: a default-deny allowlist plus a
+  `read_only: true` classification, both refused at planning time (see
+  [Security model](#security-model)).
+- Pack-declared tables are gated at registration instead, against the same
+  discovered metadata.
+
+A consumer whose action ids come from anywhere a user can influence must add
+a gate of its own. One whose action ids are compile-time constants — every
+syncer built on this crate — is already as constrained as its source code.
+
 ## Caching and freshness
 
 Live reads are the default (`cache_ttl_seconds: 0`). With a positive TTL,
