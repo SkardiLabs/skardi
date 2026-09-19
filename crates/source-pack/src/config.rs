@@ -303,6 +303,16 @@ pub struct OpenConnectorBinding {
     pub resource: BTreeMap<String, Value>,
 
     /// Source-pack tables to expose under this binding.
+    ///
+    /// May be empty, or omitted entirely: a "staging" provider (Google
+    /// Drive, Dropbox) has no table the engine scans through Open
+    /// Connector — its content arrives via a separate staging step that
+    /// downloads file bytes into an object store, which the engine then
+    /// reads through a `documents` data source. Such a binding exists only
+    /// so the staging step can resolve the connection string, connection
+    /// alias, and resource; see `register_open_connector_tables` for the
+    /// corresponding relaxation on resource-key checking.
+    #[serde(default)]
     pub tables: Vec<String>,
 }
 
@@ -318,11 +328,15 @@ impl OpenConnectorBinding {
                 binding: self.name.clone(),
             });
         }
-        if self.tables.is_empty() {
-            return Err(OpenConnectorError::EmptyTableList {
-                binding: self.name.clone(),
-            });
-        }
+        // An empty `tables` list used to be rejected unconditionally: this
+        // binding's only job was to expose tables, so having none was
+        // certainly a mistake. That is no longer the only way a binding is
+        // used — a staging-only binding (see the `tables` doc comment
+        // above) legitimately binds none, existing solely so a staging
+        // step outside this process can resolve its connection string,
+        // alias, and resource. Whether an empty list is a mistake or
+        // deliberate cannot be told from this struct alone, so it is no
+        // longer rejected here.
         // A null resource value would pass the required-key presence check
         // while sending `null` to the gateway — meaningless at best,
         // misrouted at worst.
@@ -634,14 +648,27 @@ bindings:
     }
 
     #[test]
-    fn validate_rejects_empty_table_list() {
+    fn validate_accepts_empty_table_list_as_staging_only() {
+        // A staging-only binding (Google Drive, Dropbox) legitimately
+        // exposes no table — see the `tables` doc comment. Resource keys
+        // are included here to show `validate()` does not police them
+        // against the (empty) table list either; that cross-check is
+        // `register_open_connector_tables`'s job, once a real source-pack
+        // registry is available to ask what a table declares.
         let config = parse(
-            "runtime_token_env: T\nbindings:\n  - name: b\n    source_pack: github\n    tables: []",
+            "runtime_token_env: T\nbindings:\n  - name: b\n    source_pack: github\n    resource: { folder_id: root }\n    tables: []",
         );
-        assert!(matches!(
-            config.validate(),
-            Err(OpenConnectorError::EmptyTableList { ref binding }) if binding == "b"
-        ));
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn parses_binding_with_tables_key_omitted() {
+        // Not just an empty list: the key can be absent entirely, which is
+        // how a generated staging-only binding is expected to look.
+        let config = parse("runtime_token_env: T\nbindings:\n  - name: b\n    source_pack: github");
+        assert_eq!(config.bindings.len(), 1);
+        assert!(config.bindings[0].tables.is_empty());
+        assert!(config.validate().is_ok());
     }
 
     #[test]

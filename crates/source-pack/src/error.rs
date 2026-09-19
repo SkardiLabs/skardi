@@ -145,10 +145,6 @@ pub enum OpenConnectorError {
     #[error("Open Connector binding '{binding}' must name a 'source_pack'")]
     EmptySourcePack { binding: String },
 
-    /// A binding exposed no tables.
-    #[error("Open Connector binding '{binding}' must expose at least one table")]
-    EmptyTableList { binding: String },
-
     /// A binding listed an empty table name.
     #[error("Open Connector binding '{binding}' contains an empty table name")]
     EmptyTableName { binding: String },
