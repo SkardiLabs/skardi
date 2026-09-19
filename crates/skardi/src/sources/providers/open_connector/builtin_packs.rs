@@ -73,7 +73,15 @@ mod tests {
         // declaration rather than be deleted. `feishu.document_content` is
         // that declaration — the point-read whose response object IS the
         // row — so the empty assertion became this allowlist.
-        const OBJECT_ROW_TABLES: &[&str] = &["feishu.document_content"];
+        //
+        // `notion.page_markdown` is the second, and the same shape of thing:
+        // `notion.retrieve_page_markdown` takes one `pageId` and renders that
+        // page, so there is no list to page through and no second page of a
+        // page's text. Its output schema declares every field with
+        // `additionalProperties: false`, which puts its columns inside the
+        // fingerprint gate — an upstream rename fails registration rather
+        // than surfacing as a null column mid-scan.
+        const OBJECT_ROW_TABLES: &[&str] = &["feishu.document_content", "notion.page_markdown"];
 
         let registry = super::builtin_pack_registry().expect("embedded assets parse");
         let mut object_tables = Vec::new();

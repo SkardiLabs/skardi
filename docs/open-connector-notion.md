@@ -53,6 +53,7 @@ WHERE NOT in_trash LIMIT 20;
 | `pages` | `notion.search` (pinned `query: ""`, `filter: {object: page}`) | — | cursor (`pageSize` 100) | none |
 | `data_sources` | `notion.search` (pinned `filter: {object: data_source}`) | — | cursor (`pageSize` 100) | none |
 | `block_children` | `notion.list_block_children` | `blockId` (required) | cursor (`pageSize` 100) | none |
+| `page_markdown` | `notion.retrieve_page_markdown` | `pageId` (required) | single row | none |
 
 **No filter pushdown anywhere** — `notion.search`'s only narrowing input
 is a free-text relevance `query`, which no SQL predicate maps to
@@ -70,18 +71,27 @@ Column references live in the pack definition
 (`crates/skardi/src/sources/providers/open_connector/packs/notion.yaml`);
 highlights and caveats:
 
-- **`pages`/`data_sources` are the complete visible listing**: the
-  required search `query` is pinned to `""` and the object `filter` is
-  pinned per table — Notion's spelling for "everything the integration
-  can see". Visibility is exactly what has been shared with the
-  integration in Notion.
+- **`pages`/`data_sources` are everything the integration can see, as
+  search reports it**: the required search `query` is pinned to `""` and
+  the object `filter` is pinned per table. Visibility is what has been
+  shared with the integration in Notion — but a drained walk is **not an
+  inventory**. Notion documents that search may omit an accessible page,
+  lag after a share, and change while paging, so a page's absence from
+  the listing is not evidence it is gone. Add on presence; prove removal
+  with a direct read (`page_markdown` refusing is one).
 - **Dynamic property maps stay opaque JSON** (`properties`, `parent`):
   typed projection of user-defined schemas is the deferred
   `query_data_source` work (binding-time schema freeze per the design).
   There is deliberately **no rows table yet**.
 - **`block_children` returns block metadata only** — the type-specific
   payload lives under a key named by `type`, which a fixed mapping cannot
-  address; rendered content is a future markdown table.
+  address. **The page's text is `page_markdown`**: one row per page,
+  rendered as Markdown by Open Connector's normalized
+  `retrieve_page_markdown`, with `truncated` and `unknown_block_ids`
+  saying how complete the render was and `last_edited_time` (read off the
+  page object, since the markdown endpoint reports none) for windowing an
+  ingest. Its output schema declares every field, so it is the one notion
+  table whose columns are fully inside the fingerprint gate.
 - **`users` excludes `person.email`** and the raw `person`/`bot` objects
   (capability-gated, privacy-sensitive).
 - **Deletion flags follow the real wire, not the declared contract**: on
