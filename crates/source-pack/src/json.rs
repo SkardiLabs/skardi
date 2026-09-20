@@ -1,5 +1,5 @@
 //! Canonical JSON helpers shared by fingerprinting and cache keys —
-//! plus [`json_kind`], the one kind-vocabulary for error messages.
+//! plus [`json_kind`](crate::row_path::json_kind), the one kind-vocabulary for error messages.
 
 use serde_json::Value;
 
@@ -26,7 +26,7 @@ pub fn json_kind(value: &Value) -> &'static str {
 ///
 /// # Example
 /// ```
-/// use skardi::util::json::canonical_json;
+/// use skardi_source_pack::json::canonical_json;
 ///
 /// let a = serde_json::json!({"b": 1, "a": [true, null]});
 /// let b = serde_json::json!({"a": [true, null], "b": 1});
@@ -86,7 +86,7 @@ pub fn write_canonical(value: &Value, out: &mut String) {
 ///
 /// # Example
 /// ```
-/// use skardi::util::json::blake3_hex;
+/// use skardi_source_pack::json::blake3_hex;
 ///
 /// assert_eq!(blake3_hex(b"abc"), blake3_hex(b"abc"));
 /// assert_ne!(blake3_hex(b"abc"), blake3_hex(b"abd"));

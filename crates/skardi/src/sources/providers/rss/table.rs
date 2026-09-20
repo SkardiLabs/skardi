@@ -410,8 +410,8 @@ mod tests {
     use super::*;
     use crate::sources::providers::rss::schema::{feeds_schema, items_schema};
     use crate::sources::providers::rss::testutil::{
-        MockFeedServer, MockResponse, RSS2_MINIMAL, collect_stream, feed_urls, str_col,
-        test_engine, total_rows,
+        MockFeedServer, MockResponse, MockResponseExt, RSS2_MINIMAL, collect_stream, feed_urls,
+        str_col, test_engine, total_rows,
     };
 
     /// A subscription list for the pruning tests, which need no engine.

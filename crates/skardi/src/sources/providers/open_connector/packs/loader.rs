@@ -31,20 +31,23 @@
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
-use datafusion::logical_expr::Operator;
 use serde::Deserialize;
 
 use crate::sources::providers::open_connector::error::OpenConnectorError;
-use crate::sources::providers::open_connector::filters::{Fidelity, FilterMapping, ValueFormat};
+// `Operator` here is the pack's neutral declaration, not DataFusion's.
+// The loader reads YAML and writes declarations; nothing about that needs
+// a query planner, and it used to convert to DataFusion's on the way in
+// for no reason other than where the type happened to live.
 use crate::sources::providers::open_connector::json_to_arrow::RowConverter;
 use crate::sources::providers::open_connector::json_to_arrow::{FieldMapping, FieldType};
 use crate::sources::providers::open_connector::pagination::{
-    CursorContinuation, PaginationStrategy,
+    AbsentCursor, CursorContinuation, PaginationStrategy,
 };
 use crate::sources::providers::open_connector::row_path::RowPath;
 use crate::sources::providers::open_connector::source_pack::{
     FixedValue, RowShape, SourcePack, SourcePackTable,
 };
+use skardi_source_pack::filters::{Fidelity, FilterMapping, Operator, ValueFormat};
 
 /// Parse an embedded pack asset, memoized in `cell`.
 ///
@@ -763,6 +766,14 @@ impl PaginationDoc {
                     page_size_param: page_size_input.map(leak_str),
                     page_size,
                     has_more_path: has_more_path.map(leak_str),
+                    // Every YAML-declared pack keeps the behaviour it has
+                    // today. `AbsentCursor::IsDrift` is a MEASUREMENT — that
+                    // the action sends its cursor key on every page and
+                    // spells the end as null — and no pack asset carries
+                    // that measurement yet, so there is no YAML key to read
+                    // it from. One goes in when a provider's terminal page
+                    // has actually been observed, not before.
+                    absent_cursor: AbsentCursor::EndsTheScan,
                 },
                 continuation.map(|doc| CursorContinuation {
                     action_id: doc.action.map_or(table_action, leak_str),
@@ -962,10 +973,9 @@ enum FormatDoc {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sources::providers::open_connector::source_pack::SourcePackRegistry;
 
     /// Every registered asset parses AND passes the same structural
-    /// checks binding performs. Driven off `SourcePackRegistry::builtins()`
+    /// checks binding performs. Driven off `crate::sources::providers::open_connector::builtin_pack_registry()`
     /// rather than a hand-listed roster: the roster construct had already
     /// drifted for a full milestone (`discord.yaml` shipped in 5.6
     /// unlisted), and whatever registration sees, this test now sees —
@@ -973,8 +983,8 @@ mod tests {
     /// registry name-list test's pin, not this one's.
     #[test]
     fn builtin_assets_parse_and_validate() {
-        let registry =
-            SourcePackRegistry::builtins().expect("every embedded asset parses and validates");
+        let registry = crate::sources::providers::open_connector::builtin_pack_registry()
+            .expect("every embedded asset parses and validates");
         for pack in registry.packs() {
             // parse_pack rejects an empty `tables` today; this stays as
             // the second layer should that rejection ever move.

@@ -11,15 +11,18 @@
 //! upstream action change fails registration with a targeted error instead of
 //! silently changing a table's behavior.
 
+// `pub` rather than `pub(crate)`: same audience as before — the engine's
+// exec and its pack suites — but now across a crate line.
+
 use std::collections::BTreeMap;
 
 use futures::stream::{self, StreamExt, TryStreamExt};
 use serde_json::Value;
 
-use super::client::{DiscoveredAction, OpenConnectorClient};
-use super::error::OpenConnectorError;
-use crate::util::json::blake3_hex;
-use crate::util::json::canonical_json;
+use crate::client::{DiscoveredAction, OpenConnectorClient};
+use crate::error::OpenConnectorError;
+use crate::json::blake3_hex;
+use crate::json::canonical_json;
 
 /// Maximum concurrent discovery calls while loading the registry.
 const DISCOVERY_CONCURRENCY: usize = 8;
@@ -96,11 +99,10 @@ impl ActionRegistry {
     ///
     /// # Example
     /// ```no_run
-    /// use skardi::sources::providers::open_connector::{
-    ///     ActionRegistry, OpenConnectorClient, OpenConnectorConfig,
-    /// };
+    /// use skardi_source_pack::action_registry::ActionRegistry;
+    /// use skardi_source_pack::{OpenConnectorClient, OpenConnectorConfig};
     ///
-    /// # async fn example() -> Result<(), skardi::sources::providers::open_connector::OpenConnectorError> {
+    /// # async fn example() -> Result<(), skardi_source_pack::OpenConnectorError> {
     /// let config: OpenConnectorConfig =
     ///     serde_yaml::from_str("runtime_token_env: OPEN_CONNECTOR_TOKEN").unwrap();
     /// let client = OpenConnectorClient::from_config("http://open-connector:3000", &config)?;
@@ -171,11 +173,11 @@ impl ActionRegistry {
 /// semantically identical schemas with different key orders fingerprint
 /// equally), then hashed with BLAKE3 and hex-encoded.
 ///
-/// `pub(crate)` on purpose: pack contract tests pin each table's
+/// `pub` on purpose: pack contract tests pin each table's
 /// `expected_fingerprint` against a captured gateway schema through THIS
 /// function, so pin and registration can never disagree on the
 /// canonicalization. Never re-derive it elsewhere.
-pub(crate) fn fingerprint_schema(output_schema: Option<&Value>) -> String {
+pub fn fingerprint_schema(output_schema: Option<&Value>) -> String {
     let canonical = match output_schema {
         Some(schema) => canonical_json(schema),
         None => "null".to_string(),
@@ -186,10 +188,8 @@ pub(crate) fn fingerprint_schema(output_schema: Option<&Value>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sources::providers::open_connector::client::OpenConnectorClient;
-    use crate::sources::providers::open_connector::testutil::{
-        MockGateway, MockResponse, discovery_ok, envelope_ok,
-    };
+    use crate::client::OpenConnectorClient;
+    use crate::testing::{MockGateway, MockResponse, discovery_ok, envelope_ok};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;

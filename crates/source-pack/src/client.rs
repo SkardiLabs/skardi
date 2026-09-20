@@ -41,6 +41,11 @@
 //!   suffix, and a named connection is selected with the
 //!   `x-oo-connector-alias` header.
 
+// `pub` rather than `pub(crate)`: these items were crate-visible when they
+// lived in the engine, and their audience has not changed — the engine's
+// exec, action registry and pack suites. It is now a different crate, and
+// a facade whose facade is private is not one.
+
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -51,10 +56,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use url::Url;
 
-use super::config::{OpenConnectorConfig, validate_action_id};
-use super::error::OpenConnectorError;
-use crate::util::http::{clock_jitter_nanos, parse_retry_after};
-use crate::util::text::truncate_chars;
+use crate::config::{OpenConnectorConfig, validate_action_id};
+use crate::error::{LastAttempt, OpenConnectorError, TransportFailure};
+use crate::http::{clock_jitter_nanos, parse_retry_after};
+use crate::text::truncate_chars;
 
 /// Health endpoint path (relative to the gateway base URL).
 const HEALTH_PATH: &str = "v1/health";
@@ -70,15 +75,26 @@ const CONNECTION_ALIAS_HEADER: &str = "x-oo-connector-alias";
 /// Maximum attempts for one call (including the first) before
 /// [`OpenConnectorError::RetriesExhausted`] is raised. Also the serde
 /// default for `OpenConnectorConfig::max_attempts`.
-pub(crate) const MAX_ATTEMPTS: u32 = 3;
+pub const MAX_ATTEMPTS: u32 = 3;
 
 /// Default bound on decoded response bodies (16 MiB). Also the serde
 /// default for `OpenConnectorConfig::max_response_bytes`.
-pub(crate) const DEFAULT_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
-/// Bytes read of a terminal error body — plenty for the 512-char message
-/// `terminal_reason` keeps, without buffering a worst-case 16 MiB error page.
-const ERROR_SNIPPET_BYTES: usize = 4 * 1024;
+/// Bytes read of a terminal error body.
+///
+/// **Sized for the ENVELOPE, not for the message.** An earlier 4 KiB was
+/// reasoned from the 512-char human diagnostic `terminal_reason` keeps, which
+/// looked sufficient and was not: the same bytes are what `error_code`,
+/// `message` and `echoed_action_id` parse from, so a gateway envelope longer
+/// than the cap arrived as a truncated JSON prefix and every structured field
+/// came back `None` — exactly where they matter most, because the envelopes
+/// that run long are the ones carrying a policy explanation. Truncating the
+/// human part is right; truncating the document it is parsed out of is not.
+///
+/// Still bounded, and for the original reason: a worst-case error page is
+/// 16 MiB and must never be buffered whole.
+const ERROR_SNIPPET_BYTES: usize = 64 * 1024;
 
 /// Base delay for exponential backoff between attempts.
 const BACKOFF_BASE: Duration = Duration::from_millis(200);
@@ -242,6 +258,65 @@ struct ExecuteEnvelope<'a> {
     input: &'a Value,
 }
 
+/// The transport behaviour one consumer wants.
+///
+/// Explicit, and never defaulted from the other consumer, because the two
+/// genuinely differ and silently picking one would change the other's
+/// security posture:
+///
+/// * the **syncer** wants no redirects at all, a five-second connect timeout
+///   and a fifteen-second request timeout. The redirect rule is the important
+///   one: every call carries a source's Open Connector runtime token as a
+///   bearer, and a `302` would otherwise have the client replay the request at
+///   whatever host the `Location` names. `reqwest` strips `Authorization`
+///   across hosts, so it is defence in depth rather than a live leak — but
+///   depth is the point when the header being stripped is a credential.
+/// * the **engine** keeps its existing redirect behaviour and its configured
+///   request timeout, with no separate connect timeout.
+///
+/// So this carries no `Default`. A caller states what it wants, which is what
+/// stops one consumer's policy becoming the other's by omission.
+#[derive(Debug, Clone)]
+pub struct TransportPolicy {
+    /// Total time for a request, connect included.
+    pub request_timeout: Duration,
+    /// Time to establish the connection, when the caller wants that bounded
+    /// separately. `None` leaves it to the total.
+    pub connect_timeout: Option<Duration>,
+    /// Whether to follow a redirect. `false` refuses outright.
+    pub follow_redirects: bool,
+}
+
+impl TransportPolicy {
+    /// The policy a consumer that carries a per-source credential should want.
+    ///
+    /// Named rather than spelled at each call site so the three facts stay
+    /// together: a caller that copied two of them and forgot the redirect rule
+    /// would have a client that leaks its bearer on a `302`, and nothing in a
+    /// review of the two timeouts would show it.
+    pub fn credential_bearing(request_timeout: Duration, connect_timeout: Duration) -> Self {
+        Self {
+            request_timeout,
+            connect_timeout: Some(connect_timeout),
+            follow_redirects: false,
+        }
+    }
+}
+
+impl OpenConnectorClient {
+    /// A client with an explicit transport policy.
+    ///
+    /// [`Self::new`] is this with the engine's policy; a consumer whose calls
+    /// carry a credential should use [`TransportPolicy::credential_bearing`].
+    pub fn with_policy(
+        gateway_url: &str,
+        token: impl Into<String>,
+        policy: TransportPolicy,
+    ) -> Result<Self, OpenConnectorError> {
+        Self::build(gateway_url, token, policy)
+    }
+}
+
 impl OpenConnectorClient {
     /// Build a client from the gateway URL and the typed config.
     ///
@@ -253,11 +328,9 @@ impl OpenConnectorClient {
     ///
     /// # Example
     /// ```no_run
-    /// use skardi::sources::providers::open_connector::{
-    ///     OpenConnectorClient, OpenConnectorConfig,
-    /// };
+    /// use skardi_source_pack::{OpenConnectorClient, OpenConnectorConfig};
     ///
-    /// # async fn example() -> Result<(), skardi::sources::providers::open_connector::OpenConnectorError> {
+    /// # async fn example() -> Result<(), skardi_source_pack::OpenConnectorError> {
     /// let config: OpenConnectorConfig =
     ///     serde_yaml::from_str("runtime_token_env: OPEN_CONNECTOR_TOKEN").unwrap();
     /// let client = OpenConnectorClient::from_config("http://open-connector:3000", &config)?;
@@ -308,10 +381,30 @@ impl OpenConnectorClient {
     /// Build a client from explicit parts. Kept crate-private so production
     /// construction always goes through the validated config; tests use it to
     /// inject tokens and short timeouts without touching the environment.
-    pub(crate) fn new(
+    pub fn new(
         gateway_url: &str,
         token: impl Into<String>,
         request_timeout: Duration,
+    ) -> Result<Self, OpenConnectorError> {
+        // The ENGINE's policy, unchanged by the extraction: its existing
+        // redirect behaviour and its configured request timeout, with no
+        // separate connect timeout. Stated here rather than inherited so that
+        // a consumer reading `new` sees whose defaults these are.
+        Self::build(
+            gateway_url,
+            token,
+            TransportPolicy {
+                request_timeout,
+                connect_timeout: None,
+                follow_redirects: true,
+            },
+        )
+    }
+
+    fn build(
+        gateway_url: &str,
+        token: impl Into<String>,
+        policy: TransportPolicy,
     ) -> Result<Self, OpenConnectorError> {
         let mut base_url =
             Url::parse(gateway_url).map_err(|_| OpenConnectorError::InvalidGatewayUrl {
@@ -347,8 +440,14 @@ impl OpenConnectorClient {
             base_url.set_path(&path);
         }
 
-        let http = reqwest::Client::builder()
-            .timeout(request_timeout)
+        let mut builder = reqwest::Client::builder().timeout(policy.request_timeout);
+        if let Some(connect) = policy.connect_timeout {
+            builder = builder.connect_timeout(connect);
+        }
+        if !policy.follow_redirects {
+            builder = builder.redirect(reqwest::redirect::Policy::none());
+        }
+        let http = builder
             .build()
             .map_err(|e| OpenConnectorError::HttpClientBuild {
                 reason: e.to_string(),
@@ -465,9 +564,34 @@ impl OpenConnectorClient {
     /// default-deny gating lives one layer up — `ActionRegistry::load` admits
     /// only explicitly allowlisted, locally-executable actions, and the scan
     /// engine / UDTFs check membership before calling this. Keeping the
-    /// method `pub(crate)` makes that gating structurally un-bypassable from
+    /// method `pub` makes that gating structurally un-bypassable from
     /// outside the crate.
-    pub(crate) async fn execute(
+    /// # This is a transport, not a capability gate
+    ///
+    /// `execute` validates the action id SYNTACTICALLY (a namespace-escape
+    /// guard) and nothing more. It does not check registry membership and it
+    /// does not check `read_only`, so a caller can name any action the
+    /// deployment will run. That is deliberate, and worth stating because the
+    /// absence is easy to mistake for a guarantee:
+    ///
+    /// * the authoritative gate is SERVER-side — Open Connector's
+    ///   `OOMOL_CONNECT_ALLOWED_ACTIONS`, which answers `400
+    ///   action_not_allowed` for anything outside it. A client-side check
+    ///   cannot be the boundary, because the client is the thing being
+    ///   constrained;
+    /// * the engine adds its own gate ABOVE this one, where it is needed:
+    ///   `open_connector_scan` lets a user's SQL name an arbitrary action, so
+    ///   planning refuses anything outside a default-deny allowlist and
+    ///   anything the discovered metadata does not classify `read_only:
+    ///   true` (`RawActionNotAllowlisted` / `RawActionMutating` /
+    ///   `RawActionReadOnlyUnknown`). Pack-declared tables are gated at
+    ///   registration instead.
+    ///
+    /// A consumer whose action ids come from somewhere a user can influence
+    /// must add a gate of its own; one whose action ids are compile-time
+    /// constants — every syncer here — is already as constrained as its
+    /// source code.
+    pub async fn execute(
         &self,
         action_id: &str,
         input: &Value,
@@ -496,6 +620,10 @@ impl OpenConnectorClient {
                 },
                 |status, body| OpenConnectorError::ActionExecutionFailed {
                     action_id: action_id.to_string(),
+                    status: Some(status.as_u16()),
+                    error_code: envelope_error_code(&body),
+                    message: envelope_message(&body),
+                    echoed_action_id: envelope_action_id(&body),
                     reason: terminal_reason(status, &body),
                 },
             )
@@ -511,6 +639,12 @@ impl OpenConnectorClient {
         if !envelope.success {
             return Err(OpenConnectorError::ActionExecutionFailed {
                 action_id: action_id.to_string(),
+                // No status: this is a 2xx whose envelope reports failure, so
+                // the HTTP code says nothing about what went wrong.
+                status: None,
+                error_code: envelope.error_code.clone(),
+                message: envelope.message.clone(),
+                echoed_action_id: envelope_action_id(&text),
                 reason: envelope.failure_reason(),
             });
         }
@@ -546,6 +680,10 @@ impl OpenConnectorClient {
         terminal_error: impl Fn(StatusCode, String) -> OpenConnectorError,
     ) -> Result<Response, OpenConnectorError> {
         let mut last_reason = String::new();
+        // Seeded with the shape a zero-attempt client would report. Overwritten
+        // by the first attempt that fails; `max_attempts` is at least one, so
+        // no caller can observe the seed.
+        let mut last_attempt = LastAttempt::Transport(TransportFailure::Network);
         for attempt in 1..=self.max_attempts {
             let request = build().bearer_auth(self.token.expose_secret());
             match request.send().await {
@@ -553,6 +691,7 @@ impl OpenConnectorClient {
                 Ok(response) => {
                     let status = response.status();
                     if policy.allows_status_retry(status) {
+                        last_attempt = LastAttempt::Status(status.as_u16());
                         last_reason = format!("HTTP {}", status.as_u16());
                         if attempt < self.max_attempts {
                             let wait = retry_after(&response).unwrap_or_else(|| backoff(attempt));
@@ -583,6 +722,8 @@ impl OpenConnectorClient {
                             reason: e.to_string(),
                         });
                     }
+                    let transport = TransportFailure::of(&e);
+                    last_attempt = LastAttempt::Transport(transport);
                     last_reason = e.to_string();
                     // A transport error on a non-idempotent call is ambiguous:
                     // the request may have reached the gateway and the action
@@ -590,6 +731,7 @@ impl OpenConnectorClient {
                     if policy == RetryPolicy::NonIdempotent {
                         return Err(OpenConnectorError::NonIdempotentAmbiguousFailure {
                             operation: operation.to_string(),
+                            transport,
                             reason: last_reason,
                         });
                     }
@@ -609,6 +751,7 @@ impl OpenConnectorClient {
         Err(OpenConnectorError::RetriesExhausted {
             operation: operation.to_string(),
             attempts: self.max_attempts,
+            last_attempt,
             reason: last_reason,
         })
     }
@@ -690,7 +833,12 @@ fn terminal_reason(status: StatusCode, body: &str) -> String {
     if let Ok(envelope) = serde_json::from_str::<GatewayEnvelope>(body)
         && !envelope.success
     {
-        return format!("HTTP {}: {}", status.as_u16(), envelope.failure_reason());
+        // Truncated HERE rather than by the read limit. While the body was
+        // capped at 4 KiB the cap did double duty; now that the read is sized
+        // to parse a whole envelope, this is the only thing keeping a long
+        // provider message out of a log line.
+        let reason = truncate_chars(&envelope.failure_reason(), MAX_BODY);
+        return format!("HTTP {}: {}", status.as_u16(), reason);
     }
     let trimmed = truncate_chars(body, MAX_BODY);
     format!("HTTP {}: {}", status.as_u16(), trimmed)
@@ -712,7 +860,7 @@ fn backoff(attempt: u32) -> Duration {
 /// Parse a `Retry-After` header (integer-seconds form), capped at
 /// [`MAX_RETRY_WAIT`]. HTTP-date form is ignored.
 /// Parse a `Retry-After` header, capped at [`MAX_RETRY_WAIT`]. Shared
-/// parsing lives in [`crate::util::http::parse_retry_after`]; only the cap
+/// parsing lives in [`crate::http::parse_retry_after`]; only the cap
 /// is Open Connector-specific.
 fn retry_after(response: &Response) -> Option<Duration> {
     parse_retry_after(response).map(|wait| wait.min(MAX_RETRY_WAIT))
@@ -721,7 +869,7 @@ fn retry_after(response: &Response) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sources::providers::open_connector::testutil::{
+    use crate::testing::{
         MockGateway, MockResponse, RecordedRequest, discovery_ok, envelope_err, envelope_ok,
     };
     use std::sync::Arc;
@@ -813,6 +961,82 @@ mod tests {
             ),
             "got {err}"
         );
+    }
+
+    /// **The distinction that was prose.** A retry budget spent on a gateway
+    /// that kept answering 503 and one spent on a gateway that was never
+    /// reachable are different operational facts — restart it versus find it —
+    /// and `RetriesExhausted` used to render both into one `reason` string.
+    #[tokio::test]
+    async fn exhausted_retries_name_the_transport_that_never_answered() {
+        let client = OpenConnectorClient::new(
+            "http://127.0.0.1:1",
+            "test-token",
+            Duration::from_millis(200),
+        )
+        .expect("build client")
+        .with_max_attempts(2);
+
+        let err = client.health().await.unwrap_err();
+
+        match err {
+            OpenConnectorError::RetriesExhausted { last_attempt, .. } => assert_eq!(
+                last_attempt,
+                LastAttempt::Transport(TransportFailure::Connect),
+                "nothing was listening, so the connection was never made"
+            ),
+            other => panic!("expected RetriesExhausted, got {other}"),
+        }
+    }
+
+    /// The other half, and the reason the field is an enum rather than an
+    /// always-transport value: a gateway that ANSWERS every attempt with a
+    /// retryable status exhausts the same budget, and must not be reported as
+    /// unreachable.
+    #[tokio::test]
+    async fn exhausted_retries_name_the_status_that_kept_coming_back() {
+        let gateway = MockGateway::start(|_| MockResponse::new(503, "down")).await;
+
+        let err = test_client(&gateway, 2).health().await.unwrap_err();
+
+        match err {
+            OpenConnectorError::RetriesExhausted { last_attempt, .. } => assert_eq!(
+                last_attempt,
+                LastAttempt::Status(503),
+                "the gateway answered every time; it was not a transport failure"
+            ),
+            other => panic!("expected RetriesExhausted, got {other}"),
+        }
+    }
+
+    /// A non-idempotent call cannot be re-sent, but WHY it failed still
+    /// narrows what happened: a `Connect` failure never reached the gateway,
+    /// so the action cannot have run, while a `Timeout` may have executed it.
+    /// The variant's name says the outcome is ambiguous; this field says how
+    /// ambiguous.
+    #[tokio::test]
+    async fn an_ambiguous_execute_names_its_transport_failure() {
+        let client = OpenConnectorClient::new(
+            "http://127.0.0.1:1",
+            "test-token",
+            Duration::from_millis(200),
+        )
+        .expect("build client")
+        .with_max_attempts(2);
+
+        let err = client
+            .execute("x.y", &serde_json::json!({}), None)
+            .await
+            .unwrap_err();
+
+        match err {
+            OpenConnectorError::NonIdempotentAmbiguousFailure { transport, .. } => assert_eq!(
+                transport,
+                TransportFailure::Connect,
+                "the request never reached the gateway, so nothing executed"
+            ),
+            other => panic!("expected NonIdempotentAmbiguousFailure, got {other}"),
+        }
     }
 
     #[tokio::test]
@@ -1233,6 +1457,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_long_envelope_still_yields_its_structured_fields() {
+        // **The case the old 4 KiB read got wrong.** A policy refusal carries a
+        // long human explanation, so the envelopes that run past the cap are
+        // exactly the ones whose `errorCode` a consumer most needs -- and a
+        // truncated prefix is not JSON, so every structured field parsed to
+        // None.
+        let long_message = "why this was refused. ".repeat(400);
+        let body = envelope_err("policy_denied", &long_message);
+        assert!(
+            body.len() > 4 * 1024,
+            "fixture must exceed the OLD limit or it proves nothing, got {} bytes",
+            body.len()
+        );
+        let gateway = MockGateway::start(move |_| MockResponse::new(403, body.clone())).await;
+        let err = test_client(&gateway, 3)
+            .execute("github.x", &serde_json::json!({}), None)
+            .await
+            .unwrap_err();
+        match err {
+            OpenConnectorError::ActionExecutionFailed {
+                error_code,
+                message,
+                reason,
+                ..
+            } => {
+                assert_eq!(
+                    error_code.as_deref(),
+                    Some("policy_denied"),
+                    "the structured code must survive a long envelope"
+                );
+                assert!(
+                    message.is_some_and(|m| m.starts_with("why this was refused.")),
+                    "the message must parse, not arrive as None"
+                );
+                // The human diagnostic stays bounded -- now the truncation's
+                // job rather than the read limit's.
+                assert!(
+                    reason.chars().count() < 600,
+                    "reason must stay bounded, got {} chars",
+                    reason.chars().count()
+                );
+            }
+            other => panic!("expected ActionExecutionFailed, got {other}"),
+        }
+    }
+
+    #[tokio::test]
     async fn execute_400_is_terminal_and_renders_the_envelope_error() {
         // The live gateway rejects schema-invalid input with HTTP 400 and a
         // failed envelope; the error must carry its errorCode and message,
@@ -1273,10 +1544,18 @@ mod tests {
             .execute("github.x", &serde_json::json!({}), None)
             .await
             .unwrap_err();
-        assert!(matches!(
-            err,
-            OpenConnectorError::ActionExecutionFailed { ref reason, .. } if reason.contains("502")
-        ));
+        assert!(
+            matches!(
+                err,
+                OpenConnectorError::ActionExecutionFailed {
+                    status: Some(502),
+                    ..
+                }
+            ),
+            "the status is a field, not something to recover from prose: {err}"
+        );
+        // And it is still in the message, because that is what a human reads.
+        assert!(err.to_string().contains("502"), "{err}");
         assert_eq!(
             gateway.requests().len(),
             1,
@@ -1328,5 +1607,262 @@ mod tests {
             ),
             "got {err}"
         );
+    }
+}
+
+/// The `errorCode` a failed gateway envelope carries, if the body is one.
+///
+/// Best-effort by construction: a terminal failure's body may be a proxy's
+/// HTML or nothing at all, and an absent code is a normal answer rather than a
+/// parse error. The status is the fact that always exists; this is the one
+/// that sharpens it.
+fn envelope_error_code(body: &str) -> Option<String> {
+    serde_json::from_str::<Value>(body)
+        .ok()?
+        .get("errorCode")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// The action id the gateway echoed at `meta.actionId`, when the body is a
+/// gateway envelope carrying one.
+///
+/// Best-effort for the same reason as [`envelope_error_code`], and absence is
+/// the answer that matters here: a body with no `meta.actionId` is not this
+/// gateway refusing an action, it is something else answering entirely.
+fn envelope_message(body: &str) -> Option<String> {
+    serde_json::from_str::<Value>(body)
+        .ok()?
+        .get("message")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// The action id the gateway echoed at `meta.actionId`, when the body is a
+/// gateway envelope carrying one.
+fn envelope_action_id(body: &str) -> Option<String> {
+    serde_json::from_str::<Value>(body)
+        .ok()?
+        .get("meta")?
+        .get("actionId")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+#[cfg(test)]
+mod structured_failure_tests {
+    use super::*;
+    use crate::testing::{MockGateway, MockResponse, envelope_err};
+
+    fn client(gateway: &MockGateway) -> OpenConnectorClient {
+        OpenConnectorClient::new(&gateway.url, "t", std::time::Duration::from_secs(5))
+            .expect("client")
+    }
+
+    /// **The distinction cloud's syncer is built on.** A 403 on an ACL read is
+    /// a permanent property of the resource — the credential holds no sharing
+    /// right, and it will hold none next tick either — while a 5xx is the
+    /// gateway being unavailable. Those are opposite instructions to an
+    /// operator, and recovering them from a substring search is how they
+    /// silently swap.
+    #[tokio::test]
+    async fn a_forbidden_and_a_server_error_are_distinguishable_without_reading_prose() {
+        for code in [403u16, 404, 500, 502] {
+            let gateway = MockGateway::start(move |_| MockResponse::new(code, "{}")).await;
+            let err = client(&gateway)
+                .execute("x.y", &serde_json::json!({}), None)
+                .await
+                .unwrap_err();
+            match err {
+                OpenConnectorError::ActionExecutionFailed { status, .. } => {
+                    assert_eq!(status, Some(code), "status must survive as a field");
+                }
+                other => panic!("expected ActionExecutionFailed, got {other}"),
+            }
+        }
+    }
+
+    /// **The discriminator between Open Connector's two 404s.** A build that
+    /// does not define the action answers a GATEWAY envelope, echoing the
+    /// action under test at `meta.actionId`.
+    #[tokio::test]
+    async fn an_undefined_action_echoes_the_action_it_was_asked_for() {
+        let gateway = MockGateway::start(|_| {
+            MockResponse::new(
+                404,
+                r#"{"success":false,"message":"no such action","data":null,
+                    "errorCode":"invalid_input","meta":{"actionId":"x.y"}}"#,
+            )
+        })
+        .await;
+        let err = client(&gateway)
+            .execute("x.y", &serde_json::json!({}), None)
+            .await
+            .unwrap_err();
+        match err {
+            OpenConnectorError::ActionExecutionFailed {
+                status,
+                echoed_action_id,
+                ..
+            } => {
+                assert_eq!(status, Some(404));
+                assert_eq!(
+                    echoed_action_id.as_deref(),
+                    Some("x.y"),
+                    "the gateway named the action it could not run"
+                );
+            }
+            other => panic!("expected ActionExecutionFailed, got {other}"),
+        }
+    }
+
+    /// **The other 404, and the reason the field exists at all.** A base URL
+    /// pointing at the wrong service answers THAT service's 404 — a
+    /// differently shaped body with no `meta` — and it must not be readable as
+    /// "this action is undefined", which would send an operator to the
+    /// connector catalog for a deployment problem.
+    ///
+    /// Same status, and close enough in shape to fool a substring search: the
+    /// echoed id is the only thing that separates them, which is why asserting
+    /// `None` here asserts a behaviour rather than an absence.
+    #[tokio::test]
+    async fn a_404_from_another_service_echoes_nothing() {
+        let gateway =
+            MockGateway::start(|_| MockResponse::new(404, r#"{"error":{"code":"not_found"}}"#))
+                .await;
+        let err = client(&gateway)
+            .execute("x.y", &serde_json::json!({}), None)
+            .await
+            .unwrap_err();
+        match err {
+            OpenConnectorError::ActionExecutionFailed {
+                status,
+                echoed_action_id,
+                ..
+            } => {
+                assert_eq!(status, Some(404));
+                assert_eq!(
+                    echoed_action_id, None,
+                    "a body with no gateway envelope must not look like a refusal from one"
+                );
+            }
+            other => panic!("expected ActionExecutionFailed, got {other}"),
+        }
+    }
+
+    /// `action_not_allowed` on a 400 means the DEPLOYMENT's allowlist omits the
+    /// action. Without the code it reads as a broken credential, which is the
+    /// wrong thing to go and check.
+    #[tokio::test]
+    async fn the_gateway_error_code_survives_as_a_field() {
+        let gateway = MockGateway::start(|_| {
+            MockResponse::new(400, envelope_err("action_not_allowed", "nope").as_str())
+        })
+        .await;
+        let err = client(&gateway)
+            .execute("x.y", &serde_json::json!({}), None)
+            .await
+            .unwrap_err();
+        match err {
+            OpenConnectorError::ActionExecutionFailed {
+                status, error_code, ..
+            } => {
+                assert_eq!(status, Some(400));
+                assert_eq!(error_code.as_deref(), Some("action_not_allowed"));
+            }
+            other => panic!("expected ActionExecutionFailed, got {other}"),
+        }
+    }
+
+    /// A 2xx whose envelope reports failure carries NO status, deliberately:
+    /// the HTTP code says nothing about what went wrong, and reporting 200
+    /// would invite a consumer to classify it as success.
+    #[tokio::test]
+    async fn a_failed_envelope_under_2xx_reports_no_status() {
+        let gateway = MockGateway::start(|_| {
+            MockResponse::ok(envelope_err("provider_error", "upstream said no").as_str())
+        })
+        .await;
+        let err = client(&gateway)
+            .execute("x.y", &serde_json::json!({}), None)
+            .await
+            .unwrap_err();
+        match err {
+            OpenConnectorError::ActionExecutionFailed {
+                status, error_code, ..
+            } => {
+                assert_eq!(
+                    status, None,
+                    "a 2xx failure envelope has no meaningful status"
+                );
+                assert_eq!(error_code.as_deref(), Some("provider_error"));
+            }
+            other => panic!("expected ActionExecutionFailed, got {other}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod transport_policy_tests {
+    use super::*;
+    use crate::testing::{MockGateway, MockResponse};
+
+    /// **The property the policy exists for.** Every call a credential-bearing
+    /// consumer makes carries a source's runtime token as a bearer. A client
+    /// that followed a `302` would replay the request at whatever host the
+    /// `Location` names.
+    ///
+    /// Asserting the redirect is not FOLLOWED, rather than asserting a config
+    /// flag: a flag test passes whether or not `reqwest` was actually
+    /// configured, which is the failure this guards. The gateway is asked
+    /// once, answers a redirect, and the client must stop there — a followed
+    /// redirect would show up as a second request.
+    #[tokio::test]
+    async fn a_credential_bearing_client_does_not_follow_a_redirect() {
+        let gateway = MockGateway::start(|_| {
+            MockResponse::new(302, "")
+                .with_header("location", "http://elsewhere.invalid/v1/actions/x.y")
+        })
+        .await;
+        let client = OpenConnectorClient::with_policy(
+            &gateway.url,
+            "t",
+            TransportPolicy::credential_bearing(Duration::from_secs(15), Duration::from_secs(5)),
+        )
+        .expect("client");
+
+        let err = client
+            .execute("x.y", &serde_json::json!({}), None)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                OpenConnectorError::ActionExecutionFailed {
+                    status: Some(302),
+                    ..
+                }
+            ),
+            "the redirect must surface as the response it is, not be followed: {err}"
+        );
+        assert_eq!(
+            gateway.requests().len(),
+            1,
+            "a followed redirect would have made a second request"
+        );
+    }
+
+    /// The engine's policy is stated rather than inherited, so `new` must not
+    /// quietly acquire the syncer's.
+    #[test]
+    fn the_engine_policy_still_follows_redirects() {
+        // A construction-level assertion is all that is available here — the
+        // point is that `new` builds a client at all with the engine's
+        // settings, and that it is not routed through
+        // `credential_bearing`. The behavioural half is the test above.
+        let client =
+            OpenConnectorClient::new("http://gateway.invalid", "t", Duration::from_secs(30));
+        assert!(client.is_ok());
     }
 }

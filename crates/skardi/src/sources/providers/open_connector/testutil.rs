@@ -23,55 +23,12 @@ use crate::sources::providers::open_connector::json_to_arrow::RowConverter;
 use crate::sources::providers::open_connector::row_path::RowPath;
 use crate::sources::providers::open_connector::source_pack::SourcePackTable;
 
-pub(crate) use crate::util::mock_http::{
-    MockHttpServer as MockGateway, MockResponse, RecordedRequest,
+// The gateway mock and its envelope builders now live in
+// `skardi-source-pack`, beside the client they exercise. Re-exported so
+// every pack suite in this crate keeps naming them the way it did.
+pub(crate) use skardi_source_pack::testing::{
+    MockGateway, MockResponse, RecordedRequest, discovery_ok, envelope_err, envelope_ok,
 };
-
-impl MockResponse {
-    /// `200 OK` with a JSON body.
-    ///
-    /// No `content-type` header travels with it (the shared server injects
-    /// none, and this constructor adds none): nothing in
-    /// `OpenConnectorClient` reads a response content type — bodies are
-    /// parsed as JSON regardless — so declaring one would pin a header no
-    /// test observes.
-    pub(crate) fn ok(body: &str) -> Self {
-        Self::new(200, body)
-    }
-}
-
-/// Wrap executor output (or any `data` payload) in the gateway's uniform
-/// success envelope, exactly as `POST /v1/actions/{id}` returns it.
-pub(crate) fn envelope_ok(data: &str) -> String {
-    format!(r#"{{"success":true,"message":"OK","data":{data},"meta":{{}}}}"#)
-}
-
-/// A failed gateway envelope with an `errorCode`, as the gateway returns
-/// alongside a 4xx/5xx status.
-pub(crate) fn envelope_err(error_code: &str, message: &str) -> String {
-    format!(
-        r#"{{"success":false,"message":"{message}","data":null,"errorCode":"{error_code}","meta":{{}}}}"#
-    )
-}
-
-/// A discovery envelope (`GET /v1/actions/{{id}}`) whose `data` carries the
-/// given schemas and execution block. `read_only` renders the
-/// forward-compatible `execution.readOnly` field when present — today's
-/// gateway omits it.
-pub(crate) fn discovery_ok(
-    input_schema: &str,
-    output_schema: &str,
-    locally_executable: bool,
-    read_only: Option<bool>,
-) -> String {
-    let read_only = match read_only {
-        Some(value) => format!(r#","readOnly":{value}"#),
-        None => String::new(),
-    };
-    envelope_ok(&format!(
-        r#"{{"inputSchema":{input_schema},"outputSchema":{output_schema},"execution":{{"locallyExecutable":{locally_executable}{read_only}}}}}"#
-    ))
-}
 
 /// Run one SQL statement to completion and return every result batch.
 pub(crate) async fn collect(ctx: &SessionContext, sql: &str) -> Vec<RecordBatch> {

@@ -25,67 +25,20 @@ use datafusion::physical_plan::{
     SendableRecordBatchStream,
 };
 use futures::stream;
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 use super::cache::{ScanCache, ScanKeyParts, scan_cache_key, schema_fingerprint};
 use super::client::OpenConnectorClient;
 use super::error::OpenConnectorError;
 use super::json_to_arrow::RowConverter;
-use super::pagination::{CursorContinuation, Pagination, PaginationStrategy};
 use super::row_path::RowPath;
-use super::source_pack::RowShape;
-use super::source_pack::{FixedValue, SourcePackTable};
-use std::slice;
 
-/// The scanned collection's identity and pagination contract — the shape
-/// shared by YAML-bound source-pack tables and `open_connector_scan` raw
-/// actions, which have no static [`SourcePackTable`] to point at.
-#[derive(Debug, Clone)]
-pub struct ScanTarget {
-    /// Stable table ID (`mock.items`) or a raw-action label, for errors and
-    /// tracing.
-    pub table_id: Arc<str>,
-    /// Open Connector action to execute.
-    pub action_id: Arc<str>,
-    /// Pagination contract.
-    pub pagination: PaginationStrategy,
-    /// In-band provider-error location (see `SourcePackTable::error_path`);
-    /// `None` for raw scans and packs whose providers error at HTTP level.
-    pub error_path: Option<&'static str>,
-    /// Fixed action inputs sent with every request (see
-    /// [`SourcePackTable::fixed_inputs`]); empty for raw scans, whose whole
-    /// input is caller-supplied.
-    pub fixed_inputs: &'static [(&'static str, FixedValue)],
-    /// Source-pack version, part of the cache key (0 for raw scans, which
-    /// have no pack and bypass the cache).
-    pub source_pack_version: u32,
-    /// Split-action cursor continuation (see
-    /// [`super::pagination::CursorContinuation`]); `None` for raw scans and
-    /// for every table whose provider accepts the cursor on its own action.
-    pub continuation: Option<CursorContinuation>,
-    /// Whether the row path locates an array of rows or a single row object
-    /// (see [`RowShape`]). Carried on the target rather than passed
-    /// alongside it: this is the per-table response contract, exactly like
-    /// `pagination` and `error_path`. Raw scans are always
-    /// [`RowShape::Array`].
-    pub row_shape: RowShape,
-}
-
-impl ScanTarget {
-    /// The target of a bound source-pack table.
-    pub fn from_pack_table(table: &SourcePackTable, source_pack_version: u32) -> Self {
-        Self {
-            table_id: Arc::from(table.id),
-            action_id: Arc::from(table.action_id),
-            pagination: table.pagination,
-            error_path: table.error_path,
-            fixed_inputs: table.fixed_inputs,
-            source_pack_version,
-            continuation: table.continuation,
-            row_shape: table.row_shape,
-        }
-    }
-}
+// `ScanTarget` and the walk that consumes it moved to `skardi-source-pack`:
+// naming an action, its pagination contract and its row shape says nothing
+// about Arrow, and cloud's syncer needs exactly the same description to scan
+// exactly the same gateway. Re-exported so this module's callers keep the
+// path they had.
+pub use skardi_source_pack::scan::{ActionScan, ScanBounds, ScanTarget};
 
 /// Everything a scan needs, bound once at planning time.
 pub struct OpenConnectorExec {
@@ -255,9 +208,9 @@ impl ExecutionPlan for OpenConnectorExec {
                     tracing::warn!(
                         gateway = %state.gateway,
                         binding = state.binding.as_deref().unwrap_or("<udtf>"),
-                        table = %state.target.table_id,
-                        action = %state.target.action_id,
-                        pages_fetched = state.pages_fetched,
+                        table = %state.scan.target().table_id,
+                        action = %state.scan.target().action_id,
+                        pages_fetched = state.scan.pages_fetched(),
                         error = %e,
                         "Open Connector scan failed"
                     );
@@ -274,27 +227,19 @@ impl ExecutionPlan for OpenConnectorExec {
 
 /// Mutable state of one running scan.
 struct ScanState {
-    client: Arc<OpenConnectorClient>,
+    /// The page walk itself — input assembly, execution, the provider's
+    /// in-band error, row extraction, the cursor, the page budget and the
+    /// deadline. All of it is shared with cloud's syncer and none of it
+    /// knows about Arrow.
+    scan: ActionScan,
     cache: Option<Arc<ScanCache>>,
     cache_key: String,
     gateway: String,
     binding: Option<String>,
-    connection_alias: Option<String>,
-    target: ScanTarget,
     converter: Arc<RowConverter>,
-    row_path: RowPath,
-    resource: Value,
-    filter_inputs: Vec<(String, Value)>,
     projection: Option<Vec<usize>>,
     limit_remaining: Option<usize>,
-    max_pages: u32,
     max_rows: u64,
-    scan_timeout: Duration,
-    deadline: Instant,
-    pagination: Pagination,
-    /// Pre-parsed in-band provider-error path, checked before each page's
-    /// row extraction.
-    error_path: Option<RowPath>,
     rows_emitted: u64,
     /// Cached batches to replay (non-empty only on a cache hit).
     replay: VecDeque<RecordBatch>,
@@ -307,7 +252,6 @@ struct ScanState {
     // Observability (see `log_completion`).
     started: Instant,
     cache_hit: bool,
-    pages_fetched: u32,
     rows_returned: u64,
     completion_logged: bool,
 }
@@ -361,26 +305,32 @@ impl ScanState {
         let done = cached.is_some();
         let replay = cached.unwrap_or_default();
 
+        // Pushed-down filters are ordinary caller inputs by the time they
+        // reach the walk: DataFusion's translation happened at planning time,
+        // and what is left is a list of (field, JSON value) pairs that layer
+        // over the pack's fixed inputs.
+        let scan = ActionScan::new(
+            exec.client.clone(),
+            exec.target.clone(),
+            exec.connection_alias.clone(),
+            exec.resource.clone(),
+            exec.filter_inputs.clone(),
+            exec.row_path.as_str(),
+            ScanBounds {
+                max_pages: exec.max_pages,
+                timeout: exec.scan_timeout,
+            },
+        )?;
         Ok(Self {
-            client: exec.client.clone(),
+            scan,
             cache: exec.cache.clone(),
             cache_key,
             gateway: exec.gateway.clone(),
             binding: exec.binding.clone(),
-            connection_alias: exec.connection_alias.clone(),
-            target: exec.target.clone(),
             converter: exec.converter.clone(),
-            row_path: exec.row_path.clone(),
-            resource: exec.resource.clone(),
-            filter_inputs: exec.filter_inputs.clone(),
             projection: exec.projection.clone(),
             limit_remaining: exec.limit,
-            max_pages: exec.max_pages,
             max_rows: exec.max_rows,
-            scan_timeout: exec.scan_timeout,
-            deadline: Instant::now() + exec.scan_timeout,
-            pagination: Pagination::new(exec.target.pagination)?,
-            error_path: exec.target.error_path.map(RowPath::parse).transpose()?,
             rows_emitted: 0,
             replay,
             fetched: Vec::new(),
@@ -388,7 +338,6 @@ impl ScanState {
             cache_stored: false,
             started: Instant::now(),
             cache_hit: done,
-            pages_fetched: 0,
             rows_returned: 0,
             completion_logged: false,
         })
@@ -405,10 +354,7 @@ impl ScanState {
     }
 
     fn timeout_error(&self) -> OpenConnectorError {
-        OpenConnectorError::ScanTimeout {
-            table: self.target.table_id.to_string(),
-            seconds: self.scan_timeout.as_secs(),
-        }
+        self.scan.timeout_error()
     }
 
     /// Emit the scan-completion event exactly once. Identifying fields and
@@ -421,10 +367,10 @@ impl ScanState {
         tracing::info!(
             gateway = %self.gateway,
             binding = self.binding.as_deref().unwrap_or("<udtf>"),
-            table = %self.target.table_id,
-            action = %self.target.action_id,
+            table = %self.scan.target().table_id,
+            action = %self.scan.target().action_id,
             cache_hit = self.cache_hit,
-            pages = self.pages_fetched,
+            pages = self.scan.pages_fetched(),
             rows = self.rows_returned,
             duration_ms = self.started.elapsed().as_millis() as u64,
             "Open Connector scan completed"
@@ -448,121 +394,13 @@ impl ScanState {
             self.log_completion();
             return Ok(None);
         }
-        if Instant::now() >= self.deadline {
-            return Err(self.timeout_error());
-        }
-        if self.pagination.page() > self.max_pages as usize {
-            return Err(OpenConnectorError::ScanBoundsExceeded {
-                table: self.target.table_id.to_string(),
-                bound: "max_pages",
-                limit: u64::from(self.max_pages),
-            });
-        }
-
-        // Some providers serve pages 2..N from a DIFFERENT action than the
-        // one that began the listing (Dropbox's `list_folder` →
-        // `list_folder_continue`), and that action's schema commonly
-        // accepts the cursor and nothing else. Page one always uses the
-        // table's own action with the full input.
-        let continuation = self
-            .target
-            .continuation
-            .filter(|_| self.pagination.page() > 1);
-        let action_id: &str = match &continuation {
-            Some(continuation) => continuation.action_id,
-            None => &self.target.action_id,
-        };
-
-        // Assemble the action input: resource inputs, the pack's fixed
-        // inputs, pushed-down filters (which may override a fixed input —
-        // `state=all` yields to a pushed `state='open'`), then page
-        // parameters.
-        let input = if continuation.is_some_and(|c| c.cursor_only) {
-            // Everything the non-continuation branch assembles is a hard
-            // 400 here: the continue action declares `cursor` as its only
-            // property under `additionalProperties: false`. The listing's
-            // resources, fixed inputs, filters and page size were all
-            // committed by the request that opened it, and the cursor
-            // carries that state forward on the provider's side.
-            let mut input = Map::new();
-            self.pagination.apply_cursor_only(&mut input);
-            input
-        } else {
-            let mut input = self.resource.as_object().cloned().expect(
-                "resource is a JSON object by construction (registration always builds Value::Object)",
-            );
-            for (field, value) in self.target.fixed_inputs {
-                input.insert((*field).to_string(), value.to_json());
-            }
-            for (field, value) in &self.filter_inputs {
-                input.insert(field.clone(), value.clone());
-            }
-            self.pagination.apply(&mut input);
-            input
-        };
-
-        let page = self.pagination.page();
-        // The scan deadline covers the whole gateway operation, including
-        // request I/O and any retry/backoff inside the client. Dropping this
-        // future on timeout also prevents another retry from being sent.
-        let envelope = tokio::time::timeout_at(
-            tokio::time::Instant::from_std(self.deadline),
-            self.client.execute(
-                action_id,
-                &Value::Object(input),
-                self.connection_alias.as_deref(),
-            ),
-        )
-        .await
-        .map_err(|_| self.timeout_error())??;
-        // Counted at fetch time on purpose: `pages_fetched` measures gateway
-        // traffic (requests actually made, rate-limit budget actually spent),
-        // not pages emitted downstream. A page that lands right at the
-        // deadline — or fails extraction/conversion below — was still a real
-        // gateway call, and the failure event should say so.
-        self.pages_fetched += 1;
-        if Instant::now() >= self.deadline {
-            return Err(self.timeout_error());
-        }
-        // Some gateways forward a provider's in-band application errors
-        // unchanged (Slack-style HTTP 200, `ok: false` + `error`). Packs
-        // targeting such a gateway declare `error_path` so the provider's
-        // own code surfaces instead of the misleading row-path error the
-        // missing row array would raise. (Open Connector's own executors
-        // consume Slack's `ok:false` and return a failure envelope, so its
-        // slack pack declares none — the mock pack models this mechanism.)
-        if let Some(error_path) = &self.error_path
-            && let Ok(code) = error_path.extract(&envelope, page)
-            && !code.is_null()
-        {
-            let code = match code.as_str() {
-                Some(text) => crate::util::text::truncate_chars(text, 128),
-                None => format!(
-                    "<{}>",
-                    crate::sources::providers::open_connector::row_path::json_kind(code)
-                ),
-            };
-            return Err(OpenConnectorError::ProviderReportedError {
-                // The action that actually answered — on a continuation
-                // page that is the continue action, and naming the table's
-                // opening action instead would misdirect the reader.
-                action_id: action_id.to_string(),
-                page,
-                code,
-            });
-        }
-        // Object-shaped tables hand the single response object to the SAME
-        // converter as a one-element slice: `from_ref` borrows it in place,
-        // so there is no clone of the response and no second conversion
-        // path to keep in sync with schema, projection, and error handling.
-        let rows = match self.target.row_shape {
-            RowShape::Array => self.row_path.rows(&envelope, page)?,
-            RowShape::Object => slice::from_ref(self.row_path.row_object(&envelope, page)?),
-        };
+        let page = self.scan.page();
+        let envelope = self.scan.fetch_page().await?;
+        let rows = self.scan.rows(&envelope)?;
         let batch = self.converter.convert(rows, page)?;
         // Conversion is synchronous, so it cannot be preempted by Tokio; do
         // not emit its result if it consumed the remaining scan budget.
-        if Instant::now() >= self.deadline {
+        if Instant::now() >= self.scan.deadline() {
             return Err(self.timeout_error());
         }
         let batch = match &self.projection {
@@ -570,7 +408,7 @@ impl ScanState {
                 batch
                     .project(indices)
                     .map_err(|e| OpenConnectorError::ConversionFailed {
-                        path: self.row_path.as_str().to_string(),
+                        path: self.scan.row_path().as_str().to_string(),
                         column: "<projection>".to_string(),
                         page,
                         row: 0,
@@ -594,7 +432,7 @@ impl ScanState {
         self.rows_emitted += batch.num_rows() as u64;
         if self.rows_emitted > self.max_rows {
             return Err(OpenConnectorError::ScanBoundsExceeded {
-                table: self.target.table_id.to_string(),
+                table: self.scan.target().table_id.to_string(),
                 bound: "max_rows",
                 limit: self.max_rows,
             });
@@ -620,9 +458,7 @@ impl ScanState {
         // page would fail a scan whose result is already complete for its
         // key.
         if !self.done {
-            let more = self
-                .pagination
-                .advance(&envelope, rows.len(), rows.last())?;
+            let more = self.scan.advance(&envelope, rows)?;
             if !more {
                 self.done = true;
                 self.store_cache();
@@ -653,6 +489,12 @@ mod tests {
     use super::*;
     use crate::sources::providers::open_connector::json_to_arrow::{FieldMapping, FieldType};
     use crate::sources::providers::open_connector::packs::mock;
+    use crate::sources::providers::open_connector::pagination::{
+        AbsentCursor, CursorContinuation, PaginationStrategy,
+    };
+    use crate::sources::providers::open_connector::source_pack::{
+        FixedValue, RowShape, SourcePackTable,
+    };
     use crate::sources::providers::open_connector::testutil::{
         CapturedEvent, MockGateway, MockResponse, RecordedRequest, capture_events, envelope_ok,
     };
@@ -743,6 +585,7 @@ mod tests {
                 page_size_param: Some("limit"),
                 page_size: 2,
                 has_more_path: Some("$.hasMore"),
+                absent_cursor: AbsentCursor::EndsTheScan,
             },
             required_resources: &[],
             optional_resources: &["path"],

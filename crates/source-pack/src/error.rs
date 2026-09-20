@@ -2,6 +2,100 @@
 
 use thiserror::Error;
 
+/// Why a request never produced a response.
+///
+/// Carried as a FIELD, for the third time in this crate and the same reason
+/// each time: a consumer classifies on it, and prose is not a contract. The
+/// five cases are the ones cloud's rbac syncer already separates by hand
+/// (`connectors::http::transport_class`), and they are separated because they
+/// are different instructions — `Connect` says the gateway is not there,
+/// `Timeout` says it is there and not answering in time, `Body` says it
+/// answered with something unreadable. An operator does a different thing for
+/// each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportFailure {
+    /// The request outlived its timeout.
+    Timeout,
+    /// The connection was never established.
+    Connect,
+    /// The response body could not be read or decoded.
+    Body,
+    /// The request itself could not be sent.
+    Request,
+    /// Anything else the transport reported.
+    Network,
+}
+
+impl TransportFailure {
+    /// Classify a `reqwest` failure.
+    ///
+    /// Order matters twice over.
+    ///
+    /// `is_connect` comes FIRST because a connect timeout satisfies both it
+    /// and `is_timeout`, and asking the timeout first classified every
+    /// unroutable or firewalled gateway as "the gateway did not answer" —
+    /// the opposite of what this enum documents, and the wrong operational
+    /// path for the consumer that reads it. `Timeout` now means what it says:
+    /// a connection was established and the answer did not come.
+    ///
+    /// `is_request` comes LAST of the specific predicates because it is true
+    /// for most of the others too, so it acts as the fallback before
+    /// `Network`.
+    pub fn of(error: &reqwest::Error) -> Self {
+        if error.is_connect() {
+            Self::Connect
+        } else if error.is_timeout() {
+            Self::Timeout
+        } else if error.is_body() || error.is_decode() {
+            Self::Body
+        } else if error.is_request() {
+            Self::Request
+        } else {
+            Self::Network
+        }
+    }
+
+    /// The stable token an operator greps for.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Connect => "connect",
+            Self::Body => "body",
+            Self::Request => "request",
+            Self::Network => "network",
+        }
+    }
+}
+
+impl std::fmt::Display for TransportFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// How the final attempt of a retried call failed.
+///
+/// `RetriesExhausted` conflated two very different endings — the gateway
+/// answering 503 every time, and the gateway never answering at all — into one
+/// prose `reason`. They are exactly one of the two, so this is an enum rather
+/// than a pair of `Option`s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LastAttempt {
+    /// The gateway answered, with this status, and the status was retryable.
+    Status(u16),
+    /// The gateway never answered.
+    Transport(TransportFailure),
+}
+
+impl std::fmt::Display for LastAttempt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Status(code) => write!(f, "HTTP {code}"),
+            Self::Transport(kind) => write!(f, "transport {kind}"),
+        }
+    }
+}
+
 /// Errors surfaced while validating or registering an Open Connector gateway
 /// data source.
 ///
@@ -11,7 +105,7 @@ use thiserror::Error;
 ///
 /// # Example
 /// ```
-/// use skardi::sources::providers::open_connector::{OpenConnectorConfig, OpenConnectorError};
+/// use skardi_source_pack::{OpenConnectorConfig, OpenConnectorError};
 ///
 /// // A config with no bindings is valid; one with a duplicate binding name is not.
 /// let yaml = r#"
@@ -60,9 +154,15 @@ pub enum OpenConnectorError {
     #[error("Open Connector binding '{binding}' must name a 'source_pack'")]
     EmptySourcePack { binding: String },
 
-    /// A binding exposed no tables.
-    #[error("Open Connector binding '{binding}' must expose at least one table")]
-    EmptyTableList { binding: String },
+    /// Two source packs claimed the same name.
+    ///
+    /// Reachable only through [`crate::source_pack::SourcePackRegistry::from_packs`],
+    /// which is
+    /// public so a consumer can combine pack sets. Silently keeping one let
+    /// iterator order decide which definition every later lookup resolved
+    /// against.
+    #[error("two source packs are both named '{pack}'")]
+    DuplicateSourcePack { pack: String },
 
     /// A binding listed an empty table name.
     #[error("Open Connector binding '{binding}' contains an empty table name")]
@@ -181,15 +281,94 @@ pub enum OpenConnectorError {
     )]
     InvalidActionId { action_id: String, reason: String },
 
+    /// A scan was bound with a `resource` that is not a JSON object.
+    ///
+    /// Refused rather than coerced. The resource carries the SCOPE of the
+    /// listing — which folder, which repository — and silently reading a
+    /// `null`, an array or a scalar as "no resource inputs" would send the
+    /// action its unscoped form. For an ACL enumeration that is the worst
+    /// possible default: the caller asked about one folder and the request
+    /// asks about whatever the credential can see.
+    ///
+    /// Inside the engine this was an `expect` justified by "registration
+    /// always builds `Value::Object`". That justification does not travel: a
+    /// syncer hand-builds its resource, so the invariant has to be checked
+    /// rather than assumed.
+    #[error(
+        "Open Connector scan for '{table}' was given a {found} resource; \
+         it must be a JSON object of action inputs"
+    )]
+    ScanResourceNotObject { table: String, found: String },
+
     /// An action execution call returned a terminal (non-retryable) failure.
+    ///
+    /// `status` and `error_code` are carried STRUCTURED rather than only
+    /// rendered into `reason`, because consumers classify on them and prose is
+    /// not a contract. Two callers need it and one of them is this crate:
+    ///
+    ///   * cloud's rbac syncer distinguishes "the provider refused this
+    ///     folder's ACL" (403/404 — a permanent property of the folder, which
+    ///     it reports as its own failure class) from "the gateway was down"
+    ///     (5xx — retry next tick). Those are opposite instructions to an
+    ///     operator, and getting them from a substring search is how they
+    ///     silently swap;
+    ///   * `error_code == "action_not_allowed"` on a 400 means the deployment's
+    ///     allowlist omits the action, which reads like a broken credential
+    ///     unless it is named.
+    ///
+    /// `reason` stays for the message a human reads. It is no longer the only
+    /// place the facts live — this crate's own tests used to recover the status
+    /// with `reason.contains("502")`.
     #[error("Open Connector action '{action_id}' execution failed: {reason}")]
-    ActionExecutionFailed { action_id: String, reason: String },
+    ActionExecutionFailed {
+        action_id: String,
+        /// The gateway's HTTP status, or `None` when the failure was not an
+        /// HTTP response at all (a 2xx envelope reporting `success: false`).
+        status: Option<u16>,
+        /// The gateway envelope's `errorCode`, when it sent one.
+        error_code: Option<String>,
+        /// The gateway envelope's `message`, when it sent one.
+        ///
+        /// Provider-influenced text, and carried as a field precisely so a
+        /// consumer can DECIDE about it rather than have it folded into
+        /// `reason` where the only options are print-it-all or lose it.
+        /// cloud's rbac syncer needs both halves of that choice at once: its
+        /// GitHub connector must never let this reach `sync_jobs.error` (a
+        /// measured 403 quotes an organization's OAuth policy prose), while
+        /// its OneDrive connector branches on it, because Graph spells
+        /// `accessDenied` and `itemNotFound` here and those mean "this folder
+        /// cannot be governed" rather than "the gateway failed".
+        message: Option<String>,
+        /// The action id the gateway ECHOED in `meta.actionId`, when it
+        /// answered with a gateway envelope at all.
+        ///
+        /// Distinct from `action_id`, which is what the caller ASKED for, and
+        /// the difference is the whole point: it is the only thing that
+        /// separates Open Connector's two 404s. A build that does not define
+        /// the action answers a gateway envelope echoing the action under
+        /// test; a base URL pointing at the wrong service answers that
+        /// service's own 404, a differently shaped body with no `meta` at
+        /// all. Without this field the two are indistinguishable, and a
+        /// misconfigured URL gets reported as a missing action — sending the
+        /// operator to the connector catalog for what is a deployment
+        /// problem.
+        ///
+        /// `None` therefore carries information rather than merely missing:
+        /// it means no gateway envelope came back.
+        echoed_action_id: Option<String>,
+        reason: String,
+    },
 
     /// Retries on 429 / transient 5xx / transport errors were exhausted.
     #[error("Open Connector {operation} failed after {attempts} attempt(s); last error: {reason}")]
     RetriesExhausted {
         operation: String,
         attempts: u32,
+        /// How the final attempt failed. See [`LastAttempt`] — a retry budget
+        /// spent on 503s and one spent on a gateway that was never reachable
+        /// are different operational facts, and they used to be the same
+        /// string.
+        last_attempt: LastAttempt,
         reason: String,
     },
 
@@ -202,7 +381,15 @@ pub enum OpenConnectorError {
          not retried because the request may have reached the gateway and \
          re-execution is not safe"
     )]
-    NonIdempotentAmbiguousFailure { operation: String, reason: String },
+    NonIdempotentAmbiguousFailure {
+        operation: String,
+        /// Which transport failure it was. Ambiguity is about whether the
+        /// action RAN, not about what went wrong on the wire: a `Connect`
+        /// failure did not reach the gateway and so cannot have executed
+        /// anything, while a `Timeout` may well have.
+        transport: TransportFailure,
+        reason: String,
+    },
 
     /// The provider reported an in-band error inside an otherwise
     /// successful response envelope — Slack's HTTP-200 `ok: false` +
