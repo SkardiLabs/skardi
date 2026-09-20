@@ -81,9 +81,20 @@ pub const MAX_ATTEMPTS: u32 = 3;
 /// default for `OpenConnectorConfig::max_response_bytes`.
 pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
-/// Bytes read of a terminal error body — plenty for the 512-char message
-/// `terminal_reason` keeps, without buffering a worst-case 16 MiB error page.
-const ERROR_SNIPPET_BYTES: usize = 4 * 1024;
+/// Bytes read of a terminal error body.
+///
+/// **Sized for the ENVELOPE, not for the message.** An earlier 4 KiB was
+/// reasoned from the 512-char human diagnostic `terminal_reason` keeps, which
+/// looked sufficient and was not: the same bytes are what `error_code`,
+/// `message` and `echoed_action_id` parse from, so a gateway envelope longer
+/// than the cap arrived as a truncated JSON prefix and every structured field
+/// came back `None` — exactly where they matter most, because the envelopes
+/// that run long are the ones carrying a policy explanation. Truncating the
+/// human part is right; truncating the document it is parsed out of is not.
+///
+/// Still bounded, and for the original reason: a worst-case error page is
+/// 16 MiB and must never be buffered whole.
+const ERROR_SNIPPET_BYTES: usize = 64 * 1024;
 
 /// Base delay for exponential backoff between attempts.
 const BACKOFF_BASE: Duration = Duration::from_millis(200);
@@ -822,7 +833,12 @@ fn terminal_reason(status: StatusCode, body: &str) -> String {
     if let Ok(envelope) = serde_json::from_str::<GatewayEnvelope>(body)
         && !envelope.success
     {
-        return format!("HTTP {}: {}", status.as_u16(), envelope.failure_reason());
+        // Truncated HERE rather than by the read limit. While the body was
+        // capped at 4 KiB the cap did double duty; now that the read is sized
+        // to parse a whole envelope, this is the only thing keeping a long
+        // provider message out of a log line.
+        let reason = truncate_chars(&envelope.failure_reason(), MAX_BODY);
+        return format!("HTTP {}: {}", status.as_u16(), reason);
     }
     let trimmed = truncate_chars(body, MAX_BODY);
     format!("HTTP {}: {}", status.as_u16(), trimmed)
@@ -1438,6 +1454,53 @@ mod tests {
             ),
             "got {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_long_envelope_still_yields_its_structured_fields() {
+        // **The case the old 4 KiB read got wrong.** A policy refusal carries a
+        // long human explanation, so the envelopes that run past the cap are
+        // exactly the ones whose `errorCode` a consumer most needs -- and a
+        // truncated prefix is not JSON, so every structured field parsed to
+        // None.
+        let long_message = "why this was refused. ".repeat(400);
+        let body = envelope_err("policy_denied", &long_message);
+        assert!(
+            body.len() > 4 * 1024,
+            "fixture must exceed the OLD limit or it proves nothing, got {} bytes",
+            body.len()
+        );
+        let gateway = MockGateway::start(move |_| MockResponse::new(403, body.clone())).await;
+        let err = test_client(&gateway, 3)
+            .execute("github.x", &serde_json::json!({}), None)
+            .await
+            .unwrap_err();
+        match err {
+            OpenConnectorError::ActionExecutionFailed {
+                error_code,
+                message,
+                reason,
+                ..
+            } => {
+                assert_eq!(
+                    error_code.as_deref(),
+                    Some("policy_denied"),
+                    "the structured code must survive a long envelope"
+                );
+                assert!(
+                    message.is_some_and(|m| m.starts_with("why this was refused.")),
+                    "the message must parse, not arrive as None"
+                );
+                // The human diagnostic stays bounded -- now the truncation's
+                // job rather than the read limit's.
+                assert!(
+                    reason.chars().count() < 600,
+                    "reason must stay bounded, got {} chars",
+                    reason.chars().count()
+                );
+            }
+            other => panic!("expected ActionExecutionFailed, got {other}"),
+        }
     }
 
     #[tokio::test]

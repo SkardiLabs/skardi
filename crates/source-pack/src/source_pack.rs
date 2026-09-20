@@ -569,12 +569,26 @@ impl SourcePackRegistry {
     /// built-in list: eleven hardcoded provider assets would make a library
     /// carry its consumer's choices, and cloud's set is not the engine's. The
     /// engine's `builtins()` is one caller of this.
-    pub fn from_packs(packs: impl IntoIterator<Item = &'static SourcePack>) -> Self {
-        let mut map = HashMap::new();
+    /// # Errors
+    ///
+    /// [`OpenConnectorError::DuplicateSourcePack`] when two packs claim the
+    /// same name. This is public so a consumer can combine sets — its own
+    /// packs with an override, say — and that is exactly when a collision is
+    /// reachable. Keeping the last silently made iterator order decide which
+    /// definition every later registration, version pin and action contract
+    /// resolved against, with nothing said.
+    pub fn from_packs(
+        packs: impl IntoIterator<Item = &'static SourcePack>,
+    ) -> Result<Self, OpenConnectorError> {
+        let mut map: HashMap<&'static str, &'static SourcePack> = HashMap::new();
         for pack in packs {
-            map.insert(pack.name, pack);
+            if map.insert(pack.name, pack).is_some() {
+                return Err(OpenConnectorError::DuplicateSourcePack {
+                    pack: pack.name.to_string(),
+                });
+            }
         }
-        Self { packs: map }
+        Ok(Self { packs: map })
     }
 
     /// Look up a pack by provider name.

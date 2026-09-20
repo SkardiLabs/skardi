@@ -42,7 +42,7 @@ use super::packs;
 /// assert!(registry.get("no_such_provider").is_none());
 /// ```
 pub fn builtin_pack_registry() -> Result<SourcePackRegistry, OpenConnectorError> {
-    Ok(SourcePackRegistry::from_packs([
+    SourcePackRegistry::from_packs([
         packs::mock::pack()?,
         packs::dropbox::pack()?,
         packs::github::pack()?,
@@ -54,7 +54,7 @@ pub fn builtin_pack_registry() -> Result<SourcePackRegistry, OpenConnectorError>
         packs::outlook::pack()?,
         packs::one_drive::pack()?,
         packs::google_drive::pack()?,
-    ]))
+    ])
 }
 
 #[cfg(test)]
@@ -62,6 +62,27 @@ mod tests {
     use super::super::*;
     use skardi_source_pack::pagination::*;
     use skardi_source_pack::source_pack::*;
+
+    #[test]
+    fn two_packs_of_the_same_name_are_refused() {
+        // `from_packs` is public so a consumer can combine sets -- its own
+        // packs with an override -- which is the only way a collision is
+        // reachable and therefore the only way to test it. Keeping the last
+        // silently let ITERATOR ORDER decide which definition every later
+        // registration, version pin and action contract resolved against.
+        let github = super::packs::github::pack().expect("the shipped pack parses");
+        let err = SourcePackRegistry::from_packs([github, github])
+            .expect_err("two packs named `github` must not both bind");
+        assert!(
+            matches!(err, OpenConnectorError::DuplicateSourcePack { ref pack } if pack == "github"),
+            "the collision must be refused BY NAME, got {err}"
+        );
+
+        // And the honest control: one of them binds.
+        let registry =
+            SourcePackRegistry::from_packs([github]).expect("a single pack is not a collision");
+        assert!(registry.get("github").is_some());
+    }
 
     #[test]
     fn only_the_named_shipped_tables_are_object_shaped() {

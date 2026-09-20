@@ -29,14 +29,23 @@ pub enum TransportFailure {
 impl TransportFailure {
     /// Classify a `reqwest` failure.
     ///
-    /// Order matters: `is_request` is true for most of the others too, so the
-    /// specific predicates are asked first and it acts as the fallback before
+    /// Order matters twice over.
+    ///
+    /// `is_connect` comes FIRST because a connect timeout satisfies both it
+    /// and `is_timeout`, and asking the timeout first classified every
+    /// unroutable or firewalled gateway as "the gateway did not answer" —
+    /// the opposite of what this enum documents, and the wrong operational
+    /// path for the consumer that reads it. `Timeout` now means what it says:
+    /// a connection was established and the answer did not come.
+    ///
+    /// `is_request` comes LAST of the specific predicates because it is true
+    /// for most of the others too, so it acts as the fallback before
     /// `Network`.
     pub fn of(error: &reqwest::Error) -> Self {
-        if error.is_timeout() {
-            Self::Timeout
-        } else if error.is_connect() {
+        if error.is_connect() {
             Self::Connect
+        } else if error.is_timeout() {
+            Self::Timeout
         } else if error.is_body() || error.is_decode() {
             Self::Body
         } else if error.is_request() {
@@ -144,6 +153,15 @@ pub enum OpenConnectorError {
     /// A binding did not name its source pack.
     #[error("Open Connector binding '{binding}' must name a 'source_pack'")]
     EmptySourcePack { binding: String },
+
+    /// Two source packs claimed the same name.
+    ///
+    /// Reachable only through [`SourcePackRegistry::from_packs`], which is
+    /// public so a consumer can combine pack sets. Silently keeping one let
+    /// iterator order decide which definition every later lookup resolved
+    /// against.
+    #[error("two source packs are both named '{pack}'")]
+    DuplicateSourcePack { pack: String },
 
     /// A binding listed an empty table name.
     #[error("Open Connector binding '{binding}' contains an empty table name")]
