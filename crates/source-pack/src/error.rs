@@ -156,7 +156,8 @@ pub enum OpenConnectorError {
 
     /// Two source packs claimed the same name.
     ///
-    /// Reachable only through [`SourcePackRegistry::from_packs`], which is
+    /// Reachable only through [`crate::source_pack::SourcePackRegistry::from_packs`],
+    /// which is
     /// public so a consumer can combine pack sets. Silently keeping one let
     /// iterator order decide which definition every later lookup resolved
     /// against.
