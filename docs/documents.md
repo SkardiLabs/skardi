@@ -142,8 +142,9 @@ and `tables_json` always `[]`. Sections are cut like this:
   document under 2 KiB is a single section. Sections exist so an agent can read
   *part* of a document; one it can read whole has no part worth addressing.
 - **No section exceeds 64 KiB.** An over-long one is cut at the best boundary
-  at or before the ceiling — a heading, then a blank line, then a newline, then
-  a hard cut on a character boundary. The last of those is what makes the
+  at or before the ceiling — a heading (Markdown only, and never one inside a
+  fenced code block), then a blank line, then a newline, then a hard cut on a
+  character boundary. The last of those is what makes the
   ceiling hold for input with no boundaries in it at all, such as a minified
   file or a multi-megabyte single-line export.
 

@@ -165,14 +165,28 @@ fn split_into_sections(text: &str, markdown_rules: bool) -> Vec<String> {
 
     let mut out = Vec::new();
     for section in merged {
-        let mut rest = section.as_str();
-        while !rest.is_empty() {
-            let at = ceiling_split(rest);
-            let (head, tail) = rest.split_at(at);
+        // The heading candidates for the ceiling walk are found ONCE per
+        // section, fence-aware from its first byte, and only under Markdown
+        // rules. A walk that re-scanned each window on its own would start
+        // every window with no fence state, so a `# ` inside a fenced block
+        // read as a boundary and the fence was cut across two rows; and a
+        // `.txt` has no headings at all, so a heading-shaped line in one is
+        // prose. A section always starts outside a fence: every primary
+        // boundary is fence-aware, and the merge joins whole segments.
+        let headings = if markdown_rules {
+            heading_starts(&section)
+        } else {
+            Vec::new()
+        };
+        let mut start = 0usize;
+        while start < section.len() {
+            let rest = &section[start..];
+            let at = ceiling_split(rest, &headings, start);
+            let head = &rest[..at];
             if !head.trim().is_empty() {
                 out.push(head.to_string());
             }
-            rest = tail;
+            start += at;
         }
     }
     out
@@ -193,6 +207,16 @@ fn split_into_sections(text: &str, markdown_rules: bool) -> Vec<String> {
 /// block.
 fn split_at_headings(text: &str) -> Vec<&str> {
     let mut starts = vec![0usize];
+    starts.extend(heading_starts(text));
+    slice_at(text, &starts)
+}
+
+/// Byte offsets of every level 1–2 ATX heading outside a fenced code block,
+/// in order, never including offset 0. The one fence walk in this module:
+/// both the primary split and the ceiling walk read their boundaries from it,
+/// so the two cannot disagree about what is inside a fence.
+fn heading_starts(text: &str) -> Vec<usize> {
+    let mut starts = Vec::new();
     let mut fence: Option<(char, usize)> = None;
     let mut offset = 0usize;
     for line in text.split_inclusive('\n') {
@@ -217,7 +241,7 @@ fn split_at_headings(text: &str) -> Vec<&str> {
         }
         offset += line.len();
     }
-    slice_at(text, &starts)
+    starts
 }
 
 /// The fence character and its run length, if this line opens a fence.
@@ -280,14 +304,20 @@ fn slice_at<'a>(text: &'a str, starts: &[usize]) -> Vec<&'a str> {
 /// line" has nothing to return. The search is therefore ordered and ends in a
 /// cut that always exists:
 ///
-/// 1. a heading (only reachable when the small-merge joined across one),
+/// 1. a heading — from `headings`, the fence-aware offsets the caller found
+///    over the whole section (empty for plain text), so this step can neither
+///    cut inside a fence nor treat a `# ` in a `.txt` as structure. Only
+///    reachable when the small-merge joined across one,
 /// 2. a blank line,
 /// 3. a single newline,
 /// 4. the last UTF-8 character boundary at or before the ceiling.
 ///
 /// Each candidate is the LAST one at or before the ceiling, so a section is as
 /// large as its best boundary allows rather than as small as its first.
-fn ceiling_split(section: &str) -> usize {
+///
+/// `section` is the not-yet-emitted tail of a section, `base` is where that
+/// tail begins in the whole, and `headings` are offsets into the whole.
+fn ceiling_split(section: &str, headings: &[usize], base: usize) -> usize {
     if section.len() <= MAX_SECTION_BYTES {
         return section.len();
     }
@@ -299,8 +329,14 @@ fn ceiling_split(section: &str) -> usize {
     }
     let head = &section[..window];
 
-    if let Some(at) = last_heading_start(head) {
-        return at;
+    // Strictly after `base`: a heading AT `base` is the one this tail begins
+    // with, and cutting there would make no progress.
+    if let Some(at) = headings
+        .iter()
+        .rev()
+        .find(|&&at| at > base && at <= base + window)
+    {
+        return at - base;
     }
     if let Some(at) = head.rfind("\n\n") {
         return at + 2;
@@ -313,18 +349,6 @@ fn ceiling_split(section: &str) -> usize {
     // strictly inside an over-long section, so the loop that calls it always
     // makes progress.
     window
-}
-
-fn last_heading_start(head: &str) -> Option<usize> {
-    let mut found = None;
-    let mut offset = 0usize;
-    for line in head.split_inclusive('\n') {
-        if offset > 0 && is_section_heading(line.trim_end_matches('\n')) {
-            found = Some(offset);
-        }
-        offset += line.len();
-    }
-    found
 }
 
 #[cfg(test)]
@@ -529,6 +553,53 @@ mod tests {
             "expected a blank-line boundary, got {:?}",
             &out[0][out[0].len() - 20..]
         );
+    }
+
+    /// The ceiling walk used to run its own heading scan over each window
+    /// with no fence state, so a `# ` inside a fenced block in an over-long
+    /// section was taken as the cut and the fence landed split across two
+    /// rows (codex, #262). The blank line before the fence is the boundary
+    /// the walk must take instead.
+    #[test]
+    fn the_ceiling_split_does_not_cut_inside_a_fence() {
+        let filler = "w".repeat(MAX_SECTION_BYTES / 2);
+        let text = format!(
+            "# Title\n\n{filler}\n\n```sh\n# inside the fence\n{filler}\n```\n\n{}",
+            "v".repeat(MAX_SECTION_BYTES)
+        );
+        let out = sections(&text, true);
+        assert!(out.iter().all(|s| s.len() <= MAX_SECTION_BYTES));
+        assert!(
+            out.iter().all(|s| !s.starts_with("# inside the fence")),
+            "a section starts inside the fence: {:?}",
+            out.iter().map(|s| &s[..24]).collect::<Vec<_>>()
+        );
+        assert!(
+            out[0].ends_with("\n\n"),
+            "expected the blank line before the fence, got {:?}",
+            &out[0][out[0].len() - 24..]
+        );
+        assert_lossless(&text, true);
+    }
+
+    /// Plain text has no headings, so a heading-shaped line in a `.txt` is
+    /// prose and the ceiling walk must not cut there either. The line sits
+    /// mid-segment so that a walk applying Markdown rules would find it.
+    #[test]
+    fn plain_text_never_cuts_at_a_heading_shaped_line() {
+        let filler = "w".repeat(MAX_SECTION_BYTES / 2);
+        let text = format!(
+            "{filler}\n\n{filler}\n# not a heading in a txt\n{filler}\n{}",
+            "v".repeat(MAX_SECTION_BYTES)
+        );
+        let out = sections(&text, false);
+        assert!(out.iter().all(|s| s.len() <= MAX_SECTION_BYTES));
+        assert!(
+            out.iter().all(|s| !s.starts_with("# not a heading")),
+            "{:?}",
+            out.iter().map(|s| &s[..24]).collect::<Vec<_>>()
+        );
+        assert_lossless(&text, false);
     }
 
     #[test]
