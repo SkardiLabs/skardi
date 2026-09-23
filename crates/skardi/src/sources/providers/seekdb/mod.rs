@@ -33,7 +33,7 @@ use crate::sources::hierarchy::{
     HierarchyLevel, SourceLabel, build_catalog, parse_allowed_schemas, retry_with_timeout,
 };
 use crate::sources::providers::mysql_wire::parse_mysql_wire_connection_params;
-use crate::sources::providers::{DatasetEntry, DatasetRegistry};
+use crate::sources::providers::{CountSafeTable, DatasetEntry, DatasetRegistry};
 use anyhow::{Context, Result};
 use arrow::array::{RecordBatch, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
@@ -433,15 +433,22 @@ async fn build_seekdb_table_provider(
 
     let dyn_pool: Arc<DynMySQLConnectionPool> = Arc::clone(&pool) as Arc<DynMySQLConnectionPool>;
 
-    let read_provider: Arc<dyn TableProvider> = Arc::new(
-        SqlTable::new_with_schema(
-            "seekdb",
-            &dyn_pool,
-            Arc::clone(&filtered_schema),
-            table_reference.clone(),
-        )
-        .with_dialect(Arc::new(MySqlDialect {})),
-    );
+    // Same `SqlTable` empty-projection defect as the Postgres source: an
+    // ungrouped `count(*)` asks for no columns, `SqlTable` answers with a
+    // one-column `SELECT 1` plan, and execution aborts. Both registrations
+    // read through this provider — `MySQLTableWriter` and `SeekDbDmlProvider`
+    // each forward `scan` — so wrapping once here covers them.
+    let read_provider: Arc<dyn TableProvider> = Arc::new(CountSafeTable {
+        inner: Arc::new(
+            SqlTable::new_with_schema(
+                "seekdb",
+                &dyn_pool,
+                Arc::clone(&filtered_schema),
+                table_reference.clone(),
+            )
+            .with_dialect(Arc::new(MySqlDialect {})),
+        ),
+    });
 
     let inner: Arc<dyn TableProvider> = if read_write {
         let mysql_write = MySQL::new(
