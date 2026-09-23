@@ -376,3 +376,87 @@ jobs:
           fi
           git -C tap commit -m "skardi ${version}"
           git -C tap push
+
+  npm:
+    name: "Publish to npm (${{ inputs.version }})"
+    # Same ordering rationale as `homebrew`: the packages contain the release
+    # binaries themselves, so they must not go out before the release exists.
+    needs: [build, release]
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    # The trusted publishers configured on npmjs.com bind to this workflow
+    # plus this environment; OIDC replaces any long-lived NPM_TOKEN.
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.version }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Upgrade npm for trusted publishing
+        # Node 22 ships npm 10; OIDC trusted publishing requires >= 11.5.1.
+        run: npm install -g "npm@>=11.5.1"
+
+      - name: Download CLI artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: skardi-*
+          merge-multiple: true
+
+      - name: Assemble packages
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          version="${VERSION#v}"
+          declare -A MAP=(
+            ["aarch64-apple-darwin"]=cli-darwin-arm64
+            ["x86_64-unknown-linux-gnu"]=cli-linux-x64
+            ["aarch64-unknown-linux-gnu"]=cli-linux-arm64
+          )
+          for target in "${!MAP[@]}"; do
+            pkg="npm/platforms/${MAP[$target]}"
+            mkdir -p "$pkg/bin"
+            tar xzf "artifacts/skardi-${target}.tar.gz" -C "$pkg/bin"
+            chmod +x "$pkg/bin/skardi"
+            jq ".version = \"${version}\"" "$pkg/package.json" > package.json.tmp
+            mv package.json.tmp "$pkg/package.json"
+          done
+          # The main package pins its platform packages to the same version,
+          # so an npm/npx install can never mix binaries from two releases.
+          jq ".version = \"${version}\" | .optionalDependencies |= with_entries(.value = \"${version}\")" \
+            npm/skardi/package.json > package.json.tmp
+          mv package.json.tmp npm/skardi/package.json
+
+      - name: Verify packaged binaries
+        run: |
+          set -euo pipefail
+          for pkg in npm/platforms/cli-*; do
+            name="$(jq -r .name "$pkg/package.json")"
+            version="$(jq -r .version "$pkg/package.json")"
+            test -x "$pkg/bin/skardi" || { echo "$name: bin/skardi missing or not executable"; exit 1; }
+            echo "$name@$version OK"
+          done
+          grep -q '"0.0.0"' npm/skardi/package.json && { echo "main package version not substituted"; exit 1; } || true
+
+      # Platform packages first: the main package's optionalDependencies must
+      # resolve the moment it becomes installable.
+      - name: Publish platform packages
+        run: |
+          set -euo pipefail
+          for pkg in npm/platforms/cli-darwin-arm64 npm/platforms/cli-linux-arm64 npm/platforms/cli-linux-x64; do
+            (cd "$pkg" && npm publish --access public --provenance)
+          done
+
+      - name: Publish main package
+        run: cd npm/skardi && npm publish --access public --provenance
