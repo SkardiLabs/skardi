@@ -1,9 +1,11 @@
 pub mod fts_exec;
+pub mod fts_query;
 pub mod fts_table_function;
 pub mod knn_exec;
 pub mod knn_table_function;
 pub mod vec_to_binary;
 
+pub use fts_query::websearch_to_fts5;
 pub use fts_table_function::register_sqlite_fts_udtf;
 pub use knn_table_function::{SqliteEntry, register_sqlite_knn_udtf};
 pub use vec_to_binary::register_vec_to_binary_udf;
