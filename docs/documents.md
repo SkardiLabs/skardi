@@ -25,11 +25,12 @@
 > downloading one.
 
 `documents` is a read-only skardi data source that turns a **local directory
-or `s3://` prefix** of files — PDF, Office (`.docx/.xlsx/.pptx`), ODF, and
-images — into queryable rows. Each row is one parsed **(file, page)** carrying
-reconstructed markdown, tables, and references to extracted images. It is
-backed by the pure-Rust [`liteparse`](https://github.com/run-llama/liteparse)
-crate.
+or `s3://` prefix** of files — PDF, Office (`.docx/.xlsx/.pptx`), ODF, images,
+Markdown and plain text — into queryable rows. Each row is one parsed
+**(file, page)** carrying reconstructed markdown, tables, and references to
+extracted images. Everything but text is backed by the pure-Rust
+[`liteparse`](https://github.com/run-llama/liteparse) crate; see [Text
+files](#text-files) for the two formats that are read directly.
 
 > **S3 support.** `path` and `image_store` may **each independently** be a
 > local directory or an `s3://bucket/prefix` URI; see [S3 / object
@@ -64,7 +65,7 @@ All keys are optional except `path`.
 | Option | Default | Meaning |
 |--------|---------|---------|
 | `recursive` | `true` | Descend into subdirectories. |
-| `include_globs` | all supported | Comma-separated `*.ext` globs; only matching files are parsed. |
+| `include_globs` | all supported | Comma-separated `*.ext` globs; only matching files are parsed. The default includes `*.md`, `*.markdown` and `*.txt`, which take the direct path in [Text files](#text-files). |
 | `image_mode` | `off` | `embedded` extracts image bytes; `placeholder` keeps refs only; `off` strips images. |
 | `image_store` | — | Destination for extracted image crops — a local path or an `s3://bucket/prefix`. Both backends perform a real write (S3 objects get a `Content-Type` inferred from the extension). Local refs are usable as `llm_extract`'s `image_ref` as-is; `s3://` refs are readable too but **only with `LLM_EXTRACT_IMAGE_FETCH=1`** — see [Image refs and `llm_extract`](#image-refs-and-llm_extract). When both `path` and `image_store` are `s3://`, they must be in the **same bucket** (see [S3 / object store](#s3--object-store)). |
 | `ocr` | `auto` | `auto` OCRs only complex pages (needs `ocr_server_url`); `on` always (requires `ocr_server_url`, else hard error); `off` never. See OCR. |
@@ -88,7 +89,11 @@ liteparse uniformly produces for any file):
 | `tables_json` | `Utf8` | JSON array of reconstructed tables: `[{"header":[…],"rows":[[…]]}]` (may be `[]`). |
 | `page_image_ref` | `Utf8` (nullable) | URI of the rendered full-page image, when produced. |
 | `image_refs` | `Utf8` | JSON array of URIs of cropped images on the page (`[]` ok). |
-| `file_type` | `Utf8` | `pdf` / `docx` / `xlsx` / `image` / … |
+| `file_type` | `Utf8` | `pdf` / `docx` / `xlsx` / `image` / `md` / `txt` / … |
+
+**`.md` and `.markdown` both report `file_type = 'md'`.** One format gets one
+label, or a `WHERE file_type = 'md'` over a corpus holding both spellings
+silently returns part of it. The spelling that was uploaded survives in `path`.
 
 Custom/structured columns are not configured here — they come from the
 `llm_extract` UDF, whose output schema is caller-defined. Path-derived columns
@@ -109,6 +114,53 @@ WHERE path LIKE 'batch-a/%'
   AND tables_json <> '[]'
 ORDER BY path, page;
 ```
+
+## Text files
+
+`.md`, `.markdown` and `.txt` do **not** go through liteparse. They are already
+the format it exists to produce, so the connector reads the bytes, splits them
+into sections, and emits the same rows — the section body is the file's own
+text, byte for byte. Nothing is reconstructed, so nothing can be reconstructed
+wrongly: a table stays a pipe table, a fenced code block stays fenced.
+
+This is not an optimisation. liteparse cannot read these formats at all:
+`convert_to_pdf` routes only Office, presentation, spreadsheet and image
+extensions, and `txt`/`md` appear in it only in a list used to *refuse*
+screenshots. A build that sent them there would fail every such file with
+`unsupported file format: .txt`.
+
+**A "page" is a section.** Text has no pagination, so `page` is the 1-based
+ordinal of the section within the file, and `page_image_ref` is always NULL
+and `tables_json` always `[]`. Sections are cut like this:
+
+- **Markdown** splits at ATX headings of level 1–2 (`# ` or `## ` at column 0,
+  the space required) that are outside fenced code blocks. Both ``` and `~~~`
+  fences are tracked, so a `# ` inside a shell example does not split it.
+- **Plain text** splits at blank lines.
+- **Sections under 2 KiB merge into the one after them**, so a title-only
+  preamble is not its own section — and, at the other end of the same rule, a
+  document under 2 KiB is a single section. Sections exist so an agent can read
+  *part* of a document; one it can read whole has no part worth addressing.
+- **No section exceeds 64 KiB.** An over-long one is cut at the best boundary
+  at or before the ceiling — a heading (Markdown only, and never one inside a
+  fenced code block), then a blank line, then a newline, then a hard cut on a
+  character boundary. The last of those is what makes the
+  ceiling hold for input with no boundaries in it at all, such as a minified
+  file or a multi-megabyte single-line export.
+
+Three things are refused rather than ingested, each as a per-file error the
+scan logs and skips (and which, for a source holding one file, the
+wholesale-failure guard turns into a hard error):
+
+| refused | why |
+|---|---|
+| invalid UTF-8 | A mojibake section is worse than no section: an agent quotes it back as though it were the document, and nothing downstream can tell it is not. No lossy decoding. |
+| a NUL byte | It *is* valid UTF-8, and a Postgres `text` column cannot hold it. A section carrying one fails a consumer's INSERT with a message naming neither this file nor this format. |
+| — | A leading BOM is stripped rather than refused; CRLF and lone CR are normalised to `\n`. |
+
+An empty (or whitespace-only) file is not an error. It contributes no rows and
+still counts as parsed, so it cannot by itself trip the wholesale-failure
+guard.
 
 ## OCR and external tools
 
