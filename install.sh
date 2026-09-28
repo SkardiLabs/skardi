@@ -16,6 +16,9 @@
 #   --no-agents       install the CLI only
 #   --mcp MODE        cloud | local | none
 #   --prefix DIR      where the skardi binary goes (default /usr/local/bin)
+#   --with-unreleased also install skills that need Skardi main (a main build
+#                     reports the last release's version, so it cannot be told
+#                     apart from that release automatically)
 #
 # Environment:
 #   SKARDI_INSTALL_NO_AGENTS=1   same as --no-agents
@@ -39,12 +42,14 @@ ASSUME_YES=0
 INSTALL_CLI=1
 SETUP_AGENTS=1
 MCP_MODE=""
+WITH_UNRELEASED=0
 
 [ "${SKARDI_INSTALL_NO_AGENTS:-}" = "1" ] && SETUP_AGENTS=0
 
 usage() {
   cat <<'USAGE'
-Usage: install.sh [--yes] [--agents-only | --no-agents] [--mcp cloud|local|none] [--prefix DIR]
+Usage: install.sh [--yes] [--agents-only | --no-agents] [--mcp cloud|local|none]
+                  [--prefix DIR] [--with-unreleased]
 
 Installs the skardi CLI, then offers to set up Claude Code, Codex and Cursor:
 the Skardi skills in each agent's skills directory, and Skardi's MCP server
@@ -62,6 +67,7 @@ while [ $# -gt 0 ]; do
     --mcp=*) MCP_MODE="${1#--mcp=}" ;;
     --prefix) PREFIX="${2:-}"; shift ;;
     --prefix=*) PREFIX="${1#--prefix=}" ;;
+    --with-unreleased) WITH_UNRELEASED=1 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1 (see --help)" >&2; exit 2 ;;
   esac
@@ -183,6 +189,48 @@ fetch_skills() {
   tar -xzf "$tarball" -C "$TMP/skills-src"
   SKILLS_DIR="$(find "$TMP/skills-src" -mindepth 2 -maxdepth 2 -type d -name skills | head -n 1)"
   [ -n "$SKILLS_DIR" ] || die "$SKILLS_REPO@$SKILLS_REF has no skills/ directory"
+  pick_skills
+}
+
+# 0 when version $1 >= $2, both x.y.z.
+version_ge() {
+  local a1 a2 a3 b1 b2 b3
+  IFS=. read -r a1 a2 a3 <<<"$1"; IFS=. read -r b1 b2 b3 <<<"$2"
+  a1=${a1:-0} a2=${a2:-0} a3=${a3%%[!0-9]*} b1=${b1:-0} b2=${b2:-0} b3=${b3%%[!0-9]*}
+  a3=${a3:-0} b3=${b3:-0}
+  [ "$a1" -ne "$b1" ] && { [ "$a1" -gt "$b1" ]; return; }
+  [ "$a2" -ne "$b2" ] && { [ "$a2" -gt "$b2" ]; return; }
+  [ "$a3" -ge "$b3" ]
+}
+
+# Each SKILL.md states the oldest Skardi it runs on, as
+# metadata.skardi-min-version: a release number, or "main" while no release
+# has what it needs. Skills the installed CLI is too old for are left out,
+# so the agent is never taught a capability the user's Skardi lacks. With no
+# skardi on PATH the version is unknown and only "main" skills are held back.
+pick_skills() {
+  local bin version skill name min skipped=""
+  bin="$(skardi_bin)"
+  version=""
+  [ -n "$bin" ] && version="$("$bin" --version 2>/dev/null | awk '{print $2}')" || true
+  PICKED=""
+  for skill in "$SKILLS_DIR"/*/; do
+    [ -f "$skill/SKILL.md" ] || continue
+    name="$(basename "$skill")"
+    min="$(awk 'NR==1 && /^---/ {f=1; next} f && /^---/ {exit} f && /^  skardi-min-version:/ {gsub(/"/, "", $2); print $2}' "$skill/SKILL.md")"
+    if [ "$min" = "main" ] && [ "$WITH_UNRELEASED" != "1" ]; then
+      skipped="$skipped $name"; continue
+    fi
+    if [ -n "$min" ] && [ "$min" != "main" ] && [ -n "$version" ] && ! version_ge "$version" "$min"; then
+      skipped="$skipped $name"; continue
+    fi
+    PICKED="$PICKED $name"
+  done
+  PICKED="${PICKED# }"
+  if [ -n "$skipped" ]; then
+    say "Not installed, they need a newer Skardi than ${version:-the latest release}:${skipped}"
+    say "  (on a build of Skardi main, re-run with --agents-only --with-unreleased)"
+  fi
 }
 
 # Copy every skill into DEST. A directory we did not install (no marker)
@@ -190,9 +238,8 @@ fetch_skills() {
 copy_skills() {
   local dest="$1" skill name
   mkdir -p "$dest"
-  for skill in "$SKILLS_DIR"/*/; do
-    name="$(basename "$skill")"
-    [ -f "$skill/SKILL.md" ] || continue
+  for name in $PICKED; do
+    skill="$SKILLS_DIR/$name"
     if [ -d "$dest/$name" ] && [ ! -f "$dest/$name/.skardi-install" ]; then
       warn "$dest/$name exists and was not installed by this script; left as is"
       continue
