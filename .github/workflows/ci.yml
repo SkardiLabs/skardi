@@ -658,16 +658,34 @@ jobs:
 
       # MinIO gives the `documents` connector's object-store path real S3
       # coverage without needing an AWS account or credentials in CI. Started
-      # with `docker run` rather than a `services:` entry because service
-      # containers cannot override the image command, and the MinIO image needs
-      # `server /data`.
+      # with `docker run` rather than a `services:` entry so the container can
+      # be torn down explicitly.
+      #
+      # **Why this is Bitnami's frozen image, pinned, and not MinIO's own.**
+      # `quay.io/minio/minio` — and `docker.io/minio/minio` with it — stopped
+      # answering anonymous pulls on 2026-09-28 (`unauthorized: access to the
+      # requested resource is not authorized`; quay's API now demands a login,
+      # Hub lists zero tags). main was green on this step five days earlier
+      # with no change in this file, so it is the registry that moved.
+      # `bitnamilegacy/minio` is the same upstream binary, frozen when Bitnami
+      # ended free updates in 2025-08, and it still pulls anonymously — for a
+      # CI stub that only needs a working S3 API, frozen is fine and a live
+      # registry is not. Pinned to a tag rather than `latest` because a
+      # floating tag is exactly what disappeared out from under us.
+      #
+      # No `server /data` command: this image's entrypoint runs Bitnami's
+      # `run.sh`, which starts `minio server` on 9000 against its own data
+      # directory. The credentials are the same `MINIO_ROOT_USER` /
+      # `MINIO_ROOT_PASSWORD` the upstream binary reads from its environment,
+      # and `/minio/health/live` is upstream MinIO's, so the readiness poll
+      # and the S3 tests below are unchanged.
       - name: Start MinIO for documents S3 tests
         run: |
           docker run -d --name skardi-minio \
             -p 127.0.0.1:9000:9000 \
             -e MINIO_ROOT_USER=skardiminio \
             -e MINIO_ROOT_PASSWORD=skardiminio123 \
-            quay.io/minio/minio server /data
+            bitnamilegacy/minio:2025.7.23-debian-12-r5
           # The image has no shell tooling for a container healthcheck, so poll
           # readiness from the runner (same approach as DynamoDB Local above).
           for i in $(seq 1 30); do
