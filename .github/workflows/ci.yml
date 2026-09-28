@@ -656,46 +656,48 @@ jobs:
           SKARDI_QUERY_AUDIT_LIVE_URL: postgres://skardi_user:skardi_pass@127.0.0.1:5432/mydb
         run: cargo llvm-cov --no-report nextest --all-features -- --ignored
 
-      # MinIO gives the `documents` connector's object-store path real S3
+      # RustFS gives the `documents` connector's object-store path real S3
       # coverage without needing an AWS account or credentials in CI. Started
       # with `docker run` rather than a `services:` entry so the container can
       # be torn down explicitly.
       #
-      # **Why this is Bitnami's frozen image, pinned, and not MinIO's own.**
-      # `quay.io/minio/minio` — and `docker.io/minio/minio` with it — stopped
-      # answering anonymous pulls on 2026-09-28 (`unauthorized: access to the
-      # requested resource is not authorized`; quay's API now demands a login,
-      # Hub lists zero tags). main was green on this step five days earlier
-      # with no change in this file, so it is the registry that moved.
-      # `bitnamilegacy/minio` is the same upstream binary, frozen when Bitnami
-      # ended free updates in 2025-08, and it still pulls anonymously — for a
-      # CI stub that only needs a working S3 API, frozen is fine and a live
-      # registry is not. Pinned to a tag rather than `latest` because a
-      # floating tag is exactly what disappeared out from under us.
+      # **Why RustFS, and not MinIO.** This step ran `quay.io/minio/minio`
+      # until 2026-09-28, when that registry — and `docker.io/minio/minio`
+      # with it — stopped answering anonymous pulls (`unauthorized`; quay's
+      # API now demands a login, Hub lists zero tags). main was green on this
+      # step five days earlier with no change here, so it was the registry
+      # that moved. A frozen Bitnami copy would pull, but frozen is the wrong
+      # shape for a dependency that just vanished once. RustFS is an
+      # actively released, Apache-2.0, S3-compatible server that pulls
+      # anonymously today (1.0.0, 2026-09-16), and it serves MinIO's own
+      # health alias, which is what keeps the readiness poll below unchanged.
       #
-      # No `server /data` command: this image's entrypoint runs Bitnami's
-      # `run.sh`, which starts `minio server` on 9000 against its own data
-      # directory. The credentials are the same `MINIO_ROOT_USER` /
-      # `MINIO_ROOT_PASSWORD` the upstream binary reads from its environment,
-      # and `/minio/health/live` is upstream MinIO's, so the readiness poll
-      # and the S3 tests below are unchanged.
-      - name: Start MinIO for documents S3 tests
+      # Pinned to a release tag rather than `latest`: a floating tag is
+      # precisely what disappeared out from under us.
+      #
+      # Credentials are `RUSTFS_ACCESS_KEY` / `RUSTFS_SECRET_KEY` — the only
+      # names its entrypoint reads (the `MINIO_ROOT_*` spelling appears there
+      # in an error message, not as an input). The S3 step below authenticates
+      # with the same pair through `AWS_*`, so it is untouched. Port 9000 and
+      # a data directory under `/data` are the image's defaults.
+      - name: Start RustFS for documents S3 tests
         run: |
-          docker run -d --name skardi-minio \
+          docker run -d --name skardi-rustfs \
             -p 127.0.0.1:9000:9000 \
-            -e MINIO_ROOT_USER=skardiminio \
-            -e MINIO_ROOT_PASSWORD=skardiminio123 \
-            bitnamilegacy/minio:2025.7.23-debian-12-r5
-          # The image has no shell tooling for a container healthcheck, so poll
-          # readiness from the runner (same approach as DynamoDB Local above).
+            -e RUSTFS_ACCESS_KEY=skardiminio \
+            -e RUSTFS_SECRET_KEY=skardiminio123 \
+            rustfs/rustfs:1.0.0
+          # Poll readiness from the runner (same approach as DynamoDB Local
+          # above). `/minio/health/live` is served by RustFS as a public,
+          # unauthenticated alias of its own `/health/live`.
           for i in $(seq 1 30); do
             if curl -fsS http://127.0.0.1:9000/minio/health/live >/dev/null 2>&1; then
-              echo "minio ready after ${i}s"
+              echo "rustfs ready after ${i}s"
               break
             fi
             if [ "$i" = "30" ]; then
-              echo "minio failed to become ready"
-              docker logs skardi-minio
+              echo "rustfs failed to become ready"
+              docker logs skardi-rustfs
               exit 1
             fi
             sleep 1
@@ -706,9 +708,9 @@ jobs:
       # These are `#[ignore]`d and skip themselves unless DOCUMENTS_S3_LIVE=1, so
       # the step above's credentials are what actually arms them. Set at step
       # scope, not job scope: the job-level AWS_* values are the `dummy`
-      # placeholders DynamoDB Local expects, and MinIO rejects a root password
-      # shorter than 8 characters.
-      - name: Execute documents S3 live tests against MinIO
+      # placeholders DynamoDB Local expects, and an S3 server may reject a
+      # root password shorter than 8 characters.
+      - name: Execute documents S3 live tests against RustFS
         env:
           DOCUMENTS_S3_LIVE: "1"
           DOCUMENTS_S3_BUCKET: skardi-ci-documents
@@ -726,15 +728,15 @@ jobs:
           cargo llvm-cov --no-report nextest --all-features \
             -E 'test(/live_s3_/)' --no-tests=fail -- --ignored
 
-      - name: Stop MinIO
+      - name: Stop RustFS
         if: always()
-        run: docker rm -f skardi-minio || true
+        run: docker rm -f skardi-rustfs || true
 
       # Apache AGE gives the graph provider's Postgres path real coverage —
       # the AgeClient/register_graph_source code is exercised ONLY by the
       # graph_age_live suite, which self-skips without this backend (the
       # PR #203 codecov report showed client.rs at 11% for exactly that
-      # reason). Docker-run like MinIO above, but the readiness poll must
+      # reason). Docker-run like RustFS above, but the readiness poll must
       # go over TCP: the postgres entrypoint runs a TEMPORARY
       # unix-socket-only server for initdb, so a socket-side pg_isready
       # can answer "ready" during bootstrap while the real server is
