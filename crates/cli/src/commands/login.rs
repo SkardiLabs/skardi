@@ -13,6 +13,18 @@ use std::path::Path;
 
 /// `--control-plane`'s environment step (§6.1 step 1).
 const CONTROL_PLANE_ENV: &str = "SKARDI_CONTROL_PLANE_URL";
+
+/// The hosted console, and the ONLY compiled-in URL in this binary.
+///
+/// It closes the chain for the brokered flow alone. The direct flow appends
+/// bare `/v1/me/...` and needs skardi-global's own API address, which the
+/// hosted deployment does not expose — global answers only behind the console
+/// at `/api/global/v1/...` — so there is nothing correct to write here for it,
+/// and it keeps failing by name.
+///
+/// The value is prod's `deploy/gitops/envs/prod/origin.yaml`, the one file in
+/// skardi-cloud allowed to name a public host. Change it there first.
+pub(super) const DEFAULT_CONSOLE: &str = "https://console.skardi.ai";
 /// `--server`'s environment step for the gateway URL (§6.2).
 const GATEWAY_URL_ENV: &str = "SKARDI_GATEWAY_URL";
 /// The OAuth client id, so a deployment can pin it once per shell instead of
@@ -143,12 +155,25 @@ fn options_from(
     } else {
         UrlKind::ControlPlane
     };
-    let control_plane = resolve_control_plane(
+    let resolved = resolve_control_plane(
         args.control_plane.clone(),
         std::env::var(CONTROL_PLANE_ENV).ok(),
         file.as_ref(),
         kind,
     )?;
+    // Said BEFORE the browser opens, and only when nothing chose the URL.
+    //
+    // The risk a default introduces is not that it points at prod; it is that
+    // someone on a dev cluster forgets to configure theirs and signs in to prod
+    // without noticing. Configured URLs are the person's own choice and need no
+    // announcement; the default is the one case where the CLI decided for
+    // them, so it says so, names the three ways to override, and does it while
+    // there is still time to Ctrl-C. On stderr, like the cleartext warning, so
+    // a script capturing the report is not disturbed.
+    if resolved.defaulted {
+        eprintln!("{}", default_notice(&resolved.url));
+    }
+    let control_plane = resolved.url;
     let selection = match (&args.workspace, args.all_workspaces) {
         (Some(slug), _) => Selection::Named(slug.clone()),
         (None, true) => Selection::All,
@@ -177,14 +202,20 @@ fn options_from(
     })
 }
 
-/// §6.1 step 1: `--control-plane` > `$SKARDI_CONTROL_PLANE_URL` >
-/// `control-plane:` in the file > hard error.
+/// §6.1 step 1: `--control-plane` > `$SKARDI_CONTROL_PLANE_URL` > the flow's
+/// key in the file > a built-in default for the brokered flow, or a hard error
+/// for the direct one.
 ///
-/// The design's chain ends in a "built-in default"; there is no hosted
-/// skardi-cloud control plane to encode yet, and inventing a hostname that
-/// answers nothing would fail at DNS with no mention of the three real inputs.
-/// So the chain ends the way §6.2's does — a typed error naming them — and a
-/// one-line constant replaces it the day the hosted URL exists.
+/// The design's chain always ended in a built-in default. This comment used to
+/// explain why there was none — no hosted control plane existed, and inventing
+/// a hostname that answered nothing would have failed at DNS with no mention
+/// of the three real inputs — and promised that "a one-line constant replaces
+/// it the day the hosted URL exists". That day is `console.skardi.ai`, and the
+/// constant is [`DEFAULT_CONSOLE`].
+///
+/// Only the brokered flow gets it. The direct flow still ends the way §6.2's
+/// does, a typed error naming the three inputs, because there is no hosted
+/// address for what it calls (see the constant's doc).
 /// Which recorded URL a flow should fall back to.
 ///
 /// Both arrive through `--control-plane`, and they are NOT interchangeable: a
@@ -213,26 +244,53 @@ impl UrlKind {
     }
 }
 
+/// The line printed when the CLI chose the URL. A function, not an inline
+/// format, so its wording is a tested value: it deliberately names the same
+/// three inputs the no-URL error names, and a test that only grepped for those
+/// strings could not tell the notice from the error it replaced.
+pub(super) fn default_notice(url: &str) -> String {
+    format!(
+        "signing in through {url} (the built-in default; pass --control-plane <URL>, set \
+         ${CONTROL_PLANE_ENV}, or add 'console:' to ~/.skardi/config.yaml to use another)"
+    )
+}
+
+/// A resolved URL and whether the CLI chose it.
+///
+/// `defaulted` is carried rather than recomputed by the caller (`url ==
+/// DEFAULT_CONSOLE`) because a person who WRITES the default into their file,
+/// or passes it as a flag, has configured it — and the notice exists to flag
+/// the one case where nobody did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Resolved {
+    pub url: String,
+    pub defaulted: bool,
+}
+
 fn resolve_control_plane(
     flag: Option<String>,
     env: Option<String>,
     file: Option<&ContextsFile>,
     kind: UrlKind,
-) -> Result<String> {
+) -> Result<Resolved> {
     let from_file = file.and_then(|f| match kind {
         UrlKind::Console => f.console.clone(),
         UrlKind::ControlPlane => f.control_plane.clone(),
     });
-    let resolved = [flag, env, from_file]
+    let configured = [flag, env, from_file]
         .into_iter()
         .flatten()
         .map(|url| url.trim().to_string())
         .find(|url| !url.is_empty());
-    let Some(url) = resolved else {
-        let key = kind.file_key();
-        bail!(
-            "no control plane configured: pass --control-plane <URL>, set ${CONTROL_PLANE_ENV}, or add '{key}' to ~/.skardi/config.yaml"
-        )
+    let (url, defaulted) = match (configured, kind) {
+        (Some(url), _) => (url, false),
+        (None, UrlKind::Console) => (DEFAULT_CONSOLE.to_string(), true),
+        (None, UrlKind::ControlPlane) => {
+            let key = kind.file_key();
+            bail!(
+                "no control plane configured: pass --control-plane <URL>, set ${CONTROL_PLANE_ENV}, or add '{key}' to ~/.skardi/config.yaml"
+            )
+        }
     };
     // This is the leg carrying the most sensitive traffic in the flow — the ID
     // token goes up on every call and `POST /v1/me/tokens` returns the RAW PAT
@@ -247,7 +305,7 @@ fn resolve_control_plane(
             "warning: {url} is plain http to a non-loopback host — the sign-in assertion and the minted credential would cross the network in the clear; prefer an https:// control plane"
         );
     }
-    Ok(url)
+    Ok(Resolved { url, defaulted })
 }
 
 /// The control plane `logout --revoke` should talk to, resolved by the same
@@ -265,6 +323,7 @@ pub(super) fn control_plane_for_revoke(
         // directly, which a console does not serve.
         UrlKind::ControlPlane,
     )
+    .map(|resolved| resolved.url)
 }
 
 /// Print what the run did.
@@ -324,7 +383,10 @@ fn render_report(report: &LoginReport) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{LoginArgs, UrlKind, options_from, render_report, resolve_control_plane};
+    use super::{
+        DEFAULT_CONSOLE, LoginArgs, UrlKind, default_notice, options_from, render_report,
+        resolve_control_plane,
+    };
     use crate::config::ContextsFile;
     use crate::login::{LoginReport, Selection, WrittenContext};
     use chrono::Duration;
@@ -491,7 +553,8 @@ mod tests {
                 Some(&file),
                 UrlKind::ControlPlane,
             )
-            .unwrap(),
+            .unwrap()
+            .url,
             "https://flag.example"
         );
         assert_eq!(
@@ -501,11 +564,14 @@ mod tests {
                 Some(&file),
                 UrlKind::ControlPlane,
             )
-            .unwrap(),
+            .unwrap()
+            .url,
             "https://env.example"
         );
         assert_eq!(
-            resolve_control_plane(None, None, Some(&file), UrlKind::ControlPlane).unwrap(),
+            resolve_control_plane(None, None, Some(&file), UrlKind::ControlPlane)
+                .unwrap()
+                .url,
             "https://file.example"
         );
     }
@@ -522,7 +588,8 @@ mod tests {
                 Some(&file),
                 UrlKind::ControlPlane,
             )
-            .unwrap(),
+            .unwrap()
+            .url,
             "https://file.example"
         );
     }
@@ -555,7 +622,9 @@ mod tests {
             ..ContextsFile::default()
         };
         assert_eq!(
-            resolve_control_plane(None, None, Some(&file), kind).unwrap(),
+            resolve_control_plane(None, None, Some(&file), kind)
+                .unwrap()
+                .url,
             expected
         );
     }
@@ -576,19 +645,84 @@ mod tests {
         assert!(err.contains("control-plane:"), "{err}");
         // And the reverse: the brokered flow is configured by it.
         assert_eq!(
-            resolve_control_plane(None, None, Some(&file), UrlKind::Console).unwrap(),
+            resolve_control_plane(None, None, Some(&file), UrlKind::Console)
+                .unwrap()
+                .url,
             "https://console.example"
         );
     }
 
-    /// The error names the key the flow actually reads, so a reader is not
-    /// told to add `control-plane:` when the brokered flow wants `console:`.
+    /// **With nothing configured, the brokered flow goes to the hosted
+    /// console — and says that it decided.** This is the one built-in URL in
+    /// the binary, and the notice hangs off `defaulted`, so both halves are
+    /// pinned: the value, and the fact that the caller can tell.
     #[test]
-    fn the_missing_url_error_names_the_key_for_that_flow() {
-        let err = resolve_control_plane(None, None, None, UrlKind::Console)
+    fn the_brokered_flow_defaults_to_the_hosted_console() {
+        let resolved = resolve_control_plane(None, None, None, UrlKind::Console).unwrap();
+        assert_eq!(resolved.url, DEFAULT_CONSOLE);
+        assert!(resolved.defaulted);
+        // A file with no `console:` key is the same as no file.
+        let resolved =
+            resolve_control_plane(None, None, Some(&file_with(None)), UrlKind::Console).unwrap();
+        assert_eq!(resolved.url, DEFAULT_CONSOLE);
+        assert!(resolved.defaulted);
+    }
+
+    /// The default is the LAST step, never a tie-break: anything configured
+    /// wins and is reported as configured — including someone who wrote the
+    /// default's own value into their file, which is a choice, not a default.
+    #[rstest]
+    #[case::flag(Some("https://flag.example"), None, None, "https://flag.example")]
+    #[case::env(None, Some("https://env.example"), None, "https://env.example")]
+    #[case::file(None, None, Some("https://console.example"), "https://console.example")]
+    #[case::the_default_written_by_hand(None, None, Some(DEFAULT_CONSOLE), DEFAULT_CONSOLE)]
+    fn a_configured_console_beats_the_default_and_is_not_reported_as_one(
+        #[case] flag: Option<&str>,
+        #[case] env: Option<&str>,
+        #[case] file_console: Option<&str>,
+        #[case] expected: &str,
+    ) {
+        let file = ContextsFile {
+            console: file_console.map(str::to_string),
+            ..ContextsFile::default()
+        };
+        let resolved = resolve_control_plane(
+            flag.map(str::to_string),
+            env.map(str::to_string),
+            Some(&file),
+            UrlKind::Console,
+        )
+        .unwrap();
+        assert_eq!(resolved.url, expected);
+        assert!(!resolved.defaulted);
+    }
+
+    /// The notice says it is a default and names every way to override it. It
+    /// shares the three input names with the no-URL error on purpose — they
+    /// are the same three inputs — which is exactly why it also has to carry a
+    /// word the error does not, so the two cannot be mistaken for each other by
+    /// an assertion that only looks for the inputs.
+    #[test]
+    fn the_default_notice_says_it_is_one_and_names_every_override() {
+        let notice = default_notice(DEFAULT_CONSOLE);
+        assert!(notice.contains(DEFAULT_CONSOLE), "{notice}");
+        assert!(notice.contains("built-in default"), "{notice}");
+        assert!(notice.contains("--control-plane"), "{notice}");
+        assert!(notice.contains("SKARDI_CONTROL_PLANE_URL"), "{notice}");
+        assert!(notice.contains("console:"), "{notice}");
+        // And it is not the error: no "no control plane configured".
+        assert!(!notice.contains("no control plane configured"), "{notice}");
+    }
+
+    /// The direct flow has NO default — there is no hosted address for what it
+    /// calls — so it still fails by name, and the message names the direct
+    /// flow's key rather than the brokered one's.
+    #[test]
+    fn the_direct_flow_still_has_no_default_and_names_its_own_key() {
+        let err = resolve_control_plane(None, None, None, UrlKind::ControlPlane)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("console:"), "{err}");
-        assert!(!err.contains("control-plane:"), "{err}");
+        assert!(err.contains("control-plane:"), "{err}");
+        assert!(!err.contains("console:"), "{err}");
     }
 }

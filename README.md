@@ -243,8 +243,12 @@ authenticates you in a browser and you approve one workspace, so there is no
 OAuth client to provision per deployment:
 
 ```bash
-skardi login --control-plane https://your-console.example.com
+skardi login
 ```
+
+That goes to the hosted console, `https://console.skardi.ai`. A self-hosted
+deployment names its own with `--control-plane https://your-console.example.com`
+(or `$SKARDI_CONTROL_PLANE_URL`, or `console:` in `~/.skardi/config.yaml`).
 
 It writes a workspace-scoped token into `~/.skardi/config.yaml`. `--no-browser`
 prints the approval URL instead of opening one, which is how a headless or
