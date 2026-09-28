@@ -171,11 +171,7 @@ fn options_from(
     // there is still time to Ctrl-C. On stderr, like the cleartext warning, so
     // a script capturing the report is not disturbed.
     if resolved.defaulted {
-        eprintln!(
-            "signing in through {} (the built-in default; pass --control-plane <URL>, set \
-             ${CONTROL_PLANE_ENV}, or add 'console:' to ~/.skardi/config.yaml to use another)",
-            resolved.url
-        );
+        eprintln!("{}", default_notice(&resolved.url));
     }
     let control_plane = resolved.url;
     let selection = match (&args.workspace, args.all_workspaces) {
@@ -246,6 +242,17 @@ impl UrlKind {
             UrlKind::ControlPlane => "control-plane:",
         }
     }
+}
+
+/// The line printed when the CLI chose the URL. A function, not an inline
+/// format, so its wording is a tested value: it deliberately names the same
+/// three inputs the no-URL error names, and a test that only grepped for those
+/// strings could not tell the notice from the error it replaced.
+pub(super) fn default_notice(url: &str) -> String {
+    format!(
+        "signing in through {url} (the built-in default; pass --control-plane <URL>, set \
+         ${CONTROL_PLANE_ENV}, or add 'console:' to ~/.skardi/config.yaml to use another)"
+    )
 }
 
 /// A resolved URL and whether the CLI chose it.
@@ -377,7 +384,8 @@ fn render_report(report: &LoginReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_CONSOLE, LoginArgs, UrlKind, options_from, render_report, resolve_control_plane,
+        DEFAULT_CONSOLE, LoginArgs, UrlKind, default_notice, options_from, render_report,
+        resolve_control_plane,
     };
     use crate::config::ContextsFile;
     use crate::login::{LoginReport, Selection, WrittenContext};
@@ -687,6 +695,23 @@ mod tests {
         .unwrap();
         assert_eq!(resolved.url, expected);
         assert!(!resolved.defaulted);
+    }
+
+    /// The notice says it is a default and names every way to override it. It
+    /// shares the three input names with the no-URL error on purpose — they
+    /// are the same three inputs — which is exactly why it also has to carry a
+    /// word the error does not, so the two cannot be mistaken for each other by
+    /// an assertion that only looks for the inputs.
+    #[test]
+    fn the_default_notice_says_it_is_one_and_names_every_override() {
+        let notice = default_notice(DEFAULT_CONSOLE);
+        assert!(notice.contains(DEFAULT_CONSOLE), "{notice}");
+        assert!(notice.contains("built-in default"), "{notice}");
+        assert!(notice.contains("--control-plane"), "{notice}");
+        assert!(notice.contains("SKARDI_CONTROL_PLANE_URL"), "{notice}");
+        assert!(notice.contains("console:"), "{notice}");
+        // And it is not the error: no "no control plane configured".
+        assert!(!notice.contains("no control plane configured"), "{notice}");
     }
 
     /// The direct flow has NO default — there is no hosted address for what it

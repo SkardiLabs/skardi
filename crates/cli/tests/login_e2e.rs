@@ -15,6 +15,14 @@ use tempfile::TempDir;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+/// **A bare `skardi login` now reaches the hosted console.** Since the
+/// brokered flow gained a built-in default, running `login` with no
+/// `--control-plane`, no `SKARDI_CONTROL_PLANE_URL` and no `console:` in the
+/// file dials `console.skardi.ai`, opens a request there, and polls it for
+/// five minutes. A test that does that is not a test — it is a stalled CI job
+/// leaving a pending login request on production. Every `login` invocation in
+/// this file therefore either passes `--control-plane`, seeds `console:` in
+/// the temp home, or fails before resolution (`--token`, `--client-id`).
 fn skardi(home: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_skardi"))
         .env("HOME", home)
@@ -222,24 +230,57 @@ fn a_cleartext_control_plane_is_warned_about_before_anything_is_sent() {
     }
 }
 
-/// With no `--control-plane`, no environment, and nothing recorded in the
-/// file, the failure names all three rather than dialing a guess — and it
-/// names the file key belonging to the flow that ran.
+/// **A recorded `console:` beats the built-in default, and the default's
+/// notice stays quiet when it did not choose.**
 ///
-/// Bare `skardi login` is the console-brokered flow, so the key is `console:`.
-/// That is not cosmetic: a console and the control-plane API are different
-/// services with different path layouts, so telling a brokered user to add
-/// `control-plane:` would configure the flow they are not using.
-#[test]
-fn no_control_plane_anywhere_names_the_three_inputs() {
+/// This is the hermetic half of the default. The other half — that with
+/// nothing recorded the brokered flow goes to `console.skardi.ai` and says so
+/// — is pinned at the unit level (`the_brokered_flow_defaults_to_the_hosted_
+/// console`, `the_default_notice_says_it_is_one_and_names_every_override`)
+/// and deliberately NOT here: an end-to-end run of that case has to dial the
+/// hosted service, and this test's predecessor did exactly that once the
+/// default existed — it opened a real login request on production and polled
+/// it until nextest gave up.
+///
+/// What CAN be proved end to end without leaving the machine is the property
+/// that makes the default safe: precedence. A bare `login` with `console:` in
+/// the file goes to that console and nowhere else, and it prints no notice
+/// about a default, because none was used.
+#[tokio::test]
+async fn a_recorded_console_is_dialed_and_the_default_stays_silent() {
+    let console = MockServer::start().await;
+    // Answer the open with an error, so the run ends at the first round trip
+    // — proving where it went is the point, not what happens after.
+    Mock::given(method("POST"))
+        .and(path("/api/global/v1/cli-login/requests"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(1)
+        .mount(&console)
+        .await;
     let home = TempDir::new().unwrap();
-    let output = skardi(home.path(), &["login"]);
+    std::fs::create_dir_all(home.path().join(".skardi")).unwrap();
+    std::fs::write(
+        config_path(home.path()),
+        format!("console: {}\n", console.uri()),
+    )
+    .unwrap();
 
-    assert_eq!(output.status.code(), Some(1));
+    let output = tokio::task::spawn_blocking({
+        let home = home.path().to_path_buf();
+        move || skardi(&home, &["login", "--no-browser"])
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "{}", err(&output));
     let stderr = err(&output);
-    assert!(stderr.contains("--control-plane"), "{stderr}");
-    assert!(stderr.contains("SKARDI_CONTROL_PLANE_URL"), "{stderr}");
-    assert!(stderr.contains("console:"), "{stderr}");
+    // Not the default, and not announced as one.
+    assert!(!stderr.contains("built-in default"), "{stderr}");
+    assert!(!stderr.contains("console.skardi.ai"), "{stderr}");
+    // The mock's `expect(1)` is the positive half: the request reached the
+    // recorded console. Checked explicitly so the failure names the property.
+    let received = console.received_requests().await.unwrap();
+    assert_eq!(received.len(), 1, "the recorded console was dialed once");
 }
 
 /// The direct-OAuth flow names `control-plane:`, the key IT reads.
