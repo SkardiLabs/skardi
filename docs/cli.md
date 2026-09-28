@@ -186,11 +186,24 @@ Google **Desktop** OAuth client provisioned per deployment before anyone can
 log in at all. Here the CLI speaks to no identity provider, learns nothing
 about which one you used, and needs no client id.
 
-Only one input has no built-in default, and it fails by name rather than
-guessing: the URL (`--control-plane` > `$SKARDI_CONTROL_PLANE_URL` > the
-config file). For the brokered path that is the **console's** URL — the same
-address you open in a browser — because that is what serves the approval page.
-Once a `login` succeeds it is recorded and later runs need no flag.
+The URL resolves as `--control-plane` > `$SKARDI_CONTROL_PLANE_URL` > the
+config file > **`https://console.skardi.ai`**, the hosted console. So against
+skardi-cloud a bare `skardi login` works with nothing configured. For the
+brokered path the URL is the **console's** — the same address you open in a
+browser — because that is what serves the approval page. Once a `login`
+succeeds it is recorded and later runs need no flag.
+
+When the default is what chose the URL, the CLI says so on stderr before the
+browser opens — `signing in through https://console.skardi.ai (the built-in
+default; …)` — naming the three ways to point it elsewhere. That line is the
+guard against the one real risk of a default: someone on a development
+cluster who forgot to configure theirs and would otherwise sign in to
+production without noticing.
+
+**The direct-OAuth path has no default** and fails by name instead. It calls
+skardi-global's API directly (`/v1/me/...`), which the hosted deployment
+does not expose — global answers only behind the console — so there is no
+hosted address to build in.
 
 **The two paths record it under different keys**, and that matters if you mix
 them:
