@@ -178,6 +178,20 @@ scratch.
 
 ## Install
 
+**One line** installs the CLI, then offers to set up the Claude Code, Codex
+and Cursor it finds on your machine: the skills below in each agent's skills
+directory, and Skardi's MCP server in each agent's config (Skardi Cloud by
+URL, with sign-in in the browser; or a local `skardi-server` through
+`skardi mcp`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/SkardiLabs/skardi/main/install.sh | bash
+```
+
+Run it as yourself, not with `sudo`. Add `--agents-only` to update the skills
+or set up an agent you installed later, and `--help` for the rest. The
+sections below are the same steps by hand.
+
 Four skills. [`auto-context`](https://github.com/SkardiLabs/skardi-skills/tree/main/skills/auto-context)
 turns a folder of documents — or a datastore you already run — into governed,
 searchable context served over HTTP by `skardi-server`: hybrid search (vector +
