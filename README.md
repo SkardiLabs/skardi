@@ -178,23 +178,26 @@ scratch.
 
 ## Install
 
-Two skills. [`auto-context`](https://github.com/SkardiLabs/skardi-skills/tree/main/auto-context)
+Four skills. [`auto-context`](https://github.com/SkardiLabs/skardi-skills/tree/main/skills/auto-context)
 turns a folder of documents — or a datastore you already run — into governed,
 searchable context served over HTTP by `skardi-server`: hybrid search (vector +
 FTS + RRF), defaulting to a local SQLite file the skill creates and owns, or
 pointed at Postgres + pgvector, MongoDB, or Lance.
-[`retrieval`](https://github.com/SkardiLabs/skardi-skills/tree/main/retrieval)
+[`retrieval`](https://github.com/SkardiLabs/skardi-skills/tree/main/skills/retrieval)
 teaches the agent to answer questions from a `skardi-server` you already run.
+[`graph-source`](https://github.com/SkardiLabs/skardi-skills/tree/main/skills/graph-source)
+connects a property graph and queries it through SQL, and
+[`graph-rag`](https://github.com/SkardiLabs/skardi-skills/tree/main/skills/graph-rag)
+answers questions whose evidence is in graph relationships.
 
-Both run on every [Agent Skills](https://agentskills.io/) host below. They
+All four run on every [Agent Skills](https://agentskills.io/) host below. They
 differ only in where the skill directory goes.
 
 **Claude Code** installs from the marketplace:
 
 ```text
 /plugin marketplace add SkardiLabs/skardi-skills
-/plugin install auto-context@skardi-skills
-/plugin install retrieval@skardi-skills
+/plugin install skardi@skardi-skills
 ```
 
 Every other host installs from a checkout:
@@ -208,8 +211,10 @@ git clone https://github.com/SkardiLabs/skardi-skills.git && cd skardi-skills
 
 ```bash
 mkdir -p ~/.agents/skills
-cp -r auto-context/skills/auto-context ~/.agents/skills/auto-context
-cp -r retrieval/skills/retrieval ~/.agents/skills/retrieval
+cp -r skills/auto-context ~/.agents/skills/auto-context
+cp -r skills/retrieval ~/.agents/skills/retrieval
+cp -r skills/graph-source ~/.agents/skills/graph-source
+cp -r skills/graph-rag ~/.agents/skills/graph-rag
 ```
 
 **[OpenClaw](https://docs.openclaw.ai/cli/skills)** installs through its own CLI
@@ -217,8 +222,8 @@ instead of copying, and **[Hermes](https://hermes-agent.nousresearch.com/docs/us
 reads `~/.hermes/skills/`:
 
 ```bash
-openclaw skills install ./auto-context/skills/auto-context   # add --global for every workspace
-mkdir -p ~/.hermes/skills && cp -r auto-context/skills/auto-context ~/.hermes/skills/auto-context
+openclaw skills install ./skills/auto-context   # add --global for every workspace
+mkdir -p ~/.hermes/skills && cp -r skills/auto-context ~/.hermes/skills/auto-context
 ```
 
 Per-host native directories, project-scoped installs and the Hermes
