@@ -11,14 +11,16 @@
 //!     cargo test -p skardi --test documents_s3_live \
 //!       --features documents,llm-extract -- --ignored
 //!
-//! Against MinIO (no AWS account needed):
-//!   docker run -d -p 127.0.0.1:9000:9000 -e MINIO_ROOT_USER=minioadmin \
-//!     -e MINIO_ROOT_PASSWORD=minioadmin quay.io/minio/minio server /data
+//! Against RustFS (no AWS account needed — the same S3-compatible server CI
+//! uses; MinIO's public images stopped answering anonymous pulls on
+//! 2026-09-28, so the old `quay.io/minio/minio` recipe no longer works):
+//!   docker run -d -p 127.0.0.1:9000:9000 -e RUSTFS_ACCESS_KEY=rustfsadmin \
+//!     -e RUSTFS_SECRET_KEY=rustfsadmin rustfs/rustfs:1.0.0
 //!   aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://skardi-test
 //!   DOCUMENTS_S3_LIVE=1 DOCUMENTS_S3_BUCKET=skardi-test \
 //!     AWS_ENDPOINT=http://127.0.0.1:9000 AWS_ALLOW_HTTP=true \
-//!     AWS_REGION=us-east-1 AWS_ACCESS_KEY_ID=minioadmin \
-//!     AWS_SECRET_ACCESS_KEY=minioadmin \
+//!     AWS_REGION=us-east-1 AWS_ACCESS_KEY_ID=rustfsadmin \
+//!     AWS_SECRET_ACCESS_KEY=rustfsadmin \
 //!     cargo test -p skardi --test documents_s3_live \
 //!       --features documents,llm-extract -- --ignored
 //!
