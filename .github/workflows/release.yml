@@ -283,18 +283,15 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # One multi-package publish rather than a command per crate: cargo orders
-      # skardi-source-pack before skardi (which depends on it), waits for each
-      # upload to land in the index, and in dry-run mode verifies skardi against
-      # the locally packaged skardi-source-pack instead of failing on a version
-      # crates.io does not have yet.
+      # Publishes skardi-source-pack and skardi in one cargo invocation, skipping
+      # any whose version is already on crates.io so a re-run after a partial
+      # publish finishes the job instead of failing on the uploaded crate.
       - name: Publish skardi-source-pack and skardi
-        run: cargo publish -p skardi-source-pack -p skardi ${{ inputs.dry_run && '--dry-run' || '' }}
+        run: ./scripts/publish_crates.sh ${{ inputs.dry_run && '--dry-run' || '' }}
 
       # skardi-sources is not published yet: it depends on lance via git which crates.io disallows.
       # Once lance v4 is stable on crates.io, replace the git deps in Cargo.toml, add it to
-      # the skardi facade crate, and publish with:
-      #   cargo publish -p skardi-sources  (before cargo publish -p skardi)
+      # the skardi facade crate, and add it to CRATES in scripts/publish_crates.sh.
 
   release:
     name: "Create Release (${{ inputs.version }})"

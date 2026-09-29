@@ -40,6 +40,25 @@ jobs:
         # tarball: no network, no real agent config.
         run: bash scripts/install_test.sh
 
+  release-scripts:
+    name: Release scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        # Version comes from rust-toolchain.toml.
+        run: rustup toolchain install
+      - name: Test the version bump and publish scripts
+        # Offline: runs the bump against a copy of Cargo.toml and the publish
+        # plan against a fake index, and checks every path dependency of a
+        # published crate is itself published.
+        run: ./scripts/release_scripts_test.sh
+      - name: The published crates package
+        # The v0.6.0 release failed here, at crates.io publish time, on a path
+        # dependency with no version. Packaging without verification is the
+        # same manifest check in seconds, without building.
+        run: cargo package -p skardi-source-pack -p skardi --no-verify
+
   docs:
     name: Docs
     runs-on: ubuntu-latest
