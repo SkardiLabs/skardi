@@ -25,7 +25,7 @@ tables:
   messages:
     action: outlook.list_messages
     row_path: "$.messages"
-    fingerprint: ff5dea4c5da1a4b7d5ebf8099bdae8434ed06fe4cbf0018781f6b9d61c403453
+    fingerprint: 6e6b5f0aa7bde985e32491aaa497ee9b3db16903f1f78d8f49c32e3604a0740f
     pagination:
       strategy: cursor
       cursor_input: nextLink
