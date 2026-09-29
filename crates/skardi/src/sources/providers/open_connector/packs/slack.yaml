@@ -10,7 +10,7 @@ tables:
   conversations:
     action: slack.list_conversations
     row_path: "$.conversations"
-    fingerprint: 2d4e5cee7cf87f146ab7848849f97a559ba44ff09350295e0dc50b75abf0ef84
+    fingerprint: fa7645ece26b7d8eb6c27ea88910c5bbb0e43e658f2b7cc0741c1a1543784de6
     pagination:
       strategy: cursor
       page_size_input: limit
@@ -40,7 +40,7 @@ tables:
     # not an oomol-lab release.
     action: slack.get_channel_messages
     row_path: "$.messages"
-    fingerprint: 979c92a8816ee0f1fcb8c9ca62aee4028ebbe5b09222e8cb7ce4d7f4021d395b
+    fingerprint: 7517225db41711140265f8cced59029ab52a7e8ec646582dba9d828dbc61b6c4
     pagination:
       strategy: cursor
       page_size_input: limit
@@ -113,7 +113,7 @@ tables:
   users:
     action: slack.list_users
     row_path: "$.users"
-    fingerprint: 77f3f0f41d30b9095875b1c02d5f93f31b948f4a666fdfc820192348e5e1b18f
+    fingerprint: 34d454ad37095702f6cbd0a41289c528b67a45f5f2c25991839773fa616ae5a5
     pagination:
       strategy: cursor
       page_size_input: limit

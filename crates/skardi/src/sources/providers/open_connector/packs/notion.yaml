@@ -134,7 +134,7 @@ tables:
     action: notion.retrieve_page_markdown
     row_path: "$"
     row_shape: object
-    fingerprint: 72d26f8371b5fc3ab164070018cb10c03e13e552095a06f848022484cc3a3081
+    fingerprint: b752c00966de4840efe994c6d05770d1d62911eebd6a4f18350adc00435bd2e7
     pagination:
       strategy: single_page
     resources:

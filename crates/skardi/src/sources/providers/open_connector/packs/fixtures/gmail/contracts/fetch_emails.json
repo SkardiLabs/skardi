@@ -41,6 +41,22 @@
               "messageTimestamp": {
                 "type": "string",
                 "description": "Message timestamp."
+              },
+              "historyId": {
+                "type": "string",
+                "description": "Gmail history ID when the resource carries one."
+              },
+              "internalDate": {
+                "type": "string",
+                "description": "Gmail internal date as epoch milliseconds when present."
+              },
+              "sizeEstimate": {
+                "type": "integer",
+                "description": "Estimated message size in bytes when present."
+              },
+              "snippet": {
+                "type": "string",
+                "description": "Gmail snippet when present."
               }
             },
             "additionalProperties": true,
@@ -91,6 +107,22 @@
               "messageTimestamp": {
                 "type": "string",
                 "description": "Message timestamp."
+              },
+              "historyId": {
+                "type": "string",
+                "description": "Gmail history ID when the resource carries one."
+              },
+              "internalDate": {
+                "type": "string",
+                "description": "Gmail internal date as epoch milliseconds when present."
+              },
+              "sizeEstimate": {
+                "type": "integer",
+                "description": "Estimated message size in bytes when present."
+              },
+              "snippet": {
+                "type": "string",
+                "description": "Gmail snippet when present."
               },
               "preview": {
                 "type": "object",
