@@ -70,6 +70,11 @@ jobs:
 
           # Replace the version line in the workspace Cargo.toml
           sed -i "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
+          # skardi depends on skardi-source-pack by exact version (both are published
+          # to crates.io), so its pin in [workspace.dependencies] moves with it.
+          sed -i -E "s/^(skardi-source-pack = \{.*version = \"=)[^\"]*\"/\1${VERSION}\"/" Cargo.toml
+          grep -q "^skardi-source-pack = .*version = \"=${VERSION}\"" Cargo.toml \
+            || { echo "::error::failed to bump the skardi-source-pack pin in Cargo.toml"; exit 1; }
           cargo update -p skardi --precise "${VERSION}"
 
           git add Cargo.toml Cargo.lock

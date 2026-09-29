@@ -283,8 +283,13 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Publish skardi
-        run: cargo publish -p skardi ${{ inputs.dry_run && '--dry-run' || '' }}
+      # One multi-package publish rather than a command per crate: cargo orders
+      # skardi-source-pack before skardi (which depends on it), waits for each
+      # upload to land in the index, and in dry-run mode verifies skardi against
+      # the locally packaged skardi-source-pack instead of failing on a version
+      # crates.io does not have yet.
+      - name: Publish skardi-source-pack and skardi
+        run: cargo publish -p skardi-source-pack -p skardi ${{ inputs.dry_run && '--dry-run' || '' }}
 
       # skardi-sources is not published yet: it depends on lance via git which crates.io disallows.
       # Once lance v4 is stable on crates.io, replace the git deps in Cargo.toml, add it to
