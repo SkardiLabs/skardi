@@ -1,5 +1,5 @@
 [workspace.package]
-version = "0.6.0"
+version = "0.6.0-rc.2"
 edition = "2024"
 description = "High performance query engine for both offline compute and online serving"
 authors = ["btnokami"]
@@ -23,7 +23,7 @@ resolver = "2"
 # lockstep. scripts/bump_version.sh rewrites this pin together with
 # `workspace.package.version` above and fails if it cannot, so keep it on one
 # line in this shape.
-skardi-source-pack = { path = "crates/source-pack", version = "=0.6.0" }
+skardi-source-pack = { path = "crates/source-pack", version = "=0.6.0-rc.2" }
 better-auth = { version = "0.9.0", default-features = false }
 better-auth-diesel-sqlite = { version = "=0.1.2" }
 anyhow = "1.0.98"
