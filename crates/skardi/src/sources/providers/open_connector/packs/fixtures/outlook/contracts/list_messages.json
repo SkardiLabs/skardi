@@ -107,12 +107,24 @@
           "type": "null"
         }
       ]
+    },
+    "deltaLink": {
+      "anyOf": [
+        {
+          "type": "string",
+          "description": "Delta URL for the next round of changes once a delta round is complete, or null (always null for plain listings)."
+        },
+        {
+          "type": "null"
+        }
+      ]
     }
   },
   "additionalProperties": false,
   "required": [
     "messages",
-    "nextLink"
+    "nextLink",
+    "deltaLink"
   ],
   "description": "Outlook message list response."
 }

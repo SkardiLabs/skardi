@@ -50,6 +50,10 @@
             "type": "string",
             "description": "The timestamp of the most recent edit, when the message was edited."
           },
+          "editedUserId": {
+            "type": "string",
+            "description": "The user ID of the most recent editor, when the message was edited."
+          },
           "threadTs": {
             "type": "string",
             "description": "The timestamp of the thread parent. Equal to ts on a thread parent, and absent on a message that is not in a thread."
@@ -65,6 +69,14 @@
           "replyUsersCount": {
             "type": "integer",
             "description": "The number of distinct users who replied to this thread parent."
+          },
+          "replyUserIds": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "description": "A Slack user ID."
+            },
+            "description": "Up to five user IDs of people who replied to this thread parent. Slack caps this list; use replyUsersCount for the total."
           },
           "latestReply": {
             "type": "string",
@@ -100,6 +112,11 @@
               "description": "A reaction summary on a Slack message."
             },
             "description": "Reaction summaries attached to the message."
+          },
+          "raw": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "The untouched Slack record, exactly as the Slack API returned it. Present only when includeRaw is true."
           }
         },
         "additionalProperties": true,

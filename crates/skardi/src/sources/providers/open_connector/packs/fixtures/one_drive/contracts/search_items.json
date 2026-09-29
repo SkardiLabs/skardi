@@ -57,6 +57,14 @@
                   "displayName": {
                     "type": "string",
                     "description": "Display name for the identity."
+                  },
+                  "email": {
+                    "type": "string",
+                    "description": "Email address for the identity, when Graph supplies one."
+                  },
+                  "loginName": {
+                    "type": "string",
+                    "description": "SharePoint claims login name for the identity, when Graph supplies one."
                   }
                 },
                 "additionalProperties": true,
@@ -72,6 +80,14 @@
                   "displayName": {
                     "type": "string",
                     "description": "Display name for the identity."
+                  },
+                  "email": {
+                    "type": "string",
+                    "description": "Email address for the identity, when Graph supplies one."
+                  },
+                  "loginName": {
+                    "type": "string",
+                    "description": "SharePoint claims login name for the identity, when Graph supplies one."
                   }
                 },
                 "additionalProperties": true,
@@ -87,6 +103,14 @@
                   "displayName": {
                     "type": "string",
                     "description": "Display name for the identity."
+                  },
+                  "email": {
+                    "type": "string",
+                    "description": "Email address for the identity, when Graph supplies one."
+                  },
+                  "loginName": {
+                    "type": "string",
+                    "description": "SharePoint claims login name for the identity, when Graph supplies one."
                   }
                 },
                 "additionalProperties": true,
@@ -109,6 +133,14 @@
                   "displayName": {
                     "type": "string",
                     "description": "Display name for the identity."
+                  },
+                  "email": {
+                    "type": "string",
+                    "description": "Email address for the identity, when Graph supplies one."
+                  },
+                  "loginName": {
+                    "type": "string",
+                    "description": "SharePoint claims login name for the identity, when Graph supplies one."
                   }
                 },
                 "additionalProperties": true,
@@ -124,6 +156,14 @@
                   "displayName": {
                     "type": "string",
                     "description": "Display name for the identity."
+                  },
+                  "email": {
+                    "type": "string",
+                    "description": "Email address for the identity, when Graph supplies one."
+                  },
+                  "loginName": {
+                    "type": "string",
+                    "description": "SharePoint claims login name for the identity, when Graph supplies one."
                   }
                 },
                 "additionalProperties": true,
@@ -139,6 +179,14 @@
                   "displayName": {
                     "type": "string",
                     "description": "Display name for the identity."
+                  },
+                  "email": {
+                    "type": "string",
+                    "description": "Email address for the identity, when Graph supplies one."
+                  },
+                  "loginName": {
+                    "type": "string",
+                    "description": "SharePoint claims login name for the identity, when Graph supplies one."
                   }
                 },
                 "additionalProperties": true,
@@ -174,6 +222,15 @@
               "siteId": {
                 "type": "string",
                 "description": "Site ID of the referenced item."
+              },
+              "shareId": {
+                "type": "string",
+                "description": "Sharing ID of the referenced item, when Graph supplies one."
+              },
+              "sharepointIds": {
+                "type": "object",
+                "additionalProperties": true,
+                "description": "A generic JSON object returned by Microsoft Graph."
               }
             },
             "additionalProperties": true,

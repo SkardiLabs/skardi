@@ -62,7 +62,7 @@ tables:
   drive_items:
     action: one_drive.list_folder_children
     row_path: "$.items"
-    fingerprint: 6fc6a6b319766064e084865122b06db8e5562b35193ae9dadc4d64b8f9ac207b
+    fingerprint: f5fc70edf18628e9057b27e05996ff8a484ef2701d62307f9360a54e068a191c
     pagination:
       strategy: cursor
       cursor_input: nextLink
@@ -178,7 +178,7 @@ tables:
     row_path: "$.items"
     # Identical to drive_items' pin by construction — same declared
     # output schema upstream (see the module header).
-    fingerprint: 6fc6a6b319766064e084865122b06db8e5562b35193ae9dadc4d64b8f9ac207b
+    fingerprint: f5fc70edf18628e9057b27e05996ff8a484ef2701d62307f9360a54e068a191c
     pagination:
       strategy: cursor
       cursor_input: nextLink

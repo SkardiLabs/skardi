@@ -90,6 +90,38 @@
           "locale": {
             "type": "string",
             "description": "The locale returned by Slack when requested."
+          },
+          "email": {
+            "type": "string",
+            "description": "The profile email. Slack returns it only when the token holds the users:read.email scope."
+          },
+          "tz": {
+            "type": "string",
+            "description": "The user's time zone identifier when Slack provides it."
+          },
+          "tzOffset": {
+            "type": "integer",
+            "description": "The user's UTC offset in seconds when Slack provides it."
+          },
+          "updated": {
+            "type": "integer",
+            "description": "When the user object was last updated, as a Unix timestamp in seconds."
+          },
+          "teamId": {
+            "type": "string",
+            "description": "The user's team ID when Slack provides it."
+          },
+          "isRestricted": {
+            "type": "boolean",
+            "description": "Whether the user is a guest. Single-channel guests also set isUltraRestricted."
+          },
+          "isUltraRestricted": {
+            "type": "boolean",
+            "description": "Whether the user is a single-channel guest."
+          },
+          "isAppUser": {
+            "type": "boolean",
+            "description": "Whether the user is an authorized user of the calling app."
           }
         },
         "additionalProperties": false,

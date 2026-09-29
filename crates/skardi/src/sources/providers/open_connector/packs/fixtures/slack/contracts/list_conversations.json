@@ -58,7 +58,7 @@
             "anyOf": [
               {
                 "type": "boolean",
-                "description": "Whether the bot user is a member."
+                "description": "Whether the connected Slack identity is a member."
               },
               {
                 "type": "null"
@@ -98,6 +98,42 @@
           "locale": {
             "type": "string",
             "description": "The locale returned by Slack when requested."
+          },
+          "created": {
+            "type": "integer",
+            "description": "Creation time as a Unix timestamp in seconds when Slack provides it."
+          },
+          "updated": {
+            "type": "integer",
+            "description": "Last settings update time, passed through as Slack returns it. Slack documents epoch milliseconds for channels (unlike created) and a Unix timestamp for legacy IM and MPIM objects."
+          },
+          "creatorId": {
+            "type": "string",
+            "description": "The user who created the conversation when Slack provides it."
+          },
+          "isShared": {
+            "type": "boolean",
+            "description": "Whether the conversation is shared with another workspace."
+          },
+          "isExtShared": {
+            "type": "boolean",
+            "description": "Whether the conversation is shared with an external organization."
+          },
+          "isOrgShared": {
+            "type": "boolean",
+            "description": "Whether the conversation is shared between workspaces of the same Enterprise organization."
+          },
+          "contextTeamId": {
+            "type": "string",
+            "description": "The ID of the workspace the conversation is within when Slack provides it."
+          },
+          "lastRead": {
+            "type": "string",
+            "description": "The last-read message timestamp when Slack provides it."
+          },
+          "unreadCount": {
+            "type": "integer",
+            "description": "The unread message count when Slack provides it."
           }
         },
         "additionalProperties": false,
