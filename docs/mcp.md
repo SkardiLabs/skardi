@@ -38,6 +38,35 @@ validation, same audit path.
 
 ---
 
+## Set up agents with install.sh
+
+[`install.sh`](../install.sh) writes the MCP entry for you, for the Claude
+Code, Codex and Cursor it finds on the machine, next to the Skardi skills:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/SkardiLabs/skardi/main/install.sh | bash
+# already have the CLI (Homebrew, a source build)? set up the agents only:
+curl -fsSL https://raw.githubusercontent.com/SkardiLabs/skardi/main/install.sh | bash -s -- --agents-only
+```
+
+It asks which Skardi the agents should reach, or takes `--mcp`:
+
+- `--mcp cloud` registers the Skardi Cloud gateway by URL only. The gateway
+  runs the MCP OAuth flow, so each agent opens the browser to sign in the
+  first time it connects and refreshes the token itself; no token is written
+  to any config.
+- `--mcp local` registers `skardi mcp` (the stdio bridge below). It is
+  skipped when the installed CLI has no `mcp` command, which is the case for
+  v0.5.0.
+
+An existing entry named `skardi` is never overwritten. What it writes, per
+agent: Claude Code through `claude mcp add --scope user` (or `~/.claude.json`
+when the `claude` CLI is not on `PATH`), Codex as `[mcp_servers.skardi]` in
+`~/.codex/config.toml`, Cursor as `mcpServers.skardi` in `~/.cursor/mcp.json`.
+The sections below are the same entries by hand.
+
+---
+
 ## Host setup (stdio bridge)
 
 Claude Desktop (`claude_desktop_config.json`):

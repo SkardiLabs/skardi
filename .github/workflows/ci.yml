@@ -27,6 +27,19 @@ jobs:
         # The script checks git-tracked *.md relative links + fragments.
         run: python3 scripts/check_markdown_links.py
 
+  install-script:
+    name: Install script
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test install.sh agent setup
+        # Runs install.sh --agents-only against fake homes and a local skills
+        # tarball: no network, no real agent config.
+        run: bash scripts/install_test.sh
+
   docs:
     name: Docs
     runs-on: ubuntu-latest

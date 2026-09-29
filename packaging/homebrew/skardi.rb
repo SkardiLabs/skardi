@@ -38,6 +38,16 @@ class Skardi < Formula
     bin.install "skardi"
   end
 
+  def caveats
+    <<~EOS
+      To set up Claude Code, Codex and Cursor to use Skardi (skills, plus the
+      MCP server), run install.sh with --agents-only; it does not reinstall
+      the CLI:
+
+        curl -fsSL https://raw.githubusercontent.com/SkardiLabs/skardi/main/install.sh | bash -s -- --agents-only
+    EOS
+  end
+
   test do
     assert_match version.to_s, shell_output("#{bin}/skardi --version")
   end
