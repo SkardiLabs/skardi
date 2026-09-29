@@ -83,8 +83,9 @@ jobs:
 
           git checkout -b "$BRANCH"
 
-          # Replace the version line in the workspace Cargo.toml
-          sed -i "s/^version = \".*\"/version = \"${FULL_VERSION}\"/" Cargo.toml
+          # Set workspace.package.version and skardi's exact pin on
+          # skardi-source-pack (the two are published to crates.io together).
+          ./scripts/bump_version.sh "${FULL_VERSION}"
           cargo update -p skardi --precise "${FULL_VERSION}"
 
           git add Cargo.toml Cargo.lock
