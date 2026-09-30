@@ -1,7 +1,9 @@
 //! `documents` data source connector.
 //!
 //! Turns a directory / object-store prefix of files (PDF, Office, ODF, images)
-//! into queryable `(file, page)` rows via the pure-Rust `liteparse` crate.
+//! into queryable `(file, page)` rows via the pure-Rust `liteparse` crate —
+//! except Markdown and plain text, which are content already and are read
+//! directly by the `text` module, never handed to the parser.
 //! Everything here is behind the `documents` Cargo feature.
 
 // `pub(crate)` rather than private: `llm_extract`'s image fetch reuses
@@ -10,6 +12,7 @@
 pub(crate) mod blob;
 mod parse;
 mod table;
+mod text;
 
 use std::collections::HashMap;
 use std::sync::Arc;
