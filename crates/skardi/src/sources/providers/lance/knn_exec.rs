@@ -402,12 +402,17 @@ impl ExecutionPlan for LanceKnnExec {
     // One partition (`UnknownPartitioning(1)`), so the one partition's
     // statistics and the whole plan's are the same answer.
     fn partition_statistics(&self, _partition: Option<usize>) -> DFResult<Statistics> {
-        // Return statistics indicating we'll return k rows
-        Ok(Statistics {
-            num_rows: datafusion::common::stats::Precision::Exact(self.k),
-            total_byte_size: datafusion::common::stats::Precision::Absent,
-            column_statistics: vec![],
-        })
+        // One column entry per output column, which DataFusion requires:
+        // since 53 a ProjectionExec above this plan indexes them by column,
+        // and an empty list panicked there.
+        //
+        // `k` is an upper bound, not a count. A search returns fewer rows
+        // when the dataset is smaller or a pushed-down filter rejects
+        // candidates, and an `Exact` row count lets the optimizer answer
+        // `COUNT(*)` from statistics without running the search at all.
+        let mut stats = Statistics::new_unknown(&self.schema());
+        stats.num_rows = datafusion::common::stats::Precision::Inexact(self.k);
+        Ok(stats)
     }
 }
 
