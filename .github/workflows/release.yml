@@ -50,6 +50,8 @@ jobs:
             os: ubuntu-latest
           - target: aarch64-apple-darwin
             os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
 
     steps:
       - name: Checkout code
@@ -117,13 +119,31 @@ jobs:
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }} -p skardi-cli
+        env:
+          # Static MSVC runtime, so skardi.exe runs on a machine without the
+          # Visual C++ Redistributable. Target-scoped: the other matrix
+          # entries see no RUSTFLAGS change.
+          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: "-C target-feature=+crt-static"
 
       - name: Package binary (Unix)
+        if: runner.os != 'Windows'
         run: |
           cd target/${{ matrix.target }}/release
           tar czf ../../../skardi-${{ matrix.target }}.tar.gz skardi
           cd ../../..
           shasum -a 256 skardi-${{ matrix.target }}.tar.gz > skardi-${{ matrix.target }}.tar.gz.sha256
+
+      # A .zip, not a .tar.gz: it is what Windows opens natively and what
+      # install.ps1 expands. The .sha256 keeps shasum's "<hash>  <file>" shape
+      # so every platform's checksum file reads the same way.
+      - name: Package binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $archive = "skardi-${{ matrix.target }}.zip"
+          Compress-Archive -Path "target/${{ matrix.target }}/release/skardi.exe" -DestinationPath $archive
+          $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLower()
+          [IO.File]::WriteAllText("$archive.sha256", "$hash  $archive`n")
 
       - name: Upload artifact
         if: ${{ !inputs.dry_run }}
@@ -133,6 +153,9 @@ jobs:
           path: |
             skardi-${{ matrix.target }}.tar.gz
             skardi-${{ matrix.target }}.tar.gz.sha256
+            skardi-${{ matrix.target }}.zip
+            skardi-${{ matrix.target }}.zip.sha256
+          if-no-files-found: error
 
   docker:
     name: "Docker ${{ matrix.variant }} (${{ matrix.platform }}, ${{ inputs.version }})"

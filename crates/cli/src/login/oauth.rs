@@ -228,14 +228,15 @@ struct TokenError {
 /// the per-platform choice is a tested value rather than a branch nothing can
 /// reach without launching a real browser.
 ///
-/// The empty string after `start` is load-bearing on Windows: `start` reads its
-/// first quoted argument as the new window's TITLE, so a URL passed without it
-/// becomes a title and no browser opens.
+/// Windows goes through `rundll32 url.dll,FileProtocolHandler`, not
+/// `cmd /C start`: the URL never passes through a shell. `cmd` reads the `&`
+/// between query parameters as a command separator, so `start` opened the
+/// authorize URL cut off after its first parameter and the login failed.
 fn browser_command() -> (&'static str, &'static [&'static str]) {
     if cfg!(target_os = "macos") {
         ("open", &[])
     } else if cfg!(target_os = "windows") {
-        ("cmd", &["/C", "start", ""])
+        ("rundll32", &["url.dll,FileProtocolHandler"])
     } else {
         ("xdg-open", &[])
     }
@@ -497,9 +498,11 @@ mod tests {
         if cfg!(target_os = "macos") {
             assert_eq!((program, args), ("open", &[] as &[&str]));
         } else if cfg!(target_os = "windows") {
-            // The empty title argument must survive: without it `start` reads
-            // the URL as the window title and opens nothing.
-            assert_eq!((program, args), ("cmd", &["/C", "start", ""] as &[&str]));
+            // No shell in the path: `cmd` would split the URL at its `&`s.
+            assert_eq!(
+                (program, args),
+                ("rundll32", &["url.dll,FileProtocolHandler"] as &[&str])
+            );
         } else {
             assert_eq!((program, args), ("xdg-open", &[] as &[&str]));
         }
