@@ -425,7 +425,7 @@ mod tests {
     // Require data/test_data.lance (run: python scripts/prepare_fts_test_data.py)
     // Run with: cargo test -p sources -- --ignored lance_fts
 
-    use arrow::array::{Array, Float32Array, StringArray};
+    use arrow::array::{Array, Float32Array, Int64Array, StringArray};
     use std::path::Path;
 
     const FTS_DATASET_PATH: &str = "data/test_data.lance";
@@ -732,6 +732,44 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires test_data.lance
+    async fn test_lance_fts_count_star() {
+        let ctx = setup_fts_context().await;
+        let search = "FROM lance_fts('fts_data', 'description', 'enthusiasts', 50) \
+                      WHERE revenue > 500.0";
+
+        let returned: usize = ctx
+            .sql(&format!("SELECT id {search}"))
+            .await
+            .expect("SQL parse failed")
+            .collect()
+            .await
+            .expect("Query execution failed")
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert!(returned > 0, "fixture must match some rows");
+
+        // COUNT(*) projects no columns from the search, which used to fail
+        // building a zero-column batch with no row count.
+        let batches = ctx
+            .sql(&format!("SELECT COUNT(*) AS n {search}"))
+            .await
+            .expect("SQL parse failed")
+            .collect()
+            .await
+            .expect("Query execution failed");
+        let counted = batches[0]
+            .column_by_name("n")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(counted as usize, returned);
     }
 
     #[tokio::test]

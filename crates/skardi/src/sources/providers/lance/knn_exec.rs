@@ -4,8 +4,9 @@
 //! for efficient approximate nearest neighbor search.
 
 use anyhow::Result;
-use arrow::array::{ArrayRef, Float32Array, RecordBatch};
+use arrow::array::{ArrayRef, Float32Array, RecordBatch, RecordBatchOptions};
 use arrow::datatypes::{Field, Schema, SchemaRef};
+use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::EquivalenceProperties;
@@ -300,7 +301,15 @@ impl LanceKnnExec {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        Ok(RecordBatch::try_new(self.schema.clone(), columns)?)
+        // The row count is explicit because a projection can be empty: for
+        // `COUNT(*)` DataFusion asks for no columns at all, and Arrow refuses a
+        // zero-column batch that does not say how many rows it has.
+        let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+        Ok(RecordBatch::try_new_with_options(
+            self.schema.clone(),
+            columns,
+            &options,
+        )?)
     }
 }
 
@@ -411,7 +420,7 @@ impl ExecutionPlan for LanceKnnExec {
         // candidates, and an `Exact` row count lets the optimizer answer
         // `COUNT(*)` from statistics without running the search at all.
         let mut stats = Statistics::new_unknown(&self.schema());
-        stats.num_rows = datafusion::common::stats::Precision::Inexact(self.k);
+        stats.num_rows = Precision::Inexact(self.k);
         Ok(stats)
     }
 }

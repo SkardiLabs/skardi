@@ -602,6 +602,55 @@ mod tests {
 
     #[tokio::test]
     #[ignore] // Requires test_data.lance
+    async fn test_lance_knn_count_is_the_filtered_rows_not_k() {
+        let ctx = setup_knn_context().await;
+        let query_vec = read_query_vector(&ctx).await;
+        let k = 50;
+        let search = format!(
+            "FROM lance_knn('knn_data', 'vector', {query_vec}, {k}) \
+             WHERE category = 'electronics' AND item_id > 100"
+        );
+
+        let returned: usize = ctx
+            .sql(&format!("SELECT id {search}"))
+            .await
+            .expect("SQL parse failed")
+            .collect()
+            .await
+            .expect("Query execution failed")
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        // The case under test: the filter is pushed into the search
+        // (`Exact`), so nothing above the plan recounts its rows.
+        assert!(
+            returned < k,
+            "fixture must make the filtered search return fewer than k rows, got {returned}"
+        );
+
+        let batches = ctx
+            .sql(&format!("SELECT COUNT(*) AS n {search}"))
+            .await
+            .expect("SQL parse failed")
+            .collect()
+            .await
+            .expect("Query execution failed");
+        let counted = batches[0]
+            .column_by_name("n")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+
+        // `k` is a bound, so the plan reports it as `Inexact`. Reported as
+        // `Exact`, the optimizer would answer COUNT(*) as `k` from statistics
+        // without running the search.
+        assert_eq!(counted as usize, returned);
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires test_data.lance
     async fn test_lance_knn_where_filters_reduce_results() {
         let ctx = setup_knn_context().await;
         let query_vec = read_query_vector(&ctx).await;
