@@ -1266,6 +1266,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_update_where_parameter_maps_to_its_column() {
+        let ctx = create_test_context().await;
+        let inferrer = SqlSchemaInferrer::new(Arc::new(ctx)).unwrap();
+
+        // The parameter is deliberately NOT named after its column: only the
+        // UPDATE arm's walk of the WHERE clause can map `remaining` to
+        // `stock`. Without it the name falls back to itself, which no column
+        // matches. sqlparser 0.61 made `Statement::Update` a tuple variant,
+        // and this pins that the arm still reads `selection` through it.
+        let sql = "UPDATE products SET price = 0 WHERE stock = {remaining}";
+
+        let named_params = inferrer.extract_named_parameters(sql).await.unwrap();
+
+        assert_eq!(named_params.len(), 1);
+        assert_eq!(named_params["remaining"].column_name, "stock");
+        assert_eq!(named_params["remaining"].field_type, DataType::Int64);
+    }
+
+    #[tokio::test]
     async fn test_dml_is_detected() {
         let ctx = SessionContext::new();
         let inferrer = SqlSchemaInferrer::new(Arc::new(ctx)).unwrap();
