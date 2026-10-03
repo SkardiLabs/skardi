@@ -2,6 +2,9 @@ use anyhow::Result;
 use datafusion::prelude::*;
 use std::path::PathBuf;
 use std::sync::Arc;
+// object_store 0.13 moved put/head/delete off `ObjectStore` onto this
+// blanket-implemented extension trait.
+use object_store::ObjectStoreExt as _;
 
 use crate::config::{ConfigError, DataSource};
 

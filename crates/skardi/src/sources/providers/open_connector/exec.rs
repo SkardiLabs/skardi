@@ -14,7 +14,6 @@ use std::time::{Duration, Instant};
 
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
-use datafusion::common::Statistics;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::EquivalenceProperties;
@@ -59,7 +58,7 @@ pub struct OpenConnectorExec {
     max_rows: u64,
     scan_timeout: Duration,
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl fmt::Debug for OpenConnectorExec {
@@ -123,7 +122,7 @@ impl OpenConnectorExec {
             max_rows,
             scan_timeout,
             schema,
-            properties,
+            properties: Arc::new(properties),
         })
     }
 }
@@ -147,7 +146,7 @@ impl ExecutionPlan for OpenConnectorExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -170,10 +169,6 @@ impl ExecutionPlan for OpenConnectorExec {
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
         vec![]
-    }
-
-    fn statistics(&self) -> DFResult<Statistics> {
-        Ok(Statistics::new_unknown(&self.schema))
     }
 
     fn execute(

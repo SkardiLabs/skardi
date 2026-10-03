@@ -163,7 +163,7 @@ pub struct RssScanExec {
     projection: Option<Vec<usize>>,
     limit: Option<usize>,
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     shared: Arc<ScanShared>,
 }
 
@@ -218,7 +218,7 @@ impl RssScanExec {
             projection,
             limit,
             schema,
-            properties,
+            properties: Arc::new(properties),
             shared,
         })
     }
@@ -245,7 +245,7 @@ impl ExecutionPlan for RssScanExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

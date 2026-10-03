@@ -289,7 +289,7 @@ where
             key_column: self.key_column.clone(),
             filters: filters.to_owned(),
             limit,
-            properties,
+            properties: Arc::new(properties),
         };
         Ok(Arc::new(exec))
     }
@@ -602,7 +602,7 @@ where
     conn: Arc<RwLock<C>>,
     op: RedisDmlOp,
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl<C> RedisDmlExec<C>
@@ -625,7 +625,7 @@ where
             conn,
             op,
             schema,
-            properties,
+            properties: Arc::new(properties),
         }
     }
 }
@@ -658,7 +658,7 @@ where
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -749,7 +749,7 @@ where
     key_column: Option<String>,
     filters: Vec<Expr>,
     limit: Option<usize>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl<C> RedisScanExec<C>
@@ -856,7 +856,7 @@ where
         "redis execution"
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

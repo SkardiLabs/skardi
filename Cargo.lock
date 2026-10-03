@@ -1974,31 +1974,6 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "clickhouse"
-version = "0.14.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0bfb36e41b644dcd5be4ef54a3b7d2abc9bb07eda777ab3f90d1b0dbb97c940a"
-dependencies = [
- "bnum 0.13.0",
- "bstr",
- "bytes",
- "cityhash-rs",
- "clickhouse-macros",
- "clickhouse-types",
- "futures-channel",
- "futures-util",
- "http-body-util",
- "hyper 1.10.1",
- "hyper-util",
- "lz4_flex 0.11.6",
- "polonius-the-crab",
- "serde",
- "thiserror 2.0.18",
- "tokio",
- "url",
-]
-
-[[package]]
-name = "clickhouse"
 version = "0.15.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7654154fde4d97ec1321bfe4c3965570be6fcd09e091da8afc3166ab5ee27be2"
@@ -3320,7 +3295,7 @@ dependencies = [
  "bigdecimal",
  "byteorder",
  "chrono",
- "clickhouse 0.15.2",
+ "clickhouse",
  "dashmap",
  "datafusion",
  "datafusion-proto",
@@ -4837,17 +4812,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "higher-kinded-types"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e690f8474c6c5d8ff99656fcbc195a215acc3949481a8b0b3351c838972dc776"
-dependencies = [
- "macro_rules_attribute",
- "never-say-never",
- "paste",
 ]
 
 [[package]]
@@ -7163,12 +7127,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27b02d87554356db9e9a873add8782d4ea6e3e58ea071a9adb9a2e8ddb884a8b"
 
 [[package]]
-name = "never-say-never"
-version = "6.6.666"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf5a574dadd7941adeaa71823ecba5e28331b8313fb2e1c6a5c7e5981ea53ad6"
-
-[[package]]
 name = "new_debug_unreachable"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8034,16 +7992,6 @@ dependencies = [
  "fdeflate",
  "flate2",
  "miniz_oxide",
-]
-
-[[package]]
-name = "polonius-the-crab"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec242d7eccbb2fd8b3b5b6e3cf89f94a91a800f469005b44d154359609f8af72"
-dependencies = [
- "higher-kinded-types",
- "never-say-never",
 ]
 
 [[package]]
@@ -9899,7 +9847,7 @@ dependencies = [
  "candle-nn",
  "candle-transformers",
  "chrono",
- "clickhouse 0.14.3",
+ "clickhouse",
  "datafusion",
  "datafusion-common",
  "datafusion-federation",

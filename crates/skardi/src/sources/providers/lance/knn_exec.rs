@@ -56,7 +56,7 @@ pub struct LanceKnnExec {
     /// Optional row limit applied after KNN + filter (from SQL LIMIT clause)
     scan_limit: Option<usize>,
     /// Plan properties
-    plan_properties: PlanProperties,
+    plan_properties: Arc<PlanProperties>,
 }
 
 // Note: DistanceMetric enum removed - distance metric is embedded in the Lance index
@@ -106,7 +106,7 @@ impl LanceKnnExec {
             projection: None,
             filter: None,
             scan_limit: None,
-            plan_properties,
+            plan_properties: Arc::new(plan_properties),
         })
     }
 
@@ -155,7 +155,7 @@ impl LanceKnnExec {
             projection: None,
             filter: None,
             scan_limit: None,
-            plan_properties,
+            plan_properties: Arc::new(plan_properties),
         })
     }
 
@@ -168,12 +168,12 @@ impl LanceKnnExec {
         let projected_schema: SchemaRef = Arc::new(Schema::new(projected_fields));
         self.schema = projected_schema.clone();
         self.projection = Some(projection);
-        self.plan_properties = PlanProperties::new(
+        self.plan_properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(projected_schema),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
         Ok(self)
     }
 
@@ -335,7 +335,7 @@ impl ExecutionPlan for LanceKnnExec {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.plan_properties
     }
 
@@ -399,7 +399,9 @@ impl ExecutionPlan for LanceKnnExec {
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 
-    fn statistics(&self) -> DFResult<Statistics> {
+    // One partition (`UnknownPartitioning(1)`), so the one partition's
+    // statistics and the whole plan's are the same answer.
+    fn partition_statistics(&self, _partition: Option<usize>) -> DFResult<Statistics> {
         // Return statistics indicating we'll return k rows
         Ok(Statistics {
             num_rows: datafusion::common::stats::Precision::Exact(self.k),

@@ -35,7 +35,10 @@ arrow-json = { version = "58.0.0" }
 async-trait = "0.1.88"
 axum = "0.7"
 cookie = "0.18"
-clickhouse = "0.14"
+# Must match the line datafusion-table-providers uses (0.11: ^0.15): the
+# connection pool hands back ITS `clickhouse::Client`, and a `Row` derived
+# from a second clickhouse version does not satisfy that client's bounds.
+clickhouse = "0.15"
 ctor = "0.4.1"
 datafusion = { version = "53.1.0", default-features = false, features = [
     "nested_expressions",

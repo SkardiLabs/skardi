@@ -282,15 +282,14 @@ impl SqlSchemaInferrer {
 
             // Handle UPDATE SET ... WHERE and DELETE ... WHERE
             match statement {
-                Statement::Update {
-                    selection: Some(selection),
-                    ..
-                } => {
-                    self.collect_parameter_columns_ast(
-                        selection,
-                        &mut placeholder_to_column,
-                        &mut placeholder_index,
-                    );
+                Statement::Update(update) => {
+                    if let Some(selection) = &update.selection {
+                        self.collect_parameter_columns_ast(
+                            selection,
+                            &mut placeholder_to_column,
+                            &mut placeholder_index,
+                        );
+                    }
                 }
                 Statement::Delete(delete) => {
                     if let Some(selection) = &delete.selection {
