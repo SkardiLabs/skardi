@@ -11,7 +11,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use object_store::path::Path as OsPath;
-use object_store::{Attribute, Attributes, ObjectStore, PutOptions, PutPayload};
+use object_store::{Attribute, Attributes, ObjectStore, ObjectStoreExt, PutOptions, PutPayload};
 
 /// A parsed source/target location: either a local path or an S3 object.
 #[derive(Debug, Clone, PartialEq, Eq)]

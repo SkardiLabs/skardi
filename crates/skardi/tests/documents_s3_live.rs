@@ -33,7 +33,7 @@ use std::sync::Arc;
 
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path as OsPath;
-use object_store::{ObjectStore, PutPayload};
+use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 
 /// Fixture PDF shipped with the crate — a real 2-page PDF liteparse can parse
 /// without LibreOffice or ImageMagick installed.
