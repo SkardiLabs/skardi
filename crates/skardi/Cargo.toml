@@ -173,7 +173,7 @@ uuid = { workspace = true }
 # instead of a homegrown twin. Registered by the server session (its
 # register_all also installs ->/->>/? operator rewrites session-wide, so
 # it must not hide behind graph::register_graph_udtfs).
-datafusion-functions-json = "0.52"
+datafusion-functions-json = "0.53.1"
 
 [dev-dependencies]
 # The pack's gateway mock, which this crate's pack suites use.
