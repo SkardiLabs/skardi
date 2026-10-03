@@ -9,6 +9,29 @@ becomes available.
 
 ## Install
 
+Pre-built binaries for Linux (x86_64, aarch64), macOS (Apple Silicon) and
+Windows (x86_64) are attached to every
+[release](https://github.com/SkardiLabs/skardi/releases).
+
+macOS and Linux:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/SkardiLabs/skardi/main/install.sh | bash
+```
+
+Windows (PowerShell). This puts `skardi.exe` in
+`%LOCALAPPDATA%\Programs\skardi\bin` and adds that directory to your user
+`PATH`:
+
+```powershell
+irm https://raw.githubusercontent.com/SkardiLabs/skardi/main/install.ps1 | iex
+```
+
+On Windows the config file is `%USERPROFILE%\.skardi\config.yaml`. Wherever
+these docs say `~/.skardi`, read that path instead.
+
+### From source
+
 From the repo root:
 
 ```bash

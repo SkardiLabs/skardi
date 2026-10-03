@@ -192,6 +192,14 @@ Run it as yourself, not with `sudo`. Add `--agents-only` to update the skills
 or set up an agent you installed later, and `--help` for the rest. The
 sections below are the same steps by hand.
 
+**On Windows**, in PowerShell. This installs `skardi.exe` and adds it to your
+user `PATH`, with no admin rights needed. It installs the CLI only, so set up
+agents with the steps below:
+
+```powershell
+irm https://raw.githubusercontent.com/SkardiLabs/skardi/main/install.ps1 | iex
+```
+
 Four skills. [`auto-context`](https://github.com/SkardiLabs/skardi-skills/tree/main/skills/auto-context)
 turns a folder of documents — or a datastore you already run — into governed,
 searchable context served over HTTP by `skardi-server`: hybrid search (vector +

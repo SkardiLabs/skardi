@@ -59,6 +59,31 @@ jobs:
         # same manifest check in seconds, without building.
         run: cargo package -p skardi-source-pack -p skardi --no-verify
 
+  windows-cli:
+    name: CLI (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        # Version comes from rust-toolchain.toml.
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Test skardi-cli
+        # The release ships a Windows binary, so its tests run on Windows.
+        # The integration tests that redirect HOME are #![cfg(unix)]:
+        # dirs::home_dir() ignores HOME on Windows. Unit tests and the clap
+        # smoke tests still run here.
+        run: cargo test -p skardi-cli
+      - name: The binary starts
+        run: |
+          cargo run -q -p skardi-cli -- --version
+          cargo run -q -p skardi-cli -- --help
+      - name: Test install.ps1
+        # Installs a stand-in release zip into a temp directory: no network,
+        # and the runner's real PATH is left alone.
+        shell: pwsh
+        run: ./scripts/install_test.ps1
+
   docs:
     name: Docs
     runs-on: ubuntu-latest
