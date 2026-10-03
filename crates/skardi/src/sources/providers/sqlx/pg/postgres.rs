@@ -653,7 +653,7 @@ struct SqlxPostgresInsertExec {
     op: InsertOp,
     /// Output schema: single `count` column
     output_schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl SqlxPostgresInsertExec {
@@ -682,7 +682,7 @@ impl SqlxPostgresInsertExec {
             input,
             op,
             output_schema,
-            properties,
+            properties: Arc::new(properties),
         }
     }
 }
@@ -712,7 +712,7 @@ impl ExecutionPlan for SqlxPostgresInsertExec {
         Arc::clone(&self.output_schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -856,7 +856,7 @@ struct SqlxPostgresDmlExec {
     sqlx_pool: PgPool,
     sql: String,
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl SqlxPostgresDmlExec {
@@ -876,7 +876,7 @@ impl SqlxPostgresDmlExec {
             sqlx_pool,
             sql,
             schema,
-            properties,
+            properties: Arc::new(properties),
         }
     }
 }
@@ -906,7 +906,7 @@ impl ExecutionPlan for SqlxPostgresDmlExec {
         Arc::clone(&self.schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

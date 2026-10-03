@@ -808,7 +808,7 @@ struct SeekDbDmlExec {
     pool: Arc<MySQLConnectionPool>,
     sql: String,
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl SeekDbDmlExec {
@@ -828,7 +828,7 @@ impl SeekDbDmlExec {
             pool,
             sql,
             schema,
-            properties,
+            properties: Arc::new(properties),
         }
     }
 }
@@ -858,7 +858,7 @@ impl ExecutionPlan for SeekDbDmlExec {
         Arc::clone(&self.schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

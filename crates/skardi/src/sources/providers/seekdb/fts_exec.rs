@@ -61,7 +61,7 @@ pub struct SeekDbFtsExec {
     scan_limit: Option<usize>,
     /// Output schema: table columns + `_score Float64`.
     schema: SchemaRef,
-    plan_properties: PlanProperties,
+    plan_properties: Arc<PlanProperties>,
 }
 
 impl SeekDbFtsExec {
@@ -89,7 +89,7 @@ impl SeekDbFtsExec {
             filter,
             scan_limit: None,
             schema,
-            plan_properties,
+            plan_properties: Arc::new(plan_properties),
         }
     }
 
@@ -199,7 +199,7 @@ impl ExecutionPlan for SeekDbFtsExec {
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.plan_properties
     }
 

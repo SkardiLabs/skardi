@@ -364,8 +364,8 @@ fn validate_statement(
                 operation: "INSERT INTO FUNCTION".to_string(),
             }),
         },
-        Statement::Update { table, .. } => {
-            let table_name = extract_table_name_from_table_with_joins(table);
+        Statement::Update(update) => {
+            let table_name = extract_table_name_from_table_with_joins(&update.table);
             check_write_access("UPDATE", &table_name, config)
         }
         Statement::Delete(delete) => {

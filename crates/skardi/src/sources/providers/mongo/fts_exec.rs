@@ -32,7 +32,7 @@ pub struct MongoFtsExec {
     scan_limit: Option<usize>,
     schema: SchemaRef,
     primary_key: String,
-    plan_properties: PlanProperties,
+    plan_properties: Arc<PlanProperties>,
 }
 
 impl MongoFtsExec {
@@ -59,7 +59,7 @@ impl MongoFtsExec {
             scan_limit,
             schema,
             primary_key,
-            plan_properties,
+            plan_properties: Arc::new(plan_properties),
         }
     }
 
@@ -195,7 +195,7 @@ impl ExecutionPlan for MongoFtsExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.plan_properties
     }
 
