@@ -372,7 +372,7 @@ setup_mcp() {
   if [ "$MCP_MODE" = "local" ]; then
     local bin; bin="$(skardi_bin)"
     if [ -z "$bin" ] || ! "$bin" mcp --help >/dev/null 2>&1; then
-      warn "this skardi has no 'mcp' command (it is on main, not in the latest release yet); local MCP skipped"
+      warn "this skardi has no 'mcp' command (added in v0.6.0; upgrade the CLI and re-run with --agents-only); local MCP skipped"
       return 0
     fi
   fi
