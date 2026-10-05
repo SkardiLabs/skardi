@@ -1366,7 +1366,16 @@ async fn register_data_source_for_pass(
             // further down; the missing-path check is deliberately
             // omitted here.
         }
-        (DataSourceType::Csv | DataSourceType::Parquet | DataSourceType::Lance, true) => {
+        (DataSourceType::Lance, true) => {
+            // A Lance dataset is a directory of objects, not one object, so
+            // the CSV/Parquet path below — which HEADs the object at `path` to
+            // test connectivity — would refuse every remote dataset. Lance
+            // opens the store itself, with `AWS_*` from the environment;
+            // this only refuses credentials written into the config file.
+            // The dataset may not exist yet, as for a local one.
+            s3_storage.validate_lance_configuration(source)?;
+        }
+        (DataSourceType::Csv | DataSourceType::Parquet, true) => {
             // For S3 files, validate S3 configuration and setup object store
             s3_storage.validate_configuration(source)?;
             let s3_path = source.path.to_str().unwrap_or("");
@@ -1940,7 +1949,13 @@ async fn register_data_source_for_pass(
             // table. A plain SELECT against the name will still error,
             // which is the right UX for "this dataset hasn't been written
             // to yet".
-            if !skardi::sources::providers::lance::lance_dataset_exists(path_str) {
+            let exists = skardi::sources::providers::lance::lance_dataset_exists_at(path_str)
+                .await
+                .map_err(|e| ConfigError::DataSourceRegistrationFailed {
+                    name: source.name.clone(),
+                    error: format!("{e:#}"),
+                })?;
+            if !exists {
                 tracing::warn!(
                     "Lance dataset '{}' at {} does not exist yet — skipping table \
                      registration. A job with `create_if_missing: true` will create it \

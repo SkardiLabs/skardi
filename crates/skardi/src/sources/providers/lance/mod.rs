@@ -23,6 +23,6 @@ pub use fts_table_function::{LanceFtsTableFunction, register_lance_fts_udtf};
 pub use knn_exec::LanceKnnExec;
 pub use knn_table_function::{LanceKnnTableFunction, register_lance_knn_udtf};
 pub use registration::{
-    LanceWriteOutcome, lance_dataset_exists, register_lance_table, write_lance_dataset,
-    write_lance_stream,
+    LanceWriteOutcome, is_remote_lance_uri, lance_dataset_exists, lance_dataset_exists_at,
+    register_lance_table, write_lance_dataset, write_lance_stream,
 };

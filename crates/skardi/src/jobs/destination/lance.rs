@@ -25,9 +25,10 @@ use std::sync::Arc;
 
 use super::super::definition::DestinationMode;
 use super::{JobDestination, JobDestinationKind, WriteOutcome};
-use crate::sources::providers::lance::{lance_dataset_exists, write_lance_stream};
+use crate::sources::providers::lance::{lance_dataset_exists_at, write_lance_stream};
 
-/// Writes a job's output to a Lance dataset on disk. Path is whatever the
+/// Writes a job's output to a Lance dataset, on local disk or at an object-store
+/// URI (`s3://...`, credentials from `AWS_*`). Path is whatever the
 /// destination `table:` resolves to via the data source registry. When the
 /// dataset does not exist yet, the first run creates it from the query's
 /// output schema.
@@ -84,7 +85,7 @@ impl LanceDestination {
         }
         let checked = reject_repeated_keys(stream, &self.merge_keys)
             .with_context(|| format!("Invalid merge keys for Lance dataset at {}", self.path))?;
-        if !lance_dataset_exists(&self.path) {
+        if !lance_dataset_exists_at(&self.path).await? {
             let outcome = write_lance_stream(&self.path, checked, WriteMode::Create).await?;
             return Ok(WriteOutcome {
                 rows_written: outcome.rows_written,
@@ -173,11 +174,11 @@ impl JobDestination for LanceDestination {
     }
 
     async fn exists(&self) -> Result<bool> {
-        Ok(lance_dataset_exists(&self.path))
+        lance_dataset_exists_at(&self.path).await
     }
 
     async fn schema(&self) -> Result<Option<Arc<Schema>>> {
-        if !lance_dataset_exists(&self.path) {
+        if !lance_dataset_exists_at(&self.path).await? {
             return Ok(None);
         }
         let dataset = Dataset::open(&self.path)
@@ -195,7 +196,7 @@ impl JobDestination for LanceDestination {
         if mode == DestinationMode::Upsert {
             return self.upsert(stream).await;
         }
-        let write_mode = if lance_dataset_exists(&self.path) {
+        let write_mode = if lance_dataset_exists_at(&self.path).await? {
             WriteMode::Append
         } else {
             WriteMode::Create

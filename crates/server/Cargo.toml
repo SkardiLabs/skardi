@@ -96,6 +96,7 @@ rmcp = { version = "=3.1.4", default-features = false, features = ["client", "tr
 # Raw HTTP probes for what the rmcp client can't express (an invented
 # Mcp-Session-Id). Loopback plain-HTTP only, so no TLS backend.
 reqwest = { version = "0.12", default-features = false }
+rstest = { workspace = true }
 skardi = { path = "../skardi" }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
