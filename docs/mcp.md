@@ -65,6 +65,10 @@ when the `claude` CLI is not on `PATH`), Codex as `[mcp_servers.skardi]` in
 `~/.codex/config.toml`, Cursor as `mcpServers.skardi` in `~/.cursor/mcp.json`.
 The sections below are the same entries by hand.
 
+On Windows, [`install.ps1`](../install.ps1) installs the CLI only. Add the
+entries below by hand. `"command": "skardi"` resolves to `skardi.exe` on
+`PATH` there too.
+
 ---
 
 ## Host setup (stdio bridge)
