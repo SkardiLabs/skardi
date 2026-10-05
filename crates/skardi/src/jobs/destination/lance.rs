@@ -39,7 +39,7 @@ use crate::sources::providers::lance::{lance_dataset_exists, write_lance_stream}
 /// - **one row per key.** The same key twice in one run's output fails the
 ///   write, whether or not the dataset already has that key, rather than
 ///   keeping an arbitrary one of them. This is checked here, on the stream
-///   ([`reject_repeated_keys`]): Lance's own duplicate check only fires for
+///   (`reject_repeated_keys`): Lance's own duplicate check only fires for
 ///   source rows that MATCH an existing row, so a key new to the dataset
 ///   would otherwise be inserted twice.
 /// - **a commit race is retried, not lost.** A merge that loses a race to
