@@ -18,8 +18,9 @@
 //!       AND updated_at <  {to_date}
 //!   destination:
 //!     table: "wiki_lake"          # DataFusion table ident (or dotted path)
-//!     mode: append                # append (overwrite is deferred — see below)
+//!     mode: append                # append | upsert (overwrite is deferred — see below)
 //!     create_if_missing: true     # lake destinations only
+//!     # merge_keys: [id]          # required with `mode: upsert`, refused otherwise
 //!   execution:
 //!     timeout_ms: 3600000         # optional; default = no timeout
 //! ```
@@ -31,6 +32,7 @@
 use anyhow::{Context, Result, anyhow};
 use datafusion::prelude::SessionContext;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -52,7 +54,12 @@ pub enum JobKind {
 
 /// Write mode for the destination.
 ///
-/// MVP supports `append` only. `overwrite` is deferred because the
+/// `append` adds every row. `upsert` merges on [`Destination::merge_keys`]:
+/// a row whose keys match an existing row replaces it, and any other row is
+/// inserted. Upsert is Lance-only — the SQL destinations refuse it at submit,
+/// since DataFusion's DML has no MERGE to drive them with.
+///
+/// `overwrite` is deferred because the
 /// DataFusion SQL interface we drive DB destinations through cannot wrap
 /// a `DELETE FROM` + `INSERT INTO` pair in a single transaction, so an
 /// overwrite whose INSERT failed after a successful DELETE would silently
@@ -64,6 +71,7 @@ pub enum JobKind {
 pub enum DestinationMode {
     #[default]
     Append,
+    Upsert,
 }
 
 fn default_create_if_missing() -> bool {
@@ -84,6 +92,49 @@ pub struct Destination {
     /// table is missing, regardless of this flag.
     #[serde(default = "default_create_if_missing")]
     pub create_if_missing: bool,
+    /// The columns an `upsert` matches rows on. Required with `mode: upsert`
+    /// and refused with any other mode, so a key list can never be silently
+    /// ignored. Each must be a column of the query's output; the executor
+    /// checks that at submit, once the output schema is known.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub merge_keys: Vec<String>,
+}
+
+impl Destination {
+    /// The load-time half of the upsert contract: what can be checked
+    /// without planning the query.
+    pub fn validate(&self) -> Result<()> {
+        match self.mode {
+            DestinationMode::Upsert if self.merge_keys.is_empty() => Err(anyhow!(
+                "destination `{}`: `mode: upsert` needs `merge_keys`, the columns rows are \
+                 matched on",
+                self.table
+            )),
+            DestinationMode::Append if !self.merge_keys.is_empty() => Err(anyhow!(
+                "destination `{}`: `merge_keys` only applies to `mode: upsert`; with \
+                 `mode: append` it would be ignored",
+                self.table
+            )),
+            _ => {
+                let mut seen = HashSet::new();
+                for key in &self.merge_keys {
+                    if key.trim().is_empty() {
+                        return Err(anyhow!(
+                            "destination `{}`: `merge_keys` has an empty column name",
+                            self.table
+                        ));
+                    }
+                    if !seen.insert(key.as_str()) {
+                        return Err(anyhow!(
+                            "destination `{}`: `merge_keys` names `{key}` twice",
+                            self.table
+                        ));
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 /// The `execution:` block of a job YAML.
@@ -165,6 +216,9 @@ impl JobDefinition {
         })?;
         let destination: Destination = serde_yaml::from_value(destination_value.clone())
             .with_context(|| format!("Failed to parse destination block in {}", path.display()))?;
+        destination
+            .validate()
+            .with_context(|| format!("Invalid destination block in {}", path.display()))?;
 
         let execution: Execution = match spec.get("execution") {
             Some(v) => serde_yaml::from_value(v.clone()).with_context(|| {
@@ -290,6 +344,62 @@ spec:
             err.contains("overwrite") || err.contains("unknown variant"),
             "unexpected error: {err}"
         );
+    }
+
+    fn upsert_yaml(destination: &str) -> String {
+        format!(
+            r#"
+kind: job
+metadata:
+  name: "merge"
+  version: "1.0.0"
+spec:
+  query: "SELECT 1 AS id"
+  destination:
+{destination}
+"#
+        )
+    }
+
+    #[tokio::test]
+    async fn job_yaml_accepts_upsert_with_merge_keys() {
+        let yaml = upsert_yaml("    table: \"t\"\n    mode: upsert\n    merge_keys: [id, part]");
+        let job = write_and_load(&yaml, Arc::new(SessionContext::new()))
+            .await
+            .expect("upsert with keys loads")
+            .expect("it is a job");
+        assert_eq!(job.destination.mode, DestinationMode::Upsert);
+        assert_eq!(job.destination.merge_keys, vec!["id", "part"]);
+    }
+
+    #[rstest::rstest]
+    #[case::upsert_without_keys("    table: \"t\"\n    mode: upsert", "needs `merge_keys`")]
+    #[case::keys_without_upsert(
+        "    table: \"t\"\n    mode: append\n    merge_keys: [id]",
+        "only applies to `mode: upsert`"
+    )]
+    #[case::keys_with_default_mode("    table: \"t\"\n    merge_keys: [id]", "only applies")]
+    #[case::duplicate_key(
+        "    table: \"t\"\n    mode: upsert\n    merge_keys: [id, id]",
+        "names `id` twice"
+    )]
+    #[case::empty_key(
+        "    table: \"t\"\n    mode: upsert\n    merge_keys: [\"\"]",
+        "empty column"
+    )]
+    #[tokio::test]
+    async fn job_yaml_refuses_an_inconsistent_upsert(
+        #[case] destination: &str,
+        #[case] expected: &str,
+    ) {
+        let yaml = upsert_yaml(destination);
+        let err = format!(
+            "{:#}",
+            write_and_load(&yaml, Arc::new(SessionContext::new()))
+                .await
+                .unwrap_err()
+        );
+        assert!(err.contains(expected), "expected {expected:?} in: {err}");
     }
 
     #[tokio::test]

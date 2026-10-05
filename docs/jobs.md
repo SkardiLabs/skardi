@@ -50,7 +50,7 @@ spec:
       AND updated_at <  {to_date}
   destination:
     table: "wiki_lake"          # DataFusion table identifier — bare or dotted
-    mode: append                # append is the only supported mode in MVP
+    mode: append                # append, or upsert (Lance only, needs merge_keys)
     create_if_missing: true     # lake destinations only (see below)
   execution:
     timeout_ms: 3600000         # optional wall-clock cap; default = no timeout
@@ -84,11 +84,35 @@ destination of a job.
 
 ### `destination.mode`
 
-- `append` (default, and the only mode in MVP) — add rows to the destination.
+- `append` (default) — add rows to the destination.
   - *Lake:* the dataset is created if `create_if_missing: true` and it
     does not yet exist, else appended to.
   - *DB:* rows are added with `INSERT INTO <table> SELECT ...`, wrapped
     in one transaction per run.
+- `upsert` — merge the rows into a **Lance** destination on
+  `destination.merge_keys`. A row whose keys match an existing row replaces
+  it whole, and every other row is inserted, all in one commit. Use it when a
+  job re-reads the same records each run and the dataset should hold the
+  newest copy of each, not every copy.
+
+  ```yaml
+  destination:
+    table: "docs_lake"
+    mode: upsert
+    merge_keys: [path, source_id]   # required; each must be a query output column
+  ```
+
+  - **One row per key.** If one run's output has the same key twice, the
+    write fails, naming the key, and nothing is committed. The run is never
+    resolved by picking one of the two. Skardi checks this itself, for keys
+    new to the dataset as well as existing ones, by holding each key the run
+    emits in memory until the write ends.
+  - **Concurrent writers are retried, not overwritten.** A merge that loses a
+    commit race replays its input against the newer version.
+  - **A first run on a missing dataset** (with `create_if_missing: true`)
+    creates it from the checked rows. If that run fails, no dataset is left.
+  - **DB destinations refuse it** at submit with `unsupported_write_mode`.
+    DataFusion's SQL has no `MERGE` to drive them with.
 
 **Overwrite is deliberately not supported.** Overwriting a DB destination
 would need `DELETE FROM` + `INSERT` to share one transaction, and the
@@ -97,7 +121,8 @@ multi-statement transaction handle — so a mid-run INSERT failure after a
 successful DELETE would silently leave the table empty. Rather than ship
 a version of overwrite that is atomic for Lance but not for DB
 destinations, MVP rejects overwrite at YAML load time across the board.
-Upserts / merge are out of scope for the same reason.
+`upsert` is Lance-only for the same reason: a DB destination has no atomic
+MERGE on this surface either.
 
 Workarounds while overwrite is out:
 
@@ -275,7 +300,7 @@ existed.
 
 ## Submit-time validation (the "pre-flight")
 
-Every submit runs three checks *before* creating a run row, so a
+Every submit runs four checks *before* creating a run row, so a
 malformed submit never pollutes the ledger:
 
 1. **Parameter presence** — every `{placeholder}` in the SQL must have a
@@ -293,6 +318,10 @@ malformed submit never pollutes the ledger:
    - *Destination missing, lake, `create_if_missing: true`* → accept;
      schema is realized on first write.
    - *Destination missing, lake, `create_if_missing: false`* → reject.
+4. **Upsert** — with `mode: upsert`, the destination must be Lance and every
+   `merge_keys` entry must be a column of the query output. Either failure →
+   400 `unsupported_write_mode`. (The YAML loader already refused an upsert
+   with no keys, or keys with any other mode.)
 
 On rejection the HTTP response is `400` with an `error_type` suitable
 for agent handling:
@@ -306,6 +335,7 @@ for agent handling:
 | `non_transactional_destination` | Destination source type is Redis / MongoDB / SeekDB / InfluxDB / DynamoDB — rejected because its write path cannot guarantee atomicity |
 | `schema_mismatch` | Column diff — `details.diff` carries a human-readable string |
 | `sql_plan_failure` | DataFusion rejected the rendered SQL |
+| `unsupported_write_mode` | `mode: upsert` on a DB destination, or a merge key the query does not output |
 
 ---
 

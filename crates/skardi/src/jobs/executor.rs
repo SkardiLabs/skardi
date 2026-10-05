@@ -86,6 +86,11 @@ pub enum JobSubmitError {
         source_type: DataSourceType,
     },
 
+    /// An `upsert` the destination cannot honour: a SQL destination, which
+    /// has no MERGE to drive, or a merge key the query does not output.
+    #[error("Destination '{table}' cannot take this upsert: {reason}")]
+    UnsupportedWriteMode { table: String, reason: String },
+
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
@@ -103,6 +108,7 @@ impl JobSubmitError {
             Self::SqlPlanFailure { .. } => "sql_plan_failure",
             Self::DestinationResolutionFailed { .. } => "destination_resolution_failed",
             Self::NonTransactionalDestination { .. } => "non_transactional_destination",
+            Self::UnsupportedWriteMode { .. } => "unsupported_write_mode",
             Self::Internal(_) => "internal_error",
         }
     }
@@ -252,6 +258,7 @@ impl JobExecutor {
 
         self.preflight(destination.as_ref(), &job.destination, &query_schema)
             .await?;
+        check_upsert(destination.as_ref(), &job.destination, &query_schema)?;
 
         // Persist the pending row.
         let run_id = Uuid::new_v4().simple().to_string();
@@ -339,7 +346,10 @@ impl JobExecutor {
                         table: dest.table.clone(),
                     }
                 })?;
-                Ok(Arc::new(LanceDestination::new(path)) as Arc<dyn JobDestination>)
+                Ok(
+                    Arc::new(LanceDestination::new(path).with_merge_keys(dest.merge_keys.clone()))
+                        as Arc<dyn JobDestination>,
+                )
             }
             Some(DataSourceType::Postgres)
             | Some(DataSourceType::Mysql)
@@ -477,6 +487,42 @@ fn substitute_sql_params(
 fn sorted_json(params: &HashMap<String, Value>) -> String {
     let sorted: BTreeMap<&str, &Value> = params.iter().map(|(k, v)| (k.as_str(), v)).collect();
     serde_json::to_string(&sorted).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// The submit-time half of the upsert contract (the load-time half is
+/// [`Destination::validate`]): only a lake destination merges, and every
+/// merge key has to be a column the query produces. Caught here, a bad key
+/// is a 400 at submit rather than a failed run after the source was read.
+fn check_upsert(
+    destination: &dyn JobDestination,
+    config: &Destination,
+    query_schema: &Schema,
+) -> Result<(), JobSubmitError> {
+    if config.mode != DestinationMode::Upsert {
+        return Ok(());
+    }
+    if destination.kind() != JobDestinationKind::Lake {
+        return Err(JobSubmitError::UnsupportedWriteMode {
+            table: config.table.clone(),
+            reason: "`mode: upsert` is supported for Lance destinations only".to_string(),
+        });
+    }
+    let missing: Vec<&str> = config
+        .merge_keys
+        .iter()
+        .filter(|key| query_schema.field_with_name(key).is_err())
+        .map(String::as_str)
+        .collect();
+    if !missing.is_empty() {
+        return Err(JobSubmitError::UnsupportedWriteMode {
+            table: config.table.clone(),
+            reason: format!(
+                "merge key(s) {} are not columns of the query output",
+                missing.join(", ")
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Order-insensitive schema diff: every column in `produced` must have a
@@ -667,6 +713,61 @@ mod tests {
     use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use arrow::record_batch::RecordBatch;
+
+    fn upsert_on(table: &str, keys: &[&str]) -> Destination {
+        Destination {
+            table: table.to_string(),
+            mode: DestinationMode::Upsert,
+            create_if_missing: true,
+            merge_keys: keys.iter().map(|k| k.to_string()).collect(),
+        }
+    }
+
+    fn id_name_schema() -> ArrowSchema {
+        ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ])
+    }
+
+    #[test]
+    fn check_upsert_accepts_a_lake_destination_whose_keys_are_output_columns() {
+        let lake = LanceDestination::new("unused.lance");
+        check_upsert(&lake, &upsert_on("lake", &["id"]), &id_name_schema())
+            .expect("a Lance destination keyed on an output column merges");
+    }
+
+    #[test]
+    fn check_upsert_refuses_a_sql_destination() {
+        let db = SqlDmlDestination::new(Arc::new(SessionContext::new()), "pg.public.t");
+        let err = check_upsert(&db, &upsert_on("pg.public.t", &["id"]), &id_name_schema())
+            .expect_err("SQL destinations have no MERGE");
+        assert_eq!(err.category(), "unsupported_write_mode");
+        assert!(err.to_string().contains("Lance destinations only"), "{err}");
+    }
+
+    #[test]
+    fn check_upsert_names_every_key_the_query_does_not_output() {
+        let lake = LanceDestination::new("unused.lance");
+        let err = check_upsert(
+            &lake,
+            &upsert_on("lake", &["id", "path", "source_id"]),
+            &id_name_schema(),
+        )
+        .expect_err("keys must be output columns");
+        assert!(err.to_string().contains("path, source_id"), "{err}");
+    }
+
+    #[test]
+    fn check_upsert_ignores_append() {
+        let db = SqlDmlDestination::new(Arc::new(SessionContext::new()), "pg.public.t");
+        let append = Destination {
+            mode: DestinationMode::Append,
+            merge_keys: Vec::new(),
+            ..upsert_on("pg.public.t", &[])
+        };
+        check_upsert(&db, &append, &id_name_schema()).expect("append is not an upsert");
+    }
 
     #[test]
     fn substitute_sql_params_replaces_string_and_number() {
