@@ -450,6 +450,35 @@ Ensure the Lance dataset has an INVERTED index on the target column. Without an 
 #### "Phrase search returns unexpected results"
 Verify the INVERTED index was created with `with_position=True`. Without positions, phrase queries fall back to term matching.
 
+### `fts_match`: a full-text predicate for engines that push it down
+
+`fts_match(column, query)` is a boolean predicate that names a full-text
+search in a `WHERE` clause instead of building a table, for an engine that
+authorizes queries by walking their plan and therefore cannot allow table
+functions such as `lance_fts`:
+
+```sql
+SELECT path, title
+FROM corpus
+WHERE fts_match(body, 'onboarding checklist')
+  AND "type" = 'document'
+```
+
+**The OSS server does not register or execute it.** No provider in this
+repository answers it yet, so the server leaves it out of its session, and
+a query naming it fails to plan there. It is a building block for an engine
+whose own Lance provider recognizes the predicate and turns it into a Lance
+full-text query:
+
+- call `skardi::sources::providers::lance::register_fts_match_udf(&ctx)` on
+  the session;
+- in the provider's `supports_filters_pushdown` and `scan`, find the call with
+  `as_fts_match(expr)`, which returns the column and the query expression.
+
+If no provider takes the predicate, evaluating it is an error that says so,
+never an empty result, so "nothing matched" and "nothing searched" cannot be
+confused. Use `lance_fts` for full-text search on the OSS server.
+
 ## Creating Your Own Vector Search Pipeline
 
 ### 1. Create Context Configuration

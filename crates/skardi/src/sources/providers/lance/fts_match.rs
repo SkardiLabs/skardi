@@ -123,6 +123,20 @@ pub fn register_fts_match_udf(ctx: &SessionContext) {
 
 /// An `fts_match` call a provider can serve: the column it searches and the
 /// query expression.
+///
+/// # Example
+/// ```
+/// use datafusion::execution::FunctionRegistry;
+/// use datafusion::prelude::{SessionContext, col, lit};
+/// use skardi::sources::providers::lance::{FtsMatch, as_fts_match, register_fts_match_udf};
+///
+/// let ctx = SessionContext::new();
+/// register_fts_match_udf(&ctx);
+/// let expr = ctx.udf("fts_match").unwrap().call(vec![col("body"), lit("onboarding")]);
+/// let FtsMatch { column, query } = as_fts_match(&expr).expect("an fts_match on a column");
+/// assert_eq!(column.name, "body");
+/// assert_eq!(query, &lit("onboarding"));
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FtsMatch<'a> {
     pub column: &'a Column,
