@@ -112,6 +112,16 @@ impl LanceDestination {
         let batches: Vec<RecordBatch> = checked.try_collect().await.with_context(|| {
             format!("Failed to read the rows for Lance dataset at {}", self.path)
         })?;
+        self.create_or_merge(schema, batches).await
+    }
+
+    /// Create the dataset from `batches`, or, when another writer created it
+    /// since this run looked, merge them into that writer's dataset.
+    async fn create_or_merge(
+        &self,
+        schema: arrow::datatypes::SchemaRef,
+        batches: Vec<RecordBatch>,
+    ) -> Result<WriteOutcome> {
         if batches.iter().all(|batch| batch.num_rows() == 0) {
             return Ok(WriteOutcome {
                 rows_written: 0,
@@ -642,27 +652,33 @@ mod tests {
         assert_eq!(contents(path).await, vec![(1, "a".into())]);
     }
 
-    /// Two first writers both see no dataset. The one whose create loses
-    /// merges into the winner's dataset instead of failing.
+    /// A first run whose create finds the dataset already there (another
+    /// first writer committed between its check and its create) merges into
+    /// it instead of failing. Driven directly: a real race on one process's
+    /// local filesystem is timing, and Lance's guarantee that two creates
+    /// conflict is the object store's conditional commit, not this test's.
     #[tokio::test]
-    async fn two_first_upserts_racing_both_land() {
+    async fn a_create_that_finds_the_dataset_created_meanwhile_merges() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("race.lance");
         let path = path.to_str().unwrap().to_string();
-        let a = upserting(&path);
-        let b = upserting(&path);
-        let first = rows(&[1, 2], &["a", "b"]);
-        let second = rows(&[2, 3], &["B", "c"]);
-        let (sa, sb) = (first.schema(), second.schema());
-        let (ra, rb) = tokio::join!(
-            a.write(vec_to_stream(vec![first], sa), DestinationMode::Upsert),
-            b.write(vec_to_stream(vec![second], sb), DestinationMode::Upsert),
+        let winner = rows(&[1, 2], &["a", "b"]);
+        let schema = winner.schema();
+        upserting(&path)
+            .write(vec_to_stream(vec![winner], schema), DestinationMode::Upsert)
+            .await
+            .unwrap();
+
+        let late = rows(&[2, 3], &["B", "c"]);
+        let out = upserting(&path)
+            .create_or_merge(late.schema(), vec![late])
+            .await
+            .expect("the late creator merges");
+        assert_eq!(out.rows_written, 2);
+        assert_eq!(
+            contents(&path).await,
+            vec![(1, "a".into()), (2, "B".into()), (3, "c".into())]
         );
-        ra.expect("first writer");
-        rb.expect("second writer");
-        let got = contents(&path).await;
-        assert_eq!(got.len(), 3, "one row per key: {got:?}");
-        assert!(got.contains(&(1, "a".into())) && got.iter().any(|(id, _)| *id == 3));
     }
 
     #[tokio::test]
