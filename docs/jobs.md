@@ -115,9 +115,9 @@ destination of a job.
     commit race replays its input against the newer version.
   - **A first run on a missing dataset** (with `create_if_missing: true`)
     creates it from the checked rows. If that run fails, no dataset is left.
-    A first run with zero rows succeeds and creates nothing. Two first runs
-    racing both land: the one whose create loses merges into the other's
-    dataset.
+    A first run with zero rows succeeds and creates nothing. A first run whose
+    create finds that another writer created the dataset in the meantime
+    merges into it instead of failing.
   - **Memory.** The key set, and on a first run the rows themselves (which
     `merge_insert` buffers anyway for its conflict retry), scale with one
     run's output, not with the dataset. A job that re-reads a whole source
