@@ -99,6 +99,15 @@ pub fn lance_dataset_exists(path: &str) -> bool {
 /// Whether `path` names a dataset in an object store (`s3://bucket/key`, and
 /// any other `scheme://` Lance resolves) rather than a local directory.
 /// `file://` counts as local.
+///
+/// # Example
+/// ```
+/// use skardi::sources::providers::lance::is_remote_lance_uri;
+///
+/// assert!(is_remote_lance_uri("s3://bucket/w/acme/corpus.lance"));
+/// assert!(!is_remote_lance_uri("data/corpus.lance"));
+/// assert!(!is_remote_lance_uri("file:///srv/data/corpus.lance"));
+/// ```
 pub fn is_remote_lance_uri(path: &str) -> bool {
     path.contains("://") && !path.starts_with("file://")
 }

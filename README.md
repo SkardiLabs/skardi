@@ -333,7 +333,7 @@ agents; deploy it next to your data, behind your usual auth.
 | DynamoDB | Full | Yes | Scan + filter pushdown | [docs](docs/dynamodb/) |
 | SeekDB | Full | Yes | MySQL-wire CRUD, FULLTEXT, HNSW | [docs](docs/seekdb/) |
 | ClickHouse | Read | Yes | Columnar OLAP, filter/limit pushdown | [docs](docs/clickhouse/) |
-| Lance | Read + job-write | No | KNN, BM25 FTS; job destination | [docs](docs/lance/) |
+| Lance | Read + job-write | No | KNN, BM25 FTS; job destination, local or in S3 | [docs](docs/lance/), [S3](docs/S3_USAGE.md#lance-datasets-in-s3-and-s3-compatible-stores) |
 | Apache Iceberg | Read | No | Schema evolution, partition pruning | [docs](docs/iceberg/) |
 | InfluxDB 3 | Read | No | Time series over Arrow Flight SQL | [docs](docs/influxdb/) |
 | S3 / GCS / Azure | Read | No | CSV, Parquet, Lance in object stores | [docs](docs/S3_USAGE.md) |
