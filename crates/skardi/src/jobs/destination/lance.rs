@@ -11,13 +11,14 @@
 use anyhow::{Context, Result, bail};
 use arrow::array::ArrayRef;
 use arrow::datatypes::Schema;
+use arrow::record_batch::RecordBatch;
 use arrow::row::{OwnedRow, RowConverter, SortField};
 use arrow::util::display::array_value_to_string;
 use async_trait::async_trait;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use lance::Dataset;
 use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode};
 use std::collections::HashSet;
@@ -59,6 +60,16 @@ impl LanceDestination {
     }
 
     /// The columns `upsert` matches on. Ignored by `append`.
+    ///
+    /// # Example
+    /// ```
+    /// use skardi::jobs::LanceDestination;
+    ///
+    /// // One row per (path, source_id): a re-read record replaces its row.
+    /// let dest = LanceDestination::new("data/corpus.lance")
+    ///     .with_merge_keys(vec!["path".to_string(), "source_id".to_string()]);
+    /// assert_eq!(dest.path(), "data/corpus.lance");
+    /// ```
     pub fn with_merge_keys(mut self, merge_keys: Vec<String>) -> Self {
         self.merge_keys = merge_keys;
         self
@@ -70,9 +81,18 @@ impl LanceDestination {
 
     /// Merge `stream` into the dataset on `merge_keys`.
     ///
-    /// The stream is checked for repeated keys first. A missing dataset is
-    /// then created straight from the checked stream: a repeated key aborts
-    /// that write before it commits, so no dataset is left behind.
+    /// The stream is checked for repeated and NULL keys first. A missing
+    /// dataset is then created from the checked rows, which are buffered for
+    /// that one case so that:
+    /// - **an empty first run commits nothing.** Zero rows to merge is not an
+    ///   error, and it creates no dataset (an empty one would have no rows to
+    ///   take its schema's meaning from, and a reader would be told it exists);
+    /// - **a lost creation race becomes a merge.** Two first writers both see
+    ///   no dataset; the one whose create loses replays the same rows as a
+    ///   merge into the winner's dataset, instead of failing.
+    ///
+    /// The buffer is one run's output, which `merge_insert` already holds for
+    /// its own conflict retry; every later run streams.
     async fn upsert(&self, stream: SendableRecordBatchStream) -> Result<WriteOutcome> {
         if self.merge_keys.is_empty() {
             // The loader and the submit pre-flight both refuse this; reaching
@@ -84,13 +104,39 @@ impl LanceDestination {
         }
         let checked = reject_repeated_keys(stream, &self.merge_keys)
             .with_context(|| format!("Invalid merge keys for Lance dataset at {}", self.path))?;
-        if !lance_dataset_exists(&self.path) {
-            let outcome = write_lance_stream(&self.path, checked, WriteMode::Create).await?;
+        if lance_dataset_exists(&self.path) {
+            return self.merge(checked).await;
+        }
+
+        let schema = checked.schema();
+        let batches: Vec<RecordBatch> = checked.try_collect().await.with_context(|| {
+            format!("Failed to read the rows for Lance dataset at {}", self.path)
+        })?;
+        if batches.iter().all(|batch| batch.num_rows() == 0) {
             return Ok(WriteOutcome {
-                rows_written: outcome.rows_written,
-                snapshot_id: Some(outcome.version.to_string()),
+                rows_written: 0,
+                snapshot_id: None,
             });
         }
+        let replay = |batches: &[RecordBatch]| -> SendableRecordBatchStream {
+            Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&schema),
+                futures::stream::iter(batches.to_vec().into_iter().map(Ok)),
+            ))
+        };
+        match write_lance_stream(&self.path, replay(&batches), WriteMode::Create).await {
+            Ok(outcome) => Ok(WriteOutcome {
+                rows_written: outcome.rows_written,
+                snapshot_id: Some(outcome.version.to_string()),
+            }),
+            // Another writer created it between the check and the commit.
+            Err(_) if lance_dataset_exists(&self.path) => self.merge(replay(&batches)).await,
+            Err(error) => Err(error),
+        }
+    }
+
+    /// `merge_insert` the checked rows into the existing dataset.
+    async fn merge(&self, checked: SendableRecordBatchStream) -> Result<WriteOutcome> {
         let dataset = Arc::new(
             Dataset::open(&self.path)
                 .await
@@ -114,7 +160,12 @@ impl LanceDestination {
     }
 }
 
-/// `stream`, failing at the first row whose `keys` repeat an earlier row's.
+/// `stream`, failing at the first row whose `keys` repeat an earlier row's,
+/// or hold a NULL.
+///
+/// A NULL is refused rather than merged: `merge_insert` matches keys with SQL
+/// equality, under which NULL never equals NULL, so a row with a NULL key
+/// would be inserted again on every run instead of replacing its copy.
 ///
 /// Every key seen in the run is held in memory until the stream ends, so the
 /// cost is one encoded key per output row: bounded by what one run emits, not
@@ -142,6 +193,14 @@ fn reject_repeated_keys(
             .iter()
             .map(|&i| Arc::clone(batch.column(i)))
             .collect();
+        for (name, column) in keys.iter().zip(&columns) {
+            if column.null_count() > 0 {
+                return Err(DataFusionError::Execution(format!(
+                    "merge key column '{name}' is NULL in this run's output; an upsert \
+                     cannot match a NULL key, so the write is refused"
+                )));
+            }
+        }
         let rows = converter.convert_columns(&columns)?;
         for (n, row) in rows.iter().enumerate() {
             if !seen.insert(row.owned()) {
@@ -523,6 +582,87 @@ mod tests {
             .await
             .expect_err("cancelled stream should fail the merge");
         assert_eq!(contents(path).await, vec![(1, "a".into())]);
+    }
+
+    /// SQL equality never matches NULL, so a NULL key would be inserted again
+    /// every run. Refused, naming the column, and nothing is committed.
+    #[tokio::test]
+    async fn a_null_merge_key_is_refused_rather_than_duplicated() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("null.lance");
+        let path = path.to_str().unwrap();
+        let dest = LanceDestination::new(path.to_string())
+            .with_merge_keys(vec!["id".to_string(), "name".to_string()]);
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let with_null = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(StringArray::from(vec![None::<&str>])),
+            ],
+        )
+        .unwrap();
+        let err = dest
+            .write(
+                vec_to_stream(vec![with_null], schema),
+                DestinationMode::Upsert,
+            )
+            .await
+            .expect_err("a NULL key cannot be matched");
+        assert!(format!("{err:#}").contains("'name' is NULL"), "{err:#}");
+        assert!(!lance_dataset_exists(path), "nothing is committed");
+    }
+
+    /// Zero rows to merge is not an error, and a first run with none leaves
+    /// no dataset behind; the next run with rows creates it.
+    #[tokio::test]
+    async fn an_empty_first_upsert_succeeds_and_creates_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("empty.lance");
+        let path = path.to_str().unwrap();
+        let dest = upserting(path);
+        let none = rows(&[], &[]);
+        let schema = none.schema();
+        let out = dest
+            .write(vec_to_stream(vec![none], schema), DestinationMode::Upsert)
+            .await
+            .expect("an empty upsert is a no-op");
+        assert_eq!(out.rows_written, 0);
+        assert_eq!(out.snapshot_id, None);
+        assert!(!lance_dataset_exists(path));
+
+        let first = rows(&[1], &["a"]);
+        let schema = first.schema();
+        dest.write(vec_to_stream(vec![first], schema), DestinationMode::Upsert)
+            .await
+            .unwrap();
+        assert_eq!(contents(path).await, vec![(1, "a".into())]);
+    }
+
+    /// Two first writers both see no dataset. The one whose create loses
+    /// merges into the winner's dataset instead of failing.
+    #[tokio::test]
+    async fn two_first_upserts_racing_both_land() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("race.lance");
+        let path = path.to_str().unwrap().to_string();
+        let a = upserting(&path);
+        let b = upserting(&path);
+        let first = rows(&[1, 2], &["a", "b"]);
+        let second = rows(&[2, 3], &["B", "c"]);
+        let (sa, sb) = (first.schema(), second.schema());
+        let (ra, rb) = tokio::join!(
+            a.write(vec_to_stream(vec![first], sa), DestinationMode::Upsert),
+            b.write(vec_to_stream(vec![second], sb), DestinationMode::Upsert),
+        );
+        ra.expect("first writer");
+        rb.expect("second writer");
+        let got = contents(&path).await;
+        assert_eq!(got.len(), 3, "one row per key: {got:?}");
+        assert!(got.contains(&(1, "a".into())) && got.iter().any(|(id, _)| *id == 3));
     }
 
     #[tokio::test]
