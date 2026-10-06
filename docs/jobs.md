@@ -107,10 +107,21 @@ destination of a job.
     resolved by picking one of the two. Skardi checks this itself, for keys
     new to the dataset as well as existing ones, by holding each key the run
     emits in memory until the write ends.
+  - **No NULL keys.** A NULL in any merge-key column fails the write, naming
+    the column, and nothing is committed. Lance matches keys with SQL
+    equality, under which NULL never matches, so the row would otherwise be
+    inserted again on every run.
   - **Concurrent writers are retried, not overwritten.** A merge that loses a
     commit race replays its input against the newer version.
   - **A first run on a missing dataset** (with `create_if_missing: true`)
     creates it from the checked rows. If that run fails, no dataset is left.
+    A first run with zero rows succeeds and creates nothing. Two first runs
+    racing both land: the one whose create loses merges into the other's
+    dataset.
+  - **Memory.** The key set, and on a first run the rows themselves (which
+    `merge_insert` buffers anyway for its conflict retry), scale with one
+    run's output, not with the dataset. A job that re-reads a whole source
+    on its first run holds that source's output once.
   - **DB destinations refuse it** at submit with `unsupported_write_mode`.
     DataFusion's SQL has no `MERGE` to drive them with.
 
