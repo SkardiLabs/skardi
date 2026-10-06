@@ -75,6 +75,17 @@ impl S3Storage {
         Ok(())
     }
 
+    /// Validation for a remote Lance source: an `s3://bucket/...` URI and no
+    /// credentials in `options`. Unlike CSV and Parquet there is no object to
+    /// HEAD — a Lance dataset is a prefix — and the dataset may not exist yet,
+    /// so connectivity is left to the first open or write.
+    pub fn validate_lance_configuration(&self, source: &DataSource) -> Result<()> {
+        Self::reject_credential_options(source)?;
+        let path = source.path.to_str().unwrap_or("");
+        parse_bucket(path, &source.name)?;
+        Ok(())
+    }
+
     /// Validate S3 configuration for a `documents` source, where the source
     /// `path` and the `image_store` option may **each independently** be a local
     /// directory or an `s3://` prefix.
@@ -88,17 +99,6 @@ impl S3Storage {
     ///   (see design doc §4). Cross-bucket support is a tracked follow-up.
     ///
     /// [`validate_configuration`]: RemoteStorage::validate_configuration
-    /// Validation for a remote Lance source: an `s3://bucket/...` URI and no
-    /// credentials in `options`. Unlike CSV and Parquet there is no object to
-    /// HEAD — a Lance dataset is a prefix — and the dataset may not exist yet,
-    /// so connectivity is left to the first open or write.
-    pub fn validate_lance_configuration(&self, source: &DataSource) -> Result<()> {
-        Self::reject_credential_options(source)?;
-        let path = source.path.to_str().unwrap_or("");
-        parse_bucket(path, &source.name)?;
-        Ok(())
-    }
-
     pub fn validate_documents_configuration(
         &self,
         path: &str,
