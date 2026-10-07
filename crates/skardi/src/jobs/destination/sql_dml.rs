@@ -21,7 +21,7 @@
 //! For larger ingests, use the database's native bulk loader (`COPY`,
 //! `LOAD DATA INFILE`) or a CDC pipeline.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
@@ -88,9 +88,15 @@ impl JobDestination for SqlDmlDestination {
     async fn write(
         &self,
         stream: SendableRecordBatchStream,
-        _mode: DestinationMode,
+        mode: DestinationMode,
     ) -> Result<WriteOutcome> {
-        // MVP supports append only — overwrite is rejected at YAML load.
+        // Overwrite is rejected at YAML load, and upsert at submit
+        // (`check_upsert`): DataFusion's DML has no MERGE to drive. Refused
+        // here too, so a destination built around the pre-flight cannot
+        // quietly append what was meant to replace.
+        if mode == DestinationMode::Upsert {
+            bail!("SQL destination '{}' does not support upsert", self.table);
+        }
         let schema = stream.schema();
 
         // Tally rows as the stream flows through the counting adapter so we

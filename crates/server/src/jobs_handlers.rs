@@ -97,7 +97,8 @@ fn submit_error_status(err: &JobSubmitError) -> StatusCode {
         | JobSubmitError::SchemaMismatch { .. }
         | JobSubmitError::SqlPlanFailure { .. }
         | JobSubmitError::DestinationResolutionFailed { .. }
-        | JobSubmitError::NonTransactionalDestination { .. } => StatusCode::BAD_REQUEST,
+        | JobSubmitError::NonTransactionalDestination { .. }
+        | JobSubmitError::UnsupportedWriteMode { .. } => StatusCode::BAD_REQUEST,
         JobSubmitError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -463,6 +464,8 @@ pub async fn list_jobs(
                     "table": def.destination.table,
                     "mode": format!("{:?}", def.destination.mode).to_lowercase(),
                     "create_if_missing": def.destination.create_if_missing,
+                    "merge_keys": def.destination.merge_keys,
+                    "repeated_keys": def.destination.repeated_keys,
                 },
                 "parameters": params,
             }));

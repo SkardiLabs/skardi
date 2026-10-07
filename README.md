@@ -314,8 +314,9 @@ agents; deploy it next to your data, behind your usual auth.
 - **Semantic overlay** — plain-English descriptions of tables and columns served
   on `GET /data_source`, so the agent reads what data *means* before querying
   instead of guessing from a schema dump. [docs/semantics.md](docs/semantics.md)
-- **Offline jobs** — async batch writes with atomic commit, crash recovery and a
-  run ledger you can list and inspect. [docs/jobs.md](docs/jobs.md)
+- **Offline jobs** — async batch writes (append, or upsert into Lance on merge
+  keys) with atomic commit, crash recovery and a run ledger you can list and
+  inspect. [docs/jobs.md](docs/jobs.md)
 - **Retrieval built in** — KNN, FTS and hybrid RRF in SQL; `candle()` embeddings,
   `chunk()`, `onnx_predict()` and `llm_extract()` as UDFs, so content and vector
   land on the same row atomically. [docs/embeddings/](docs/embeddings/)

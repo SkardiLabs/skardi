@@ -16,7 +16,9 @@ pub mod destination;
 pub mod executor;
 pub mod store;
 
-pub use definition::{Destination, DestinationMode, Execution, JobDefinition, JobKind};
+pub use definition::{
+    Destination, DestinationMode, Execution, JobDefinition, JobKind, RepeatedKeys,
+};
 pub use destination::{
     JobDestination, JobDestinationKind, LanceDestination, SqlDmlDestination, WriteOutcome,
 };
