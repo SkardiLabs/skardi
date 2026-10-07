@@ -149,7 +149,7 @@ impl LanceDestination {
         let produced: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
         let kept = keep_last_per_key(&schema, batches, &self.merge_keys)
             .with_context(|| format!("Invalid merge keys for Lance dataset at {}", self.path))?;
-        let mut outcome = if lance_dataset_exists(&self.path) {
+        let mut outcome = if lance_dataset_exists_at(&self.path).await? {
             let replay: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
                 Arc::clone(&schema),
                 futures::stream::iter(kept.into_iter().map(Ok)),
