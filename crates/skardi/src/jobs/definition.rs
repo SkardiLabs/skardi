@@ -21,6 +21,7 @@
 //!     mode: append                # append | upsert (overwrite is deferred — see below)
 //!     create_if_missing: true     # lake destinations only
 //!     # merge_keys: [id]          # required with `mode: upsert`, refused otherwise
+//!     # repeated_keys: keep_last  # upsert only: refuse (default) | keep_last
 //!   execution:
 //!     timeout_ms: 3600000         # optional; default = no timeout
 //! ```
@@ -98,6 +99,34 @@ pub struct Destination {
     /// checks that at submit, once the output schema is known.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub merge_keys: Vec<String>,
+    /// What an `upsert` does with a key that appears more than once in one
+    /// run's output: [`RepeatedKeys::Refuse`] (the default) or
+    /// [`RepeatedKeys::KeepLast`]. Only meaningful with `mode: upsert`.
+    #[serde(default, skip_serializing_if = "RepeatedKeys::is_refuse")]
+    pub repeated_keys: RepeatedKeys,
+}
+
+/// What an upsert does with a merge key repeated within one run's output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepeatedKeys {
+    /// Fail the write, naming the key, and commit nothing: the run is never
+    /// resolved by picking one copy silently.
+    #[default]
+    Refuse,
+    /// Keep the copy that comes LAST in the query's output order, for a
+    /// source whose listing can return one record twice in a window (a
+    /// record updated mid-pagination reappears on a later page, so the last
+    /// copy is the newest). The run's whole output is buffered to find the
+    /// last copy, and `rows_written` counts every row the query produced, so
+    /// a caller comparing it against a LIMIT still sees a full page as full.
+    KeepLast,
+}
+
+impl RepeatedKeys {
+    fn is_refuse(&self) -> bool {
+        *self == RepeatedKeys::Refuse
+    }
 }
 
 impl Destination {
@@ -112,6 +141,11 @@ impl Destination {
             )),
             DestinationMode::Append if !self.merge_keys.is_empty() => Err(anyhow!(
                 "destination `{}`: `merge_keys` only applies to `mode: upsert`; with \
+                 `mode: append` it would be ignored",
+                self.table
+            )),
+            DestinationMode::Append if self.repeated_keys != RepeatedKeys::Refuse => Err(anyhow!(
+                "destination `{}`: `repeated_keys` only applies to `mode: upsert`; with \
                  `mode: append` it would be ignored",
                 self.table
             )),
@@ -359,6 +393,35 @@ spec:
 {destination}
 "#
         )
+    }
+
+    #[tokio::test]
+    async fn job_yaml_reads_repeated_keys_and_refuses_it_without_upsert() {
+        let load = |destination: &str| {
+            let yaml = upsert_yaml(destination);
+            async move { write_and_load(&yaml, Arc::new(SessionContext::new())).await }
+        };
+        let keep_last = load(
+            "    table: \"t\"\n    mode: upsert\n    merge_keys: [id]\n    repeated_keys: keep_last",
+        )
+        .await
+        .expect("keep_last loads")
+        .expect("it is a job");
+        assert_eq!(keep_last.destination.repeated_keys, RepeatedKeys::KeepLast);
+
+        let default = load("    table: \"t\"\n    mode: upsert\n    merge_keys: [id]")
+            .await
+            .expect("loads")
+            .expect("it is a job");
+        assert_eq!(default.destination.repeated_keys, RepeatedKeys::Refuse);
+
+        let err = load("    table: \"t\"\n    mode: append\n    repeated_keys: keep_last")
+            .await
+            .expect_err("repeated_keys without upsert");
+        assert!(
+            format!("{err:#}").contains("only applies to `mode: upsert`"),
+            "{err:#}"
+        );
     }
 
     #[tokio::test]

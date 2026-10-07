@@ -100,6 +100,7 @@ destination of a job.
     table: "docs_lake"
     mode: upsert
     merge_keys: [path, source_id]   # required; each must be a query output column
+    repeated_keys: keep_last        # optional: refuse (default) | keep_last
   ```
 
   - **One row per key.** If one run's output has the same key twice, the
@@ -107,6 +108,13 @@ destination of a job.
     resolved by picking one of the two. Skardi checks this itself, for keys
     new to the dataset as well as existing ones, by holding each key the run
     emits in memory until the write ends.
+  - **Unless you ask for the last copy.** With `repeated_keys: keep_last`, a
+    key repeated in one run keeps the row that comes last in the query's
+    output, for a source whose listing can return one record twice (a record
+    updated mid-pagination reappears on a later page). The run's output is
+    buffered to find it, and `rows_written` counts every row the query
+    produced, so a caller comparing it against a `LIMIT` still sees a full
+    page as full. The default is `repeated_keys: refuse`.
   - **No NULL keys.** A NULL in any merge-key column fails the write, naming
     the column, and nothing is committed. Lance matches keys with SQL
     equality, under which NULL never matches, so the row would otherwise be
