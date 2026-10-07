@@ -24,7 +24,7 @@ use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode}
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use super::super::definition::DestinationMode;
+use super::super::definition::{DestinationMode, RepeatedKeys};
 use super::{JobDestination, JobDestinationKind, WriteOutcome};
 use crate::sources::providers::lance::{lance_dataset_exists_at, write_lance_stream};
 
@@ -50,6 +50,7 @@ use crate::sources::providers::lance::{lance_dataset_exists_at, write_lance_stre
 pub struct LanceDestination {
     path: String,
     merge_keys: Vec<String>,
+    repeated_keys: RepeatedKeys,
 }
 
 impl LanceDestination {
@@ -57,6 +58,7 @@ impl LanceDestination {
         Self {
             path: path.into(),
             merge_keys: Vec::new(),
+            repeated_keys: RepeatedKeys::Refuse,
         }
     }
 
@@ -73,6 +75,24 @@ impl LanceDestination {
     /// ```
     pub fn with_merge_keys(mut self, merge_keys: Vec<String>) -> Self {
         self.merge_keys = merge_keys;
+        self
+    }
+
+    /// What `upsert` does with a key repeated within one run's output
+    /// ([`RepeatedKeys`]). Ignored by `append`.
+    ///
+    /// # Example
+    /// ```
+    /// use skardi::jobs::{LanceDestination, RepeatedKeys};
+    ///
+    /// // A source whose listing can repeat a record: keep its last copy.
+    /// let dest = LanceDestination::new("data/corpus.lance")
+    ///     .with_merge_keys(vec!["path".to_string()])
+    ///     .with_repeated_keys(RepeatedKeys::KeepLast);
+    /// assert_eq!(dest.path(), "data/corpus.lance");
+    /// ```
+    pub fn with_repeated_keys(mut self, repeated_keys: RepeatedKeys) -> Self {
+        self.repeated_keys = repeated_keys;
         self
     }
 
@@ -103,6 +123,9 @@ impl LanceDestination {
                 self.path
             );
         }
+        if self.repeated_keys == RepeatedKeys::KeepLast {
+            return self.upsert_keeping_last(stream).await;
+        }
         let checked = reject_repeated_keys(stream, &self.merge_keys)
             .with_context(|| format!("Invalid merge keys for Lance dataset at {}", self.path))?;
         if lance_dataset_exists_at(&self.path).await? {
@@ -114,6 +137,31 @@ impl LanceDestination {
             format!("Failed to read the rows for Lance dataset at {}", self.path)
         })?;
         self.create_or_merge(schema, batches).await
+    }
+
+    /// [`RepeatedKeys::KeepLast`]: buffer the run, keep each key's last row,
+    /// merge those, and report every row the query produced.
+    async fn upsert_keeping_last(&self, stream: SendableRecordBatchStream) -> Result<WriteOutcome> {
+        let schema = stream.schema();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.with_context(|| {
+            format!("Failed to read the rows for Lance dataset at {}", self.path)
+        })?;
+        let produced: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+        let kept = keep_last_per_key(&schema, batches, &self.merge_keys)
+            .with_context(|| format!("Invalid merge keys for Lance dataset at {}", self.path))?;
+        let mut outcome = if lance_dataset_exists_at(&self.path).await? {
+            let replay: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&schema),
+                futures::stream::iter(kept.into_iter().map(Ok)),
+            ));
+            self.merge(replay).await?
+        } else {
+            self.create_or_merge(schema, kept).await?
+        };
+        // Every row the query produced, superseded copies included: the
+        // count a caller compares against its LIMIT to tell a full page.
+        outcome.rows_written = produced;
+        Ok(outcome)
     }
 
     /// Create the dataset from `batches`, or, when another writer created it
@@ -174,6 +222,61 @@ impl LanceDestination {
             snapshot_id: Some(merged.version().version.to_string()),
         })
     }
+}
+
+/// `batches` with only the LAST row of each repeated `keys` value, in their
+/// original order otherwise. A NULL key is refused, as in
+/// [`reject_repeated_keys`], for the same reason.
+fn keep_last_per_key(
+    schema: &arrow::datatypes::SchemaRef,
+    batches: Vec<RecordBatch>,
+    keys: &[String],
+) -> DFResult<Vec<RecordBatch>> {
+    let indices = keys
+        .iter()
+        .map(|key| schema.index_of(key))
+        .collect::<Result<Vec<usize>, _>>()?;
+    let converter = RowConverter::new(
+        indices
+            .iter()
+            .map(|&i| SortField::new(schema.field(i).data_type().clone()))
+            .collect(),
+    )?;
+    let mut encoded = Vec::with_capacity(batches.len());
+    for batch in &batches {
+        let columns: Vec<ArrayRef> = indices
+            .iter()
+            .map(|&i| Arc::clone(batch.column(i)))
+            .collect();
+        for (name, column) in keys.iter().zip(&columns) {
+            if column.null_count() > 0 {
+                return Err(DataFusionError::Execution(format!(
+                    "merge key column '{name}' is NULL in this run's output; an upsert \
+                     cannot match a NULL key, so the write is refused"
+                )));
+            }
+        }
+        encoded.push(converter.convert_columns(&columns)?);
+    }
+    // Walk from the end: the first time a key is seen there is its last row.
+    let mut seen: HashSet<OwnedRow> = HashSet::new();
+    let mut keep: Vec<Vec<bool>> = encoded
+        .iter()
+        .map(|rows| vec![false; rows.num_rows()])
+        .collect();
+    for (b, rows) in encoded.iter().enumerate().rev() {
+        for r in (0..rows.num_rows()).rev() {
+            keep[b][r] = seen.insert(rows.row(r).owned());
+        }
+    }
+    batches
+        .into_iter()
+        .zip(keep)
+        .map(|(batch, mask)| {
+            arrow::compute::filter_record_batch(&batch, &arrow::array::BooleanArray::from(mask))
+                .map_err(DataFusionError::from)
+        })
+        .collect()
 }
 
 /// `stream`, failing at the first row whose `keys` repeat an earlier row's,
@@ -685,6 +788,43 @@ mod tests {
         assert_eq!(
             contents(&path).await,
             vec![(1, "a".into()), (2, "B".into()), (3, "c".into())]
+        );
+    }
+
+    /// keep_last: a key repeated in one run (here across batches) keeps its
+    /// LAST row, and the reported count is every row the query produced, so a
+    /// caller comparing it with a LIMIT still sees a full page as full.
+    #[tokio::test]
+    async fn keep_last_keeps_the_last_copy_and_counts_every_row() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("keep.lance");
+        let path = path.to_str().unwrap();
+        let dest = upserting(path).with_repeated_keys(RepeatedKeys::KeepLast);
+        let first = rows(&[1, 2], &["a", "old"]);
+        let second = rows(&[2, 3], &["new", "c"]);
+        let schema = first.schema();
+        let out = dest
+            .write(
+                vec_to_stream(vec![first, second], schema),
+                DestinationMode::Upsert,
+            )
+            .await
+            .expect("a repeat is kept, not refused");
+        assert_eq!(out.rows_written, 4, "every row the query produced");
+        assert_eq!(
+            contents(path).await,
+            vec![(1, "a".into()), (2, "new".into()), (3, "c".into())]
+        );
+
+        // Into the existing dataset too.
+        let again = rows(&[3, 3], &["x", "y"]);
+        let schema = again.schema();
+        dest.write(vec_to_stream(vec![again], schema), DestinationMode::Upsert)
+            .await
+            .unwrap();
+        assert_eq!(
+            contents(path).await,
+            vec![(1, "a".into()), (2, "new".into()), (3, "y".into())]
         );
     }
 

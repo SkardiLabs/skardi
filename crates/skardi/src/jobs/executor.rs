@@ -346,10 +346,11 @@ impl JobExecutor {
                         table: dest.table.clone(),
                     }
                 })?;
-                Ok(
-                    Arc::new(LanceDestination::new(path).with_merge_keys(dest.merge_keys.clone()))
-                        as Arc<dyn JobDestination>,
-                )
+                Ok(Arc::new(
+                    LanceDestination::new(path)
+                        .with_merge_keys(dest.merge_keys.clone())
+                        .with_repeated_keys(dest.repeated_keys),
+                ) as Arc<dyn JobDestination>)
             }
             Some(DataSourceType::Postgres)
             | Some(DataSourceType::Mysql)
@@ -720,6 +721,7 @@ mod tests {
             mode: DestinationMode::Upsert,
             create_if_missing: true,
             merge_keys: keys.iter().map(|k| k.to_string()).collect(),
+            repeated_keys: Default::default(),
         }
     }
 
