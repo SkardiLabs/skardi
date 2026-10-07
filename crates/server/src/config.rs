@@ -2741,6 +2741,78 @@ spec:
         assert_eq!(n, 2);
     }
 
+    fn lance_context(dir: &std::path::Path, source: &str) -> std::path::PathBuf {
+        let content = format!(
+            r#"
+kind: context
+metadata:
+  name: lance-context
+  version: 1.0.0
+spec:
+  data_sources:
+{source}
+"#
+        );
+        let path = dir.join("context.yaml");
+        fs::write(&path, content).unwrap();
+        path
+    }
+
+    /// A Lance dataset a job has not created yet is not an error at boot:
+    /// registration is deferred, for local paths and object-store URIs alike.
+    #[tokio::test]
+    async fn a_lance_dataset_that_does_not_exist_yet_is_deferred() {
+        let temp_dir = TempDir::new().unwrap();
+        let missing = temp_dir.path().join("never-written.lance");
+        let context = lance_context(
+            temp_dir.path(),
+            &format!(
+                "    - name: \"corpus\"\n      type: \"lance\"\n      path: \"{}\"",
+                missing.display()
+            ),
+        );
+        let data_sources = load_context_config(&context).unwrap();
+        let mut session_ctx = SessionContext::new();
+        register_data_sources(&mut session_ctx, &data_sources)
+            .await
+            .expect("a missing dataset defers, it does not fail boot");
+        assert!(
+            session_ctx.table("corpus").await.is_err(),
+            "not registered yet"
+        );
+    }
+
+    /// A remote Lance source with credentials written into its options is
+    /// refused when the context loads; one whose URI names no bucket is
+    /// refused at registration. Neither dials the store.
+    #[tokio::test]
+    async fn a_remote_lance_source_is_validated_before_the_store_is_dialled() {
+        let temp_dir = TempDir::new().unwrap();
+        let with_credentials = lance_context(
+            temp_dir.path(),
+            "    - name: \"corpus\"\n      type: \"lance\"\n      location: \"remote_s3\"\n      \
+             path: \"s3://bucket/corpus.lance\"\n      options:\n        \
+             aws_secret_access_key: \"nope\"",
+        );
+        let err = load_context_config(&with_credentials).expect_err("inline credentials");
+        assert!(format!("{err:#}").contains("must not be stored"), "{err:#}");
+
+        let no_bucket = lance_context(
+            temp_dir.path(),
+            "    - name: \"corpus\"\n      type: \"lance\"\n      location: \"remote_s3\"\n      \
+             path: \"s3:///corpus.lance\"",
+        );
+        let data_sources = load_context_config(&no_bucket).unwrap();
+        let mut session_ctx = SessionContext::new();
+        let err = register_data_sources(&mut session_ctx, &data_sources)
+            .await
+            .expect_err("a URI with no bucket");
+        assert!(
+            format!("{err:#}").to_lowercase().contains("bucket"),
+            "{err:#}"
+        );
+    }
+
     /// `ocr: on` with no `ocr_server_url` must fail at registration (preflight),
     /// not silently produce empty pages mid-scan. This build links liteparse
     /// without the bundled Tesseract engine, so OCR needs an HTTP engine.
