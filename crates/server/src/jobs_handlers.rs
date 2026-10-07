@@ -465,6 +465,7 @@ pub async fn list_jobs(
                     "mode": format!("{:?}", def.destination.mode).to_lowercase(),
                     "create_if_missing": def.destination.create_if_missing,
                     "merge_keys": def.destination.merge_keys,
+                    "repeated_keys": def.destination.repeated_keys,
                 },
                 "parameters": params,
             }));
