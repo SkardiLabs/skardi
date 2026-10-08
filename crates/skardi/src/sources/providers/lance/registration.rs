@@ -40,9 +40,9 @@ pub async fn register_lance_table(
 ) -> Result<()> {
     tracing::info!("Registering Lance dataset: {} from path: {}", name, path);
 
-    // Verify the dataset directory exists
-    let dataset_path = Path::new(path);
-    if !dataset_path.exists() {
+    // A local dataset is checked up front for the clearer error; a remote
+    // one is checked by opening it, just below.
+    if !is_remote_lance_uri(path) && !Path::new(path).exists() {
         return Err(anyhow::anyhow!(
             "Lance dataset directory does not exist: {}",
             path
@@ -94,6 +94,52 @@ pub async fn register_lance_table(
 pub fn lance_dataset_exists(path: &str) -> bool {
     let p = Path::new(path);
     p.is_dir() && p.join("_versions").exists()
+}
+
+/// Whether `path` names a dataset in an object store (`s3://bucket/key`, and
+/// any other `scheme://` Lance resolves) rather than a local directory.
+/// `file://` counts as local.
+///
+/// # Example
+/// ```
+/// use skardi::sources::providers::lance::is_remote_lance_uri;
+///
+/// assert!(is_remote_lance_uri("s3://bucket/w/acme/corpus.lance"));
+/// assert!(!is_remote_lance_uri("data/corpus.lance"));
+/// assert!(!is_remote_lance_uri("file:///srv/data/corpus.lance"));
+/// ```
+pub fn is_remote_lance_uri(path: &str) -> bool {
+    path.contains("://") && !path.starts_with("file://")
+}
+
+/// [`lance_dataset_exists`] for local paths and object-store URIs alike.
+///
+/// A remote dataset is probed by opening it, with credentials and endpoint
+/// from `AWS_*` in the environment: "not found" is `Ok(false)`, which is the
+/// "create a fresh dataset" answer, and anything else (no route, refused
+/// credentials) is an error, never a quiet `false` that would make the next
+/// write try to create over an existing dataset.
+///
+/// # Example
+/// ```no_run
+/// use skardi::sources::providers::lance::lance_dataset_exists_at;
+///
+/// # async fn demo() -> anyhow::Result<()> {
+/// if !lance_dataset_exists_at("s3://bucket/corpus.lance").await? {
+///     // first run: the job creates it
+/// }
+/// # Ok(())
+/// # }
+/// ```
+pub async fn lance_dataset_exists_at(path: &str) -> Result<bool> {
+    if !is_remote_lance_uri(path) {
+        return Ok(lance_dataset_exists(path));
+    }
+    match Dataset::open(path).await {
+        Ok(_) => Ok(true),
+        Err(lance::Error::DatasetNotFound { .. }) => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("Failed to probe Lance dataset at {path}")),
+    }
 }
 
 /// Result of a Lance write operation — the version the dataset landed on
@@ -308,6 +354,35 @@ mod tests {
     fn test_path_validation() {
         let path = Path::new("/nonexistent/path");
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn remote_uris_are_told_apart_from_local_paths() {
+        for remote in [
+            "s3://bucket/corpus.lance",
+            "gs://b/c.lance",
+            "az://c/d.lance",
+        ] {
+            assert!(is_remote_lance_uri(remote), "{remote}");
+        }
+        for local in [
+            "data/corpus.lance",
+            "/abs/corpus.lance",
+            "file:///abs/corpus.lance",
+        ] {
+            assert!(!is_remote_lance_uri(local), "{local}");
+        }
+    }
+
+    #[tokio::test]
+    async fn exists_at_answers_local_paths_like_the_sync_check() {
+        let tmp = TempDir::new().unwrap();
+        let missing = tmp.path().join("nope.lance");
+        assert!(
+            !lance_dataset_exists_at(missing.to_str().unwrap())
+                .await
+                .unwrap()
+        );
     }
 
     #[test]

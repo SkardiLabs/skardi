@@ -61,7 +61,11 @@ iceberg = "0.10.1"
 iceberg-datafusion = "0.10.1"
 iceberg-storage-opendal = "0.10.1"
 insta = { version = "1.41.1", features = ["glob", "filters"] }
-lance = { version = "8.0.1", default-features = false }
+# `aws`: Lance datasets on S3 and S3-compatible stores (MinIO, RustFS), which
+# is where a job's output and the server reading it meet when they run in
+# different pods. Configured the way the rest of the engine's S3 access is,
+# through `AWS_*` in the environment, never in a config file.
+lance = { version = "8.0.1", default-features = false, features = ["aws"] }
 # `tokenizer-jieba`: Chinese full-text indexes (skardi-cloud Lance OKF FTS
 # design, 2026-10-01). ICU is compiled in unconditionally from Lance 8.0;
 # lindera (Korean/Japanese dictionaries) stays off until a benchmark asks.

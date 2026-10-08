@@ -26,9 +26,10 @@ use std::sync::Arc;
 
 use super::super::definition::{DestinationMode, RepeatedKeys};
 use super::{JobDestination, JobDestinationKind, WriteOutcome};
-use crate::sources::providers::lance::{lance_dataset_exists, write_lance_stream};
+use crate::sources::providers::lance::{lance_dataset_exists_at, write_lance_stream};
 
-/// Writes a job's output to a Lance dataset on disk. Path is whatever the
+/// Writes a job's output to a Lance dataset, on local disk or at an object-store
+/// URI (`s3://...`, credentials from `AWS_*`). Path is whatever the
 /// destination `table:` resolves to via the data source registry. When the
 /// dataset does not exist yet, the first run creates it from the query's
 /// output schema.
@@ -127,7 +128,7 @@ impl LanceDestination {
         }
         let checked = reject_repeated_keys(stream, &self.merge_keys)
             .with_context(|| format!("Invalid merge keys for Lance dataset at {}", self.path))?;
-        if lance_dataset_exists(&self.path) {
+        if lance_dataset_exists_at(&self.path).await? {
             return self.merge(checked).await;
         }
 
@@ -148,7 +149,7 @@ impl LanceDestination {
         let produced: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
         let kept = keep_last_per_key(&schema, batches, &self.merge_keys)
             .with_context(|| format!("Invalid merge keys for Lance dataset at {}", self.path))?;
-        let mut outcome = if lance_dataset_exists(&self.path) {
+        let mut outcome = if lance_dataset_exists_at(&self.path).await? {
             let replay: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
                 Arc::clone(&schema),
                 futures::stream::iter(kept.into_iter().map(Ok)),
@@ -188,8 +189,13 @@ impl LanceDestination {
                 snapshot_id: Some(outcome.version.to_string()),
             }),
             // Another writer created it between the check and the commit.
-            Err(_) if lance_dataset_exists(&self.path) => self.merge(replay(&batches)).await,
-            Err(error) => Err(error),
+            Err(error) => {
+                if lance_dataset_exists_at(&self.path).await? {
+                    self.merge(replay(&batches)).await
+                } else {
+                    Err(error)
+                }
+            }
         }
     }
 
@@ -345,11 +351,11 @@ impl JobDestination for LanceDestination {
     }
 
     async fn exists(&self) -> Result<bool> {
-        Ok(lance_dataset_exists(&self.path))
+        lance_dataset_exists_at(&self.path).await
     }
 
     async fn schema(&self) -> Result<Option<Arc<Schema>>> {
-        if !lance_dataset_exists(&self.path) {
+        if !lance_dataset_exists_at(&self.path).await? {
             return Ok(None);
         }
         let dataset = Dataset::open(&self.path)
@@ -367,7 +373,7 @@ impl JobDestination for LanceDestination {
         if mode == DestinationMode::Upsert {
             return self.upsert(stream).await;
         }
-        let write_mode = if lance_dataset_exists(&self.path) {
+        let write_mode = if lance_dataset_exists_at(&self.path).await? {
             WriteMode::Append
         } else {
             WriteMode::Create
@@ -385,6 +391,7 @@ mod tests {
     use super::super::test_util::vec_to_stream;
     use super::super::{CancellableStream, JobDestination};
     use super::*;
+    use crate::sources::providers::lance::lance_dataset_exists;
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use arrow::record_batch::RecordBatch;

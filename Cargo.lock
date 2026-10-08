@@ -5717,6 +5717,7 @@ dependencies = [
  "async-recursion",
  "async-trait",
  "async_cell",
+ "aws-credential-types",
  "bitpacking",
  "byteorder",
  "bytes",
@@ -6085,6 +6086,8 @@ dependencies = [
  "arrow-select",
  "async-recursion",
  "async-trait",
+ "aws-config",
+ "aws-credential-types",
  "byteorder",
  "bytes",
  "chrono",
@@ -6097,6 +6100,8 @@ dependencies = [
  "log",
  "moka",
  "object_store",
+ "object_store_opendal",
+ "opendal",
  "path_abs",
  "pin-project",
  "prost 0.14.3",
@@ -7357,6 +7362,23 @@ dependencies = [
  "walkdir",
  "wasm-bindgen-futures",
  "web-time",
+]
+
+[[package]]
+name = "object_store_opendal"
+version = "0.57.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0eb12a624a41fce745838d0ef3701ff6c47797c13cd18ad3612fd2a3134fdbd8"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "chrono",
+ "futures",
+ "mea",
+ "object_store",
+ "opendal",
+ "pin-project",
+ "tokio",
 ]
 
 [[package]]
@@ -9985,6 +10007,7 @@ dependencies = [
  "opentelemetry_sdk",
  "reqwest 0.12.28",
  "rmcp",
+ "rstest",
  "serde",
  "serde_json",
  "serde_yaml",

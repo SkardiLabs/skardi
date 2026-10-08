@@ -75,6 +75,17 @@ impl S3Storage {
         Ok(())
     }
 
+    /// Validation for a remote Lance source: an `s3://bucket/...` URI and no
+    /// credentials in `options`. Unlike CSV and Parquet there is no object to
+    /// HEAD — a Lance dataset is a prefix — and the dataset may not exist yet,
+    /// so connectivity is left to the first open or write.
+    pub fn validate_lance_configuration(&self, source: &DataSource) -> Result<()> {
+        Self::reject_credential_options(source)?;
+        let path = source.path.to_str().unwrap_or("");
+        parse_bucket(path, &source.name)?;
+        Ok(())
+    }
+
     /// Validate S3 configuration for a `documents` source, where the source
     /// `path` and the `image_store` option may **each independently** be a local
     /// directory or an `s3://` prefix.
@@ -617,6 +628,31 @@ mod tests {
         assert!(!s3_storage.is_remote_path(&PathBuf::from("data/file.csv")));
         assert!(!s3_storage.is_remote_path(&PathBuf::from("/path/to/file.csv")));
         assert!(!s3_storage.is_remote_path(&PathBuf::from("file://path/to/file.csv")));
+    }
+
+    #[rstest::rstest]
+    #[case::clean("s3://bucket/w/acme/okf/github_okf.lance", None, true)]
+    #[case::credentials_in_options("s3://bucket/corpus.lance", Some("aws_access_key_id"), false)]
+    #[case::no_bucket("s3:///corpus.lance", None, false)]
+    fn lance_remote_validation_checks_the_uri_and_refuses_inline_credentials(
+        #[case] path: &str,
+        #[case] option: Option<&str>,
+        #[case] ok: bool,
+    ) {
+        // No HEAD and no network: a Lance dataset is a prefix, and it may not
+        // exist yet. Connectivity is the first open's business.
+        let options = option
+            .map(|key| format!("options:\n  {key}: x\n"))
+            .unwrap_or_default();
+        let yaml = format!("name: corpus\ntype: lance\npath: \"{path}\"\n{options}");
+        let source: DataSource = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(
+            S3Storage::new()
+                .validate_lance_configuration(&source)
+                .is_ok(),
+            ok,
+            "{path} {option:?}"
+        );
     }
 
     #[test]
