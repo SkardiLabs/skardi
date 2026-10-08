@@ -72,7 +72,7 @@ spec:
 ```
 
 ```bash
-# from a source checkout — Docker once --query-audit-db ships in a tagged release
+# from a source checkout; the v0.6.0 Docker image takes the same flags (Docker & cloud, under More)
 git clone https://github.com/SkardiLabs/skardi.git && cd skardi
 cargo run --release --bin skardi-server -- \
   --ctx ctx.yaml --query-audit-db ./audit.db --port 8080
