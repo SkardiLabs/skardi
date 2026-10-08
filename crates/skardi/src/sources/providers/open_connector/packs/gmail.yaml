@@ -18,7 +18,7 @@ tables:
   threads:
     action: gmail.list_threads
     row_path: "$.threads"
-    fingerprint: f2e659510abc405446d94d35ba1e7f74c088b0a33b31552f6d082ca2db397d07
+    fingerprint: 52cd9f235bece5fddde8ed9b349af29649c9b9e33dbfb4b0eb8075f8502855fd
     pagination:
       strategy: cursor
       cursor_input: pageToken
@@ -43,7 +43,7 @@ tables:
   messages:
     action: gmail.fetch_emails
     row_path: "$.messages"
-    fingerprint: b086cd5b5d06813de9c25decab3e09c1f226ddb3b22ef47d23ff6bcc4db701f8
+    fingerprint: cce290431d22b73d396b176fdbd85fab2595dd847579b5480ea87a5b1f3bfdb6
     pagination:
       strategy: cursor
       cursor_input: pageToken
@@ -92,7 +92,7 @@ tables:
   drafts:
     action: gmail.list_drafts
     row_path: "$.drafts"
-    fingerprint: 6f6f13e5f942463d35ac1ef363a934b02b522c65aef84c8ff5a9caf50f0e2de7
+    fingerprint: 6f7866ad930b6118fcdd0b481da0f1ef6b3274ec253b6c14597929d799affc27
     pagination:
       strategy: cursor
       cursor_input: pageToken

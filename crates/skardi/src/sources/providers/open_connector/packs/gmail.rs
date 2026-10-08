@@ -123,7 +123,10 @@
 //!   `null_parent_on_a_nested_path_becomes_sql_null`). Non-null there
 //!   would convert a nulled-out parent into a dead scan.
 //! - **Fingerprints are pinned** from a live gateway capture
-//!   (`fixtures/gmail/contracts/`, gateway v1.3.4) and cover the whole
+//!   (`fixtures/gmail/contracts/`, gateway v1.3.4; `list_threads`,
+//!   `fetch_emails` and `list_drafts` re-captured 2026-10-08 from upstream
+//!   Open Connector main 632042fd: attachment items gained a declared
+//!   shape, every mapped path is unchanged) and cover the whole
 //!   declared schema, `anyOf` branches included — the hash is over
 //!   canonical JSON, so a renamed field inside `fetch_emails`' row
 //!   items fails registration like anywhere else. What the coverage-gap
