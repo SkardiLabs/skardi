@@ -72,7 +72,7 @@ spec:
 ```
 
 ```bash
-# from a source checkout — Docker once --query-audit-db ships in a tagged release
+# from a source checkout; the v0.6.0 Docker image takes the same flags (Docker & cloud, under More)
 git clone https://github.com/SkardiLabs/skardi.git && cd skardi
 cargo run --release --bin skardi-server -- \
   --ctx ctx.yaml --query-audit-db ./audit.db --port 8080
@@ -93,8 +93,9 @@ JSON
 **3 — Promote what recurs.** &nbsp;`in flight` — the
 [`skardi-query-log`](https://github.com/SkardiLabs/skardi-skills/pull/25) skill
 reads the ledger, writes the pipeline, reloads the server, health-checks it, and
-rolls back if the install fails. Held until `--query-audit-db` lands in a tagged
-release; today you can read the ledger yourself with plain SQL — it is a SQLite
+rolls back if the install fails. The server flag it relies on,
+`--query-audit-db`, ships in v0.6.0; the skill itself is still in review, and
+until it lands you can read the ledger yourself with plain SQL — it is a SQLite
 file indexed on `(session_id, created_at)`.
 
 ```yaml
@@ -122,7 +123,7 @@ skardi run weekly-churn -p window='7 days'
 curl -X POST localhost:8080/weekly-churn/execute \
   -H 'Content-Type: application/json' -d '{"window": "7 days"}'
 # same pipeline as an MCP tool — hosts that spawn a local process (Claude Desktop, …)
-# from a source checkout until `skardi mcp` ships in a tagged release
+# (v0.6.0 or later)
 skardi mcp
 # … and as remote MCP — hosts that only take a URL (claude.ai, hosted agents):
 # the server above already serves http://localhost:8080/mcp. With auth enabled
