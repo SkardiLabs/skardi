@@ -18,7 +18,7 @@ pub mod registration;
 pub mod utils;
 
 pub use fts_exec::LanceFtsExec;
-pub use fts_match::{FTS_MATCH, FtsMatch, as_fts_match, register_fts_match_udf};
+pub use fts_match::{FTS_MATCH, FtsMatch, FtsQueryText, as_fts_match, register_fts_match_udf};
 pub use fts_table_function::{LanceFtsTableFunction, register_lance_fts_udtf};
 pub use knn_exec::LanceKnnExec;
 pub use knn_table_function::{LanceKnnTableFunction, register_lance_knn_udtf};
