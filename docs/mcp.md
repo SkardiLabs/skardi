@@ -56,8 +56,8 @@ It asks which Skardi the agents should reach, or takes `--mcp`:
   first time it connects and refreshes the token itself; no token is written
   to any config.
 - `--mcp local` registers `skardi mcp` (the stdio bridge below). It is
-  skipped when the installed CLI has no `mcp` command, which is the case for
-  v0.5.0.
+  skipped when the installed CLI has no `mcp` command, which is the case
+  before v0.6.0.
 
 An existing entry named `skardi` is never overwritten. What it writes, per
 agent: Claude Code through `claude mcp add --scope user` (or `~/.claude.json`
