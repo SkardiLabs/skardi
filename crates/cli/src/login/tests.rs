@@ -946,6 +946,25 @@ async fn the_browser_path_presents_the_id_token_to_the_control_plane() {
     let written = std::fs::read_to_string(&path).unwrap();
     assert!(!written.contains("the-id-token"), "{written}");
     assert!(written.contains("skardi_pat_tok-1"), "{written}");
+
+    // The CLI identifies itself to the control plane, and not to the identity
+    // provider: the token endpoint is Google's in production, a third party.
+    let user_agent = |r: &Request| {
+        r.headers
+            .get("user-agent")
+            .map(|v| v.to_str().unwrap().to_string())
+    };
+    assert!(
+        user_agent(discovery).is_some_and(|ua| ua.starts_with("skardi-cli")),
+        "{:?}",
+        user_agent(discovery)
+    );
+    let token = requests
+        .iter()
+        .find(|r| r.url.path() == "/token")
+        .expect("the code was redeemed");
+    assert_eq!(user_agent(token), None);
+    assert!(!token.headers.contains_key("dnt"));
 }
 
 #[test]

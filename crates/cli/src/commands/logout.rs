@@ -245,8 +245,11 @@ async fn authenticate(args: &LogoutArgs, path: &Path, env: &LogoutEnv<'_>) -> Re
                 .context(
                     "--revoke re-authenticates, which needs --client-id (or $SKARDI_OAUTH_CLIENT_ID), or --identity dev:<id> against a loopback control plane",
                 )?;
+            // Not `http`: the identity provider is a third party, and the
+            // CLI's identity headers are for the control plane alone.
+            let idp = control_plane::identity_provider_client(env.request_timeout)?;
             oauth::acquire_id_token(
-                &http,
+                &idp,
                 &oauth::Endpoints::default(),
                 &client_id,
                 false,

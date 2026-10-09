@@ -14,6 +14,7 @@
 //! and a mint answers `201 {"token": "<raw>", "pat": {"token_id": …}}`.
 
 use anyhow::{Context, Result};
+use reqwest::ClientBuilder;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::fmt;
@@ -46,12 +47,29 @@ pub fn client(timeout: Duration) -> Result<reqwest::Client> {
 /// first to tell CLI sign-ins from console ones, and the second to record
 /// nothing about the client at all.
 pub fn client_for(timeout: Duration, identity: ClientIdentity) -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .no_proxy()
-        .timeout(timeout)
+    bounded(timeout)
         .default_headers(identity.headers())
         .build()
         .context("build the HTTP client for the control plane")
+}
+
+/// The HTTP client for the identity provider's token endpoint — Google, unless
+/// `--client-id` names another — that `login --client-id` and
+/// `logout --revoke` redeem their authorization code at.
+///
+/// Bounded like [`client`], and deliberately WITHOUT the CLI's identity
+/// headers: the provider is a third party, and the User-Agent and `DNT` are
+/// skardi-cloud's to read, not Google's. Sharing one client is how they
+/// leaked there, so the bearer acquisition gets this one and the control
+/// plane gets [`client`].
+pub fn identity_provider_client(timeout: Duration) -> Result<reqwest::Client> {
+    bounded(timeout)
+        .build()
+        .context("build the HTTP client for the identity provider")
+}
+
+fn bounded(timeout: Duration) -> ClientBuilder {
+    ClientBuilder::new().no_proxy().timeout(timeout)
 }
 
 /// Cap on a control-plane response body. Memberships and one PAT are a few
@@ -352,7 +370,10 @@ fn snippet(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_SNIPPET_CHARS, Membership, MembershipsBody, Minted, client_for, parse_error};
+    use super::{
+        MAX_SNIPPET_CHARS, Membership, MembershipsBody, Minted, client_for,
+        identity_provider_client, parse_error,
+    };
     use crate::identity::{ClientIdentity, Surface};
     use std::time::Duration;
     use wiremock::matchers::method;
@@ -387,6 +408,27 @@ mod tests {
             );
             assert_eq!(headers.contains_key("dnt"), do_not_track);
         }
+    }
+
+    /// The identity provider is a third party: its client carries neither the
+    /// CLI's User-Agent nor `DNT`, whatever `DO_NOT_TRACK` says.
+    #[tokio::test]
+    async fn the_identity_provider_client_does_not_identify_the_cli() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        identity_provider_client(Duration::from_secs(5))
+            .unwrap()
+            .post(server.uri())
+            .send()
+            .await
+            .unwrap();
+        let requests = server.received_requests().await.unwrap();
+        let headers = &requests[0].headers;
+        assert!(!headers.contains_key("user-agent"), "{headers:?}");
+        assert!(!headers.contains_key("dnt"), "{headers:?}");
     }
 
     /// The raw token must not reach a log line, a panic message, or an

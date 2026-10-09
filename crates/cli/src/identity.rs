@@ -13,7 +13,9 @@
 //!   a request that carries `DNT: 1`.
 //!
 //! The headers go only where the CLI already sends requests: the server or
-//! gateway it is pointed at, and the control plane it signs in to. The CLI
+//! gateway it is pointed at, and the control plane it signs in to. Never to
+//! the identity provider a `--client-id` login redeems its code at — that is
+//! a third party (`login::control_plane::identity_provider_client`). The CLI
 //! makes no request of its own to report them, and against a local
 //! skardi-server they stay on the machine.
 

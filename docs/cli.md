@@ -439,8 +439,8 @@ against.
 
 ## What the CLI sends about itself — and `DO_NOT_TRACK`
 
-Every request the CLI makes carries a `User-Agent` naming the CLI, its version,
-and the operating system and processor type it was built for:
+Every request the CLI makes to Skardi carries a `User-Agent` naming the CLI, its
+version, and the operating system and processor type it was built for:
 
 ```
 User-Agent: skardi-cli/0.9.1 (macos; aarch64)
@@ -450,9 +450,10 @@ User-Agent: skardi-cli/0.9.1 mcp (linux; x86_64)    # from `skardi mcp`
 That is all of it. The OS and architecture are compile-time constants, nothing
 on the machine is probed, and nothing about you is included. The header goes
 only where the CLI already sends requests: the server or gateway you point it
-at, and the control plane `login` and `logout --revoke` talk to. The CLI makes
-no request of its own to report it, and against a local skardi-server it never
-leaves your machine.
+at, and the control plane `login` and `logout --revoke` talk to. The identity
+provider a `--client-id` login signs in through (Google, by default) gets
+neither this header nor `DNT`. The CLI makes no request of its own to report
+it, and against a local skardi-server it never leaves your machine.
 
 skardi-cloud uses it to count which clients people use, and which versions and
 platforms are in use. It records, per day, the client kind, version, platform
