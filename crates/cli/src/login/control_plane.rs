@@ -19,6 +19,8 @@ use serde_json::{Value, json};
 use std::fmt;
 use std::time::Duration;
 
+use crate::identity::{ClientIdentity, Surface};
+
 /// Per-request ceiling on control-plane calls.
 ///
 /// Bounded because of the ROLLBACK, not the happy path: a revoke that hangs
@@ -36,9 +38,18 @@ pub const CONTROL_PLANE_TIMEOUT: Duration = Duration::from_secs(30);
 /// parameter only so a test can prove the bound bites without waiting
 /// [`CONTROL_PLANE_TIMEOUT`] for it.
 pub fn client(timeout: Duration) -> Result<reqwest::Client> {
+    client_for(timeout, ClientIdentity::from_env(Surface::Cli))
+}
+
+/// As [`client`], presenting `identity` — the CLI's User-Agent, and `DNT: 1`
+/// when the person opted out (`crate::identity`). The control plane reads the
+/// first to tell CLI sign-ins from console ones, and the second to record
+/// nothing about the client at all.
+pub fn client_for(timeout: Duration, identity: ClientIdentity) -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .no_proxy()
         .timeout(timeout)
+        .default_headers(identity.headers())
         .build()
         .context("build the HTTP client for the control plane")
 }
@@ -341,7 +352,42 @@ fn snippet(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_SNIPPET_CHARS, Membership, MembershipsBody, Minted, parse_error};
+    use super::{MAX_SNIPPET_CHARS, Membership, MembershipsBody, Minted, client_for, parse_error};
+    use crate::identity::{ClientIdentity, Surface};
+    use std::time::Duration;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Sign-in traffic carries the CLI's identity too, so the control plane
+    /// can tell a CLI login from a console one — and an opt-out reaches it.
+    #[tokio::test]
+    async fn the_control_plane_client_carries_the_cli_identity() {
+        for do_not_track in [false, true] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+            let identity = ClientIdentity {
+                surface: Surface::Cli,
+                do_not_track,
+            };
+            client_for(Duration::from_secs(5), identity)
+                .unwrap()
+                .get(server.uri())
+                .send()
+                .await
+                .unwrap();
+            let requests = server.received_requests().await.unwrap();
+            let headers = &requests[0].headers;
+            assert_eq!(
+                headers["user-agent"].to_str().unwrap(),
+                identity.user_agent(),
+                "do_not_track={do_not_track}"
+            );
+            assert_eq!(headers.contains_key("dnt"), do_not_track);
+        }
+    }
 
     /// The raw token must not reach a log line, a panic message, or an
     /// `{err:?}` rendering through this type — so `Debug` is hand-written, and

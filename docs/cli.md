@@ -437,6 +437,40 @@ needs `--i-know-this-is-dev-auth`, so the decision is visible in the command
 that made it. Every run prints a warning naming what it authenticated
 against.
 
+## What the CLI sends about itself — and `DO_NOT_TRACK`
+
+Every request the CLI makes carries a `User-Agent` naming the CLI, its version,
+and the operating system and processor type it was built for:
+
+```
+User-Agent: skardi-cli/0.9.1 (macos; aarch64)
+User-Agent: skardi-cli/0.9.1 mcp (linux; x86_64)    # from `skardi mcp`
+```
+
+That is all of it. The OS and architecture are compile-time constants, nothing
+on the machine is probed, and nothing about you is included. The header goes
+only where the CLI already sends requests: the server or gateway you point it
+at, and the control plane `login` and `logout --revoke` talk to. The CLI makes
+no request of its own to report it, and against a local skardi-server it never
+leaves your machine.
+
+skardi-cloud uses it to count which clients people use, and which versions and
+platforms are in use. It records, per day, the client kind, version, platform
+and a network prefix (never your full IP address). See the
+[privacy policy](https://www.skardi.ai/privacy).
+
+**To opt out, set `DO_NOT_TRACK`:**
+
+```bash
+export DO_NOT_TRACK=1
+```
+
+The CLI then sends `DNT: 1` and a `User-Agent` of just `skardi-cli`, with no
+version or platform, and skardi-cloud records nothing about the client. `1`,
+`true` and `yes` opt out; unset, empty, `0` and `false` do not. The opt-out
+covers the client details only: skardi-cloud still records that your account
+was active on a given day, which it needs in order to run the service.
+
 ## Ad-hoc SQL — `query`
 
 `skardi query` sends one SQL statement to `POST /query` on the server and
