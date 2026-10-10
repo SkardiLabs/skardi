@@ -143,16 +143,88 @@
               },
               "messageText": {
                 "type": "string",
-                "description": "Extracted message body text."
+                "description": "Extracted message body; HTML is preferred when both HTML and plain-text alternatives are present."
               },
               "attachmentList": {
                 "type": "array",
                 "items": {
                   "type": "object",
-                  "additionalProperties": true,
-                  "description": "Gmail API object."
+                  "properties": {
+                    "attachmentId": {
+                      "anyOf": [
+                        {
+                          "type": "string",
+                          "description": "Gmail attachment ID, or null when bytes are stored directly in the message part."
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "filename": {
+                      "type": "string",
+                      "description": "Attachment filename; empty for unnamed parts."
+                    },
+                    "mimeType": {
+                      "type": "string",
+                      "description": "Attachment MIME type."
+                    },
+                    "size": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "description": "Attachment size in bytes."
+                    },
+                    "partId": {
+                      "anyOf": [
+                        {
+                          "type": "string",
+                          "description": "Gmail MIME part ID when supplied."
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "contentId": {
+                      "anyOf": [
+                        {
+                          "type": "string",
+                          "description": "Bare Content-ID without angle brackets, when supplied."
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "disposition": {
+                      "anyOf": [
+                        {
+                          "type": "string",
+                          "enum": [
+                            "inline",
+                            "attachment"
+                          ],
+                          "description": "Content-Disposition when supplied and recognized."
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    }
+                  },
+                  "additionalProperties": false,
+                  "required": [
+                    "attachmentId",
+                    "filename",
+                    "mimeType",
+                    "size",
+                    "partId",
+                    "contentId",
+                    "disposition"
+                  ],
+                  "description": "Attachment or inline resource metadata from a Gmail MIME part."
                 },
-                "description": "Message attachments."
+                "description": "Message attachments and inline resources, including unnamed CID parts."
               },
               "raw": {
                 "type": "string",

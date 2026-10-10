@@ -12,112 +12,205 @@
             "description": "Gmail draft ID."
           },
           "message": {
-            "type": "object",
-            "properties": {
-              "messageId": {
-                "type": "string",
-                "minLength": 1,
-                "description": "Gmail message ID."
-              },
-              "threadId": {
-                "type": "string",
-                "minLength": 1,
-                "description": "Gmail thread ID."
-              },
-              "labelIds": {
-                "type": "array",
-                "items": {
-                  "type": "string",
-                  "minLength": 1
-                },
-                "description": "Gmail label IDs."
-              },
-              "subject": {
-                "type": "string",
-                "description": "Message subject."
-              },
-              "sender": {
-                "type": "string",
-                "description": "Message sender."
-              },
-              "to": {
-                "type": "string",
-                "description": "Message recipients."
-              },
-              "messageTimestamp": {
-                "type": "string",
-                "description": "Message timestamp."
-              },
-              "historyId": {
-                "type": "string",
-                "description": "Gmail history ID when the resource carries one."
-              },
-              "internalDate": {
-                "type": "string",
-                "description": "Gmail internal date as epoch milliseconds when present."
-              },
-              "sizeEstimate": {
-                "type": "integer",
-                "description": "Estimated message size in bytes when present."
-              },
-              "snippet": {
-                "type": "string",
-                "description": "Gmail snippet when present."
-              },
-              "preview": {
+            "anyOf": [
+              {
                 "type": "object",
-                "additionalProperties": true,
-                "description": "Gmail API object."
-              },
-              "payload": {
-                "anyOf": [
-                  {
+                "properties": {
+                  "messageId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Gmail message ID."
+                  },
+                  "threadId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Gmail thread ID."
+                  },
+                  "labelIds": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "description": "Gmail label IDs."
+                  },
+                  "subject": {
+                    "type": "string",
+                    "description": "Message subject."
+                  },
+                  "sender": {
+                    "type": "string",
+                    "description": "Message sender."
+                  },
+                  "to": {
+                    "type": "string",
+                    "description": "Message recipients."
+                  },
+                  "messageTimestamp": {
+                    "type": "string",
+                    "description": "Message timestamp."
+                  },
+                  "historyId": {
+                    "type": "string",
+                    "description": "Gmail history ID when the resource carries one."
+                  },
+                  "internalDate": {
+                    "type": "string",
+                    "description": "Gmail internal date as epoch milliseconds when present."
+                  },
+                  "sizeEstimate": {
+                    "type": "integer",
+                    "description": "Estimated message size in bytes when present."
+                  },
+                  "snippet": {
+                    "type": "string",
+                    "description": "Gmail snippet when present."
+                  },
+                  "preview": {
                     "type": "object",
                     "additionalProperties": true,
                     "description": "Gmail API object."
                   },
-                  {
-                    "type": "null"
+                  "payload": {
+                    "anyOf": [
+                      {
+                        "type": "object",
+                        "additionalProperties": true,
+                        "description": "Gmail API object."
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "messageText": {
+                    "type": "string",
+                    "description": "Extracted message body; HTML is preferred when both HTML and plain-text alternatives are present."
+                  },
+                  "attachmentList": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "attachmentId": {
+                          "anyOf": [
+                            {
+                              "type": "string",
+                              "description": "Gmail attachment ID, or null when bytes are stored directly in the message part."
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "filename": {
+                          "type": "string",
+                          "description": "Attachment filename; empty for unnamed parts."
+                        },
+                        "mimeType": {
+                          "type": "string",
+                          "description": "Attachment MIME type."
+                        },
+                        "size": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "description": "Attachment size in bytes."
+                        },
+                        "partId": {
+                          "anyOf": [
+                            {
+                              "type": "string",
+                              "description": "Gmail MIME part ID when supplied."
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "contentId": {
+                          "anyOf": [
+                            {
+                              "type": "string",
+                              "description": "Bare Content-ID without angle brackets, when supplied."
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "disposition": {
+                          "anyOf": [
+                            {
+                              "type": "string",
+                              "enum": [
+                                "inline",
+                                "attachment"
+                              ],
+                              "description": "Content-Disposition when supplied and recognized."
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        }
+                      },
+                      "additionalProperties": false,
+                      "required": [
+                        "attachmentId",
+                        "filename",
+                        "mimeType",
+                        "size",
+                        "partId",
+                        "contentId",
+                        "disposition"
+                      ],
+                      "description": "Attachment or inline resource metadata from a Gmail MIME part."
+                    },
+                    "description": "Message attachments and inline resources, including unnamed CID parts."
+                  },
+                  "raw": {
+                    "type": "string",
+                    "description": "Raw RFC 2822 message when requested."
                   }
-                ]
-              },
-              "messageText": {
-                "type": "string",
-                "description": "Extracted message body text."
-              },
-              "attachmentList": {
-                "type": "array",
-                "items": {
-                  "type": "object",
-                  "additionalProperties": true,
-                  "description": "Gmail API object."
                 },
-                "description": "Message attachments."
+                "additionalProperties": true,
+                "required": [
+                  "messageId",
+                  "threadId",
+                  "labelIds",
+                  "subject",
+                  "sender",
+                  "to",
+                  "messageTimestamp"
+                ],
+                "description": "Normalized Gmail message."
               },
-              "raw": {
-                "type": "string",
-                "description": "Raw RFC 2822 message when requested."
+              {
+                "type": "object",
+                "properties": {
+                  "messageId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Gmail message ID."
+                  },
+                  "threadId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Gmail thread ID."
+                  }
+                },
+                "additionalProperties": false,
+                "description": "Draft message IDs returned when verbose is false."
               }
-            },
-            "additionalProperties": true,
-            "required": [
-              "messageId",
-              "threadId",
-              "labelIds",
-              "subject",
-              "sender",
-              "to",
-              "messageTimestamp"
-            ],
-            "description": "Normalized Gmail message."
+            ]
           }
         },
-        "additionalProperties": true,
+        "additionalProperties": false,
         "required": [
           "id",
           "message"
         ],
-        "description": "Gmail draft."
+        "description": "Draft with message IDs or hydrated message details."
       }
     },
     "nextPageToken": {
