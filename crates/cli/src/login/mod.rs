@@ -146,9 +146,10 @@ pub async fn login(options: LoginOptions, config_path: &Path) -> Result<LoginRep
     if uses_console_broker(&options) {
         return console_brokered_login(options, config_path).await;
     }
+    let idp = control_plane::identity_provider_client(control_plane::CONTROL_PLANE_TIMEOUT)?;
+    let bearer = acquire_bearer(&idp, &options).await?;
     let http = control_plane::client(control_plane::CONTROL_PLANE_TIMEOUT)?;
-    let bearer = acquire_bearer(&http, &options).await?;
-    let cp = ControlPlane::new(http.clone(), &options.control_plane, bearer);
+    let cp = ControlPlane::new(http, &options.control_plane, bearer);
 
     let memberships = cp.memberships().await.map_err(describe_cp_failure)?;
     let mut report = LoginReport::default();
@@ -532,7 +533,10 @@ fn abandoned(token: &Minted, cause: anyhow::Error) -> anyhow::Error {
 }
 
 /// Step 1-3: the credential presented to the control plane.
-async fn acquire_bearer(http: &reqwest::Client, options: &LoginOptions) -> Result<String> {
+/// `idp` talks to the identity provider only — see
+/// [`control_plane::identity_provider_client`] for why it is not the
+/// control-plane client.
+async fn acquire_bearer(idp: &reqwest::Client, options: &LoginOptions) -> Result<String> {
     if let Some(identity) = &options.identity {
         check_dev_identity(
             identity,
@@ -558,7 +562,7 @@ async fn acquire_bearer(http: &reqwest::Client, options: &LoginOptions) -> Resul
         )
     };
     oauth::acquire_id_token(
-        http,
+        idp,
         &options.endpoints,
         client_id,
         options.no_browser,

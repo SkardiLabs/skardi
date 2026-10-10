@@ -15,6 +15,7 @@ use commands::login::{LoginArgs, LogoutArgs};
 use commands::pipeline::PipelineCmd;
 use commands::query::ContextFlags;
 use config::ClientConfig;
+use identity::{ClientIdentity, Surface};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -22,6 +23,7 @@ mod client;
 mod cloud;
 mod commands;
 mod config;
+mod identity;
 mod login;
 mod mcp;
 mod output;
@@ -272,7 +274,13 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
     // credential issue no request at all (§8).
     cloud::ensure_available(capability, &config)?;
     cloud::ensure_credential_fresh(&config, chrono::Utc::now())?;
-    let client = ApiClient::new(&config)?;
+    // `skardi mcp` says so in its User-Agent: an agent driving the CLI is the
+    // split skardi-cloud's client analytics most wants (`identity`).
+    let surface = match cli.command {
+        Commands::Mcp => Surface::Mcp,
+        _ => Surface::Cli,
+    };
+    let client = ApiClient::with_identity(&config, ClientIdentity::from_env(surface))?;
 
     let outcome = match cli.command {
         Commands::Query {
