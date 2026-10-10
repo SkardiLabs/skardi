@@ -15,3 +15,7 @@
 *.sqlite3
 *.sqlite3-wal
 *.sqlite3-shm
+
+# npm platform-package binaries are extracted from release artifacts at
+# publish time (.github/workflows/release.yml), never committed.
+npm/platforms/*/bin/
