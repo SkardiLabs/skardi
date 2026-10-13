@@ -16,21 +16,25 @@ constraint of the Meta platform. The Cloud API has no endpoint for fetching
 message history. Inbound messages are delivered once, by webhook (retried for up
 to 7 days on failure), and the business must persist them itself.
 
-The design therefore offers three options. **They are independent, not
-sequential**: Option 3 is a push path that does not touch OC and can ship on its
-own. Ranked by value, Option 3 is the main line; Options 1 and 2 are optional
-add-ons. The table is ordered by how much existing machinery each one reuses,
-not by implementation order.
+A complete integration is therefore two complementary paths, not a choice
+between them: **a pull path** (a source pack over OC, for account-side data) **and
+a push path** (a webhook receiver in skardi-server, for messages). Neither can
+substitute for the other: the webhook never delivers a template or phone-number
+list, and OC never delivers a message. A third component, analytics tables, is
+**optional**: most of its value is already covered by the delivery receipts the
+webhook captures.
 
-| Option | Deliverable | Repos touched | Existing components reused |
+| Component | Data it yields | Repos touched | Existing components reused |
 |---|---|---|---|
-| 1. `whatsapp` source pack | Three read-only tables: `phone_numbers`, `business_profile`, `message_templates` | skardi (pack YAML plus the fixed accessor boilerplate) | OC's `whatsapp` provider, the pack engine, `open_connector_query`, the pack docs template |
-| 2. Analytics tables | `message_analytics`, `pricing_analytics`, `template_analytics` | OC (three new read actions, about half a day) + skardi (tables added to the pack) | Same as above, plus `kind: job` to snapshot into Lance (escaping Meta's one-year lookback) |
-| 3. Message capture: a `kind: webhook` receiver | Queryable `wa_messages` and `wa_statuses` tables for RAG and BI | skardi-server (one new resource kind plus one route) | The pack column grammar and `JsonToArrow`, the jobs `SqlDmlDestination` / `LanceDestination` writers with upsert dedup, the existing Postgres/SQLite/Lance sources |
+| 1. `whatsapp` source pack (pull) | Current-state snapshots: `phone_numbers`, `business_profile`, `message_templates` | skardi (pack YAML plus the fixed accessor boilerplate) | OC's `whatsapp` provider, the pack engine, `open_connector_query`, the pack docs template |
+| 2. `kind: webhook` receiver (push) | Inbound messages and delivery receipts: `wa_messages`, `wa_statuses`, for RAG and BI | skardi-server (one new resource kind plus one route) | The pack column grammar and `JsonToArrow`, the jobs `SqlDmlDestination` / `LanceDestination` writers with upsert dedup, the existing Postgres/SQLite/Lance sources |
+| 3. Analytics tables (pull, **optional**) | Meta's own aggregates: `message_analytics`, `pricing_analytics`, `template_analytics` | OC (three new read actions, about half a day) + skardi (tables added to the pack) | Same as component 1, plus `kind: job` to snapshot into Lance (escaping Meta's one-year lookback) |
 | Deferred follow-ups: media download, outbound send, multi-tenant Embedded Signup, Coexistence history import | — | mostly OC | — |
 
-Rejected alternatives (OC triggers + Open Flow, third-party BSPs, unofficial
-providers) are covered one by one in [Options compared](#options-compared).
+The two required components share no code and can be built, reviewed, and
+shipped independently, in either order. Rejected alternatives (OC triggers +
+Open Flow, third-party BSPs, unofficial providers) are covered one by one in
+[Alternatives considered](#alternatives-considered).
 
 ## Background and goals
 
@@ -58,7 +62,7 @@ Users want WhatsApp to work the same way. Typical asks:
 3. Message data landed with **the least new code**, and that code built as a
    generic capability so other webhook-shaped sources (Slack Events, Stripe,
    GitHub) can reuse it.
-4. Every option is independently deliverable and verifiable.
+4. Each component is independently deliverable and verifiable.
 
 ### Non-goals
 
@@ -80,7 +84,7 @@ OC ships an official Meta Cloud API provider, `whatsapp`
 | Item | Current state | Effect on this design |
 |---|---|---|
 | Auth | `api_key`: a permanent Meta System User token (Bearer), plus an optional extra field `wabaId` as the default WABA | No new credential shape; `wabaId` can live on the OC connection or be passed as a binding resource |
-| Graph version | `v23.0` (`runtime.ts:10`) | Usable, but Meta's latest is v26.0; bump to v25+/v26 in the Option 2 OC PR |
+| Graph version | `v23.0` (`runtime.ts:10`) | Usable, but Meta's latest is v26.0; bump to v25+/v26 in the component 3 OC PR |
 | Read actions | `get_phone_numbers`, `get_phone_number`, `get_business_profile`, `get_message_templates`, `get_template_status`, `get_media_info` | The first three groups become tables; `get_media_info` only returns a 5-minute URL that needs a Bearer header to download, so it is not table material |
 | Write actions | `send_message`, `send_template_message`, `send_media(_by_id)`, `upload_media`, `send_location/contacts/interactive_*`, `create/delete_message_template` | Non-goal |
 | **List messages / conversations** | **None** | The platform does not provide it; see the next section |
@@ -135,15 +139,15 @@ OC also carries nine third-party WhatsApp-adjacent providers; see
 
 | Component | Location | How it is reused |
 |---|---|---|
-| OC source registration, client, pagination, fingerprint gate | `crates/source-pack/src/{client,pagination,action_registry}.rs`, `providers/open_connector/{mod,table,exec}.rs` | Every table in Options 1 and 2, unchanged |
-| Pack YAML grammar (`row_path`, `row_shape: object`, `single_page`, `cursor`, `resources`, `fixed_inputs`, `filters`) | `providers/open_connector/packs/loader.rs:645-760`; templates `slack.yaml`, `feishu.yaml` (`document_content` is the `row_shape: object` precedent) | Options 1 and 2 use it as-is; Option 3 borrows the same `columns:` grammar |
-| JSON-to-Arrow column mapping | `providers/open_connector/json_to_arrow.rs` (`JsonToArrow::from_columns`; types include `timestamp_s_string_utc`, which matches Meta's string epoch-seconds timestamps exactly) | Option 3's receiver hands flattened rows to it instead of writing a second converter |
-| `kind: job` and destination writers | `crates/skardi/src/jobs/destination/{lance,sql_dml}.rs`; `mode: upsert` + `merge_keys` + `repeated_keys: keep_last` (Lance only) | Option 2 snapshots; Option 3 dedup-merge from staging into Lance (**no new dedup code**) |
-| Pipeline `INSERT … VALUES {rows}` | `docs/pipelines.md:105-190` | Option 3's manual backfill / repair path, and the outbound-content path |
-| Writable SQL sources (Postgres / MySQL / SQLite, `access_mode: read_write`) | `crates/server/src/config.rs:904 WRITABLE_SOURCE_TYPES` | Option 3's staging table |
-| Auth layer | `crates/server/src/auth/` | Option 3's webhook route must be **exempted** from it and use HMAC instead |
-| Pack docs template and live-verification flow | `docs/open-connector-slack.md`, `docs/superpowers/skills/source-pack/` | Options 1 and 2 follow the flow verbatim |
-| skardi-cloud ETL generator | `skardi-cloud/code/rust/crates/skardi-etl`, already generates "OC table → Lance" job bundles | Option 2 snapshot jobs can be generated by it |
+| OC source registration, client, pagination, fingerprint gate | `crates/source-pack/src/{client,pagination,action_registry}.rs`, `providers/open_connector/{mod,table,exec}.rs` | Every table in components 1 and 3, unchanged |
+| Pack YAML grammar (`row_path`, `row_shape: object`, `single_page`, `cursor`, `resources`, `fixed_inputs`, `filters`) | `providers/open_connector/packs/loader.rs:645-760`; templates `slack.yaml`, `feishu.yaml` (`document_content` is the `row_shape: object` precedent) | Components 1 and 3 use it as-is; component 2 borrows the same `columns:` grammar |
+| JSON-to-Arrow column mapping | `providers/open_connector/json_to_arrow.rs` (`JsonToArrow::from_columns`; types include `timestamp_s_string_utc`, which matches Meta's string epoch-seconds timestamps exactly) | Component 2's receiver hands flattened rows to it instead of writing a second converter |
+| `kind: job` and destination writers | `crates/skardi/src/jobs/destination/{lance,sql_dml}.rs`; `mode: upsert` + `merge_keys` + `repeated_keys: keep_last` (Lance only) | Component 3 snapshots; component 2 dedup-merge from staging into Lance (**no new dedup code**) |
+| Pipeline `INSERT … VALUES {rows}` | `docs/pipelines.md:105-190` | Component 2's manual backfill / repair path, and the outbound-content path |
+| Writable SQL sources (Postgres / MySQL / SQLite, `access_mode: read_write`) | `crates/server/src/config.rs:904 WRITABLE_SOURCE_TYPES` | Component 2's staging table |
+| Auth layer | `crates/server/src/auth/` | Component 2's webhook route must be **exempted** from it and use HMAC instead |
+| Pack docs template and live-verification flow | `docs/open-connector-slack.md`, `docs/superpowers/skills/source-pack/` | Components 1 and 3 follow the flow verbatim |
+| skardi-cloud ETL generator | `skardi-cloud/code/rust/crates/skardi-etl`, already generates "OC table → Lance" job bundles | Component 3 snapshot jobs can be generated by it |
 
 **What Skardi does not have:** any inbound webhook / ingest route; any push or
 streaming source (no Kafka / NATS / Redis Streams); a job scheduler (runs start
@@ -164,12 +168,12 @@ Conclusion: on the official path, **Twilio is the only** way to get messages
 without running a webhook receiver, and only for customers who already route
 WhatsApp through Twilio. It is listed as an optional pack under deferred follow-ups.
 
-## Options compared
+## Alternatives considered
 
 | Alternative | What it yields | New code | New operational dependency | Verdict |
 |---|---|---|---|---|
-| **A. Official OC pack (pull only)** | Numbers, templates, business profile; analytics after an OC action | Pack YAML; ~100 lines in OC | None | **Adopted as Options 1 and 2** |
-| **B1. Native Skardi webhook receiver** | Inbound messages, delivery statuses, and all 19 management event types | One route in skardi-server + a `kind: webhook` resource + a Meta verification preset (est. 1–2 weeks incl. tests) | One public HTTPS address | **Adopted as Option 3**; built as a generic capability |
+| **A. Official OC pack (pull only)** | Numbers, templates, business profile; analytics after an OC action | Pack YAML; ~100 lines in OC | None | **Adopted as components 1 and 3** |
+| **B1. Native Skardi webhook receiver** | Inbound messages, delivery statuses, and all 19 management event types | One route in skardi-server + a `kind: webhook` resource + a Meta verification preset (est. 1–2 weeks incl. tests) | One public HTTPS address | **Adopted as component 2**; built as a generic capability |
 | B2. OC trigger + Open Flow | Same as B1 | A `whatsapp` trigger in OC (~250 lines, modelled on telegram) + Skardi implementing Open Flow's `receive` callback protocol | Open Flow must be deployed (public ingress, subscription leases, dedup all live there) | Not the main line: the WhatsApp trigger does not exist today, and it would tie Skardi to Open Flow's subscription state machine. B1's verification step can later delegate to OC's `receive` operation; the interface leaves room for that |
 | C. Third-party BSP pack (Twilio) | WhatsApp messages in a Twilio account | Pack YAML | Twilio account and fees | Optional, deferred |
 | D. Unofficial WhatsApp Web providers | Full chat history | Pack YAML | Account-ban risk | Rejected |
@@ -177,56 +181,63 @@ WhatsApp through Twilio. It is listed as an optional pack under deferred follow-
 
 ## Recommended architecture
 
+Both paths use the official Meta Cloud API, from opposite directions. The pull
+path goes Skardi → OC → Graph API and yields account-side snapshots. The push
+path goes Meta → skardi-server and yields messages and receipts; it does not go
+through OC, and the Meta app secret it needs lives in skardi-server's
+environment, a different secret from the access token OC holds (separation of
+duties). A deployment that wants messages *and* template / phone-number lists
+runs both.
+
 ```
-                 ┌────────────────────────── pull (Options 1 / 2) ─────────────────────┐
-                 │                                                                      │
- Meta Graph API ◄┤ OC gateway ◄── Bearer runtime token ── skardi-server                 │
- (WABA / phone  │  whatsapp.get_phone_numbers        saas.wa.phone_numbers              │
-  / templates / │  whatsapp.get_message_templates    saas.wa.message_templates          │
-  analytics)    │  whatsapp.get_business_profile     saas.wa.business_profile           │
-                │  whatsapp.get_*_analytics (new)     saas.wa.{message,pricing,template}_analytics
-                │                                        │ kind: job (upsert)            │
-                │                                        ▼                               │
-                │                                   Lance: wa_analytics_history           │
-                └──────────────────────────────────────────────────────────────────────┘
+ ┌──────────────────── pull: component 1 (+ optional component 3) ────────────────────┐
+ │                                                                                    │
+ │ Meta Graph API ◄── OC gateway ◄── Bearer runtime token ── skardi-server             │
+ │ (WABA node)        whatsapp.get_phone_numbers        saas.wa.phone_numbers          │
+ │                    whatsapp.get_message_templates    saas.wa.message_templates      │
+ │                    whatsapp.get_business_profile     saas.wa.business_profile       │
+ │                    whatsapp.get_*_analytics (new)     saas.wa.*_analytics  (optional)│
+ │                                                          │ kind: job (upsert)       │
+ │                                                          ▼                          │
+ │                                                     Lance: wa_analytics_history      │
+ └────────────────────────────────────────────────────────────────────────────────────┘
 
-                 ┌────────────────────────── push (Option 3) ──────────────────────────┐
- Meta webhooks ──► https://<public>/webhooks/whatsapp-inbound   (skardi-server, kind: webhook)
-   messages      │   1. GET  hub.challenge handshake  3. unwrap entry[]/changes[] → flat rows
-   statuses      │   2. POST X-Hub-Signature-256      4. JsonToArrow column mapping (pack grammar)
-                 │                                    5. SqlDmlDestination → staging table (append-only)
-                 │                                        │ 200 OK (<250 ms)
-                 │                                        ▼
-                 │   SQLite / Postgres: wa_events_messages, wa_events_statuses
-                 │                                        │ kind: job, mode: upsert,
-                 │                                        │ merge_keys:[message_id], keep_last
-                 │                                        ▼
-                 │   Lance: wa_messages, wa_statuses  ──► pipelines / RAG / federated joins
-                 └──────────────────────────────────────────────────────────────────────┘
+ ┌──────────────────── push: component 2 ─────────────────────────────────────────────┐
+ │ Meta Cloud API ──► https://<public>/webhooks/whatsapp-inbound  (skardi-server)      │
+ │   webhooks:      │  1. GET  hub.challenge handshake  3. unwrap entry[]/changes[]    │
+ │   messages       │  2. POST X-Hub-Signature-256      4. JsonToArrow (pack grammar)  │
+ │   statuses       │                                   5. SqlDmlDestination → staging │
+ │                  │                                        │ 200 OK (<250 ms)        │
+ │                  │                                        ▼                         │
+ │                  │   SQLite / Postgres: wa_events_messages, wa_events_statuses       │
+ │                  │                                        │ kind: job, mode: upsert, │
+ │                  │                                        │ merge_keys:[message_id]  │
+ │                  │                                        ▼                         │
+ │                  │   Lance: wa_messages, wa_statuses ──► pipelines / RAG / joins    │
+ └────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-The two paths are independent. The pull path knows nothing about messages; the
-push path does not go through OC (the Meta app secret lives in skardi-server's
-environment, a different secret from the access token held by OC — separation
-of duties).
+**Which component answers which question:**
 
-**What Option 3 alone does and does not give you:**
-
-- Does: every inbound message; every outbound receipt (with per-message
-  `pricing.category` / `billable`, so sent / delivered volume and cost can be
-  aggregated straight from `wa_statuses`, at finer granularity than Option 2's
-  Meta analytics fields and without the one-year lookback); and, once the
-  management fields are subscribed, template review, phone-number quality, and
-  account review events by adding a `field` under `routes`.
-- Does not: current-state snapshots (template list, phone-number list, business
-  profile — that is Option 1); history from before the subscription (Meta has no
-  backfill, so **the earlier it ships, the more it accumulates**); and **the
-  content of outbound messages** — the Cloud API echoes only statuses, never the
-  body of messages the business sends; see [Outbound message content](#outbound-message-content).
+- **Component 2 (webhook)** — every inbound message; every outbound receipt (with
+  per-message `pricing.category` / `billable`, so sent / delivered volume and
+  cost can be aggregated straight from `wa_statuses`, at finer granularity than
+  Meta's analytics fields and without the one-year lookback); and, once the
+  management fields are subscribed, *change events* for template review,
+  phone-number quality, and account review, by adding a `field` under `routes`.
+  It never yields a full list of templates or numbers, only deltas, and it has no
+  backfill: history from before the subscription is gone (**the earlier it ships,
+  the more it accumulates**). It also never carries **the content of outbound
+  messages**; see [Outbound message content](#outbound-message-content).
+- **Component 1 (pack)** — the current template list, phone-number list, and
+  business profile, as Meta sees them right now. No messages.
+- **Component 3 (analytics, optional)** — Meta's own aggregate numbers. Worth
+  building only when Meta's reporting figures are required to match exactly, or
+  to recover up to a year of metrics from before the webhook subscription.
 
 ## Detailed design
 
-### Option 1: the `whatsapp` source pack
+### Component 1: the `whatsapp` source pack (pull)
 
 Files: `packs/whatsapp.yaml` + `packs/whatsapp.rs` (`OnceLock` + `loader::builtin`)
 + one line in `packs/mod.rs` + the `builtin_packs.rs` registry entry
@@ -286,35 +297,7 @@ declared keys and undeclared columns sit outside the gate — the same situation
 as GitHub / Notion passthrough rows. Live verification must confirm a non-NULL
 value for every mapped column, as the skill requires.
 
-### Option 2: analytics tables (needs one OC PR)
-
-**OC side** (`src/providers/whatsapp/`, following the `add-provider` skill, about
-half a day):
-
-| New read action | Graph call | Inputs (all optional, with defaults) | Normalized output |
-|---|---|---|---|
-| `get_message_analytics` | `GET /{waba_id}?fields=analytics.start(s).end(e).granularity(g)[.phone_numbers([..])][.product_types([..])][.country_codes([..])]` | `waba_id`, `start` / `end` (epoch seconds; default end = now, start = end − 30 d), `granularity` (`HALF_HOUR\|DAY\|MONTH`, default `DAY`), `phone_numbers[]`, `product_types[]`, `country_codes[]` | `{ granularity, data_points: [{start, end, sent, delivered}] }` |
-| `get_pricing_analytics` | Same shape, field `pricing_analytics`, `granularity ∈ DAILY\|HALF_HOUR\|MONTHLY`, `metric_types`, `pricing_types`, `pricing_categories`, `dimensions` | As above plus dimension parameters | `{ data_points: [{start, end, phone_number?, country?, pricing_category?, pricing_type?, tier?, volume, cost}] }` (flattening `data[].data_points[]`) |
-| `get_template_analytics` | Field `template_analytics`, `granularity` fixed to `DAILY`, `template_ids` ≤ 10 | `template_ids[]` (required), `start` / `end` | `{ data_points: [{template_id, start, end, sent, delivered, read, clicked[], cost}] }` |
-
-In the same PR: bump the Graph version to `v26.0` (or at least v25.0); forward
-`after` in `get_phone_numbers`; read `Retry-After` in the error mapping. All are
-small fixes the OC maintainers will welcome.
-
-**Skardi side:** three more pack tables with `row_path: "$.data_points"` and
-`single_page` (Meta's analytics fields do not paginate). Time ranges: pack
-`filters` support only `eq | gt | gt_eq`, so `period_start >= {ts}` is pushed as
-`start` with `format: epoch_seconds`, `fidelity: inexact`, and `end` defaults to
-now on the OC side. For an exact window or half-hour granularity, use
-`open_connector_query('saas', 'whatsapp.pricing_analytics', '{"start":…,"end":…,"granularity":"HALF_HOUR"}', 'acme-waba')`.
-
-**Persisting into Lance (escaping the one-year lookback):** one `kind: job`,
-triggered daily by an external cron (Skardi has no scheduler), `mode: upsert`,
-`merge_keys: [phone_number, pricing_category, period_start]`,
-`repeated_keys: keep_last` — re-running is idempotent. skardi-cloud's `skardi-etl`
-can generate this bundle directly.
-
-### Option 3: the `kind: webhook` receiver
+### Component 2: the `kind: webhook` receiver (push)
 
 This is the only part that adds a new feature to skardi-server. Principle: **the
 only Meta-specific pieces are the verification preset and the envelope
@@ -460,7 +443,7 @@ sending side to record its own copy at send time:
   inbound (`wamid.…`) and outbound (Meta returns ids in the same namespace), and
   the status table joins on `message_id` as usual.
 
-This is outside Option 3's code scope but must be documented, or users will
+This is outside component 2's code scope but must be documented, or users will
 assume the table holds full conversations.
 
 #### Query examples
@@ -489,6 +472,37 @@ The only extra abstraction is the `provider` preset layer. Beyond
 Column mapping and writing are generic already. The first version implements only
 the `meta_whatsapp` preset, but neither the YAML nor the route mentions WhatsApp.
 
+### Component 3 (optional): analytics tables (needs one OC PR)
+
+Optional, see [Recommended architecture](#recommended-architecture) for when it
+is worth building.
+
+**OC side** (`src/providers/whatsapp/`, following the `add-provider` skill, about
+half a day):
+
+| New read action | Graph call | Inputs (all optional, with defaults) | Normalized output |
+|---|---|---|---|
+| `get_message_analytics` | `GET /{waba_id}?fields=analytics.start(s).end(e).granularity(g)[.phone_numbers([..])][.product_types([..])][.country_codes([..])]` | `waba_id`, `start` / `end` (epoch seconds; default end = now, start = end − 30 d), `granularity` (`HALF_HOUR\|DAY\|MONTH`, default `DAY`), `phone_numbers[]`, `product_types[]`, `country_codes[]` | `{ granularity, data_points: [{start, end, sent, delivered}] }` |
+| `get_pricing_analytics` | Same shape, field `pricing_analytics`, `granularity ∈ DAILY\|HALF_HOUR\|MONTHLY`, `metric_types`, `pricing_types`, `pricing_categories`, `dimensions` | As above plus dimension parameters | `{ data_points: [{start, end, phone_number?, country?, pricing_category?, pricing_type?, tier?, volume, cost}] }` (flattening `data[].data_points[]`) |
+| `get_template_analytics` | Field `template_analytics`, `granularity` fixed to `DAILY`, `template_ids` ≤ 10 | `template_ids[]` (required), `start` / `end` | `{ data_points: [{template_id, start, end, sent, delivered, read, clicked[], cost}] }` |
+
+In the same PR: bump the Graph version to `v26.0` (or at least v25.0); forward
+`after` in `get_phone_numbers`; read `Retry-After` in the error mapping. All are
+small fixes the OC maintainers will welcome.
+
+**Skardi side:** three more pack tables with `row_path: "$.data_points"` and
+`single_page` (Meta's analytics fields do not paginate). Time ranges: pack
+`filters` support only `eq | gt | gt_eq`, so `period_start >= {ts}` is pushed as
+`start` with `format: epoch_seconds`, `fidelity: inexact`, and `end` defaults to
+now on the OC side. For an exact window or half-hour granularity, use
+`open_connector_query('saas', 'whatsapp.pricing_analytics', '{"start":…,"end":…,"granularity":"HALF_HOUR"}', 'acme-waba')`.
+
+**Persisting into Lance (escaping the one-year lookback):** one `kind: job`,
+triggered daily by an external cron (Skardi has no scheduler), `mode: upsert`,
+`merge_keys: [phone_number, pricing_category, period_start]`,
+`repeated_keys: keep_last` — re-running is idempotent. skardi-cloud's `skardi-etl`
+can generate this bundle directly.
+
 ### Deferred follow-ups (on demand)
 
 - **Media archiving:** `media_id` from a webhook is valid for 7 days. Needs a new
@@ -504,7 +518,7 @@ the `meta_whatsapp` preset, but neither the YAML nor the route mentions WhatsApp
   App, the `history` field replays 180 days; add `field: history` under `routes`,
   with slightly different unwrapping (chunking, `progress`).
 - **Delegating to OC triggers:** if Open Flow is ever deployed, steps 2–4 of
-  Option 3 can call OC's `POST /v1/providers/whatsapp/triggers/:id/execute` with
+  component 2 can call OC's `POST /v1/providers/whatsapp/triggers/:id/execute` with
   the `receive` operation and the app secret moves back into OC. Model
   "verify + unwrap" as a trait now so it can be swapped.
 
@@ -512,32 +526,31 @@ the `meta_whatsapp` preset, but neither the YAML nor the route mentions WhatsApp
 
 | Milestone | Repo / branch | Content | Estimate | Prerequisites |
 |---|---|---|---|---|
-| M1 pack (Option 1) | skardi `feature/open-connector-whatsapp-pack` | Three tables, fixtures (null / null-parent / empty / nested / extra-field / schema-mismatch), fingerprint capture and drift-refusal tests, MockGateway e2e, `docs/open-connector-whatsapp.md`, status paragraph in `docs/open-connector.md` | 2–3 days | A Meta developer account with a WABA and a test number, plus a local OC gateway (`~/Workspace/open-connector`) |
-| M2a OC actions (Option 2) | open-connector (upstream PR) | Three analytics read actions, v26.0, `after` on `get_phone_numbers`, `Retry-After` | 0.5–1 day | None |
-| M2b analytics tables (Option 2) | skardi, same branch as M1 or a new one | Three pack tables + snapshot job example + docs | 1–2 days | M2a merged and included in the OC version Skardi pins |
-| M3 webhook (Option 3) | skardi `feature/webhook-source` | `kind: webhook` loading, route, `meta_whatsapp` preset, unwrapper, reuse of column mapping and writers, metrics, docs `docs/webhooks.md` + `docs/whatsapp/` examples | 1–2 weeks | One public HTTPS address (cloudflared / ngrok for local development) |
-| M3b merge jobs | skardi (with M3) | `wa-merge-messages` / `wa-merge-statuses` example jobs + skardi-etl template | 0.5 day | M3 |
+| M1 pack (component 1) | skardi `feature/open-connector-whatsapp-pack` | Three tables, fixtures (null / null-parent / empty / nested / extra-field / schema-mismatch), fingerprint capture and drift-refusal tests, MockGateway e2e, `docs/open-connector-whatsapp.md`, status paragraph in `docs/open-connector.md` | 2–3 days | A Meta developer account with a WABA and a test number, plus a local OC gateway (`~/Workspace/open-connector`) |
+| M2 webhook (component 2) | skardi `feature/webhook-source` | `kind: webhook` loading, route, `meta_whatsapp` preset, unwrapper, reuse of column mapping and writers, metrics, docs `docs/webhooks.md` + `docs/whatsapp/` examples | 1–2 weeks | One public HTTPS address (cloudflared / ngrok for local development) |
+| M2b merge jobs | skardi (with M2) | `wa-merge-messages` / `wa-merge-statuses` example jobs + skardi-etl template | 0.5 day | M2 |
+| M3a OC actions (component 3, optional) | open-connector (upstream PR) | Three analytics read actions, v26.0, `after` on `get_phone_numbers`, `Retry-After` | 0.5–1 day | None |
+| M3b analytics tables (component 3, optional) | skardi, same branch as M1 or a new one | Three pack tables + snapshot job example + docs | 1–2 days | M3a merged and included in the OC version Skardi pins |
 | Deferred | on demand | See deferred follow-ups | — | — |
 
-**Recommended order: M3 → M3b first.** It is the only path that yields messages,
-and with no backfill, the earlier it ships the more data accumulates. M1 is
-independent and cheap; pick it up when needed. Most of M2's value is already
-covered by `wa_statuses`; it is worth doing only when Meta's own aggregate
-numbers are required, or to recover a year of metrics from before the webhook
-subscription. M1 and M3 share no code and can run in parallel by different
-people; M2 follows the upstream merge cadence. Each milestone is its own PR,
-with tests and docs as AGENTS.md requires, and no drive-by refactors.
+M1 and M2 are both required for a complete integration. They share no code and
+can run in parallel by different people, each as its own PR. If they have to be
+sequenced, **start M2**: it is the only path that yields messages, and with no
+backfill the earlier it ships the more data accumulates; M1 is cheap and can
+follow at any time. M3 is optional and follows the upstream OC merge cadence.
+Each milestone carries tests and docs as AGENTS.md requires, with no drive-by
+refactors.
 
 ## Verification plan
 
-- **M1 / M2 (packs):** follow the `source-pack` skill's live verification
+- **M1 / M3 (packs):** follow the `source-pack` skill's live verification
   strictly: run OC locally, read every table across multiple pages with a real
   token, and confirm at least one real non-NULL value per mapped column; the
   termination condition of `message_templates` (the shape of `paging` on the
   last page) must be proven by a live capture; fingerprints come from live
   captures, never hand-written. Without credentials, use the 403-vs-400 trick to
   validate input shapes first.
-- **M3 (webhook):**
+- **M2 (webhook):**
   - Unit tests for HMAC and the challenge using fixed vectors from Meta's docs;
     one case each for a bad signature, a missing header, and an oversized body.
   - Unwrapper fixtures built from the official `messages` samples (text / image /
@@ -551,7 +564,7 @@ with tests and docs as AGENTS.md requires, and no drive-by refactors.
 
 ## Risks and open questions
 
-1. **Who owns the public ingress.** Option 3 needs an HTTPS address with a CA
+1. **Who owns the public ingress.** Component 2 needs an HTTPS address with a CA
    certificate. Self-hosted users bring their own; skardi-cloud must decide
    whether to expose `/webhooks/*` per tenant (and how it relates to the existing
    ingress, WAF, and rate limiting). **Open: who on the skardi-cloud side takes this.**
@@ -562,7 +575,7 @@ with tests and docs as AGENTS.md requires, and no drive-by refactors.
    `paging` as-is; whether `cursors.after` is empty on the last page needs live
    verification. If it is non-empty with no `next`, OC must normalize a `hasMore`
    (the same class of problem Dropbox had).
-4. **Upstream OC cadence.** Option 2 depends on the OC PR merging and entering the
+4. **Upstream OC cadence.** Component 3 depends on the OC PR merging and entering the
    OC version Skardi pins. Until then analytics can be fetched ad hoc through the
    OC proxy, but cannot enter a pack (`open_connector_scan` rejects the proxy).
 5. **Privacy and compliance.** `from_wa_id` is a phone number and `text` is the
