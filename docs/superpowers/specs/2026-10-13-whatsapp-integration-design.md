@@ -423,9 +423,19 @@ spec:
 receipts: sent / delivered / read). The job is triggered every few minutes by an
 external cron; the staging table can be pruned on a retention schedule.
 
-**Single-node, zero-dependency deployment:** use SQLite for staging (already a
-writable source) and a local Lance directory; no Postgres required. Multi-replica
-deployments switch to Postgres by changing only `destination.table`.
+**Staging backend (decided):** the staging table lives in a transactional SQL
+source Skardi can already write to — Postgres, MySQL, or SQLite with
+`access_mode: read_write`. Open-source users choose: SQLite gives a
+zero-dependency single-node setup (a local file plus a Lance directory), at the
+cost of a single writer that may queue under peak load and hand Meta a 500 and
+a retry; Postgres suits multi-replica or high-traffic deployments. The docs ship
+both examples. On skardi-cloud the workspace already has Postgres, and the
+operator renders the destination to it; SQLite is not used there. Switching is
+a change to `destination.table` only.
+
+The staging table is not just a buffer: it is queryable by SQL before the merge
+job runs, it is where repairs and manual backfills land, and it can be pruned
+on a retention schedule once rows have been merged into Lance.
 
 #### Public ingress on skardi-cloud (decided)
 
@@ -611,9 +621,9 @@ refactors.
    [Public ingress on skardi-cloud](#public-ingress-on-skardi-cloud-decided).
    Still open on the cloud side: the metering counter for ingest events, and
    the gateway's single-replica availability during rollouts.
-2. **Default staging backend.** SQLite is suggested (zero dependencies), but its
-   single-writer model may hand Meta a 500 and a retry under peak load; high-traffic
-   tenants should use Postgres. The docs must say so.
+2. **Staging backend — decided.** skardi-cloud uses the workspace's Postgres;
+   open-source users choose between SQLite (zero dependencies, single writer)
+   and Postgres. See [Staging backend](#dedup-and-merge-into-lance-zero-new-code).
 3. **`message_templates` paging termination.** The OC action forwards Meta's
    `paging` as-is; whether `cursors.after` is empty on the last page needs live
    verification. If it is non-empty with no `next`, OC must normalize a `hasMore`
