@@ -10,7 +10,7 @@ tables:
   conversations:
     action: slack.list_conversations
     row_path: "$.conversations"
-    fingerprint: fa7645ece26b7d8eb6c27ea88910c5bbb0e43e658f2b7cc0741c1a1543784de6
+    fingerprint: 780f342067b2c4798b004f1ab8cd7e8eaf1c744f07054b1fff3f03c480d45d2f
     pagination:
       strategy: cursor
       page_size_input: limit
@@ -113,7 +113,7 @@ tables:
   users:
     action: slack.list_users
     row_path: "$.users"
-    fingerprint: 34d454ad37095702f6cbd0a41289c528b67a45f5f2c25991839773fa616ae5a5
+    fingerprint: fe44b3c7fe1e3de1cfdee0b2c7face77036a83c779937ffd4c6ff404bd508cf6
     pagination:
       strategy: cursor
       page_size_input: limit

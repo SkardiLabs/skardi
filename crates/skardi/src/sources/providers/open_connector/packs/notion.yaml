@@ -19,7 +19,7 @@ tables:
   users:
     action: notion.list_users
     row_path: "$.results"
-    fingerprint: 2c7a234b30e3b016a4405586602c2bbe9e8fe873eb9b62c5257c98eb3f099421
+    fingerprint: fbf4147fb836b7b9fcb5dd1b3fbffac2134530ceae1e23151cbb4ebee58822a1
     pagination:
       strategy: cursor
       cursor_input: startCursor
@@ -38,7 +38,7 @@ tables:
   pages:
     action: notion.search
     row_path: "$.results"
-    fingerprint: a7d90d2d753b28954b1bf77c26abc2ff4b36caf905c8c1fc74a182acb2a6e9d1
+    fingerprint: db8ff8b27cd96dfce0631e2997c8a1d024f91175e044554178814d077a2e2969
     pagination:
       strategy: cursor
       cursor_input: startCursor
@@ -74,7 +74,7 @@ tables:
   data_sources:
     action: notion.search
     row_path: "$.results"
-    fingerprint: a7d90d2d753b28954b1bf77c26abc2ff4b36caf905c8c1fc74a182acb2a6e9d1
+    fingerprint: db8ff8b27cd96dfce0631e2997c8a1d024f91175e044554178814d077a2e2969
     pagination:
       strategy: cursor
       cursor_input: startCursor
@@ -100,7 +100,7 @@ tables:
   block_children:
     action: notion.list_block_children
     row_path: "$.results"
-    fingerprint: 69f20cdc842b890c280265048d143d36de1699396b8ca4f53f7a7f203b7bd51c
+    fingerprint: b8022fd280049b1a9963758aa18e15adc04695c06eef9e86db7766213d0d8c86
     pagination:
       strategy: cursor
       cursor_input: startCursor

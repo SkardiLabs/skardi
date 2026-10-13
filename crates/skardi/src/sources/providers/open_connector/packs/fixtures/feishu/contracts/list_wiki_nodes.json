@@ -24,7 +24,8 @@
         {
           "type": "null"
         }
-      ]
+      ],
+      "description": "The token for the next page."
     }
   },
   "additionalProperties": false,
