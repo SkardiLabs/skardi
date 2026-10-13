@@ -646,6 +646,9 @@ mod tests {
         // schema, anyOf included, so declared drift still fails
         // registration. Pinned so the walker's blind spot stays visible
         // — teaching it to descend branch schemas would make this `&[]`.
+        // The captured draft `message` is also object | null through anyOf:
+        // its two nested identity paths are declared inside the object branch,
+        // but the same conservative walker cannot resolve them either.
         // (notion's pin is a mix of both: most of its search-backed paths
         // are declared inside the same kind of anyOf, a couple —
         // `is_archived`, `public_url` — genuinely are not.)
@@ -671,7 +674,7 @@ mod tests {
             (
                 "drafts",
                 include_str!("fixtures/gmail/contracts/list_drafts.json"),
-                &[],
+                &["message_id", "thread_id"],
             ),
             (
                 "labels",
