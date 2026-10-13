@@ -527,18 +527,30 @@ the `meta_whatsapp` preset, but neither the YAML nor the route mentions WhatsApp
 Optional, see [Recommended architecture](#recommended-architecture) for when it
 is worth building.
 
-**OC side** (`src/providers/whatsapp/`, following the `add-provider` skill, about
-half a day):
+**OC side — submitted upstream as
+[oomol-lab/open-connector#731](https://github.com/oomol-lab/open-connector/pull/731)**
+(branch `bakey:feat/whatsapp-analytics`, commit `30db2fd5`). The PR adds the
+three read actions below plus the `after` cursor on `get_phone_numbers`, with a
+provider test covering the modifier rendering, the `data[]` flattening, the
+template edge's query encoding, and the window validation. `npm run fix-check`,
+catalog generation, the action-example check, and the provider guard suites all
+pass. Not yet done: a live call against a WABA (no credentials in the authoring
+environment), which skardi's own live verification covers before the pack lands.
 
 | New read action | Graph call | Inputs (all optional, with defaults) | Normalized output |
 |---|---|---|---|
 | `get_message_analytics` | `GET /{waba_id}?fields=analytics.start(s).end(e).granularity(g)[.phone_numbers([..])][.product_types([..])][.country_codes([..])]` | `waba_id`, `start` / `end` (epoch seconds; default end = now, start = end − 30 d), `granularity` (`HALF_HOUR\|DAY\|MONTH`, default `DAY`), `phone_numbers[]`, `product_types[]`, `country_codes[]` | `{ granularity, data_points: [{start, end, sent, delivered}] }` |
 | `get_pricing_analytics` | Same shape, field `pricing_analytics`, `granularity ∈ DAILY\|HALF_HOUR\|MONTHLY`, `metric_types`, `pricing_types`, `pricing_categories`, `dimensions` | As above plus dimension parameters | `{ data_points: [{start, end, phone_number?, country?, pricing_category?, pricing_type?, tier?, volume, cost}] }` (flattening `data[].data_points[]`) |
-| `get_template_analytics` | Field `template_analytics`, `granularity` fixed to `DAILY`, `template_ids` ≤ 10 | `template_ids[]` (required), `start` / `end` | `{ data_points: [{template_id, start, end, sent, delivered, read, clicked[], cost}] }` |
+| `get_template_analytics` | **Edge**, not a field: `GET /{waba_id}/template_analytics?start&end&granularity=DAILY&template_ids=[..]&metric_types=[..]&use_waba_timezone&after` (DAILY is the only granularity the edge accepts; ≤10 templates; 90-day history; template analytics must be enabled on the WABA first) | `template_ids[]` (required), `start` / `end`, `metric_types[]`, `use_waba_timezone`, `after` | `{ data_points: [{template_id, start, end, sent, delivered, read, clicked: [{type, button_content, count}], cost: [{type, value}]}], paging }` |
 
-In the same PR: bump the Graph version to `v26.0` (or at least v25.0); forward
-`after` in `get_phone_numbers`; read `Retry-After` in the error mapping. All are
-small fixes the OC maintainers will welcome.
+Encoding details settled in the PR: inside the dot-chained modifiers, scalars are
+bare (`granularity(DAY)` must be unquoted) and lists are JSON arrays; empty
+lists are omitted, which Meta reads the same as an absent filter. `start` /
+`end` default to the last 30 days, and `start >= end` is a 400 before any request.
+
+Left for a separate OC PR, deliberately: the Graph version bump (v23.0 → v26.0)
+and `Retry-After` parsing. Both touch every WhatsApp action, so they should not
+ride on a feature PR.
 
 **Skardi side:** three more pack tables with `row_path: "$.data_points"` and
 `single_page` (Meta's analytics fields do not paginate). Time ranges: pack
@@ -579,7 +591,7 @@ can generate this bundle directly.
 | M1 pack (component 1) | skardi `feature/open-connector-whatsapp-pack` | Three tables, fixtures (null / null-parent / empty / nested / extra-field / schema-mismatch), fingerprint capture and drift-refusal tests, MockGateway e2e, `docs/open-connector-whatsapp.md`, status paragraph in `docs/open-connector.md` | 2–3 days | A Meta developer account with a WABA and a test number, plus a local OC gateway (`~/Workspace/open-connector`) |
 | M2 webhook (component 2) | skardi `feature/webhook-source` | `kind: webhook` loading, route, `meta_whatsapp` preset, unwrapper, reuse of column mapping and writers, metrics, docs `docs/webhooks.md` + `docs/whatsapp/` examples | 1–2 weeks | One public HTTPS address (cloudflared / ngrok for local development) |
 | M2b merge jobs | skardi (with M2) | `wa-merge-messages` / `wa-merge-statuses` example jobs + skardi-etl template | 0.5 day | M2 |
-| M3a OC actions (component 3, optional) | open-connector (upstream PR) | Three analytics read actions, v26.0, `after` on `get_phone_numbers`, `Retry-After` | 0.5–1 day | None |
+| M3a OC actions (component 3, optional) | open-connector [#731](https://github.com/oomol-lab/open-connector/pull/731) — **submitted** | Three analytics read actions and `after` on `get_phone_numbers` (Graph version bump and `Retry-After` split out to a follow-up) | done, awaiting upstream review | None |
 | M3b analytics tables (component 3, optional) | skardi, same branch as M1 or a new one | Three pack tables + snapshot job example + docs | 1–2 days | M3a merged and included in the OC version Skardi pins |
 | Deferred | on demand | See deferred follow-ups | — | — |
 
@@ -628,9 +640,13 @@ refactors.
    `paging` as-is; whether `cursors.after` is empty on the last page needs live
    verification. If it is non-empty with no `next`, OC must normalize a `hasMore`
    (the same class of problem Dropbox had).
-4. **Upstream OC cadence.** Component 3 depends on the OC PR merging and entering the
-   OC version Skardi pins. Until then analytics can be fetched ad hoc through the
-   OC proxy, but cannot enter a pack (`open_connector_scan` rejects the proxy).
+4. **Upstream OC cadence.** The OC PR is submitted
+   ([oomol-lab/open-connector#731](https://github.com/oomol-lab/open-connector/pull/731));
+   component 3 still depends on it merging and entering the OC version Skardi
+   pins. Until then analytics can be fetched ad hoc through the OC proxy, but
+   cannot enter a pack (`open_connector_scan` rejects the proxy). The request
+   shapes were cross-checked against two open-source clients but not yet
+   exercised against a live WABA.
 5. **Privacy and compliance.** `from_wa_id` is a phone number and `text` is the
    customer's own words. The Lance tables should fall under the existing query
    audit (`--query-audit-db`), masked views at the pipeline layer should be
