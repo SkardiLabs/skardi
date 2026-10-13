@@ -51,7 +51,8 @@
         {
           "type": "null"
         }
-      ]
+      ],
+      "description": "Pagination URL for the next page, or null when there is no next page."
     }
   },
   "additionalProperties": false,

@@ -25,7 +25,7 @@ tables:
   messages:
     action: outlook.list_messages
     row_path: "$.messages"
-    fingerprint: 6e6b5f0aa7bde985e32491aaa497ee9b3db16903f1f78d8f49c32e3604a0740f
+    fingerprint: e21be3f6acd2cb274deeba16b488d01321e8bc1a552aabc7b6e53a76661c2d8e
     pagination:
       strategy: cursor
       cursor_input: nextLink
@@ -145,7 +145,7 @@ tables:
   mail_folders:
     action: outlook.list_mail_folders
     row_path: "$.mailFolders"
-    fingerprint: c67baab75ea0098b468dda7db65900df8c43c037259c59955917c7e9fa8eef0b
+    fingerprint: 4c969202f42ac5b342feff864471640313074afda04c75e8a14e35ba9b45492c
     pagination:
       strategy: cursor
       cursor_input: nextLink

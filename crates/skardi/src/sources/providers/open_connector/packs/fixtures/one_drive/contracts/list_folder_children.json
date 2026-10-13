@@ -318,7 +318,8 @@
         {
           "type": "null"
         }
-      ]
+      ],
+      "description": "Opaque nextLink for fetching the next page, if any."
     }
   },
   "additionalProperties": false,
