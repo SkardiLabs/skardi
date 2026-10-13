@@ -67,7 +67,7 @@ tables:
   files:
     action: dropbox.list_folder
     row_path: "$.entries"
-    fingerprint: 87502bce0a4c30043fdbde3e45f6c02158ed64338ffeac203eb31f6bde7d6be1
+    fingerprint: 9782eda1fb2a7d90ce5a1e3d3e26f52acc3bb60c07cc4b4f562ca8826958101d
     pagination:
       strategy: cursor
       cursor_input: cursor
@@ -85,7 +85,7 @@ tables:
       has_more_path: "$.hasMore"
       continuation:
         action: dropbox.list_folder_continue
-        fingerprint: 87502bce0a4c30043fdbde3e45f6c02158ed64338ffeac203eb31f6bde7d6be1
+        fingerprint: 9782eda1fb2a7d90ce5a1e3d3e26f52acc3bb60c07cc4b4f562ca8826958101d
         inputs: cursor_only
     resources:
       optional: [path]
@@ -130,7 +130,7 @@ tables:
   shared_links:
     action: dropbox.list_shared_links
     row_path: "$.links"
-    fingerprint: 7f7c822b99a1afcbf4ea81371527a14ab4d24918dbde170eb115037003144067
+    fingerprint: b1ec82643620320da974f3d9895b24e4b926c3e06c2c3a8682e872010ba3ed16
     # No continuation block: the executor `compactObject`s `path` and
     # `cursor` together and the input schema declares both, so pages 2..N
     # repeat the action with the full input, the engine's default.
@@ -203,7 +203,7 @@ tables:
   file_search:
     action: dropbox.search_files
     row_path: "$.matches"
-    fingerprint: 472377cc3b4fd9890843390919e5b165e52fdd358d8ee08cc109c2a08f0d356c
+    fingerprint: fc2733d9b81a9b215333c836f70d29a6f6030ae3e322a99aaccf1cdbcf288b87
     pagination:
       strategy: cursor
       cursor_input: cursor
@@ -216,7 +216,7 @@ tables:
       has_more_path: "$.hasMore"
       continuation:
         action: dropbox.search_files_continue
-        fingerprint: 472377cc3b4fd9890843390919e5b165e52fdd358d8ee08cc109c2a08f0d356c
+        fingerprint: fc2733d9b81a9b215333c836f70d29a6f6030ae3e322a99aaccf1cdbcf288b87
         inputs: cursor_only
     resources:
       required: [query]

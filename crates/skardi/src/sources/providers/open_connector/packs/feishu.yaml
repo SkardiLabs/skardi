@@ -36,7 +36,7 @@ tables:
   chats:
     action: feishu.list_chats
     row_path: "$.items"
-    fingerprint: 51dcd0f7fe1efb4437ee71cf62e9991b535e5d0bc71a3b9998a96b090b4e6cd3
+    fingerprint: ae92a20605dc6b38d1c350df84bbe2989a2284450a17fcf6a7b398b958a9882d
     pagination:
       strategy: cursor
       cursor_input: pageToken
@@ -65,7 +65,7 @@ tables:
   messages:
     action: feishu.list_messages
     row_path: "$.items"
-    fingerprint: 51dcd0f7fe1efb4437ee71cf62e9991b535e5d0bc71a3b9998a96b090b4e6cd3
+    fingerprint: ae92a20605dc6b38d1c350df84bbe2989a2284450a17fcf6a7b398b958a9882d
     pagination:
       strategy: cursor
       cursor_input: pageToken
@@ -154,7 +154,7 @@ tables:
   document_blocks:
     action: feishu.list_document_blocks
     row_path: "$.items"
-    fingerprint: 8b27c6542e4e2b3dc113f52e56b111863cc20b87df0c8bfd4b629b97661ff63a
+    fingerprint: 01197fece20db6e4dc097595b5d8b28cd42380aa1c6c625cd4a2377a112883aa
     pagination:
       strategy: cursor
       cursor_input: pageToken
@@ -178,7 +178,7 @@ tables:
   chat_members:
     action: feishu.list_chat_members
     row_path: "$.items"
-    fingerprint: 51dcd0f7fe1efb4437ee71cf62e9991b535e5d0bc71a3b9998a96b090b4e6cd3
+    fingerprint: ae92a20605dc6b38d1c350df84bbe2989a2284450a17fcf6a7b398b958a9882d
     pagination:
       strategy: cursor
       cursor_input: pageToken
@@ -197,7 +197,7 @@ tables:
   tasks:
     action: feishu.list_tasks
     row_path: "$.items"
-    fingerprint: f8d062dc87c010a03a76e6b1b0bc252f2de8b7004365042422de3f89b13f6382
+    fingerprint: 32c84c3fbbb16e2b6b1721646a52c01eef37064530310b623101f8672841af1f
     pagination:
       strategy: cursor
       cursor_input: pageToken
@@ -237,7 +237,7 @@ tables:
   wiki_spaces:
     action: feishu.list_wiki_spaces
     row_path: "$.items"
-    fingerprint: e6b2676fbe15e20f408f30c5d2f4aafee1cd628c434f699f1520f780fc940a6a
+    fingerprint: 3e409151958df3889afbd4461debb32f96f4d6336fb79bc79b09bf336fdeda97
     pagination:
       strategy: cursor
       cursor_input: pageToken
@@ -256,7 +256,7 @@ tables:
   wiki_nodes:
     action: feishu.list_wiki_nodes
     row_path: "$.items"
-    fingerprint: e6b2676fbe15e20f408f30c5d2f4aafee1cd628c434f699f1520f780fc940a6a
+    fingerprint: 3e409151958df3889afbd4461debb32f96f4d6336fb79bc79b09bf336fdeda97
     pagination:
       strategy: cursor
       cursor_input: pageToken
