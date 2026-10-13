@@ -20,7 +20,8 @@
         {
           "type": "null"
         }
-      ]
+      ],
+      "description": "The token to fetch the next page, when hasMore is true."
     },
     "hasMore": {
       "anyOf": [
@@ -31,7 +32,8 @@
         {
           "type": "null"
         }
-      ]
+      ],
+      "description": "Whether more pages are available."
     },
     "total": {
       "anyOf": [
@@ -42,7 +44,8 @@
         {
           "type": "null"
         }
-      ]
+      ],
+      "description": "The total number of items, when the API reports it."
     }
   },
   "additionalProperties": false,

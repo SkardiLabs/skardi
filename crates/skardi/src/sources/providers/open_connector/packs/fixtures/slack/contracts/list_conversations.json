@@ -19,7 +19,8 @@
               {
                 "type": "null"
               }
-            ]
+            ],
+            "description": "The name of the conversation when available."
           },
           "type": {
             "type": "string",
@@ -41,7 +42,8 @@
               {
                 "type": "null"
               }
-            ]
+            ],
+            "description": "Whether the conversation is archived."
           },
           "isPrivate": {
             "anyOf": [
@@ -52,7 +54,8 @@
               {
                 "type": "null"
               }
-            ]
+            ],
+            "description": "Whether the conversation is private."
           },
           "isMember": {
             "anyOf": [
@@ -63,7 +66,8 @@
               {
                 "type": "null"
               }
-            ]
+            ],
+            "description": "Whether the connected Slack identity is a member."
           },
           "memberCount": {
             "type": "integer",
@@ -78,7 +82,8 @@
               {
                 "type": "null"
               }
-            ]
+            ],
+            "description": "The conversation topic."
           },
           "purpose": {
             "anyOf": [
@@ -89,7 +94,8 @@
               {
                 "type": "null"
               }
-            ]
+            ],
+            "description": "The conversation purpose."
           },
           "userId": {
             "type": "string",
@@ -160,7 +166,8 @@
         {
           "type": "null"
         }
-      ]
+      ],
+      "description": "The cursor for the next page."
     }
   },
   "additionalProperties": false,

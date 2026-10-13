@@ -20,7 +20,8 @@
               {
                 "type": "null"
               }
-            ]
+            ],
+            "description": "Mailbox history checkpoint ID."
           },
           "snippet": {
             "type": "string",
@@ -96,7 +97,8 @@
                     {
                       "type": "null"
                     }
-                  ]
+                  ],
+                  "description": "Gmail API object."
                 },
                 "messageText": {
                   "type": "string",
@@ -116,7 +118,8 @@
                           {
                             "type": "null"
                           }
-                        ]
+                        ],
+                        "description": "Gmail attachment ID, or null when bytes are stored directly in the message part."
                       },
                       "filename": {
                         "type": "string",
@@ -140,7 +143,8 @@
                           {
                             "type": "null"
                           }
-                        ]
+                        ],
+                        "description": "Gmail MIME part ID when supplied."
                       },
                       "contentId": {
                         "anyOf": [
@@ -151,7 +155,8 @@
                           {
                             "type": "null"
                           }
-                        ]
+                        ],
+                        "description": "Bare Content-ID without angle brackets, when supplied."
                       },
                       "disposition": {
                         "anyOf": [
@@ -166,7 +171,8 @@
                           {
                             "type": "null"
                           }
-                        ]
+                        ],
+                        "description": "Content-Disposition when supplied and recognized."
                       }
                     },
                     "additionalProperties": false,
@@ -220,7 +226,8 @@
         {
           "type": "null"
         }
-      ]
+      ],
+      "description": "Opaque pagination token returned by Gmail."
     },
     "resultSizeEstimate": {
       "type": "integer",
