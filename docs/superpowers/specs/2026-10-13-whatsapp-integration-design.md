@@ -427,6 +427,46 @@ external cron; the staging table can be pruned on a retention schedule.
 writable source) and a local Lance directory; no Postgres required. Multi-replica
 deployments switch to Postgres by changing only `destination.table`.
 
+#### Public ingress on skardi-cloud (decided)
+
+Self-hosted deployments expose skardi-server's `/webhooks/:name` themselves.
+On skardi-cloud, each tenant gets its endpoint through the existing
+`skardi-gateway`, which already serves a public, unauthenticated, per-tenant
+URL shape (`https://<org-slug>.api.skardi.cloud/external/<tenant_slug>/<endpoint>`)
+behind an ALB with a CA-issued wildcard certificate — exactly what Meta
+requires. The webhook path reuses that host and routing model:
+
+```
+GET|POST https://<org-slug>.api.skardi.cloud/webhooks/<tenant_slug>/<name>
+   └─ gateway: host → org, path → workspace route table
+        └─ raw passthrough → skardi-server.<workspace>.svc /webhooks/<name>
+```
+
+Division of responsibilities:
+
+- **The gateway** does route-table lookup, a body-size cap (Meta sends at most
+  3 MB; cap at 4 MB), per-tenant rate limiting, and metering. It forwards both
+  GET and POST with the body **byte-for-byte** and the headers intact, and
+  stamps no identity — the request is unauthenticated by design.
+- **skardi-server** does the `hub.challenge` handshake and the HMAC check. The
+  verify token and app secret stay in the workspace's environment; the gateway
+  never holds a tenant's Meta secrets, matching the existing boundary where OC
+  credentials never enter the gateway either.
+- **The route table** only lists `<name>`s that the workspace declares as a
+  `kind: webhook` resource (the operator renders it from the bound context, as
+  it does for pipelines). Undeclared names are 404 at the gateway, so junk
+  traffic never reaches a worker.
+
+Why not reuse `/external/<endpoint>`: it is POST-only, its meaning is "run this
+pipeline" (and it is metered as a pipeline run), and it may reshape the request
+body — any of which breaks the GET handshake or the signature check.
+
+Two things to size for: the gateway is single-replica today, so webhook
+availability equals gateway availability (Meta's 7-day retry turns an outage
+into a delay, not a loss, but gateway rollout windows must be short); and
+metering needs its own counter (ingest events), because webhook deliveries are
+not pipeline runs.
+
 #### Outbound message content
 
 `wa_messages` is in practice an **inbound** table. For messages the business
@@ -564,10 +604,13 @@ refactors.
 
 ## Risks and open questions
 
-1. **Who owns the public ingress.** Component 2 needs an HTTPS address with a CA
-   certificate. Self-hosted users bring their own; skardi-cloud must decide
-   whether to expose `/webhooks/*` per tenant (and how it relates to the existing
-   ingress, WAF, and rate limiting). **Open: who on the skardi-cloud side takes this.**
+1. **Public ingress — decided.** Self-hosted users expose skardi-server's
+   `/webhooks/:name` themselves; on skardi-cloud, `skardi-gateway` serves
+   `/webhooks/<tenant_slug>/<name>` on the existing per-org host as a raw
+   passthrough, with verification staying in skardi-server. See
+   [Public ingress on skardi-cloud](#public-ingress-on-skardi-cloud-decided).
+   Still open on the cloud side: the metering counter for ingest events, and
+   the gateway's single-replica availability during rollouts.
 2. **Default staging backend.** SQLite is suggested (zero dependencies), but its
    single-writer model may hand Meta a 500 and a retry under peak load; high-traffic
    tenants should use Postgres. The docs must say so.
