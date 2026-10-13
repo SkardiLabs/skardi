@@ -541,12 +541,16 @@ environment), which skardi's own live verification covers before the pack lands.
 |---|---|---|---|
 | `get_message_analytics` | `GET /{waba_id}?fields=analytics.start(s).end(e).granularity(g)[.phone_numbers([..])][.product_types([..])][.country_codes([..])]` | `waba_id`, `start` / `end` (epoch seconds; default end = now, start = end − 30 d), `granularity` (`HALF_HOUR\|DAY\|MONTH`, default `DAY`), `phone_numbers[]`, `product_types[]`, `country_codes[]` | `{ granularity, data_points: [{start, end, sent, delivered}] }` |
 | `get_pricing_analytics` | Same shape, field `pricing_analytics`, `granularity ∈ DAILY\|HALF_HOUR\|MONTHLY`, `metric_types`, `pricing_types`, `pricing_categories`, `dimensions` | As above plus dimension parameters | `{ data_points: [{start, end, phone_number?, country?, pricing_category?, pricing_type?, tier?, volume, cost}] }` (flattening `data[].data_points[]`) |
-| `get_template_analytics` | **Edge**, not a field: `GET /{waba_id}/template_analytics?start&end&granularity=DAILY&template_ids=[..]&metric_types=[..]&use_waba_timezone&after` (DAILY is the only granularity the edge accepts; ≤10 templates; 90-day history; template analytics must be enabled on the WABA first) | `template_ids[]` (required), `start` / `end`, `metric_types[]`, `use_waba_timezone`, `after` | `{ data_points: [{template_id, start, end, sent, delivered, read, clicked: [{type, button_content, count}], cost: [{type, value}]}], paging }` |
+| `get_template_analytics` | **Edge**, not a field: `GET /{waba_id}/template_analytics?start&end&granularity=DAILY&template_ids=[id,id]&metric_types=cost,clicked,…&product_type&use_waba_timezone&after` (DAILY is the only granularity the edge accepts; ≤10 templates; 90-day history; template analytics must be enabled on the WABA first with `POST /{waba_id}?is_enabled_for_insights=true`; read and click counts are only kept for 7 days per message) | `template_ids[]` (required), `start` / `end` (UNIX seconds or `YYYY-MM-DD`; dates are mandatory when `use_waba_timezone` is true, so timestamps are converted), `metric_types[]`, `product_type`, `use_waba_timezone`, `after` | `{ waba_timezone?, data_points: [{template_id, start, end, sent, delivered, read, clicked: [{type, button_content, count}], cost: [{type, value}]}], paging }` |
 
-Encoding details settled in the PR: inside the dot-chained modifiers, scalars are
-bare (`granularity(DAY)` must be unquoted) and lists are JSON arrays; empty
-lists are omitted, which Meta reads the same as an absent filter. `start` /
-`end` default to the last 30 days, and `start >= end` is a 400 before any request.
+Encoding details, verified against Meta's analytics reference (downloaded with
+curl on 2026-10-13; the page is JS-heavy and the fetch tools time out on it):
+inside the dot-chained modifiers every value is bare, lists as comma-separated
+items (`.dimensions(PRICING_CATEGORY,TIER).country_codes(US,IN)`), never JSON
+arrays or quotes; empty lists are omitted, which Meta reads the same as an
+absent filter. `start` / `end` default to the last 30 days, and `start >= end`
+is a 400 before any request. Pricing rows carry a `tier` such as `0:750000`
+only for billable utility and authentication messages.
 
 Left for a separate OC PR, deliberately: the Graph version bump (v23.0 → v26.0)
 and `Retry-After` parsing. Both touch every WhatsApp action, so they should not
@@ -645,8 +649,11 @@ refactors.
    component 3 still depends on it merging and entering the OC version Skardi
    pins. Until then analytics can be fetched ad hoc through the OC proxy, but
    cannot enter a pack (`open_connector_scan` rejects the proxy). The request
-   shapes were cross-checked against two open-source clients but not yet
-   exercised against a live WABA.
+   shapes match Meta's analytics reference verbatim and were cross-checked
+   against two open-source clients, but have not yet been exercised against a
+   live WABA: Graph API is reachable from the authoring environment (an
+   immediate 400 from `/me` without a token), and the only missing piece is a
+   System User token with `whatsapp_business_management` plus a WABA ID.
 5. **Privacy and compliance.** `from_wa_id` is a phone number and `text` is the
    customer's own words. The Lance tables should fall under the existing query
    audit (`--query-audit-db`), masked views at the pipeline layer should be
