@@ -671,10 +671,12 @@ mod tests {
                     "message_timestamp",
                 ],
             ),
+            // drafts: since the 632042fd contract refresh, `message` is an
+            // anyOf too, so its ids join messages' blind spot above.
             (
                 "drafts",
                 include_str!("fixtures/gmail/contracts/list_drafts.json"),
-                &[],
+                &["message_id", "thread_id"],
             ),
             (
                 "labels",
