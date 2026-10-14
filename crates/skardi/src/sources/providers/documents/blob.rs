@@ -470,28 +470,28 @@ mod tests {
 
     #[tokio::test]
     async fn remote_uri_keys_address_the_raw_object_key() {
-        // A ref URI with a non-ASCII / `%` / space name must write and read the
-        // object whose key is that string verbatim — the same key a listing of
-        // the bucket returns — not a percent-encoded variant of it.
+        // A ref URI carrying a hostile name must write and read the object whose
+        // key is that string verbatim — the same key a listing of the bucket
+        // returns — not a percent-encoded or normalised variant of it.
         let mem = Arc::new(object_store::memory::InMemory::new());
         let blob = BlobStore::Remote(mem.clone());
-        for (uri, key) in [
-            (
-                "s3://bk/extracted/团体.PDF_page_1.png",
-                "extracted/团体.PDF_page_1.png",
-            ),
-            (
-                "s3://bk/extracted/50% off.pdf_img0.png",
-                "extracted/50% off.pdf_img0.png",
-            ),
-        ] {
-            let loc = Loc::parse(uri).unwrap();
-            blob.put(&loc, b"IMG").await.unwrap();
-            mem.head(&OsPath::parse(key).unwrap())
+        for name in super::super::HOSTILE_OBJECT_NAMES {
+            let key = format!("extracted/{name}_page_1.png");
+            let uri = format!("s3://bk/{key}");
+            let loc = Loc::parse(&uri).unwrap();
+            blob.put(&loc, name.as_bytes()).await.unwrap();
+            let raw = OsPath::parse(&key)
+                .unwrap_or_else(|e| panic!("Path::parse rejects fixture name {name:?}: {e}"));
+            mem.head(&raw)
                 .await
-                .unwrap_or_else(|e| panic!("{uri} not stored at raw key {key}: {e}"));
-            assert_eq!(blob.get(&loc).await.unwrap(), b"IMG");
+                .unwrap_or_else(|e| panic!("{uri:?} not stored at raw key {key:?}: {e}"));
+            assert_eq!(blob.get(&loc).await.unwrap(), name.as_bytes());
         }
+        // NFC and NFD stay two objects.
+        assert_eq!(
+            mem.list(None).count().await,
+            super::super::HOSTILE_OBJECT_NAMES.len()
+        );
         // ASCII keys are unchanged by the raw parse.
         assert_eq!(
             Loc::parse("s3://bk/corpus/a.pdf").unwrap(),
