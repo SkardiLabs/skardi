@@ -306,6 +306,7 @@ fn loc_is_under(entry: &Loc, base: &Loc) -> bool {
             if eb != bb {
                 return false;
             }
+            let (ek, bk): (&str, &str) = (ek.as_ref(), bk.as_ref());
             let trimmed = bk.trim_end_matches('/');
             trimmed.is_empty() || ek == trimmed || ek.starts_with(&format!("{trimmed}/"))
         }
@@ -1265,6 +1266,65 @@ mod tests {
             .map(|(_, r)| r)
             .collect();
         assert_eq!(without_excl, vec!["a.pdf", "crops/a.pdf_img0.png"]);
+    }
+
+    #[tokio::test]
+    async fn list_docs_reads_non_ascii_and_escaped_keys_at_their_listed_location() {
+        use object_store::path::Path as OsPath;
+        use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
+        use std::sync::Arc;
+
+        // Keys exactly as raw writers store them: `OsPath::parse` keeps the
+        // string verbatim (no percent-encoding). `docs/enc/…` is the shape an
+        // encoding writer (`OsPath::child` / `OsPath::from`) produces: the S3
+        // key literally contains `%E5…`.
+        let raw_cjk = "docs/团体.PDF";
+        let raw_pct_space = "docs/50% off report.pdf";
+        let encoded = OsPath::from("docs/enc/团体.pdf");
+        assert!(encoded.as_ref().starts_with("docs/enc/%E5"), "{encoded}");
+
+        let mem = Arc::new(object_store::memory::InMemory::new());
+        for (key, body) in [
+            (OsPath::parse(raw_cjk).unwrap(), &b"CJK"[..]),
+            (OsPath::parse(raw_pct_space).unwrap(), &b"PCT"[..]),
+            (encoded.clone(), &b"ENC"[..]),
+            (OsPath::parse("docs/plain.pdf").unwrap(), &b"ASCII"[..]),
+        ] {
+            mem.put(&key, PutPayload::from(body.to_vec()))
+                .await
+                .unwrap();
+        }
+        let store = BlobStore::Remote(mem as Arc<dyn ObjectStore>);
+        let prefix = Loc::parse("s3://bk/docs").unwrap();
+        let opts = ParseOptions {
+            recursive: true,
+            include_globs: vec!["*.pdf".into()],
+            ..ParseOptions::default()
+        };
+
+        let entries = list_docs(&store, &prefix, &opts, None).await.unwrap();
+        let mut got: Vec<(String, Vec<u8>)> = Vec::new();
+        for (loc, rel) in &entries {
+            // The provider's fetch: the listed location, never a rebuilt name.
+            let bytes = store
+                .get(loc)
+                .await
+                .unwrap_or_else(|e| panic!("fetch {rel}: {e:#}"));
+            got.push((rel.clone(), bytes));
+        }
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("50% off report.pdf".to_string(), b"PCT".to_vec()),
+                (
+                    encoded.as_ref().strip_prefix("docs/").unwrap().to_string(),
+                    b"ENC".to_vec()
+                ),
+                ("plain.pdf".to_string(), b"ASCII".to_vec()),
+                ("团体.PDF".to_string(), b"CJK".to_vec()),
+            ]
+        );
     }
 
     #[test]
