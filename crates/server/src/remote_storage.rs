@@ -184,13 +184,12 @@ impl S3Storage {
     ) -> Result<()> {
         use futures::StreamExt;
         use object_store::PutPayload;
-        use object_store::path::Path as ObjectPath;
 
         if path.starts_with("s3://") {
             let bucket = parse_bucket(path, source_name)?;
             let (store, region) = build_bucket_store(&bucket, source_name)?;
             let prefix = s3_key_prefix(path);
-            let op = (!prefix.is_empty()).then(|| ObjectPath::from(prefix.as_str()));
+            let op = (!prefix.is_empty()).then(|| raw_object_path(&prefix));
             // Poll only the first stream item: this proves auth/network/prefix
             // reachability without draining a full inventory of a large prefix.
             // `None` (empty but reachable) is a pass; a first-item error fails.
@@ -211,7 +210,7 @@ impl S3Storage {
             let bucket = parse_bucket(img, source_name)?;
             let (store, region) = build_bucket_store(&bucket, source_name)?;
             let base = s3_key_prefix(img);
-            let probe = ObjectPath::from(write_probe_key(&base));
+            let probe = raw_object_path(&write_probe_key(&base));
             store
                 .put(&probe, PutPayload::from_static(b"skardi-write-probe"))
                 .await
@@ -269,12 +268,42 @@ fn loc_is_under_or_equal(inner: &str, outer: &str) -> bool {
     inner == outer || inner.starts_with(&format!("{outer}/"))
 }
 
-/// The key/prefix portion of an `s3://bucket/key` URI (no leading `/`).
+/// The key/prefix portion of a documents `s3://bucket/key` URI (no leading
+/// `/`), taken verbatim exactly as the documents provider's `Loc::parse` takes
+/// it: the text after the bucket, with no URL parsing or percent-decoding. The
+/// preflight must probe the same raw key the scan will list and write.
 fn s3_key_prefix(s3_uri: &str) -> String {
-    url::Url::parse(s3_uri)
-        .ok()
-        .map(|u| u.path().trim_start_matches('/').to_string())
+    s3_uri
+        .strip_prefix("s3://")
+        .and_then(|rest| rest.split_once('/'))
+        .map(|(_, key)| key.trim_start_matches('/').to_string())
         .unwrap_or_default()
+}
+
+/// The object-store path for a raw object key, verbatim: `Path::parse` does not
+/// percent-encode, whereas `Path::from` would turn `团` into `%E5…` and `%` into
+/// `%25` and so probe a key the documents scan never touches. Mirrors the
+/// documents provider's `raw_object_path`, including its fallback: only a key
+/// `Path::parse` rejects (an empty, `.` or `..` segment, or a control
+/// character) falls back to the old `Path::from`.
+fn raw_object_path(key: &str) -> object_store::path::Path {
+    object_store::path::Path::parse(key).unwrap_or_else(|_| object_store::path::Path::from(key))
+}
+
+/// The object-store path for the key part of a parsed `s3://` URL.
+///
+/// `Url::path()` is already percent-encoded (`团` becomes `%E5%9B%A2`, a space
+/// `%20`), so it is decoded back to the raw key and parsed verbatim:
+/// `Path::from_url_path` is percent-decode + `Path::parse`. Feeding it to
+/// `Path::from` instead encodes the `%` again and addresses `%25E5…`, a key
+/// that does not exist. A path `Path::parse` rejects (an empty, `.` or `..`
+/// segment, or a control character) falls back to the old `Path::from`, as
+/// the documents provider's `raw_object_path` does. Plain ASCII keys are the
+/// same path either way.
+fn s3_object_path(url: &url::Url) -> object_store::path::Path {
+    let encoded = url.path().trim_start_matches('/');
+    object_store::path::Path::from_url_path(encoded)
+        .unwrap_or_else(|_| object_store::path::Path::from(encoded))
 }
 
 /// Validate that a region and some credential source are present, returning the
@@ -533,8 +562,6 @@ impl RemoteStorage for S3Storage {
         s3_path: &str,
         aws_region: &str,
     ) -> Result<()> {
-        use object_store::path::Path as ObjectPath;
-
         tracing::debug!(
             "Testing S3 connectivity for '{}' at path: {}",
             source_name,
@@ -552,14 +579,13 @@ impl RemoteStorage for S3Storage {
                 path: format!("No bucket name found in S3 URL: {}", s3_path),
             })?;
 
-        // Extract object path (remove leading slash)
-        let object_path_str = s3_url.path().trim_start_matches('/');
-        let object_store_path = ObjectPath::from(object_path_str);
+        // The raw object key (percent-decoded from the URL path, never re-encoded).
+        let object_store_path = s3_object_path(&s3_url);
 
         tracing::debug!(
             "S3 connectivity test - Bucket: {}, Object: {}",
             bucket_name,
-            object_path_str
+            object_store_path
         );
 
         // Test connectivity by attempting to get object metadata
@@ -750,6 +776,57 @@ options:
         assert_eq!(s3_key_prefix("s3://bucket/in/corpus/"), "in/corpus/");
         assert_eq!(s3_key_prefix("s3://bucket"), "");
         assert_eq!(s3_key_prefix("s3://bucket/"), "");
+        // Hostile names are taken verbatim, never URL-encoded or decoded.
+        assert_eq!(s3_key_prefix("s3://bucket/docs/团体"), "docs/团体");
+        assert_eq!(
+            s3_key_prefix("s3://bucket/my docs/50% off"),
+            "my docs/50% off"
+        );
+        assert_eq!(s3_key_prefix("s3://bucket/a/%E5%9B%A2"), "a/%E5%9B%A2");
+    }
+
+    #[test]
+    fn raw_object_path_keeps_the_key_verbatim() {
+        use object_store::path::Path as ObjectPath;
+        for key in [
+            "docs/团体",
+            "my docs/50% off",
+            "a/%E5%9B%A2",
+            "q#1/what?/[x]",
+        ] {
+            assert_eq!(raw_object_path(key).as_ref(), key);
+        }
+        // Plain ASCII keys are the same path as before.
+        assert_eq!(
+            raw_object_path("in/corpus/"),
+            ObjectPath::from("in/corpus/")
+        );
+        assert_eq!(
+            raw_object_path("crops/.skardi-write-probe"),
+            ObjectPath::from("crops/.skardi-write-probe")
+        );
+        // A key `Path::parse` rejects falls back to the old lossy `Path::from`.
+        assert_eq!(raw_object_path("a//b"), ObjectPath::from("a//b"));
+    }
+
+    #[test]
+    fn s3_object_path_decodes_the_url_path_to_the_raw_key() {
+        use object_store::path::Path as ObjectPath;
+        let p = |s: &str| s3_object_path(&url::Url::parse(s).unwrap());
+        // Non-ASCII and spaces arrive percent-encoded from `Url::path()` and
+        // must come back as the raw key, not `%25`-double-encoded.
+        assert_eq!(p("s3://b/data/团体.parquet").as_ref(), "data/团体.parquet");
+        assert_eq!(
+            p("s3://b/data/my report.csv").as_ref(),
+            "data/my report.csv"
+        );
+        assert_eq!(p("s3://b/data/50% off.csv").as_ref(), "data/50% off.csv");
+        // Plain ASCII keys are unchanged.
+        assert_eq!(
+            p("s3://b/data/plain.csv"),
+            ObjectPath::from("data/plain.csv")
+        );
+        assert_eq!(p("s3://b"), ObjectPath::ROOT);
     }
 
     #[test]
