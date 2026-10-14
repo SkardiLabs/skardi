@@ -368,6 +368,7 @@ impl TableFunctionImpl for OpenConnectorScanFunction {
                 // Raw scans declare no pagination contract at all, so
                 // there is no listing to continue.
                 continuation: None,
+                min_page_interval: None,
             },
             converter,
             row_path,

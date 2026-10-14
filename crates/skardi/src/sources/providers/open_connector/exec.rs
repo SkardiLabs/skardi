@@ -594,6 +594,7 @@ mod tests {
                 expected_fingerprint: "unused-in-exec",
                 cursor_only: true,
             }),
+            min_page_interval: None,
         }))
     }
 
@@ -630,6 +631,7 @@ mod tests {
             error_path: None,
             expected_fingerprint: None,
             continuation: None,
+            min_page_interval: None,
         }))
     }
 

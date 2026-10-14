@@ -398,6 +398,7 @@ mod tests {
             error_path: None,
             expected_fingerprint: None,
             continuation: None,
+            min_page_interval: None,
         }
     }
 
@@ -419,6 +420,7 @@ mod tests {
                 expected_fingerprint: "aa",
                 cursor_only: true,
             }),
+            min_page_interval: None,
             ..leaked_table("t.entries")
         }
     }
@@ -596,6 +598,7 @@ mod tests {
                 expected_fingerprint: "aa",
                 cursor_only: false,
             }),
+            min_page_interval: None,
             ..cursor_only_table()
         }
     }
@@ -631,6 +634,7 @@ mod tests {
                 expected_fingerprint: "aa",
                 cursor_only: false,
             }),
+            min_page_interval: None,
             ..full_continuation_table()
         }
         .check_full_continuation_inputs(None)

@@ -223,6 +223,7 @@ mod tests {
             error_path: None,
             expected_fingerprint: None,
             continuation: None,
+            min_page_interval: None,
         }))
     }
 

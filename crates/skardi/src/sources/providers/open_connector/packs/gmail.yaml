@@ -54,6 +54,15 @@ tables:
       # so a page of N rows costs N+1 Gmail calls — the page size bounds
       # that burst against the per-user quota.
       page_size: 100
+    # 3s start to start: a page is 505 quota units (one messages.list plus a
+    # metadata messages.get per row, which Open Connector issues ten at a
+    # time) and arrives in ~2.3s, so back-to-back pages run at ~300 units/s
+    # against Gmail's per-user moving average of 250 units/s and the fourth
+    # page is refused (measured on skardi-dev-b, 2026-10-14: every walk got
+    # 2-4 pages, then 429s). Spaced 3s apart a walk averages ~170 units/s,
+    # with room for a second consumer of the same mailbox. 18 pages (a
+    # 1,774-message mailbox) take ~54s instead of failing.
+    min_page_interval_ms: 3000
     # detail=summary pins the bounded row shape: `ids` carries no
     # metadata worth a table, `full` hydrates entire decoded bodies and
     # attachment trees (unbounded row size). Bodies belong to a future

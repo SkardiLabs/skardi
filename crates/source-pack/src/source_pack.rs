@@ -10,6 +10,7 @@
 //! so a Skardi upgrade cannot silently change a table's schema.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use serde_json::Value;
 
@@ -139,6 +140,20 @@ pub struct SourcePackTable {
     /// (see [`CursorContinuation`]). `None` for every table whose provider
     /// accepts the cursor on its own action.
     pub continuation: Option<CursorContinuation>,
+    /// The least time between the starts of two consecutive page requests,
+    /// for a provider whose per-user quota a full-speed walk outruns.
+    ///
+    /// The case is Gmail: a `messages` page of 100 rows costs 505 quota units
+    /// (one list plus a hydrating get per row) and arrives in ~2.3s, so pages
+    /// back to back run at ~300 units/s against a per-user moving average of
+    /// 250, and the fourth page is refused. A rate limit answered with a 429
+    /// costs a retry wait at best and the whole scan at worst; spacing the
+    /// pages keeps the walk under the line instead. Measured start to start,
+    /// so time spent fetching counts toward the interval and a slow page is
+    /// never delayed further. The first page is never delayed.
+    ///
+    /// `None` for every table that can be walked at full speed.
+    pub min_page_interval: Option<Duration>,
 }
 
 impl SourcePackTable {
