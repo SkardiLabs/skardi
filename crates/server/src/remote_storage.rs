@@ -5,6 +5,7 @@ use std::sync::Arc;
 // object_store 0.13 moved put/head/delete off `ObjectStore` onto this
 // blanket-implemented extension trait.
 use object_store::ObjectStoreExt as _;
+use object_store::path::Path as ObjectPath;
 
 use crate::config::{ConfigError, DataSource};
 
@@ -286,8 +287,8 @@ fn s3_key_prefix(s3_uri: &str) -> String {
 /// documents provider's `raw_object_path`, including its fallback: only a key
 /// `Path::parse` rejects (an empty, `.` or `..` segment, or a control
 /// character) falls back to the old `Path::from`.
-fn raw_object_path(key: &str) -> object_store::path::Path {
-    object_store::path::Path::parse(key).unwrap_or_else(|_| object_store::path::Path::from(key))
+fn raw_object_path(key: &str) -> ObjectPath {
+    ObjectPath::parse(key).unwrap_or_else(|_| ObjectPath::from(key))
 }
 
 /// The object-store path for the key part of a parsed `s3://` URL.
@@ -300,10 +301,9 @@ fn raw_object_path(key: &str) -> object_store::path::Path {
 /// segment, or a control character) falls back to the old `Path::from`, as
 /// the documents provider's `raw_object_path` does. Plain ASCII keys are the
 /// same path either way.
-fn s3_object_path(url: &url::Url) -> object_store::path::Path {
+fn s3_object_path(url: &url::Url) -> ObjectPath {
     let encoded = url.path().trim_start_matches('/');
-    object_store::path::Path::from_url_path(encoded)
-        .unwrap_or_else(|_| object_store::path::Path::from(encoded))
+    ObjectPath::from_url_path(encoded).unwrap_or_else(|_| ObjectPath::from(encoded))
 }
 
 /// Validate that a region and some credential source are present, returning the
@@ -787,7 +787,6 @@ options:
 
     #[test]
     fn raw_object_path_keeps_the_key_verbatim() {
-        use object_store::path::Path as ObjectPath;
         for key in [
             "docs/团体",
             "my docs/50% off",
@@ -811,7 +810,6 @@ options:
 
     #[test]
     fn s3_object_path_decodes_the_url_path_to_the_raw_key() {
-        use object_store::path::Path as ObjectPath;
         let p = |s: &str| s3_object_path(&url::Url::parse(s).unwrap());
         // Non-ASCII and spaces arrive percent-encoded from `Url::path()` and
         // must come back as the raw key, not `%25`-double-encoded.
