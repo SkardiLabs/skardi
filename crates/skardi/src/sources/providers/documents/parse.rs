@@ -1269,30 +1269,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_docs_reads_non_ascii_and_escaped_keys_at_their_listed_location() {
+    async fn list_docs_reads_hostile_names_at_their_listed_location() {
+        use super::super::HOSTILE_OBJECT_NAMES;
         use object_store::path::Path as OsPath;
         use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
         use std::sync::Arc;
 
-        // Keys exactly as raw writers store them: `OsPath::parse` keeps the
-        // string verbatim (no percent-encoding). `docs/enc/…` is the shape an
-        // encoding writer (`OsPath::child` / `OsPath::from`) produces: the S3
-        // key literally contains `%E5…`.
-        let raw_cjk = "docs/团体.PDF";
-        let raw_pct_space = "docs/50% off report.pdf";
+        // Raw writers store each fixture name verbatim: `OsPath::parse` keeps the
+        // string as-is (no percent-encoding, no Unicode normalisation). Assert
+        // that explicitly so a name `parse` cannot represent fails loudly here
+        // instead of being skipped.
+        let mut seeded: Vec<(OsPath, Vec<u8>)> = Vec::new();
+        for name in HOSTILE_OBJECT_NAMES {
+            let key = format!("docs/{name}");
+            let path = OsPath::parse(&key)
+                .unwrap_or_else(|e| panic!("Path::parse rejects fixture name {name:?}: {e}"));
+            assert_eq!(path.as_ref(), key, "Path::parse altered {name:?}");
+            seeded.push((path, name.as_bytes().to_vec()));
+        }
+        // The shape an encoding writer (`OsPath::child` / `OsPath::from`)
+        // produces: the stored key literally contains `%E5…`.
         let encoded = OsPath::from("docs/enc/团体.pdf");
         assert!(encoded.as_ref().starts_with("docs/enc/%E5"), "{encoded}");
+        seeded.push((encoded.clone(), b"ENC".to_vec()));
+        seeded.push((OsPath::parse("docs/plain.pdf").unwrap(), b"ASCII".to_vec()));
 
         let mem = Arc::new(object_store::memory::InMemory::new());
-        for (key, body) in [
-            (OsPath::parse(raw_cjk).unwrap(), &b"CJK"[..]),
-            (OsPath::parse(raw_pct_space).unwrap(), &b"PCT"[..]),
-            (encoded.clone(), &b"ENC"[..]),
-            (OsPath::parse("docs/plain.pdf").unwrap(), &b"ASCII"[..]),
-        ] {
-            mem.put(&key, PutPayload::from(body.to_vec()))
-                .await
-                .unwrap();
+        for (key, body) in &seeded {
+            mem.put(key, PutPayload::from(body.clone())).await.unwrap();
         }
         let store = BlobStore::Remote(mem as Arc<dyn ObjectStore>);
         let prefix = Loc::parse("s3://bk/docs").unwrap();
@@ -1309,22 +1313,22 @@ mod tests {
             let bytes = store
                 .get(loc)
                 .await
-                .unwrap_or_else(|e| panic!("fetch {rel}: {e:#}"));
+                .unwrap_or_else(|e| panic!("fetch {rel:?}: {e:#}"));
             got.push((rel.clone(), bytes));
         }
         got.sort();
-        assert_eq!(
-            got,
-            vec![
-                ("50% off report.pdf".to_string(), b"PCT".to_vec()),
-                (
-                    encoded.as_ref().strip_prefix("docs/").unwrap().to_string(),
-                    b"ENC".to_vec()
-                ),
-                ("plain.pdf".to_string(), b"ASCII".to_vec()),
-                ("团体.PDF".to_string(), b"CJK".to_vec()),
-            ]
-        );
+
+        let mut want: Vec<(String, Vec<u8>)> = seeded
+            .iter()
+            .map(|(k, body)| {
+                let rel = k.as_ref().strip_prefix("docs/").unwrap().to_string();
+                (rel, body.clone())
+            })
+            .collect();
+        want.sort();
+        // Every name, including the NFC/NFD pair as two distinct entries.
+        assert_eq!(got.len(), HOSTILE_OBJECT_NAMES.len() + 2);
+        assert_eq!(got, want);
     }
 
     #[test]
