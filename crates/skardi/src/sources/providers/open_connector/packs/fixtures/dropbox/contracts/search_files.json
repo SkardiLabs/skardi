@@ -30,7 +30,8 @@
                   {
                     "type": "null"
                   }
-                ]
+                ],
+                "description": "The Dropbox item ID when available."
               },
               "pathDisplay": {
                 "anyOf": [
@@ -41,7 +42,8 @@
                   {
                     "type": "null"
                   }
-                ]
+                ],
+                "description": "The user-facing cased path when available."
               },
               "pathLower": {
                 "anyOf": [
@@ -52,7 +54,8 @@
                   {
                     "type": "null"
                   }
-                ]
+                ],
+                "description": "The lower-cased full path when available."
               },
               "clientModified": {
                 "anyOf": [
@@ -63,7 +66,8 @@
                   {
                     "type": "null"
                   }
-                ]
+                ],
+                "description": "The client-provided modification timestamp in ISO 8601 format when available."
               },
               "serverModified": {
                 "anyOf": [
@@ -74,7 +78,8 @@
                   {
                     "type": "null"
                   }
-                ]
+                ],
+                "description": "The server-side modification timestamp in ISO 8601 format when available."
               },
               "rev": {
                 "anyOf": [
@@ -85,7 +90,8 @@
                   {
                     "type": "null"
                   }
-                ]
+                ],
+                "description": "The Dropbox file revision when available."
               },
               "sizeBytes": {
                 "anyOf": [
@@ -96,7 +102,8 @@
                   {
                     "type": "null"
                   }
-                ]
+                ],
+                "description": "The file size in bytes when available."
               },
               "isDownloadable": {
                 "anyOf": [
@@ -107,7 +114,8 @@
                   {
                     "type": "null"
                   }
-                ]
+                ],
+                "description": "Whether the file can be downloaded directly."
               },
               "contentHash": {
                 "anyOf": [
@@ -118,7 +126,8 @@
                   {
                     "type": "null"
                   }
-                ]
+                ],
+                "description": "The Dropbox content hash when available."
               },
               "url": {
                 "anyOf": [
@@ -129,7 +138,8 @@
                   {
                     "type": "null"
                   }
-                ]
+                ],
+                "description": "The shared link URL when available."
               },
               "expiresAt": {
                 "anyOf": [
@@ -140,7 +150,8 @@
                   {
                     "type": "null"
                   }
-                ]
+                ],
+                "description": "The shared link expiration timestamp in ISO 8601 format when available."
               },
               "sharingInfo": {
                 "anyOf": [
@@ -153,7 +164,8 @@
                   {
                     "type": "null"
                   }
-                ]
+                ],
+                "description": "A generic JSON object returned by Dropbox."
               },
               "linkPermissions": {
                 "anyOf": [
@@ -166,7 +178,8 @@
                   {
                     "type": "null"
                   }
-                ]
+                ],
+                "description": "Shared-link permission metadata when Dropbox includes it."
               }
             },
             "additionalProperties": false,
@@ -204,7 +217,8 @@
               {
                 "type": "null"
               }
-            ]
+            ],
+            "description": "Dropbox highlight spans when requested and returned."
           }
         },
         "additionalProperties": false,
@@ -226,7 +240,8 @@
         {
           "type": "null"
         }
-      ]
+      ],
+      "description": "The cursor for continuing the search when available."
     },
     "hasMore": {
       "type": "boolean",

@@ -106,7 +106,8 @@
         {
           "type": "null"
         }
-      ]
+      ],
+      "description": "Pagination URL for the next page, or null when there is no next page."
     },
     "deltaLink": {
       "anyOf": [
@@ -117,7 +118,8 @@
         {
           "type": "null"
         }
-      ]
+      ],
+      "description": "Delta URL for the next round of changes once a delta round is complete, or null (always null for plain listings)."
     }
   },
   "additionalProperties": false,

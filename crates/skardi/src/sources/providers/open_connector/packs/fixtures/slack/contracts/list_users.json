@@ -19,7 +19,8 @@
               {
                 "type": "null"
               }
-            ]
+            ],
+            "description": "The username of the user."
           },
           "realName": {
             "anyOf": [
@@ -30,7 +31,8 @@
               {
                 "type": "null"
               }
-            ]
+            ],
+            "description": "The real name of the user."
           },
           "displayName": {
             "anyOf": [
@@ -41,7 +43,8 @@
               {
                 "type": "null"
               }
-            ]
+            ],
+            "description": "The display name of the user."
           },
           "isBot": {
             "anyOf": [
@@ -52,7 +55,8 @@
               {
                 "type": "null"
               }
-            ]
+            ],
+            "description": "Whether the user is a bot user."
           },
           "isDeleted": {
             "anyOf": [
@@ -63,7 +67,8 @@
               {
                 "type": "null"
               }
-            ]
+            ],
+            "description": "Whether the user is deleted."
           },
           "isAdmin": {
             "anyOf": [
@@ -74,7 +79,8 @@
               {
                 "type": "null"
               }
-            ]
+            ],
+            "description": "Whether the user is an admin."
           },
           "isOwner": {
             "anyOf": [
@@ -85,7 +91,8 @@
               {
                 "type": "null"
               }
-            ]
+            ],
+            "description": "Whether the user is an owner."
           },
           "locale": {
             "type": "string",
@@ -148,7 +155,8 @@
         {
           "type": "null"
         }
-      ]
+      ],
+      "description": "The cursor for the next page."
     }
   },
   "additionalProperties": false,
