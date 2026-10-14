@@ -631,17 +631,33 @@ fn parse_source_blocking(root: &str, opts: &ParseOptions) -> Result<Vec<ParsedPa
         None => (None, None),
     };
 
+    scan_blocking(
+        &read_store,
+        &prefix_loc,
+        write_store.as_ref(),
+        image_base.as_ref(),
+        opts,
+    )
+}
+
+/// List -> read -> parse over already-resolved backends: the scan loop behind
+/// [`parse_source`]. Builds its own current-thread runtime, so it must be
+/// called from a thread that is not inside one (the dedicated parse thread).
+/// Split from [`parse_source_blocking`] only so tests can drive the real loop
+/// over an in-memory object store.
+fn scan_blocking(
+    read_store: &BlobStore,
+    prefix_loc: &Loc,
+    write_store: Option<&BlobStore>,
+    image_base: Option<&Loc>,
+    opts: &ParseOptions,
+) -> Result<Vec<ParsedPage>> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .context("failed to build tokio runtime for documents parse")?;
 
-    let entries = runtime.block_on(list_docs(
-        &read_store,
-        &prefix_loc,
-        opts,
-        image_base.as_ref(),
-    ))?;
+    let entries = runtime.block_on(list_docs(read_store, prefix_loc, opts, image_base))?;
     let total = entries.len();
 
     let mut rows = Vec::new();
@@ -668,7 +684,7 @@ fn parse_source_blocking(root: &str, opts: &ParseOptions) -> Result<Vec<ParsedPa
                 &bytes,
                 &rel_path,
                 opts,
-                write_store.as_ref(),
+                write_store,
                 &mut writes,
             ))
         };
@@ -1329,6 +1345,66 @@ mod tests {
         // Every name, including the NFC/NFD pair as two distinct entries.
         assert_eq!(got.len(), HOSTILE_OBJECT_NAMES.len() + 2);
         assert_eq!(got, want);
+    }
+
+    /// End to end through the provider's real scan loop (list -> read ->
+    /// liteparse -> rows) over an in-memory object store: every hostile fixture
+    /// name, stored under its raw key, must come out as rows whose `path` is
+    /// the raw name. Before the fix every non-ASCII / `%` / `#` / `?` / `[ ]`
+    /// name was listed, fetched at a re-encoded key, and skipped.
+    #[test]
+    fn scan_parses_hostile_names_from_an_object_store_into_rows() {
+        use super::super::HOSTILE_OBJECT_NAMES;
+        use object_store::path::Path as OsPath;
+        use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        let pdf = std::fs::read("tests/fixtures/documents/two_pages.pdf").unwrap();
+        let mem = Arc::new(object_store::memory::InMemory::new());
+        let seed = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        for name in HOSTILE_OBJECT_NAMES {
+            let key = format!("docs/{name}");
+            let path = OsPath::parse(&key)
+                .unwrap_or_else(|e| panic!("Path::parse rejects fixture name {name:?}: {e}"));
+            assert_eq!(path.as_ref(), key, "Path::parse altered {name:?}");
+            seed.block_on(mem.put(&path, PutPayload::from(pdf.clone())))
+                .unwrap();
+        }
+        drop(seed);
+
+        let opts = ParseOptions {
+            recursive: true,
+            include_globs: vec!["*.pdf".into()],
+            image_mode: ImageMode::Off,
+            image_store: None,
+            ocr: OcrMode::Off,
+            render_page_images: false,
+            ocr_server_url: None,
+        };
+        let store = BlobStore::Remote(mem as Arc<dyn ObjectStore>);
+        let prefix = Loc::parse("s3://bk/docs").unwrap();
+        let rows = scan_blocking(&store, &prefix, None, None, &opts).unwrap();
+
+        let mut pages_by_path: BTreeMap<&str, Vec<i32>> = BTreeMap::new();
+        for row in &rows {
+            assert_eq!(row.doc_id, doc_id_for(&row.path), "{:?}", row.path);
+            assert_eq!(row.file_type, "pdf", "{:?}", row.path);
+            assert!(!row.markdown.is_empty(), "{:?}", row.path);
+            pages_by_path
+                .entry(row.path.as_str())
+                .or_default()
+                .push(row.page);
+        }
+        let mut want: Vec<&str> = HOSTILE_OBJECT_NAMES.to_vec();
+        want.sort_unstable();
+        // Every name, raw (NFC and NFD as two documents), each fully parsed.
+        assert_eq!(pages_by_path.keys().copied().collect::<Vec<_>>(), want);
+        for (path, pages) in &pages_by_path {
+            assert_eq!(pages, &vec![1, 2], "{path:?}");
+        }
     }
 
     #[test]
