@@ -1,0 +1,43 @@
+{
+  "type": "object",
+  "properties": {
+    "messaging_product": {
+      "type": "string",
+      "description": "Messaging product identifier, typically whatsapp."
+    },
+    "about": {
+      "type": "string",
+      "description": "About text shown on the business profile."
+    },
+    "address": {
+      "type": "string",
+      "description": "Business address."
+    },
+    "description": {
+      "type": "string",
+      "description": "Business description."
+    },
+    "email": {
+      "type": "string",
+      "description": "Business support email address."
+    },
+    "profile_picture_url": {
+      "type": "string",
+      "description": "Public URL for the business profile picture."
+    },
+    "websites": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "description": "A website URL."
+      },
+      "description": "Websites linked from the business profile."
+    },
+    "vertical": {
+      "type": "string",
+      "description": "Business vertical selected in Meta."
+    }
+  },
+  "additionalProperties": true,
+  "description": "A WhatsApp business profile."
+}

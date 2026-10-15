@@ -1,0 +1,102 @@
+{
+  "type": "object",
+  "properties": {
+    "phone_numbers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Meta phone number ID."
+          },
+          "display_phone_number": {
+            "type": "string",
+            "description": "Phone number in display format, including country code."
+          },
+          "verified_name": {
+            "type": "string",
+            "description": "Verified business name shown to WhatsApp users."
+          },
+          "quality_rating": {
+            "type": "string",
+            "description": "Meta quality rating for this phone number."
+          },
+          "code_verification_status": {
+            "type": "string",
+            "description": "Verification status of the phone number."
+          },
+          "platform_type": {
+            "type": "string",
+            "description": "Hosting platform type, such as CLOUD_API."
+          },
+          "last_onboarded_time": {
+            "type": "string",
+            "description": "Timestamp for the latest phone number onboarding event."
+          },
+          "throughput": {
+            "type": "object",
+            "properties": {
+              "level": {
+                "type": "string",
+                "description": "Messaging throughput tier for the phone number."
+              }
+            },
+            "additionalProperties": true,
+            "description": "Messaging throughput information returned by Meta."
+          },
+          "webhook_configuration": {
+            "type": "object",
+            "properties": {
+              "application": {
+                "type": "string",
+                "description": "Webhook endpoint configured for the phone number, when Meta returns one."
+              }
+            },
+            "additionalProperties": true,
+            "description": "Webhook configuration returned by Meta."
+          }
+        },
+        "additionalProperties": true,
+        "description": "A WhatsApp Business phone number."
+      },
+      "description": "Phone numbers returned for the WABA."
+    },
+    "paging": {
+      "type": "object",
+      "properties": {
+        "cursors": {
+          "type": "object",
+          "properties": {
+            "before": {
+              "type": "string",
+              "description": "Cursor for the previous page."
+            },
+            "after": {
+              "type": "string",
+              "description": "Cursor for the next page."
+            }
+          },
+          "additionalProperties": true,
+          "description": "Cursor values returned by Meta."
+        },
+        "previous": {
+          "type": "string",
+          "description": "URL for the previous page, when provided."
+        },
+        "next": {
+          "type": "string",
+          "description": "URL for the next page, when provided."
+        }
+      },
+      "additionalProperties": true,
+      "description": "Pagination data returned by Meta."
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "phone_numbers",
+    "paging"
+  ],
+  "description": "Action output."
+}

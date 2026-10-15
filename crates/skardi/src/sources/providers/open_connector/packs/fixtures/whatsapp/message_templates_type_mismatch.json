@@ -1,0 +1,26 @@
+{
+  "templates": [
+    {
+      "id": "200000000000001",
+      "name": "hello_world",
+      "status": "APPROVED",
+      "category": "UTILITY",
+      "language": "en_US",
+      "components": []
+    },
+    {
+      "id": 42,
+      "name": "number_where_utf8_is_declared",
+      "status": "APPROVED",
+      "category": "UTILITY",
+      "language": "en_US",
+      "components": []
+    }
+  ],
+  "paging": {
+    "cursors": {
+      "before": "a",
+      "after": "b"
+    }
+  }
+}

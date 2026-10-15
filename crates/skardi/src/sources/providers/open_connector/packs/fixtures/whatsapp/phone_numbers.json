@@ -1,0 +1,33 @@
+{
+  "phone_numbers": [
+    {
+      "id": "100000000000001",
+      "display_phone_number": "+1 555-0100",
+      "verified_name": "Example Store",
+      "quality_rating": "GREEN",
+      "code_verification_status": "VERIFIED",
+      "platform_type": "CLOUD_API",
+      "last_onboarded_time": "2026-01-15T08:30:00+0000",
+      "throughput": {
+        "level": "STANDARD"
+      },
+      "webhook_configuration": {
+        "application": "https://hooks.example.com/webhooks/whatsapp-inbound"
+      }
+    },
+    {
+      "id": "100000000000002",
+      "display_phone_number": "+1 555-0101",
+      "verified_name": "Example Support",
+      "quality_rating": "UNKNOWN",
+      "code_verification_status": "NOT_VERIFIED",
+      "platform_type": "CLOUD_API"
+    }
+  ],
+  "paging": {
+    "cursors": {
+      "before": "QVFIUk9iZWdpbg==",
+      "after": "QVFIUmVuZA=="
+    }
+  }
+}

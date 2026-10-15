@@ -1,0 +1,184 @@
+# WhatsApp Cloud API source pack. Wire contract reconciled against a live
+# Open Connector gateway (v1.9.0, commit 9a2ac5b6, 2026-10-15) and the
+# `whatsapp` executor source. Two things set this provider apart from the
+# packs before it:
+#
+# - Inputs are snake_case, not camelCase: `waba_id`, `phone_number_id`,
+#   `template_ids`. The executors forward the Graph API's own spellings.
+#   Resource keys below are those OC keys verbatim.
+# - Rows are NORMALIZED by the executors (`normalizePhoneNumber`,
+#   `normalizeTemplate`, `normalizeBusinessProfile`, the analytics
+#   `data_points` flatteners), each a `compactObject` that drops absent
+#   keys. "Absent" therefore means an omitted key, never an explicit null.
+#
+# Messages are deliberately NOT here: the Cloud API has no endpoint for
+# message history. They arrive by webhook and are the `kind: webhook`
+# receiver's job (docs/webhooks.md). This pack is the account side.
+#
+# Pagination: the three cursor tables ride Meta's Graph cursor
+# (`paging.cursors.after`); OC forwards it unchanged and emits no has-more
+# boolean, so termination is Meta's own end-of-collection spelling — the
+# live pass pins which one. Design rationale lives in packs/whatsapp.rs.
+kind: pack
+pack: whatsapp
+version: 1
+
+tables:
+  # One row per business phone number on the WABA.
+  phone_numbers:
+    action: whatsapp.get_phone_numbers
+    row_path: "$.phone_numbers"
+    fingerprint: 741cb04f7a7ac8faaa339b6b9cdad2cf316074d879f744033fc5f600ea959174
+    pagination:
+      strategy: cursor
+      cursor_input: after
+      next_cursor_path: "$.paging.cursors.after"
+      page_size_input: limit
+      page_size: 100
+    # `waba_id` falls back to the WABA configured on the OC connection
+    # when omitted, so a binding may leave it out.
+    resources:
+      optional: [waba_id]
+    columns:
+      - { name: id, path: id, type: utf8, nullable: false }
+      - { name: display_phone_number, path: display_phone_number, type: utf8, nullable: true }
+      - { name: verified_name, path: verified_name, type: utf8, nullable: true }
+      - { name: quality_rating, path: quality_rating, type: utf8, nullable: true }
+      - { name: code_verification_status, path: code_verification_status, type: utf8, nullable: true }
+      - { name: platform_type, path: platform_type, type: utf8, nullable: true }
+      # Meta emits an ISO-8601 string with a numeric offset; kept as text
+      # until the live pass settles the spelling.
+      - { name: last_onboarded_time, path: last_onboarded_time, type: utf8, nullable: true }
+      - { name: throughput_level, path: throughput.level, type: utf8, nullable: true }
+      - { name: webhook_application, path: webhook_configuration.application, type: utf8, nullable: true }
+
+  # The business profile of ONE phone number: a point read whose whole
+  # response is the row, hence `row_shape: object` and one binding per
+  # number (precedent: feishu.document_content).
+  business_profile:
+    action: whatsapp.get_business_profile
+    row_path: "$"
+    row_shape: object
+    fingerprint: 32eb4b6a0126bc1cf924d54cef1cc6d90dc7de9ec2c1bcf39b0b8cd48bb759c6
+    pagination: { strategy: single_page }
+    resources:
+      required: [phone_number_id]
+    columns:
+      - { name: messaging_product, path: messaging_product, type: utf8, nullable: true }
+      - { name: about, path: about, type: utf8, nullable: true }
+      - { name: address, path: address, type: utf8, nullable: true }
+      - { name: description, path: description, type: utf8, nullable: true }
+      - { name: email, path: email, type: utf8, nullable: true }
+      - { name: profile_picture_url, path: profile_picture_url, type: utf8, nullable: true }
+      - { name: websites, path: websites, type: utf8_list, nullable: true }
+      - { name: vertical, path: vertical, type: utf8, nullable: true }
+
+  # One row per message template on the WABA, every language variant its
+  # own row (Meta's model: a template name is a group, each language a
+  # template with its own id and status).
+  message_templates:
+    action: whatsapp.get_message_templates
+    row_path: "$.templates"
+    fingerprint: 38741cad371ce0fb949a2474d260b797d80f374ee346c0709e20b5adb317a6df
+    pagination:
+      strategy: cursor
+      cursor_input: after
+      next_cursor_path: "$.paging.cursors.after"
+      page_size_input: limit
+      page_size: 100
+    # `name_or_content` is Meta's substring search over names and bodies —
+    # a search box, not a predicate — so it is a resource, not a filter.
+    resources:
+      optional: [waba_id, name_or_content]
+    columns:
+      - { name: id, path: id, type: utf8, nullable: false }
+      - { name: name, path: name, type: utf8, nullable: false }
+      - { name: status, path: status, type: utf8, nullable: true }
+      - { name: category, path: category, type: utf8, nullable: true }
+      - { name: language, path: language, type: utf8, nullable: true }
+      # Header/body/footer/buttons as Meta shapes them: opaque JSON, the
+      # honest mapping for a sparse, type-tagged component list.
+      - { name: components, path: components, type: json, nullable: true }
+    # Meta filters these three server-side, but as string enums whose
+    # out-of-domain literals it may answer with the unfiltered listing,
+    # so every push is Inexact and DataFusion re-applies the predicate.
+    filters:
+      - { column: status, op: eq, input: status, fidelity: inexact }
+      - { column: category, op: eq, input: category, fidelity: inexact }
+      - { column: language, op: eq, input: language, fidelity: inexact }
+
+  # Sent/delivered counts per window from the WABA's `analytics` field.
+  # Meta returns the whole window in one response; no pagination exists
+  # on this field, and the captured contract declares no cursor.
+  message_analytics:
+    action: whatsapp.get_message_analytics
+    row_path: "$.data_points"
+    fingerprint: 68aaf2884e9c7239acfeaa9647e94d9fdc19ac0c021e16dab2ad5e33efbea7c7
+    pagination: { strategy: single_page }
+    # Window and breakdown arguments are resources rather than filters:
+    # `start`/`end` cannot be a pushed `>=` (the loader refuses a filter
+    # input that is also a resource, and the window is a pair), and OC
+    # defaults them to the last 30 days when a binding omits them.
+    resources:
+      optional: [waba_id, start, end, granularity, phone_numbers, product_types, country_codes]
+    columns:
+      - { name: period_start, path: start, type: timestamp_s_utc, nullable: false }
+      - { name: period_end, path: end, type: timestamp_s_utc, nullable: false }
+      - { name: sent, path: sent, type: int64, nullable: true }
+      - { name: delivered, path: delivered, type: int64, nullable: true }
+
+  # Per-message volume and cost from the WABA's `pricing_analytics`
+  # field, one row per window × requested dimension combination. The
+  # only source of cost AMOUNTS: delivery receipts carry a category and a
+  # billable flag but no money.
+  pricing_analytics:
+    action: whatsapp.get_pricing_analytics
+    row_path: "$.data_points"
+    fingerprint: 21b1e17181fd4aa840366c58ccbdca8b8f3154996283ef73f23e38b53b678e28
+    pagination: { strategy: single_page }
+    resources:
+      optional: [waba_id, start, end, granularity, phone_numbers, country_codes, metric_types, pricing_types, pricing_categories, dimensions]
+    columns:
+      - { name: period_start, path: start, type: timestamp_s_utc, nullable: false }
+      - { name: period_end, path: end, type: timestamp_s_utc, nullable: false }
+      - { name: volume, path: volume, type: int64, nullable: true }
+      - { name: cost, path: cost, type: float64, nullable: true }
+      # Each dimension column is present only when that dimension was
+      # requested; `tier` additionally only on billable utility and
+      # authentication rows (Meta's volume-tier rule).
+      - { name: phone_number, path: phone_number, type: utf8, nullable: true }
+      - { name: country, path: country, type: utf8, nullable: true }
+      - { name: pricing_category, path: pricing_category, type: utf8, nullable: true }
+      - { name: pricing_type, path: pricing_type, type: utf8, nullable: true }
+      - { name: tier, path: tier, type: utf8, nullable: true }
+
+  # Daily sent/delivered/read/click/cost metrics per template from the
+  # `template_analytics` edge (DAILY is the only granularity it accepts).
+  # The edge pages with the same Graph cursor as the listings but takes no
+  # page-size input, so `page_size` here is only the LIMIT ceiling and
+  # is never sent.
+  template_analytics:
+    action: whatsapp.get_template_analytics
+    row_path: "$.data_points"
+    fingerprint: 69f419262cbbcb11b055bce3c82e1e3a99141033a67c34e85c25a98ea3afc977
+    pagination:
+      strategy: cursor
+      cursor_input: after
+      next_cursor_path: "$.paging.cursors.after"
+      page_size: 100
+    # Meta caps `template_ids` at ten per call; template analytics must
+    # also have been enabled on the WABA once (pack doc).
+    resources:
+      required: [template_ids]
+      optional: [waba_id, start, end, metric_types, product_type, use_waba_timezone]
+    columns:
+      - { name: template_id, path: template_id, type: utf8, nullable: false }
+      - { name: period_start, path: start, type: timestamp_s_utc, nullable: false }
+      - { name: period_end, path: end, type: timestamp_s_utc, nullable: false }
+      - { name: sent, path: sent, type: int64, nullable: true }
+      - { name: delivered, path: delivered, type: int64, nullable: true }
+      - { name: read, path: read, type: int64, nullable: true }
+      # `[{type, button_content, count}]` and `[{type, value}]`: lists of
+      # typed metric objects, kept whole as JSON.
+      - { name: clicked, path: clicked, type: json, nullable: true }
+      - { name: cost, path: cost, type: json, nullable: true }

@@ -43,9 +43,15 @@ gateway **runtime token**.
 > file permissions — live-verified against a real Workspace account,
 > shared-drive rows included; three structurally unreachable columns
 > stay documented as residuals per the pack doc),
-> and [Dropbox](open-connector-dropbox.md) (files, shared links, file
+> [Dropbox](open-connector-dropbox.md) (files, shared links, file
 > search — split-action cursor continuation; live-verified against a real
-> account, all five pins captured from a live gateway).
+> account, all five pins captured from a live gateway),
+> and [WhatsApp](open-connector-whatsapp.md) (phone numbers, business
+> profile, message templates, and the message / pricing / template
+> analytics fields — the account side of a WABA; messages themselves are
+> delivered only by webhook and belong to the
+> [`kind: webhook` receiver](webhooks.md); pins captured from a live
+> gateway, live pass against a real WABA pending per the pack doc).
 > Further provider packs (Google Calendar, Jira, …) ship one pack per
 > release per the
 > [design spec](superpowers/specs/2026-07-11-open-connector-integration-design.md);
