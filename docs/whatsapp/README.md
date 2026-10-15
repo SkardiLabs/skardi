@@ -82,7 +82,9 @@ curl -s localhost:8080/query -H 'content-type: application/json' -d '{
 ```
 
 Meta's epoch-seconds `timestamp` lands as an ISO-8601 UTC instant
-(`2025-06-08T20:59:43Z`); `ingested_at` is the server's own write time.
+(`2025-06-08T20:59:43Z`); `ingested_at` is the server's own write time. Both
+are `TEXT` in SQLite — they compare and sort correctly as strings, and the
+merge jobs cast them to real timestamps on the way into Lance.
 
 To deliver a sample without Meta, sign one of the documented payloads
 yourself:
@@ -109,7 +111,10 @@ curl -s -X POST localhost:8080/jobs/wa-merge-statuses/run \
 ```
 
 The first run creates `docs/whatsapp/lake/wa_messages.lance`; later runs
-upsert on `message_id`, so the two staging copies become one row. Schedule
+upsert on `message_id`, so the two staging copies become one row. Lance
+datasets are registered as tables at startup, so after the **first** run
+restart the server once before querying `wa_messages` (the startup log says
+`does not exist yet — skipping table registration` until then). Schedule
 the jobs from cron with `{since}` set to the previous run's start minus a
 few minutes of overlap — the upsert makes the overlap harmless, and
 watermarking on `ingested_at` rather than Meta's timestamp is what keeps a

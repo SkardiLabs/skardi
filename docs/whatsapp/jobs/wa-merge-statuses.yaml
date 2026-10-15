@@ -12,9 +12,11 @@ metadata:
 
 spec:
   query: |
-    SELECT message_id, waba_id, phone_number_id, status, status_at,
+    SELECT message_id, waba_id, phone_number_id, status,
+           arrow_cast(status_at, 'Timestamp(Millisecond, Some("UTC"))') AS status_at,
            recipient_id, conversation_id, conversation_origin,
-           pricing_category, billable, error_code, raw, ingested_at
+           pricing_category, billable, error_code, raw,
+           arrow_cast(ingested_at, 'Timestamp(Millisecond, Some("UTC"))') AS ingested_at
     FROM staging.main.wa_events_statuses
     WHERE ingested_at >= {since}
   destination:

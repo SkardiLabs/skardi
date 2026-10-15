@@ -15,11 +15,16 @@ metadata:
   description: "Dedup staging.main.wa_events_messages into the wa_messages Lance dataset"
 
 spec:
+  # The staging columns are TEXT in SQLite (ISO-8601 UTC); cast them so the
+  # Lance dataset carries real timestamps. On Postgres staging they are
+  # already TIMESTAMPTZ and the cast is a no-op.
   query: |
     SELECT message_id, waba_id, phone_number_id, display_phone_number,
-           from_wa_id, to_wa_id, contact_name, received_at, message_type,
-           text, media_id, media_mime_type, caption, reply_to_message_id,
-           interactive_reply_id, raw, ingested_at
+           from_wa_id, to_wa_id, contact_name,
+           arrow_cast(received_at, 'Timestamp(Millisecond, Some("UTC"))') AS received_at,
+           message_type, text, media_id, media_mime_type, caption,
+           reply_to_message_id, interactive_reply_id, raw,
+           arrow_cast(ingested_at, 'Timestamp(Millisecond, Some("UTC"))') AS ingested_at
     FROM staging.main.wa_events_messages
     WHERE ingested_at >= {since}
   destination:
