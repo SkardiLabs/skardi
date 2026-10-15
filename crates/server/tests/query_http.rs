@@ -79,6 +79,7 @@ fn make_state_with_audit(query_audit: Option<Arc<QueryAuditStore>>) -> AppState 
     let config = ServerConfig {
         pipelines: HashMap::new(),
         jobs: HashMap::new(),
+        webhooks: HashMap::new(),
         data_sources: vec![
             data_source("products", AccessMode::ReadOnly),
             data_source("scratch", AccessMode::ReadWrite),
@@ -88,6 +89,7 @@ fn make_state_with_audit(query_audit: Option<Arc<QueryAuditStore>>) -> AppState 
             pipeline_path: None,
             jobs_path: None,
             jobs_db_path: None,
+            webhooks_path: None,
             ctx_file: None,
             semantics_path: None,
             port: 0,

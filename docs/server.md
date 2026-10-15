@@ -25,6 +25,7 @@ cargo run --bin skardi-server -- \
   --jobs <job-file-or-directory> \
   --jobs-db <path-to-jobs.db> \
   --semantics <semantics-file-or-directory> \
+  --webhooks <webhook-file-or-directory> \
   --port 8080
 ```
 
@@ -35,6 +36,7 @@ cargo run --bin skardi-server -- \
 | `--jobs` | Job YAML file or directory. When omitted, every `/jobs/*` endpoint returns `503` with `error_type: jobs_disabled`. |
 | `--jobs-db` | SQLite run ledger for jobs. Default: `~/.skardi/jobs.db` (parent dirs created on first use). |
 | `--semantics` | `kind: semantics` YAML file or directory. Attaches NL descriptions to tables / columns on `GET /data_source`. **Auto-discovered** from `<ctx_dir>/semantics/` or `<ctx_dir>/semantics.yaml` when omitted. See [semantics.md](semantics.md). |
+| `--webhooks` | `kind: webhook` YAML file or directory. Each file becomes a public `GET|POST /webhooks/<name>` route that verifies a provider's deliveries and appends them to a table. When omitted, every `/webhooks/*` route returns `404`. See [webhooks.md](webhooks.md). |
 | `--port` | Port to listen on. Default: `8080`. |
 
 On startup the server:
@@ -46,7 +48,11 @@ On startup the server:
    orphan runs — any row left in `pending` or `running` by a previous
    crash is rewritten to `failed` with the message `"server restarted
    before run completed"`.
-4. Binds the HTTP listener.
+4. Loads webhook files, resolves their secrets from the environment, and
+   preflights every destination table (it must exist, on a read-write
+   transactional source, with exactly the route's columns in order);
+   any mismatch is a startup error.
+5. Binds the HTTP listener.
 
 ---
 
@@ -114,6 +120,8 @@ and updates automatically when pipelines, jobs, or semantics reload.
 | `/jobs/runs` | GET | List recent runs; supports `?job=<name>&limit=N`. |
 | `/jobs/runs/:run_id` | GET | Current state of one run. |
 | `/jobs/runs/:run_id/cancel` | POST | Flag a run for cancellation. |
+| `/webhooks/:name` | GET | Provider subscription handshake (Meta's `hub.challenge`). Public; authenticated by the verify token. See [webhooks.md](webhooks.md). |
+| `/webhooks/:name` | POST | One provider delivery, verified by its signature and appended to the route's tables. Public; `200` means committed. |
 
 Request / response bodies for pipeline execution are documented in
 [pipelines.md § Response format](pipelines.md#response-format); job run
@@ -578,5 +586,6 @@ on that source, from pipelines and jobs alike.
 
 - **[Pipelines](pipelines.md)** — YAML shape, parameters, invocation, and response format for the online-serving side.
 - **[Jobs](jobs.md)** — YAML shape, destinations, run ledger, and cancellation for the offline-batch side.
+- **[Webhooks](webhooks.md)** — provider push deliveries (WhatsApp today) verified and appended to a table you can query.
 - **[Semantics](semantics.md)** — natural-language descriptions on tables and columns; the agent-facing catalog overlay.
 - **[CLI](cli.md)** — `skardi run`, aliases, federated SQL from the shell.

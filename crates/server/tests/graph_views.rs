@@ -50,6 +50,7 @@ fn args_with_ctx(ctx_path: std::path::PathBuf) -> CliArgs {
         pipeline_path: None,
         jobs_path: None,
         jobs_db_path: None,
+        webhooks_path: None,
         ctx_file: Some(ctx_path),
         semantics_path: None,
         port: 8080,

@@ -1,0 +1,33 @@
+# Context for the WhatsApp webhook bundle: a read-write SQLite staging
+# catalog the webhook appends to, and the two Lance datasets the merge jobs
+# dedup into. Run from the repository root; create staging.db first with
+#
+#   sqlite3 docs/whatsapp/staging.db < docs/whatsapp/staging.sqlite.sql
+kind: context
+
+metadata:
+  name: ctx_whatsapp
+  version: 1.0.0
+
+spec:
+  data_sources:
+    # The webhook's destination. `catalog` mode exposes every table in the
+    # file as staging.main.<table>; `read_write` is required for the insert.
+    - name: "staging"
+      type: "sqlite"
+      path: "docs/whatsapp/staging.db"
+      hierarchy_level: "catalog"
+      access_mode: "read_write"
+      description: "Append-only log of WhatsApp deliveries, one table per route"
+
+    # The merge jobs' destinations. A job's bare `table: wa_messages` names
+    # this source; the first run creates the dataset (create_if_missing).
+    - name: "wa_messages"
+      type: "lance"
+      path: "docs/whatsapp/lake/wa_messages.lance"
+      description: "One row per inbound WhatsApp message, deduplicated on message_id"
+
+    - name: "wa_statuses"
+      type: "lance"
+      path: "docs/whatsapp/lake/wa_statuses.lance"
+      description: "One row per delivery receipt, deduplicated on (message_id, status)"

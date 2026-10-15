@@ -1,0 +1,65 @@
+# WhatsApp Cloud API → staging tables.
+#
+# Served at GET|POST /webhooks/whatsapp-inbound. Register that URL as the
+# callback in Meta's App Dashboard (WhatsApp → Configuration) with the value
+# of WHATSAPP_VERIFY_TOKEN as the verify token, and subscribe to the
+# `messages` field. See docs/webhooks.md.
+#
+# Both routes read the same `messages` field: Meta files inbound messages
+# under value.messages[] and delivery receipts under value.statuses[], in
+# changes labelled `field: "messages"` either way.
+kind: webhook
+
+metadata:
+  name: whatsapp-inbound
+  version: "1.0.0"
+  description: "Inbound WhatsApp messages and delivery receipts, appended to staging"
+
+spec:
+  provider: meta_whatsapp
+  verify_token_env: WHATSAPP_VERIFY_TOKEN
+  app_secret_env: WHATSAPP_APP_SECRET
+  max_body_bytes: 4194304
+
+  routes:
+    # One row per inbound message. `to_wa_id` is NULL here: inbound rows
+    # identify the business side by phone_number_id. The sender's own copy
+    # of outbound messages (see docs/webhooks.md) fills it.
+    - field: messages
+      destination: { table: staging.main.wa_events_messages, mode: append }
+      columns:
+        - { name: message_id,           path: id,                              type: utf8,                  nullable: false }
+        - { name: waba_id,              path: _waba_id,                        type: utf8,                  nullable: false }
+        - { name: phone_number_id,      path: _metadata.phone_number_id,       type: utf8,                  nullable: false }
+        - { name: display_phone_number, path: _metadata.display_phone_number,  type: utf8,                  nullable: true }
+        - { name: from_wa_id,           path: from,                            type: utf8,                  nullable: false }
+        - { name: to_wa_id,             path: _to_wa_id,                       type: utf8,                  nullable: true }
+        - { name: contact_name,         path: _contact.profile.name,           type: utf8,                  nullable: true }
+        - { name: received_at,          path: timestamp,                       type: timestamp_s_string_utc, nullable: false }
+        - { name: message_type,         path: type,                            type: utf8,                  nullable: false }
+        - { name: text,                 path: text.body,                       type: utf8,                  nullable: true }
+        - { name: media_id,             path: _media.id,                       type: utf8,                  nullable: true }
+        - { name: media_mime_type,      path: _media.mime_type,                type: utf8,                  nullable: true }
+        - { name: caption,              path: _media.caption,                  type: utf8,                  nullable: true }
+        - { name: reply_to_message_id,  path: context.id,                      type: utf8,                  nullable: true }
+        - { name: interactive_reply_id, path: _interactive_reply.id,           type: utf8,                  nullable: true }
+        - { name: raw,                  path: _raw,                            type: json,                  nullable: false }
+
+    # One row per delivery receipt: sent / delivered / read / failed. The
+    # pricing object carries a category and a billable flag but no amount;
+    # cost figures come from the WABA's pricing_analytics, not from here.
+    - field: statuses
+      destination: { table: staging.main.wa_events_statuses, mode: append }
+      columns:
+        - { name: message_id,          path: id,                        type: utf8,                  nullable: false }
+        - { name: waba_id,             path: _waba_id,                  type: utf8,                  nullable: false }
+        - { name: phone_number_id,     path: _metadata.phone_number_id, type: utf8,                  nullable: false }
+        - { name: status,              path: status,                    type: utf8,                  nullable: false }
+        - { name: status_at,           path: timestamp,                 type: timestamp_s_string_utc, nullable: false }
+        - { name: recipient_id,        path: recipient_id,              type: utf8,                  nullable: false }
+        - { name: conversation_id,     path: conversation.id,           type: utf8,                  nullable: true }
+        - { name: conversation_origin, path: conversation.origin.type,  type: utf8,                  nullable: true }
+        - { name: pricing_category,    path: pricing.category,          type: utf8,                  nullable: true }
+        - { name: billable,            path: pricing.billable,          type: boolean,               nullable: true }
+        - { name: error_code,          path: _error.code,               type: int64,                 nullable: true }
+        - { name: raw,                 path: _raw,                      type: json,                  nullable: false }

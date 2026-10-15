@@ -51,6 +51,24 @@ histogram_quantile(0.99, rate(pipeline_latency_ms_bucket[5m]))
 histogram_quantile(0.50, rate(pipeline_latency_ms_bucket[5m]))
 ```
 
+## Webhook Metrics
+
+Every `/webhooks/:name` request records:
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `webhook_requests_total` | Counter | `name`, `outcome` | Deliveries and handshakes by outcome |
+| `webhook_rows_total` | Counter | `name`, `field` | Rows appended, per route field |
+| `webhook_latency_ms` | Histogram | `name` | Handler latency (verification through commit) |
+
+`outcome` is `ok`, `handshake_ok`, `handshake_rejected`, `signature_rejected`,
+`payload_too_large`, `invalid_payload`, `conversion_error`, or `write_error`.
+Requests for a webhook name that is not configured are not recorded: the name
+is caller-controlled and would be an unbounded label. A sustained
+`signature_rejected` rate means the app secret the server holds is not the
+one Meta signs with; `write_error` means deliveries are being retried by Meta
+and will keep arriving until the destination accepts them.
+
 ## Local Observability Stack
 
 A `docker-compose.yml` is included with a pre-configured Grafana stack:

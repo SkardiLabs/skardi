@@ -30,6 +30,7 @@ fn args(jobs_path: PathBuf, jobs_db: PathBuf, audit_db: PathBuf) -> CliArgs {
         pipeline_path: None,
         jobs_path: Some(jobs_path),
         jobs_db_path: Some(jobs_db),
+        webhooks_path: None,
         ctx_file: None,
         semantics_path: None,
         port: 8080,
