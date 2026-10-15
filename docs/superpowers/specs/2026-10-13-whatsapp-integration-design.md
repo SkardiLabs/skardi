@@ -21,14 +21,16 @@ between them: **a pull path** (a source pack over OC, for account-side data) **a
 a push path** (a webhook receiver in skardi-server, for messages). Neither can
 substitute for the other: the webhook never delivers a template or phone-number
 list, and OC never delivers a message. A third component, analytics tables, is
-**optional**: most of its value is already covered by the delivery receipts the
-webhook captures.
+**optional for volume reporting and required for cost reporting**: the
+delivery receipts the webhook captures carry a pricing category and a billable
+flag but no amount, so message counts by category come from receipts while
+cost figures come only from Meta's `pricing_analytics`.
 
 | Component | Data it yields | Repos touched | Existing components reused |
 |---|---|---|---|
 | 1. `whatsapp` source pack (pull) | Current-state snapshots: `phone_numbers`, `business_profile`, `message_templates` | skardi (pack YAML plus the fixed accessor boilerplate) | OC's `whatsapp` provider, the pack engine, `open_connector_query`, the pack docs template |
 | 2. `kind: webhook` receiver (push) | Inbound messages and delivery receipts: `wa_messages`, `wa_statuses`, for RAG and BI | skardi-server (one new resource kind plus one route) | The pack column grammar and `JsonToArrow`, the jobs `SqlDmlDestination` / `LanceDestination` writers with upsert dedup, the existing Postgres/SQLite/Lance sources |
-| 3. Analytics tables (pull, **optional**) | Meta's own aggregates: `message_analytics`, `pricing_analytics`, `template_analytics` | OC (three new read actions, about half a day) + skardi (tables added to the pack) | Same as component 1, plus `kind: job` to snapshot into Lance (escaping Meta's one-year lookback) |
+| 3. Analytics tables (pull, **optional unless cost figures are needed**) | Meta's own aggregates: `message_analytics`, `pricing_analytics`, `template_analytics` — the only source of cost amounts | OC (three new read actions, about half a day) + skardi (tables added to the pack) | Same as component 1, plus `kind: job` to snapshot into Lance (escaping Meta's one-year lookback) |
 | Deferred follow-ups: media download, outbound send, multi-tenant Embedded Signup, Coexistence history import | — | mostly OC | — |
 
 The two required components share no code and can be built, reviewed, and
@@ -219,21 +221,28 @@ runs both.
 
 **Which component answers which question:**
 
-- **Component 2 (webhook)** — every inbound message; every outbound receipt (with
-  per-message `pricing.category` / `billable`, so sent / delivered volume and
-  cost can be aggregated straight from `wa_statuses`, at finer granularity than
-  Meta's analytics fields and without the one-year lookback); and, once the
-  management fields are subscribed, *change events* for template review,
-  phone-number quality, and account review, by adding a `field` under `routes`.
-  It never yields a full list of templates or numbers, only deltas, and it has no
-  backfill: history from before the subscription is gone (**the earlier it ships,
-  the more it accumulates**). It also never carries **the content of outbound
-  messages**; see [Outbound message content](#outbound-message-content).
+- **Component 2 (webhook)** — every inbound message; every outbound receipt.
+  A receipt's `pricing` object carries `billable`, `pricing_model`, and
+  `category` (Meta's webhook reference), so sent / delivered / read **counts**
+  by category, number, and recipient can be aggregated straight from
+  `wa_statuses`, at finer granularity than Meta's analytics fields and without
+  the one-year lookback. It carries **no amount**, so cost cannot be derived from
+  receipts. Once the management fields are subscribed, the receiver can also
+  land *change events* for template review, phone-number quality, and account
+  review; those fields deliver one object per change rather than an array, so
+  each needs a `rows: value` route (see step 4 below), and the first version
+  ships only `messages` and `statuses`. The webhook never yields a full list of
+  templates or numbers, only deltas, and it has no backfill: history from before
+  the subscription is gone (**the earlier it ships, the more it accumulates**).
+  It also never carries **the content of outbound messages**; see
+  [Outbound message content](#outbound-message-content).
 - **Component 1 (pack)** — the current template list, phone-number list, and
   business profile, as Meta sees them right now. No messages.
-- **Component 3 (analytics, optional)** — Meta's own aggregate numbers. Worth
-  building only when Meta's reporting figures are required to match exactly, or
-  to recover up to a year of metrics from before the webhook subscription.
+- **Component 3 (analytics)** — Meta's own aggregate numbers, and the **only
+  source of cost amounts** (`pricing_analytics` returns `cost` per window and
+  dimension). Required for the cost-by-category use case in the goals; optional
+  when only counts are needed, or to recover up to a year of metrics from before
+  the webhook subscription.
 
 ## Detailed design
 
@@ -246,7 +255,7 @@ follows the `source-pack` skill.
 
 | Table | Action | Row path | Pagination | Resources | Notes |
 |---|---|---|---|---|---|
-| `phone_numbers` | `whatsapp.get_phone_numbers` | `$.phone_numbers` | `single_page`, `page_size_input: limit`, `page_size: 100`, `next_cursor_path: "$.paging.cursors.after"` as a tripwire | optional `wabaId` (defaults to the WABA on the OC connection) | The action does not forward `after`; more than 100 numbers trips the wire instead of silently truncating — the pack's established behavior |
+| `phone_numbers` | `whatsapp.get_phone_numbers` | `$.phone_numbers` | `single_page` with `next_cursor_path: "$.paging.cursors.after"` as a tripwire; the page size goes through `fixed_inputs: { limit: 100 }` because the loader's `single_page` variant accepts only `next_cursor_path` (`deny_unknown_fields`) | optional `wabaId` (defaults to the WABA on the OC connection) | More than 100 numbers trips the wire instead of silently truncating — the pack's established behavior. Once the `after` cursor from OC #731 is in the pinned OC version, switch to `cursor` paging like `message_templates` |
 | `business_profile` | `whatsapp.get_business_profile` | `$`, `row_shape: object` | `single_page` | required `phoneNumberId` | A point read; one binding per phone number (precedent: `feishu.document_content`) |
 | `message_templates` | `whatsapp.get_message_templates` | `$.templates` | `cursor`, `cursor_input: after`, `next_cursor_path: "$.paging.cursors.after"`, `page_size: 100` | optional `wabaId` | Meta omits `paging.next` on the last page but may still return `cursors.after`: **the termination condition must be live-verified**, and may need `has_more_path` (OC has no normalized `hasMore` today, so OC may need to add one) |
 
@@ -327,6 +336,7 @@ spec:
         - { name: phone_number_id,     path: _metadata.phone_number_id, type: utf8, nullable: false }
         - { name: display_phone_number,path: _metadata.display_phone_number, type: utf8, nullable: true }
         - { name: from_wa_id,          path: from,                     type: utf8, nullable: false }
+        - { name: to_wa_id,            path: _to_wa_id,                type: utf8, nullable: true }   # NULL inbound; set by the sender's copy
         - { name: contact_name,        path: _contact.profile.name,    type: utf8, nullable: true }
         - { name: received_at,         path: timestamp,                type: timestamp_s_string_utc, nullable: false }
         - { name: message_type,        path: type,                     type: utf8, nullable: false }
@@ -341,6 +351,8 @@ spec:
       destination: { table: staging.main.wa_events_statuses, mode: append }
       columns:
         - { name: message_id,       path: id,                       type: utf8, nullable: false }
+        - { name: waba_id,          path: _waba_id,                 type: utf8, nullable: false }
+        - { name: phone_number_id,  path: _metadata.phone_number_id, type: utf8, nullable: false }
         - { name: status,           path: status,                   type: utf8, nullable: false }
         - { name: status_at,        path: timestamp,                type: timestamp_s_string_utc, nullable: false }
         - { name: recipient_id,     path: recipient_id,             type: utf8, nullable: false }
@@ -351,6 +363,15 @@ spec:
         - { name: error_code,       path: _error.code,              type: int64, nullable: true }
         - { name: raw,              path: _raw,                     type: json, nullable: false }
 ```
+
+Every route also gets an `ingested_at` column (`timestamp_ms_utc`, the server
+clock at write time) that the receiver appends after column mapping. It is not
+declared in `columns:` because it is not part of the payload; it exists so the
+merge job can watermark on *arrival* rather than on Meta's `timestamp` (see
+[Dedup and merge](#dedup-and-merge-into-lance-zero-new-code)). Status rows keep
+`waba_id` and `phone_number_id` so a receipt can be attributed to a tenant and
+sending number even when the outbound message was never copied into
+`wa_messages`; without them, per-number BI and the multi-tenant fan-out break.
 
 #### Request handling
 
@@ -366,8 +387,17 @@ spec:
    `X-Hub-Signature-256` in constant time; on mismatch return 401 and `warn!`.
    Bodies over `max_body_bytes` return 413.
 4. **Envelope unwrapping** (Meta-specific, ~60 lines of Rust): walk
-   `entry[i].changes[j]`, match `change.field` against `routes[].field`; for each
-   `value.messages[k]` emit one flat object: the original message object plus
+   `entry[i].changes[j]`, match `change.field` against `routes[].field`, and pick
+   rows by the route's `rows` selector. `rows: list` (the default) iterates the
+   array named after the field — `value.messages[]`, `value.statuses[]`; a
+   `messages`-field change may carry either array, so one change can feed both
+   routes. `rows: value` treats the change's `value` object itself as the single
+   row, which is the shape of every management field
+   (`message_template_status_update`, `phone_number_quality_update`,
+   `account_update`, …). The first version implements the two list routes and
+   defines `rows: value` in the grammar, so adding a management field later is a
+   YAML change, not a parser change. For each `value.messages[k]` emit one flat
+   object: the original message object plus
    synthetic keys `_waba_id` (`entry.id`), `_metadata` (`value.metadata`),
    `_contact` (the `value.contacts[]` entry whose `wa_id == from`), `_media`
    (`message[message.type]`, only for type ∈ image / video / audio / document /
@@ -406,11 +436,11 @@ kind: job
 metadata: { name: wa-merge-messages, version: "1.0.0" }
 spec:
   query: |
-    SELECT message_id, waba_id, phone_number_id, from_wa_id, contact_name,
+    SELECT message_id, waba_id, phone_number_id, from_wa_id, to_wa_id, contact_name,
            received_at, message_type, text, media_id, media_mime_type, caption,
-           reply_to_message_id, interactive_reply_id, raw
+           reply_to_message_id, interactive_reply_id, raw, ingested_at
     FROM staging.main.wa_events_messages
-    WHERE received_at >= {since}
+    WHERE ingested_at >= {since}
   destination:
     table: wa_messages
     mode: upsert
@@ -418,6 +448,14 @@ spec:
     repeated_keys: keep_last
     create_if_missing: true
 ```
+
+The watermark is `ingested_at`, the receiver's own write time, **not** Meta's
+`received_at`. A delivery Meta retries after an outage, or a row a manual
+backfill inserts, carries an old `received_at`; a watermark on that column
+would skip such rows forever, which would silently void the seven-day retry
+guarantee. The cron passes `{since}` as the previous run's start time minus a
+small overlap; re-merging the overlap is harmless because the upsert is
+idempotent.
 
 `wa_statuses` merges on `[message_id, status]` (a message has at most three
 receipts: sent / delivered / read). The job is triggered every few minutes by an
@@ -488,7 +526,13 @@ sending side to record its own copy at send time:
 - A caller that sends through OC `whatsapp.send_*` takes the returned
   `messages[0].id` and writes a row into `wa_events_messages` through the
   existing pipeline `INSERT … VALUES {rows}`, with `from_wa_id` set to the
-  business number and `message_type` set to an agreed value such as `outbound_text`.
+  business number, `to_wa_id` set to the customer, `message_type` set to an
+  agreed value such as `outbound_text`, and `reply_to_message_id` set when the
+  send used `context.message_id`. (`to_wa_id` is NULL on inbound rows; the
+  inbound side is identified by `phone_number_id`.) Without `to_wa_id` and
+  `reply_to_message_id` on outbound rows there is no way to say which inbound
+  message an outbound one answered, and "unanswered" queries degrade to
+  "no later message to that customer", which a campaign send would satisfy.
 - The merge job does not distinguish direction: `message_id` is unique for both
   inbound (`wamid.…`) and outbound (Meta returns ids in the same namespace), and
   the status table joins on `message_id` as usual.
@@ -499,11 +543,28 @@ assume the table holds full conversations.
 #### Query examples
 
 ```sql
--- customer messages in the last 24h with no reply (joined against statuses)
-SELECT m.from_wa_id, m.contact_name, m.text, m.received_at
+-- inbound volume per business number per day, from receipts and messages
+SELECT phone_number_id, date_trunc('day', received_at) AS day, count(*) AS inbound
+FROM wa_messages WHERE message_type NOT LIKE 'outbound%'
+GROUP BY 1, 2 ORDER BY 2 DESC, 3 DESC;
+
+-- inbound messages in the last 24h that no outbound message has answered.
+-- "Answered" is defined by the sender's own copy (see Outbound message content):
+-- an outbound row whose context.id names the inbound message (a true reply),
+-- or, failing that, any outbound row to the same customer sent after it.
+-- The second rule is a heuristic and is labelled as such in the result.
+SELECT m.from_wa_id, m.contact_name, m.text, m.received_at,
+       bool_or(o.reply_to_message_id = m.message_id) AS answered_by_reply,
+       count(o.message_id) > 0                       AS answered_by_any_later_message
 FROM wa_messages m
-LEFT JOIN wa_statuses s ON s.recipient_id = m.from_wa_id AND s.status_at > m.received_at
-WHERE m.received_at >= now() - INTERVAL '1 day' AND s.message_id IS NULL;
+LEFT JOIN wa_messages o
+       ON o.message_type LIKE 'outbound%'
+      AND o.to_wa_id = m.from_wa_id
+      AND o.received_at > m.received_at
+WHERE m.received_at >= now() - INTERVAL '1 day'
+  AND m.message_type NOT LIKE 'outbound%'
+GROUP BY 1, 2, 3, 4
+HAVING count(o.message_id) = 0;
 
 -- join against the CRM by phone number
 SELECT c.account_name, count(*) AS inbound
@@ -556,18 +617,46 @@ Left for a separate OC PR, deliberately: the Graph version bump (v23.0 → v26.0
 and `Retry-After` parsing. Both touch every WhatsApp action, so they should not
 ride on a feature PR.
 
-**Skardi side:** three more pack tables with `row_path: "$.data_points"` and
-`single_page` (Meta's analytics fields do not paginate). Time ranges: pack
-`filters` support only `eq | gt | gt_eq`, so `period_start >= {ts}` is pushed as
-`start` with `format: epoch_seconds`, `fidelity: inexact`, and `end` defaults to
-now on the OC side. For an exact window or half-hour granularity, use
-`open_connector_query('saas', 'whatsapp.pricing_analytics', '{"start":…,"end":…,"granularity":"HALF_HOUR"}', 'acme-waba')`.
+**Skardi side:** three more pack tables with `row_path: "$.data_points"`.
+
+| Table | Pagination | Resources |
+|---|---|---|
+| `message_analytics` | `single_page` (the `analytics` field does not paginate) | optional `start`, `end`, `granularity`, `phone_numbers`, `product_types`, `country_codes` |
+| `pricing_analytics` | `single_page` | optional `start`, `end`, `granularity`, `phone_numbers`, `country_codes`, `metric_types`, `pricing_types`, `pricing_categories`, `dimensions` |
+| `template_analytics` | `cursor`: `cursor_input: after`, `next_cursor_path: "$.paging.cursors.after"` — the edge returns `paging`, so `single_page` would truncate; termination on the last page needs the same live check as `message_templates` | required `template_ids`; optional `start`, `end`, `metric_types`, `product_type`, `use_waba_timezone` |
+
+Window arguments are **resources, not pushed filters**. The two cannot coexist:
+the loader refuses a filter whose input collides with a declared resource, and
+`open_connector_query` refuses any resource key the table does not declare
+(`UnknownResourceKey` at planning). Declaring them as optional resources makes
+both call shapes work — a binding fixes them in YAML, and an ad hoc call passes
+them in the resource JSON:
+`open_connector_query('saas', 'whatsapp.pricing_analytics', '{"start":…,"end":…,"granularity":"HALF_HOUR","dimensions":["PRICING_CATEGORY"]}', 'acme-waba')`.
+A binding that omits `start` / `end` gets OC's rolling default, the last 30
+days, which is what a daily snapshot wants.
 
 **Persisting into Lance (escaping the one-year lookback):** one `kind: job`,
 triggered daily by an external cron (Skardi has no scheduler), `mode: upsert`,
-`merge_keys: [phone_number, pricing_category, period_start]`,
-`repeated_keys: keep_last` — re-running is idempotent. skardi-cloud's `skardi-etl`
-can generate this bundle directly.
+`repeated_keys: keep_last` — re-running is idempotent. Two rules make the key
+sound. First, the binding fixes the **full** dimension set,
+`dimensions: [PHONE, COUNTRY, PRICING_CATEGORY, PRICING_TYPE, TIER]`, so every
+row carries the grain the key needs; with fewer dimensions, distinct rows
+would share a key and `keep_last` would silently drop all but one. Second, the
+merge key is a single column the job's SQL computes with `coalesce` on every
+dimension, because the Lance upsert **refuses a NULL merge key** (SQL equality
+never matches NULL) and `tier` is omitted on free messages, `phone_number` on
+rows without the PHONE dimension:
+
+```sql
+SELECT concat_ws('|', period_start, coalesce(phone_number, ''), coalesce(country, ''),
+                 coalesce(pricing_category, ''), coalesce(pricing_type, ''),
+                 coalesce(tier, '')) AS row_key,
+       period_start, period_end, phone_number, country, pricing_category,
+       pricing_type, tier, volume, cost
+FROM saas.wa.pricing_analytics
+```
+
+with `merge_keys: [row_key]`. skardi-cloud's `skardi-etl` can generate this bundle.
 
 ### Deferred follow-ups (on demand)
 
@@ -603,7 +692,8 @@ M1 and M2 are both required for a complete integration. They share no code and
 can run in parallel by different people, each as its own PR. If they have to be
 sequenced, **start M2**: it is the only path that yields messages, and with no
 backfill the earlier it ships the more data accumulates; M1 is cheap and can
-follow at any time. M3 is optional and follows the upstream OC merge cadence.
+follow at any time. M3 is optional for counts but required for cost figures
+(receipts carry no amount), and it follows the upstream OC merge cadence.
 Each milestone carries tests and docs as AGENTS.md requires, with no drive-by
 refactors.
 
