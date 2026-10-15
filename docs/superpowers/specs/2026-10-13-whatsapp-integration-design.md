@@ -461,59 +461,65 @@ idempotent.
 receipts: sent / delivered / read). The job is triggered every few minutes by an
 external cron; the staging table can be pruned on a retention schedule.
 
-**Staging backend (decided):** the staging table lives in a transactional SQL
-source Skardi can already write to — Postgres, MySQL, or SQLite with
-`access_mode: read_write`. Open-source users choose: SQLite gives a
-zero-dependency single-node setup (a local file plus a Lance directory), at the
-cost of a single writer that may queue under peak load and hand Meta a 500 and
-a retry; Postgres suits multi-replica or high-traffic deployments. The docs ship
-both examples. On skardi-cloud the workspace already has Postgres, and the
-operator renders the destination to it; SQLite is not used there. Switching is
-a change to `destination.table` only.
+**Staging backend (self-hosted decided; skardi-cloud proposed):** the staging
+table lives in a transactional SQL source Skardi can already write to —
+Postgres, MySQL, or SQLite with `access_mode: read_write`. Open-source users
+choose: SQLite gives a zero-dependency single-node setup (a local file plus a
+Lance directory), at the cost of a single writer that may queue under peak load
+and hand Meta a 500 and a retry; Postgres suits multi-replica or high-traffic
+deployments. The docs ship both examples, and switching is a change to
+`destination.table` only. On skardi-cloud, "the operator renders the
+destination to the workspace's Postgres" is **not** a made decision: that
+Postgres is written by the execution plane's workers, not by the per-workspace
+engine, so the cloud landing path is part of the open item in
+[Public ingress](#public-ingress-self-hosted-decided-skardi-cloud-open).
 
 The staging table is not just a buffer: it is queryable by SQL before the merge
 job runs, it is where repairs and manual backfills land, and it can be pruned
 on a retention schedule once rows have been merged into Lance.
 
-#### Public ingress on skardi-cloud (decided)
+#### Public ingress (self-hosted decided; skardi-cloud open)
 
-Self-hosted deployments expose skardi-server's `/webhooks/:name` themselves.
-On skardi-cloud, each tenant gets its endpoint through the existing
-`skardi-gateway`, which already serves a public, unauthenticated, per-tenant
-URL shape (`https://<org-slug>.api.skardi.cloud/external/<tenant_slug>/<endpoint>`)
-behind an ALB with a CA-issued wildcard certificate — exactly what Meta
-requires. The webhook path reuses that host and routing model:
+**Self-hosted:** skardi-server serves `GET|POST /webhooks/:name` itself, behind
+whatever CA-certified HTTPS the operator already has (Meta rejects self-signed
+certificates). The verify token and app secret live in the server's
+environment. This is the design the rest of this section describes.
 
-```
-GET|POST https://<org-slug>.api.skardi.cloud/webhooks/<tenant_slug>/<name>
-   └─ gateway: host → org, path → workspace route table
-        └─ raw passthrough → skardi-server.<workspace>.svc /webhooks/<name>
-```
+**skardi-cloud: proposed, not decided.** An earlier revision of this document
+recorded a per-tenant `skardi-gateway` route
+(`/webhooks/<tenant_slug>/<name>`, raw passthrough, each workspace holding its
+own `WHATSAPP_APP_SECRET`). Review surfaced two standing cloud constraints it
+conflicts with, so the cloud half is withdrawn here and handed to skardi-cloud
+to spec:
 
-Division of responsibilities:
+1. **One Meta app or one per tenant.** A Meta app has a single webhook callback
+   for every WABA it serves. If Skardi owns the Meta app — the direction
+   skardi-cloud is moving towards for providers whose users cannot self-serve a
+   credential (skardi-cloud #688, still open), and what multi-tenant Embedded
+   Signup requires anyway — cloud ingress is **one** endpoint that fans out by
+   `entry.id` (the WABA) to the owning workspace, and the app secret is
+   Skardi's, not the tenant's. The per-tenant route is the self-hosted shape,
+   not the cloud shape.
+2. **Where events land.** On cloud, ingestion runs through the ETL execution
+   plane into the workspace corpus, which carries file- and row-level ACL
+   through rbac and the catalog (team-workspaces design, 2026-09-30). The
+   per-workspace engine's registered sources hold read credentials only, and
+   the gateway is a request passthrough by decision — the Slack Events
+   receiver was removed from it on 2026-07-07 precisely because provider event
+   processing belongs in a dedicated ingest service, "re-introduction is
+   expected once a dedicated connector/ingest service exists". A
+   `wa_messages` Lance table written by the engine outside the corpus would
+   bypass the ACL model, and with it the question of who in a workspace may
+   read whose conversations.
 
-- **The gateway** does route-table lookup, a body-size cap (Meta sends at most
-  3 MB; cap at 4 MB), per-tenant rate limiting, and metering. It forwards both
-  GET and POST with the body **byte-for-byte** and the headers intact, and
-  stamps no identity — the request is unauthenticated by design.
-- **skardi-server** does the `hub.challenge` handshake and the HMAC check. The
-  verify token and app secret stay in the workspace's environment; the gateway
-  never holds a tenant's Meta secrets, matching the existing boundary where OC
-  credentials never enter the gateway either.
-- **The route table** only lists `<name>`s that the workspace declares as a
-  `kind: webhook` resource (the operator renders it from the bound context, as
-  it does for pipelines). Undeclared names are 404 at the gateway, so junk
-  traffic never reaches a worker.
-
-Why not reuse `/external/<endpoint>`: it is POST-only, its meaning is "run this
-pipeline" (and it is metered as a pipeline run), and it may reshape the request
-body — any of which breaks the GET handshake or the signature check.
-
-Two things to size for: the gateway is single-replica today, so webhook
-availability equals gateway availability (Meta's 7-day retry turns an outage
-into a delay, not a loss, but gateway rollout windows must be short); and
-metering needs its own counter (ingest events), because webhook deliveries are
-not pipeline runs.
+What this document keeps for cloud is the **payload contract**: the Meta
+verification preset, the envelope unwrapping with its synthetic keys, and the
+flat row shapes of `messages` and `statuses`. Those are the same whether the
+rows are written by skardi-server into a staging table or by an ETL worker
+into the corpus. The open item for skardi-cloud is: *single Skardi-owned Meta
+app endpoint, fan-out by WABA, land through the ETL plane into the corpus with
+ACL* — including which members may read which conversations (per number, per
+agent) before any message becomes queryable.
 
 #### Outbound message content
 
@@ -720,16 +726,16 @@ refactors.
 
 ## Risks and open questions
 
-1. **Public ingress — decided.** Self-hosted users expose skardi-server's
-   `/webhooks/:name` themselves; on skardi-cloud, `skardi-gateway` serves
-   `/webhooks/<tenant_slug>/<name>` on the existing per-org host as a raw
-   passthrough, with verification staying in skardi-server. See
-   [Public ingress on skardi-cloud](#public-ingress-on-skardi-cloud-decided).
-   Still open on the cloud side: the metering counter for ingest events, and
-   the gateway's single-replica availability during rollouts.
-2. **Staging backend — decided.** skardi-cloud uses the workspace's Postgres;
-   open-source users choose between SQLite (zero dependencies, single writer)
-   and Postgres. See [Staging backend](#dedup-and-merge-into-lance-zero-new-code).
+1. **Public ingress — self-hosted decided, skardi-cloud open.** Self-hosted
+   users expose skardi-server's `/webhooks/:name` themselves. The cloud shape
+   depends on skardi-cloud #688 (one Skardi-owned Meta app → one endpoint
+   fanning out by WABA) and on the ETL execution plane owning ingestion; it is
+   handed to skardi-cloud to spec. See
+   [Public ingress](#public-ingress-self-hosted-decided-skardi-cloud-open).
+2. **Staging backend — self-hosted decided, skardi-cloud open.** Open-source
+   users choose between SQLite (zero dependencies, single writer) and
+   Postgres. On cloud the landing path is the execution plane's, not the
+   engine's; see [Staging backend](#dedup-and-merge-into-lance-zero-new-code).
 3. **`message_templates` paging termination.** The OC action forwards Meta's
    `paging` as-is; whether `cursors.after` is empty on the last page needs live
    verification. If it is non-empty with no `next`, OC must normalize a `hasMore`
@@ -745,8 +751,12 @@ refactors.
    immediate 400 from `/me` without a token), and the only missing piece is a
    System User token with `whatsapp_business_management` plus a WABA ID.
 5. **Privacy and compliance.** `from_wa_id` is a phone number and `text` is the
-   customer's own words. The Lance tables should fall under the existing query
-   audit (`--query-audit-db`), masked views at the pipeline layer should be
+   customer's own words. On skardi-cloud this is first an **authorization**
+   question, not only audit and retention: which workspace members may read
+   which conversations — per business number, per agent — has to be expressed
+   in the ACL model before messages land in a queryable corpus. Self-hosted,
+   the Lance tables should fall under the existing query audit
+   (`--query-audit-db`), masked views at the pipeline layer should be
    considered, and a retention policy is still to be decided.
 6. **Meta version and policy drift.** OC is on v23.0; Graph versions retire after
    about two years. Embedded Signup v2 retires on 2026-10-15. Analytics lookback
