@@ -27,9 +27,10 @@ spec:
            arrow_cast(ingested_at, 'Timestamp(Millisecond, Some("UTC"))') AS ingested_at
     FROM staging.main.wa_events_messages
     WHERE ingested_at >= {since}
+    ORDER BY ingested_at, message_id
   destination:
     table: "wa_messages"          # the `type: lance` source of that name in ctx_whatsapp.yaml
     mode: upsert
     merge_keys: [message_id]
-    repeated_keys: keep_last      # a redelivery is the same message; keep the latest copy
+    repeated_keys: keep_last      # keeps the last copy in stream order — hence the ORDER BY
     create_if_missing: true
