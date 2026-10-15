@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use arrow::array::{ArrayRef, TimestampMillisecondArray};
+use arrow::compute::can_cast_types;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use datafusion::prelude::SessionContext;
@@ -293,7 +294,46 @@ async fn preflight_destination(
             expected.join(", ")
         ));
     }
+    for (produced, target) in route
+        .output_schema()
+        .fields()
+        .iter()
+        .zip(actual.fields().iter())
+    {
+        if !write_compatible(produced.data_type(), target.data_type()) {
+            return Err(anyhow!(
+                "webhook '{webhook}': route '{}' destination '{}' column '{}' is {} in the \
+                 table but the route writes {}; the insert would fail on every delivery and \
+                 the provider would retry it for days, so the server refuses to start",
+                route.field,
+                route.table,
+                produced.name(),
+                target.data_type(),
+                produced.data_type()
+            ));
+        }
+    }
     Ok(())
+}
+
+/// Whether a column the route produces can be written into a table column
+/// of `to`'s type by the insert planner's cast.
+///
+/// Anything may be written into a text column (that is how a timestamp
+/// lands in SQLite `TEXT`), but a text column may only be written into
+/// text: the planner would accept `Utf8 → Int64` and then fail at run time
+/// on the first non-numeric value, which for a `wamid.…` id is every value.
+/// Every other pair defers to Arrow's own cast table.
+fn write_compatible(from: &DataType, to: &DataType) -> bool {
+    let is_text =
+        |t: &DataType| matches!(t, DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View);
+    if is_text(to) {
+        return true;
+    }
+    if is_text(from) {
+        return false;
+    }
+    can_cast_types(from, to)
 }
 
 #[cfg(test)]
@@ -387,6 +427,85 @@ spec:
         let batch = route.convert(&[], 0).unwrap();
         assert_eq!(batch.num_rows(), 0);
         assert_eq!(batch.schema().fields().len(), 6);
+    }
+
+    #[test]
+    fn write_compatibility_allows_text_targets_and_refuses_text_sources_elsewhere() {
+        let ts = DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()));
+        assert!(write_compatible(&DataType::Utf8, &DataType::Utf8));
+        assert!(write_compatible(&ts, &DataType::Utf8));
+        assert!(write_compatible(&DataType::Boolean, &DataType::Utf8));
+        assert!(write_compatible(&ts, &DataType::Int64));
+        assert!(write_compatible(&DataType::Boolean, &DataType::Int64));
+        assert!(write_compatible(&DataType::Int64, &DataType::Float64));
+        assert!(write_compatible(
+            &ts,
+            &DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into()))
+        ));
+        assert!(!write_compatible(&DataType::Utf8, &DataType::Int64));
+        assert!(!write_compatible(&DataType::Utf8, &DataType::Boolean));
+        assert!(!write_compatible(&DataType::Utf8, &ts));
+    }
+
+    fn source(name: &str, source_type: DataSourceType, read_write: bool) -> DataSource {
+        DataSource {
+            name: name.to_string(),
+            source_type,
+            path: Default::default(),
+            connection_string: None,
+            schema: None,
+            options: None,
+            hierarchy_level: Default::default(),
+            access_mode: if read_write {
+                skardi::sources::AccessMode::ReadWrite
+            } else {
+                skardi::sources::AccessMode::ReadOnly
+            },
+            enable_cache: false,
+            description: None,
+            open_connector: None,
+            rss: None,
+            graph: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn preflight_refuses_a_non_transactional_source_and_a_malformed_table() {
+        let ctx = Arc::new(SessionContext::new());
+        let mut defs = HashMap::new();
+        defs.insert("t".to_string(), definition());
+
+        let lake = [source("staging", DataSourceType::Lance, true)];
+        let err = WebhookRegistry::build(&defs, &lake, &ctx)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("transactional SQL source"),
+            "{err}"
+        );
+
+        let yaml = YAML.replace("staging.main.events", ".main.events");
+        let def = WebhookDefinition::from_yaml_with_env(&yaml, |_| Some("x".into()))
+            .unwrap()
+            .unwrap();
+        defs.insert("t".to_string(), def);
+        let sqlite = [source("staging", DataSourceType::Sqlite, true)];
+        let err = WebhookRegistry::build(&defs, &sqlite, &ctx)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not a table identifier"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_empty_registry_has_no_names_and_a_redacted_debug() {
+        let ctx = Arc::new(SessionContext::new());
+        let registry = WebhookRegistry::build(&HashMap::new(), &[], &ctx)
+            .await
+            .unwrap();
+        assert!(registry.is_empty());
+        assert!(registry.names().is_empty());
+        assert!(registry.get("nope").is_none());
+        assert_eq!(format!("{registry:?}"), "WebhookRegistry { names: [] }");
     }
 
     #[tokio::test]

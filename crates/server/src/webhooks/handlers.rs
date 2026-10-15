@@ -172,7 +172,7 @@ pub async fn webhook_receive(
         }
     };
 
-    match apply_routes(&state, &webhook, &envelope).await {
+    match apply_routes(&state, &name, &webhook, &envelope).await {
         Ok(written) => {
             let total: usize = written.iter().map(|w| w.rows).sum();
             tracing::info!(
@@ -187,11 +187,6 @@ pub async fn webhook_receive(
                 waba_ids(&envelope),
                 started.elapsed().as_millis()
             );
-            for w in &written {
-                state
-                    .webhook_metrics
-                    .record_rows(&name, &w.field, w.rows as u64);
-            }
             state
                 .webhook_metrics
                 .record_request(&name, outcome::OK, elapsed_ms(started));
@@ -199,54 +194,61 @@ pub async fn webhook_receive(
                 "success": true,
                 "webhook": name,
                 "rows": total,
-                "routes": written
-                    .iter()
-                    .map(|w| json!({"field": w.field, "table": w.table, "rows": w.rows}))
-                    .collect::<Vec<_>>(),
+                "routes": written.iter().map(Written::to_json).collect::<Vec<_>>(),
             }))
             .into_response()
         }
-        Err(RouteFailure::NotAnEnvelope) => {
-            tracing::warn!("webhook {name}: verified body is not a webhook envelope");
-            finish_error(
-                &state,
-                &name,
-                started,
-                StatusCode::BAD_REQUEST,
-                outcome::INVALID_PAYLOAD,
-                "verified body is JSON but not a webhook envelope (no `entry` array)",
-                None,
-            )
-        }
-        Err(RouteFailure::Conversion { route, error }) => {
-            tracing::error!(
-                "webhook {name}: route {route}: rows could not be mapped to the declared columns: {error}"
-            );
-            finish_error(
-                &state,
-                &name,
-                started,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                outcome::CONVERSION_ERROR,
-                "rows could not be mapped to the declared columns",
-                Some(json!({"route": route, "error": error})),
-            )
-        }
-        Err(RouteFailure::Write {
-            route,
-            table,
-            error,
-        }) => {
-            tracing::error!("webhook {name}: route {route}: write to {table} failed: {error}");
-            finish_error(
-                &state,
-                &name,
-                started,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                outcome::WRITE_ERROR,
-                "rows could not be written to the destination table",
-                Some(json!({"route": route, "table": table, "error": error})),
-            )
+        Err(RouteFailure { kind, committed }) => {
+            let committed_json: Vec<Value> = committed.iter().map(Written::to_json).collect();
+            match kind {
+                FailureKind::NotAnEnvelope => {
+                    tracing::warn!("webhook {name}: verified body is not a webhook envelope");
+                    finish_error(
+                        &state,
+                        &name,
+                        started,
+                        StatusCode::BAD_REQUEST,
+                        outcome::INVALID_PAYLOAD,
+                        "verified body is JSON but not a webhook envelope (no `entry` array)",
+                        None,
+                    )
+                }
+                FailureKind::Conversion { route, error } => {
+                    tracing::error!(
+                        "webhook {name}: route {route}: rows could not be mapped to the declared columns: {error}"
+                    );
+                    finish_error(
+                        &state,
+                        &name,
+                        started,
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        outcome::CONVERSION_ERROR,
+                        "rows could not be mapped to the declared columns",
+                        Some(json!({"route": route, "error": error, "committed": committed_json})),
+                    )
+                }
+                FailureKind::Write {
+                    route,
+                    table,
+                    error,
+                } => {
+                    tracing::error!(
+                        "webhook {name}: route {route}: write to {table} failed after {} earlier route(s) committed: {error}",
+                        committed.len()
+                    );
+                    finish_error(
+                        &state,
+                        &name,
+                        started,
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        outcome::WRITE_ERROR,
+                        "rows could not be written to the destination table",
+                        Some(
+                            json!({"route": route, "table": table, "error": error, "committed": committed_json}),
+                        ),
+                    )
+                }
+            }
         }
     }
 }
@@ -257,7 +259,19 @@ struct Written {
     rows: usize,
 }
 
-enum RouteFailure {
+impl Written {
+    fn to_json(&self) -> Value {
+        json!({"field": self.field, "table": self.table, "rows": self.rows})
+    }
+}
+
+/// A route failed; `committed` is what earlier routes already wrote.
+struct RouteFailure {
+    kind: FailureKind,
+    committed: Vec<Written>,
+}
+
+enum FailureKind {
     NotAnEnvelope,
     Conversion {
         route: String,
@@ -274,47 +288,67 @@ enum RouteFailure {
 /// route's commit answers 500; the provider's retry then re-appends the
 /// earlier route's rows, which the merge job's upsert collapses. That is
 /// the documented trade-off for keeping one transaction per table.
+///
+/// Rows are counted on `webhook_rows_total` the moment their write
+/// commits, so a failure further down never hides rows that did land.
 async fn apply_routes(
     state: &AppState,
+    name: &str,
     webhook: &CompiledWebhook,
     envelope: &Value,
 ) -> Result<Vec<Written>, RouteFailure> {
     let ingested_at_ms = chrono::Utc::now().timestamp_millis();
-    let mut written = Vec::with_capacity(webhook.routes.len());
+    let mut committed = Vec::with_capacity(webhook.routes.len());
     for route in &webhook.routes {
-        let rows = meta_whatsapp::unwrap_rows(envelope, &route.field, route.rows)
-            .map_err(|UnwrapError::NotAnEnvelope| RouteFailure::NotAnEnvelope)?;
-        let count = rows.len();
-        if count > 0 {
-            let batch =
-                route
-                    .convert(&rows, ingested_at_ms)
-                    .map_err(|e| RouteFailure::Conversion {
-                        route: route.field.clone(),
-                        error: format!("{e:#}"),
-                    })?;
-            let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
-                batch.schema(),
-                futures::stream::iter(vec![Ok(batch)]),
-            ));
-            let destination =
-                SqlDmlDestination::new(Arc::clone(&state.session_ctx), route.table.clone());
-            destination
-                .write(stream, DestinationMode::Append)
-                .await
-                .map_err(|e| RouteFailure::Write {
-                    route: route.field.clone(),
-                    table: route.table.clone(),
-                    error: format!("{e:#}"),
-                })?;
+        match apply_route(state, route, envelope, ingested_at_ms).await {
+            Ok(written) => {
+                state
+                    .webhook_metrics
+                    .record_rows(name, &written.field, written.rows as u64);
+                committed.push(written);
+            }
+            Err(kind) => return Err(RouteFailure { kind, committed }),
         }
-        written.push(Written {
-            field: route.field.clone(),
-            table: route.table.clone(),
-            rows: count,
-        });
     }
-    Ok(written)
+    Ok(committed)
+}
+
+async fn apply_route(
+    state: &AppState,
+    route: &super::registry::CompiledRoute,
+    envelope: &Value,
+    ingested_at_ms: i64,
+) -> Result<Written, FailureKind> {
+    let rows = meta_whatsapp::unwrap_rows(envelope, &route.field, route.rows)
+        .map_err(|UnwrapError::NotAnEnvelope| FailureKind::NotAnEnvelope)?;
+    let count = rows.len();
+    if count > 0 {
+        let batch = route
+            .convert(&rows, ingested_at_ms)
+            .map_err(|e| FailureKind::Conversion {
+                route: route.field.clone(),
+                error: format!("{e:#}"),
+            })?;
+        let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            batch.schema(),
+            futures::stream::iter(vec![Ok(batch)]),
+        ));
+        let destination =
+            SqlDmlDestination::new(Arc::clone(&state.session_ctx), route.table.clone());
+        destination
+            .write(stream, DestinationMode::Append)
+            .await
+            .map_err(|e| FailureKind::Write {
+                route: route.field.clone(),
+                table: route.table.clone(),
+                error: format!("{e:#}"),
+            })?;
+    }
+    Ok(Written {
+        field: route.field.clone(),
+        table: route.table.clone(),
+        rows: count,
+    })
 }
 
 /// Distinct `entry[].id` values, for the one-line log. Bounded so a batched

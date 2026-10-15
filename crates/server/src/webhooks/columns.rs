@@ -152,4 +152,49 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("empty segment"), "{err}");
     }
+
+    #[rstest::rstest]
+    #[case("boolean", FieldType::Boolean)]
+    #[case("int64", FieldType::Int64)]
+    #[case("uint64", FieldType::UInt64)]
+    #[case("float64", FieldType::Float64)]
+    #[case("utf8", FieldType::Utf8)]
+    #[case("timestamp_ms_utc", FieldType::TimestampMillisUtc)]
+    #[case("timestamp_s_utc", FieldType::TimestampSecondsUtc)]
+    #[case("timestamp_ms_string_utc", FieldType::TimestampMillisStringUtc)]
+    #[case("timestamp_s_string_utc", FieldType::TimestampSecondsStringUtc)]
+    #[case(
+        "timestamp_s_frac_string_utc",
+        FieldType::TimestampSecondsFractionalStringUtc
+    )]
+    #[case("utf8_list", FieldType::Utf8List)]
+    #[case("json", FieldType::Json)]
+    fn every_type_spelling_maps_to_the_shared_field_type(
+        #[case] spelling: &str,
+        #[case] expected: FieldType,
+    ) {
+        let spec = doc(&format!(
+            "{{ name: c, path: p, type: {spelling}, nullable: true }}"
+        ))
+        .into_spec("r")
+        .unwrap();
+        assert_eq!(spec.field_type, expected);
+        assert!(spec.nullable);
+    }
+
+    #[test]
+    fn empty_names_and_paths_are_refused() {
+        let err = doc("{ name: ' ', path: a, type: utf8, nullable: true }")
+            .into_spec("r")
+            .unwrap_err();
+        assert!(err.contains("empty name"), "{err}");
+        let err = doc("{ name: a, path: '', type: utf8, nullable: true }")
+            .into_spec("r")
+            .unwrap_err();
+        assert!(err.contains("empty path"), "{err}");
+        let err = doc("{ name: a, path: '$', type: utf8, nullable: true }")
+            .into_spec("r")
+            .unwrap_err();
+        assert!(err.contains("must not start with '$'"), "{err}");
+    }
 }

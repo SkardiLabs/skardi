@@ -499,4 +499,89 @@ spec:
         let yaml = MINIMAL.replace("provider: meta_whatsapp", "provider: slack_events");
         assert!(WebhookDefinition::from_yaml_with_env(&yaml, env_all).is_err());
     }
+
+    #[test]
+    fn load_from_file_reads_webhooks_and_skips_other_kinds() {
+        let dir = tempfile::tempdir().unwrap();
+        let hook = dir.path().join("hook.yaml");
+        std::fs::write(&hook, MINIMAL).unwrap();
+        let job = dir.path().join("job.yaml");
+        std::fs::write(
+            &job,
+            "kind: job\nmetadata: { name: j }\nspec: { query: 'SELECT 1' }\n",
+        )
+        .unwrap();
+        let broken = dir.path().join("broken.yaml");
+        std::fs::write(&broken, "kind: webhook\nmetadata: [\n").unwrap();
+
+        // SAFETY: test-only, unique variable names, read once by this call.
+        unsafe {
+            std::env::set_var("WA_VERIFY", "v");
+            std::env::set_var("WA_SECRET", "s");
+        }
+        let loaded = WebhookDefinition::load_from_file(&hook).unwrap().unwrap();
+        assert_eq!(loaded.name, "wa-inbound");
+        assert!(WebhookDefinition::load_from_file(&job).unwrap().is_none());
+        let err = WebhookDefinition::load_from_file(&broken).unwrap_err();
+        assert!(format!("{err:#}").contains("broken.yaml"), "{err:#}");
+        let err = WebhookDefinition::load_from_file(dir.path().join("missing.yaml")).unwrap_err();
+        assert!(format!("{err:#}").contains("missing.yaml"), "{err:#}");
+    }
+
+    #[rstest::rstest]
+    #[case::tiny_body(
+        "  app_secret_env: WA_SECRET\n",
+        "  app_secret_env: WA_SECRET\n  max_body_bytes: 10\n",
+        "max_body_bytes"
+    )]
+    #[case::empty_field("    - field: messages\n", "    - field: ''\n", "empty field")]
+    #[case::empty_table(
+        "table: staging.main.wa_events_messages",
+        "table: ''",
+        "empty destination table"
+    )]
+    #[case::no_columns(
+        "        - { name: raw, path: _raw, type: json, nullable: false }\n",
+        "",
+        "declares no columns"
+    )]
+    #[case::empty_env_name(
+        "verify_token_env: WA_VERIFY",
+        "verify_token_env: ''",
+        "empty environment variable"
+    )]
+    fn each_validation_rule_names_the_problem(
+        #[case] old: &str,
+        #[case] new: &str,
+        #[case] expected: &str,
+    ) {
+        let yaml = MINIMAL.replace(old, new);
+        assert_ne!(yaml, MINIMAL, "the case must change the document");
+        let err = WebhookDefinition::from_yaml_with_env(&yaml, env_all).unwrap_err();
+        assert!(format!("{err:#}").contains(expected), "{err:#}");
+    }
+
+    #[test]
+    fn a_definition_without_routes_is_refused() {
+        let yaml = "kind: webhook\nmetadata: { name: r }\nspec:\n  provider: meta_whatsapp\n  verify_token_env: WA_VERIFY\n  app_secret_env: WA_SECRET\n  routes: []\n";
+        let err = WebhookDefinition::from_yaml_with_env(yaml, env_all).unwrap_err();
+        assert!(format!("{err:#}").contains("at least one route"), "{err:#}");
+    }
+
+    #[test]
+    fn provider_label_and_optional_metadata_round_trip() {
+        let def = WebhookDefinition::from_yaml_with_env(MINIMAL, env_all)
+            .unwrap()
+            .unwrap();
+        assert_eq!(def.provider.label(), "meta_whatsapp");
+        assert!(def.description.is_none());
+        let yaml = MINIMAL.replace(
+            "version: \"1.0.0\"",
+            "version: \"1.0.0\", description: \"d\"",
+        );
+        let def = WebhookDefinition::from_yaml_with_env(&yaml, env_all)
+            .unwrap()
+            .unwrap();
+        assert_eq!(def.description.as_deref(), Some("d"));
+    }
 }

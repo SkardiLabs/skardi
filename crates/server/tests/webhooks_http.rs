@@ -737,3 +737,225 @@ async fn the_documented_whatsapp_bundle_loads_against_its_own_ddl() {
         assert_eq!(loaded.name(), job);
     }
 }
+
+/// An envelope whose single change carries both arrays, so one delivery
+/// feeds the messages route and the statuses route.
+fn both_arrays_envelope() -> Vec<u8> {
+    let mut envelope: Value = serde_json::from_slice(&fixture("text_message")).unwrap();
+    let statuses: Value = serde_json::from_slice(&fixture("status_delivered")).unwrap();
+    envelope["entry"][0]["changes"][0]["value"]["statuses"] =
+        statuses["entry"][0]["changes"][0]["value"]["statuses"].clone();
+    serde_json::to_vec(&envelope).unwrap()
+}
+
+#[tokio::test]
+async fn a_later_route_failure_reports_what_earlier_routes_committed() {
+    let (state, path, _dir) = server().await;
+    let conn = tokio_rusqlite::Connection::open(&path).await.unwrap();
+    conn.call(|c| {
+        c.execute_batch("DROP TABLE wa_events_statuses")
+            .map_err(tokio_rusqlite::Error::from)
+    })
+    .await
+    .unwrap();
+    conn.close().await.unwrap();
+
+    let body = both_arrays_envelope();
+    let resp = deliver(
+        &state,
+        "wa-inbound",
+        body.clone(),
+        Some(&sign(&body, APP_SECRET)),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let err = body_json(resp).await;
+    assert_eq!(err["error_type"], "write_error");
+    assert_eq!(err["details"]["route"], "statuses");
+    assert_eq!(err["details"]["committed"][0]["field"], "messages");
+    assert_eq!(err["details"]["committed"][0]["rows"], json!(1));
+    // The messages route really did commit before the statuses route failed.
+    let rows = query(
+        &state,
+        "SELECT count(*) AS n FROM staging.main.wa_events_messages",
+    )
+    .await;
+    assert_eq!(rows[0]["n"], json!(1));
+}
+
+#[tokio::test]
+async fn a_delivery_carrying_both_arrays_feeds_both_routes() {
+    let (state, _path, _dir) = server().await;
+    let body = both_arrays_envelope();
+    let resp = deliver(
+        &state,
+        "wa-inbound",
+        body.clone(),
+        Some(&sign(&body, APP_SECRET)),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let ack = body_json(resp).await;
+    assert_eq!(ack["rows"], json!(2));
+    assert_eq!(ack["routes"][0]["rows"], json!(1));
+    assert_eq!(ack["routes"][1]["rows"], json!(1));
+}
+
+#[tokio::test]
+async fn a_payload_that_lacks_a_non_nullable_column_is_a_conversion_error() {
+    // Same as WEBHOOK_YAML but `text` must be present — an image has none.
+    let yaml = WEBHOOK_YAML.replace(
+        "{ name: text,                path: text.body,                type: utf8, nullable: true }",
+        "{ name: text,                path: text.body,                type: utf8, nullable: false }",
+    );
+    assert_ne!(yaml, WEBHOOK_YAML);
+    let dir = TempDir::new().unwrap();
+    let path = create_db(&dir, &[MESSAGES_DDL, STATUSES_DDL]).await;
+    let state = setup_app_state(config(path, &[&yaml])).await.unwrap();
+
+    let body = fixture("image_message");
+    let resp = deliver(
+        &state,
+        "wa-inbound",
+        body.clone(),
+        Some(&sign(&body, APP_SECRET)),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let err = body_json(resp).await;
+    assert_eq!(err["error_type"], "conversion_error");
+    assert_eq!(err["details"]["route"], "messages");
+    let detail = err["details"]["error"].as_str().unwrap();
+    assert!(detail.contains("text"), "{detail}");
+    assert!(
+        !detail.contains("Taj Mahal"),
+        "values never appear: {detail}"
+    );
+    assert!(
+        query(&state, "SELECT 1 FROM staging.main.wa_events_messages")
+            .await
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn every_handshake_rejection_is_a_403_with_the_reason() {
+    let (state, _path, _dir) = server().await;
+    for (query_string, reason) in [
+        (
+            "hub.mode=unsubscribe&hub.verify_token=verify-me&hub.challenge=1",
+            "hub.mode",
+        ),
+        (
+            "hub.mode=subscribe&hub.verify_token=verify-me",
+            "hub.challenge",
+        ),
+        ("hub.mode=subscribe&hub.challenge=1", "hub.verify_token"),
+    ] {
+        let resp = configure_routes(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/webhooks/wa-inbound?{query_string}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{query_string}");
+        let err = body_json(resp).await;
+        assert_eq!(err["error_type"], "handshake_rejected");
+        assert!(err["error"].as_str().unwrap().contains(reason), "{err}");
+    }
+}
+
+#[tokio::test]
+async fn startup_refuses_a_destination_column_of_the_wrong_type() {
+    let dir = TempDir::new().unwrap();
+    let ddl = MESSAGES_DDL.replace("message_id TEXT NOT NULL", "message_id INTEGER NOT NULL");
+    assert_ne!(ddl, MESSAGES_DDL);
+    let path = create_db(&dir, &[&ddl, STATUSES_DDL]).await;
+    let err = setup_app_state(config(path, &[WEBHOOK_YAML]))
+        .await
+        .err()
+        .expect("a text id into an integer column must fail at startup");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("message_id"), "{msg}");
+    assert!(msg.contains("Int64"), "{msg}");
+    assert!(msg.contains("Utf8"), "{msg}");
+}
+
+/// The server-config loader: `--webhooks` over a directory with a webhook,
+/// a non-webhook file to skip, and the duplicate-name refusal.
+#[tokio::test]
+async fn load_server_config_scans_a_webhooks_directory() {
+    use skardi_server::config::load_server_config;
+
+    let dir = TempDir::new().unwrap();
+    let db = create_db(&dir, &[MESSAGES_DDL, STATUSES_DDL]).await;
+    let ctx = dir.path().join("ctx.yaml");
+    std::fs::write(
+        &ctx,
+        format!(
+            "kind: context\nmetadata: {{ name: t }}\nspec:\n  data_sources:\n    - name: staging\n      type: sqlite\n      path: {}\n      hierarchy_level: catalog\n      access_mode: read_write\n",
+            db.display()
+        ),
+    )
+    .unwrap();
+    let hooks = dir.path().join("webhooks");
+    std::fs::create_dir(&hooks).unwrap();
+    let yaml = WEBHOOK_YAML
+        .replace("TEST_WA_VERIFY", "LSC_WA_VERIFY")
+        .replace("TEST_WA_SECRET", "LSC_WA_SECRET");
+    std::fs::write(hooks.join("wa.yaml"), &yaml).unwrap();
+    std::fs::write(
+        hooks.join("notes.yaml"),
+        "kind: semantics\nmetadata: { name: n }\nspec: {}\n",
+    )
+    .unwrap();
+    // SAFETY: test-only, unique variable names, read once by the loader.
+    unsafe {
+        std::env::set_var("LSC_WA_VERIFY", VERIFY_TOKEN);
+        std::env::set_var("LSC_WA_SECRET", APP_SECRET);
+    }
+
+    let args = CliArgs {
+        ctx_file: Some(ctx.clone()),
+        webhooks_path: Some(hooks.clone()),
+        ..CliArgs::default()
+    };
+    let config = load_server_config(args).await.unwrap();
+    assert_eq!(config.webhooks.len(), 1);
+    assert!(config.webhooks.contains_key("wa-inbound"));
+
+    // A second file with the same name is refused.
+    std::fs::write(hooks.join("wa-again.yaml"), &yaml).unwrap();
+    let args = CliArgs {
+        ctx_file: Some(ctx.clone()),
+        webhooks_path: Some(hooks.clone()),
+        ..CliArgs::default()
+    };
+    let err = load_server_config(args)
+        .await
+        .err()
+        .expect("duplicate must fail");
+    assert!(
+        format!("{err:#}").contains("Duplicate webhook name"),
+        "{err:#}"
+    );
+
+    // A directory with no webhook at all loads nothing (and warns).
+    let empty = dir.path().join("nohooks");
+    std::fs::create_dir(&empty).unwrap();
+    std::fs::write(
+        empty.join("notes.yaml"),
+        "kind: semantics\nmetadata: { name: n }\nspec: {}\n",
+    )
+    .unwrap();
+    let args = CliArgs {
+        ctx_file: Some(ctx),
+        webhooks_path: Some(empty),
+        ..CliArgs::default()
+    };
+    let config = load_server_config(args).await.unwrap();
+    assert!(config.webhooks.is_empty());
+}
