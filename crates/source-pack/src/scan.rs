@@ -131,8 +131,12 @@ pub struct ScanBounds {
     /// [`OpenConnectorError::ScanBoundsExceeded`], never a quiet stop —
     /// stopping would report a PREFIX of the collection as the whole of it.
     pub max_pages: u32,
-    /// Wall-clock budget for the entire walk, request I/O and client-internal
-    /// retry backoff included.
+    /// Wall-clock budget for this scan's requests, I/O and client-internal
+    /// retry backoff included: the entire walk for an in-process scan, and
+    /// this process's share of it for a [`ActionScan::resume`]d one. A
+    /// durable walk's overall bound belongs to its owner (one page per
+    /// leased work, under the owner's own deadline), not to a wall clock
+    /// carried across processes.
     pub timeout: Duration,
 }
 

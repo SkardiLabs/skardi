@@ -296,6 +296,30 @@ What stays in `skardi` is what genuinely needs Arrow or DataFusion:
 | the page walk, producing JSON rows | converting rows to `RecordBatch`, projection, LIMIT |
 | the scan's page budget and deadline | the scan cache, keyed on the Arrow schema |
 
+### Durable, one-page-at-a-time walks
+
+A caller that spreads one walk over several processes (Skardi Cloud lists one
+page per durable work) resumes it from a saved position instead of re-running
+the pack's pagination rules itself:
+
+1. After handling a page, call `ActionScan::advance`. If it returns `false`
+   the walk is complete; persist nothing further.
+2. Otherwise persist `ActionScan::position()` (a serializable `PagePosition`:
+   page number and opaque cursor; `Debug` hides the cursor) together with the
+   page's rows, in one transaction.
+3. The next process builds a fresh `ActionScan` for the same table and
+   resource, calls `resume(position)` before any request, and fetches one page.
+   A scan that has already fetched refuses to be re-positioned.
+
+A resumed scan keeps every in-process check: authoritative raw page counts,
+has-more validation, split continuation actions, and immediate cursor-repeat
+detection. What it cannot see is history from other processes, so the owner
+of the walk must refuse a position it has already accepted (cross-process loop
+fencing), and owns the walk's overall deadline: `ScanBounds::timeout` bounds
+only the resumed process's share. A refused action's structured `data` (for
+example Dropbox's `reset` cursor) is kept on `ActionExecutionFailed` as a
+`ProviderData`, which never prints its contents.
+
 ### What the client does not gate
 
 `OpenConnectorClient::execute` and the `ActionScan` walk validate an action id
