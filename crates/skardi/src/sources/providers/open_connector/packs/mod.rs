@@ -13,3 +13,4 @@ pub mod notion;
 pub mod one_drive;
 pub mod outlook;
 pub mod slack;
+pub mod whatsapp;

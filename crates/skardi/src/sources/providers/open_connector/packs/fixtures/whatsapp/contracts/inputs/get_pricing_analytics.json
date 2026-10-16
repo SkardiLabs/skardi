@@ -1,0 +1,105 @@
+{
+  "type": "object",
+  "properties": {
+    "waba_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "WhatsApp Business Account ID. Omit to use the default credential WABA ID."
+    },
+    "start": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Start of the reporting window as a UNIX timestamp in seconds. Defaults to 30 days before end."
+    },
+    "end": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "End of the reporting window as a UNIX timestamp in seconds. Defaults to now."
+    },
+    "granularity": {
+      "type": "string",
+      "enum": [
+        "HALF_HOUR",
+        "DAILY",
+        "MONTHLY"
+      ],
+      "description": "Width of each data point.",
+      "default": "DAILY"
+    },
+    "phone_numbers": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "Business phone numbers to include, in international format without the plus sign. Omit to include every number in the WABA."
+    },
+    "country_codes": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "Two-letter country codes to include. Omit to include every country."
+    },
+    "metric_types": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "COST",
+          "VOLUME"
+        ],
+        "description": "Pricing metric."
+      },
+      "description": "Metrics to return. Omit for both. COST is withheld for WABAs billed through a Solution Partner's credit line."
+    },
+    "pricing_types": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "FREE_CUSTOMER_SERVICE",
+          "FREE_ENTRY_POINT",
+          "REGULAR"
+        ],
+        "description": "Pricing type."
+      },
+      "description": "Pricing types to include. Omit for all."
+    },
+    "pricing_categories": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "AUTHENTICATION",
+          "AUTHENTICATION_INTERNATIONAL",
+          "MARKETING",
+          "MARKETING_LITE",
+          "SERVICE",
+          "UTILITY",
+          "REFERRAL_CONVERSION"
+        ],
+        "description": "Pricing category."
+      },
+      "description": "Pricing categories to include. Omit for all."
+    },
+    "dimensions": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "COUNTRY",
+          "PHONE",
+          "PRICING_CATEGORY",
+          "PRICING_TYPE",
+          "TIER"
+        ],
+        "description": "Breakdown dimension."
+      },
+      "description": "Dimensions to break each data point down by. Omit for totals per window."
+    }
+  },
+  "additionalProperties": false,
+  "description": "Input for reading WhatsApp pricing analytics."
+}

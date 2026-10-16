@@ -1,0 +1,57 @@
+{
+  "type": "object",
+  "properties": {
+    "waba_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "WhatsApp Business Account ID. Omit to use the default credential WABA ID."
+    },
+    "start": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Start of the reporting window as a UNIX timestamp in seconds. Defaults to 30 days before end."
+    },
+    "end": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "End of the reporting window as a UNIX timestamp in seconds. Defaults to now."
+    },
+    "granularity": {
+      "type": "string",
+      "enum": [
+        "HALF_HOUR",
+        "DAY",
+        "MONTH"
+      ],
+      "description": "Width of each data point.",
+      "default": "DAY"
+    },
+    "phone_numbers": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "Business phone numbers to include, in international format without the plus sign. Omit to include every number in the WABA."
+    },
+    "product_types": {
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "minimum": 0,
+        "description": "Meta product type code."
+      },
+      "description": "Message types to include: 0 for template messages sent to users, 2 for non-template messages sent to users, 100 for messages received from users. Omit to include all."
+    },
+    "country_codes": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "Two-letter country codes to include. Omit to include every country."
+    }
+  },
+  "additionalProperties": false,
+  "description": "Input for reading WhatsApp message analytics."
+}

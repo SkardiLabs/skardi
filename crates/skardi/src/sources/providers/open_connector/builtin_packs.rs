@@ -1,13 +1,13 @@
 //! The built-in source packs this Skardi build ships, and their tests.
 //!
 //! `skardi-source-pack` owns `SourcePackRegistry`; this owns what goes in it.
-//! The split is content versus machinery: eleven provider assets are this
+//! The split is content versus machinery: twelve provider assets are this
 //! binary's choices, and a library that hardcoded them would be making its
 //! consumers' choices too — cloud registers a different set against the same
 //! type.
 //!
 //! The tests came here with the content rather than staying with the type they
-//! call. Every one of them asserts something about the eleven assets — that
+//! call. Every one of them asserts something about the twelve assets — that
 //! github's pack is registered, that iteration is in name order, that the
 //! reconciled set matches what the cloud pin carried — which is a fact about
 //! this build, not about a registry.
@@ -20,7 +20,7 @@ use super::packs;
 /// The built-in source packs this Skardi build ships.
 ///
 /// The list lives here rather than in `skardi-source-pack` because it is
-/// CONTENT, not machinery: eleven provider assets are this binary's choices,
+/// CONTENT, not machinery: twelve provider assets are this binary's choices,
 /// and a library that hardcoded them would be making its consumers' choices
 /// too. The pack owns `SourcePackRegistry`; callers supply what goes in it,
 /// which is what lets cloud register a different set against the same type.
@@ -54,6 +54,7 @@ pub fn builtin_pack_registry() -> Result<SourcePackRegistry, OpenConnectorError>
         packs::outlook::pack()?,
         packs::one_drive::pack()?,
         packs::google_drive::pack()?,
+        packs::whatsapp::pack()?,
     ])
 }
 
@@ -102,7 +103,18 @@ mod tests {
         // `additionalProperties: false`, which puts its columns inside the
         // fingerprint gate — an upstream rename fails registration rather
         // than surfacing as a null column mid-scan.
-        const OBJECT_ROW_TABLES: &[&str] = &["feishu.document_content", "notion.page_markdown"];
+        //
+        // `whatsapp.business_profile` is the third: `get_business_profile`
+        // takes one `phone_number_id` and returns that number's profile
+        // object, one binding per number. Its schema is `looseObject`
+        // (`additionalProperties: true`), so unlike Notion's the fingerprint
+        // gate covers only the declared keys; the executor's normalizer
+        // emits exactly those, which the live pass confirms column by column.
+        const OBJECT_ROW_TABLES: &[&str] = &[
+            "feishu.document_content",
+            "notion.page_markdown",
+            "whatsapp.business_profile",
+        ];
 
         let registry = super::builtin_pack_registry().expect("embedded assets parse");
         let mut object_tables = Vec::new();
@@ -204,7 +216,8 @@ mod tests {
                 "notion",
                 "one_drive",
                 "outlook",
-                "slack"
+                "slack",
+                "whatsapp"
             ]
         );
     }
@@ -344,6 +357,26 @@ mod tests {
     }
 
     #[test]
+    fn builtin_whatsapp_pack_is_registered() {
+        let registry = super::builtin_pack_registry().expect("embedded assets parse");
+        let pack = registry.require("whatsapp").unwrap();
+        assert_eq!(pack.name, "whatsapp");
+        assert_eq!(pack.version, 1);
+        let ids: Vec<&str> = pack.tables.iter().map(|table| table.id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "whatsapp.business_profile",
+                "whatsapp.message_analytics",
+                "whatsapp.message_templates",
+                "whatsapp.phone_numbers",
+                "whatsapp.pricing_analytics",
+                "whatsapp.template_analytics",
+            ]
+        );
+    }
+
+    #[test]
     fn builtin_pack_short_names_stay_unambiguous() {
         // The short-name convention (`tables: [issues]`) is only sound while
         // every built-in pack keeps `<pack>.<table>` IDs with unique last
@@ -361,6 +394,7 @@ mod tests {
             "outlook",
             "one_drive",
             "google_drive",
+            "whatsapp",
         ] {
             let pack = registry.require(name).unwrap();
             let mut seen = std::collections::HashSet::new();

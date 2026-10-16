@@ -1,0 +1,80 @@
+{
+  "type": "object",
+  "properties": {
+    "waba_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "WhatsApp Business Account ID. Omit to use the default credential WABA ID."
+    },
+    "template_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "Meta template IDs to report on.",
+      "minItems": 1,
+      "maxItems": 10
+    },
+    "start": {
+      "anyOf": [
+        {
+          "type": "integer",
+          "minimum": 0,
+          "description": "UNIX timestamp in seconds; Meta rounds it back to 00:00 UTC of that day."
+        },
+        {
+          "type": "string",
+          "description": "Calendar date as YYYY-MM-DD.",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+        }
+      ],
+      "description": "Start of the reporting window. Defaults to 30 days before end. Meta keeps 90 days of history."
+    },
+    "end": {
+      "anyOf": [
+        {
+          "type": "integer",
+          "minimum": 0,
+          "description": "UNIX timestamp in seconds; Meta rounds it back to 00:00 UTC of that day."
+        },
+        {
+          "type": "string",
+          "description": "Calendar date as YYYY-MM-DD.",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+        }
+      ],
+      "description": "End of the reporting window. Defaults to today."
+    },
+    "metric_types": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "description": "Template metric, such as COST, CLICKED, DELIVERED, READ, or SENT."
+      },
+      "description": "Metrics to return. Omit for all. Conversion metrics such as APP_PURCHASES exist for Marketing Messages API businesses only."
+    },
+    "product_type": {
+      "type": "string",
+      "enum": [
+        "CLOUD_API",
+        "MARKETING_MESSAGES_API_FOR_WHATSAPP"
+      ],
+      "description": "Which product's template sends to report on. Omit for Cloud API."
+    },
+    "use_waba_timezone": {
+      "type": "boolean",
+      "description": "Whether daily windows follow the WABA's configured timezone instead of UTC. Timestamps passed as start or end are converted to YYYY-MM-DD, which Meta requires in this mode.",
+      "default": false
+    },
+    "after": {
+      "type": "string",
+      "description": "Pagination cursor returned by a previous response."
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "template_ids"
+  ],
+  "description": "Input for reading WhatsApp template analytics."
+}

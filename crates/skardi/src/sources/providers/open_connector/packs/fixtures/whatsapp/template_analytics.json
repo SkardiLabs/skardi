@@ -1,0 +1,51 @@
+{
+  "waba_timezone": "America/Los_Angeles",
+  "data_points": [
+    {
+      "template_id": "200000000000001",
+      "start": 1759276800,
+      "end": 1759363200,
+      "sent": 1,
+      "delivered": 1,
+      "read": 1,
+      "cost": [
+        {
+          "type": "amount_spent",
+          "value": 0.01
+        },
+        {
+          "type": "cost_per_delivered",
+          "value": 0.01
+        }
+      ]
+    },
+    {
+      "template_id": "200000000000002",
+      "start": 1759276800,
+      "end": 1759363200,
+      "sent": 1,
+      "delivered": 1,
+      "read": 1,
+      "clicked": [
+        {
+          "type": "quick_reply_button",
+          "button_content": "Contact Support",
+          "count": 108
+        }
+      ],
+      "cost": [
+        {
+          "type": "amount_spent",
+          "value": 0.03
+        }
+      ]
+    }
+  ],
+  "paging": {
+    "cursors": {
+      "before": "MAZDZD",
+      "after": "MjQZD"
+    },
+    "hasMore": false
+  }
+}
