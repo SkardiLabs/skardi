@@ -624,7 +624,8 @@ impl OpenConnectorClient {
                     error_code: envelope_error_code(&body),
                     data: serde_json::from_str::<Value>(&body)
                         .ok()
-                        .and_then(|body| body.get("data").cloned()),
+                        .and_then(|body| body.get("data").cloned())
+                        .map(crate::error::ProviderData),
                     message: envelope_message(&body),
                     echoed_action_id: envelope_action_id(&body),
                     reason: terminal_reason(status, &body),
@@ -646,7 +647,7 @@ impl OpenConnectorClient {
                 // the HTTP code says nothing about what went wrong.
                 status: None,
                 error_code: envelope.error_code.clone(),
-                data: envelope.data.clone(),
+                data: envelope.data.clone().map(crate::error::ProviderData),
                 message: envelope.message.clone(),
                 echoed_action_id: envelope_action_id(&text),
                 reason: envelope.failure_reason(),
@@ -1687,9 +1688,14 @@ mod structured_failure_tests {
                 OpenConnectorError::ActionExecutionFailed { status, data, .. } => {
                     assert_eq!(status, Some(code), "status must survive as a field");
                     assert_eq!(
-                        data.unwrap()["error"][".tag"],
+                        data.as_ref().unwrap().0["error"][".tag"],
                         "reset",
                         "typed refusal survives gateway wrapping"
+                    );
+                    assert_eq!(
+                        format!("{data:?}"),
+                        "Some(ProviderData(..))",
+                        "never logged"
                     );
                 }
                 other => panic!("expected ActionExecutionFailed, got {other}"),

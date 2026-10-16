@@ -96,6 +96,18 @@ impl std::fmt::Display for LastAttempt {
     }
 }
 
+/// A gateway refusal's structured `data`, kept for callers that branch on
+/// it (a reset cursor, a provider status). It may carry cursors or provider
+/// text, so `Debug` reports only that it exists; read it through `.0`.
+#[derive(Clone, PartialEq)]
+pub struct ProviderData(pub serde_json::Value);
+
+impl std::fmt::Debug for ProviderData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ProviderData(..)")
+    }
+}
+
 /// Errors surfaced while validating or registering an Open Connector gateway
 /// data source.
 ///
@@ -329,7 +341,7 @@ pub enum OpenConnectorError {
         error_code: Option<String>,
         /// Structured provider refusal facts (e.g. a reset cursor or a 404
         /// hidden inside the gateway's HTTP 400). Never display this payload.
-        data: Option<serde_json::Value>,
+        data: Option<ProviderData>,
         /// The gateway envelope's `message`, when it sent one.
         ///
         /// Provider-influenced text, and carried as a field precisely so a
