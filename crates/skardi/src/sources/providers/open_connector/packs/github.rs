@@ -764,6 +764,11 @@ bindings:
 
         let bodies = execute_bodies(&gateway);
         assert_eq!(bodies.len(), 2, "150 rows at perPage=100 → 2 pages");
+        for body in &bodies {
+            let input: serde_json::Value = serde_json::from_str(body).unwrap();
+            assert_eq!(input["input"]["sort"], "created");
+            assert_eq!(input["input"]["direction"], "asc");
+        }
         assert!(bodies[0].contains(r#""page":1"#) && bodies[0].contains(r#""perPage":100"#));
         assert!(bodies[1].contains(r#""page":2"#));
         assert!(
