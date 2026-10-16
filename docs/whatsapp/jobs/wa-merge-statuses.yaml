@@ -18,8 +18,8 @@ spec:
            pricing_category, billable, error_code, raw,
            arrow_cast(ingested_at, 'Timestamp(Millisecond, Some("UTC"))') AS ingested_at
     FROM staging.main.wa_events_statuses
-    WHERE ingested_at >= {since}
-    ORDER BY ingested_at, message_id, status
+    WHERE arrow_cast(ingested_at, 'Timestamp(Millisecond, Some("UTC"))') >= arrow_cast({since}, 'Timestamp(Millisecond, Some("UTC"))')
+    ORDER BY arrow_cast(ingested_at, 'Timestamp(Millisecond, Some("UTC"))'), message_id, status
   destination:
     table: "wa_statuses"          # the `type: lance` source of that name in ctx_whatsapp.yaml
     mode: upsert

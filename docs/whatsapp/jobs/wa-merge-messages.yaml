@@ -26,8 +26,11 @@ spec:
            reply_to_message_id, interactive_reply_id, raw,
            arrow_cast(ingested_at, 'Timestamp(Millisecond, Some("UTC"))') AS ingested_at
     FROM staging.main.wa_events_messages
-    WHERE ingested_at >= {since}
-    ORDER BY ingested_at, message_id
+    -- Compare and order as timestamps, not text: SQLite stores ingested_at as
+    -- ISO text whose zero fraction is dropped ("...:00Z" vs "...:00.500Z"),
+    -- which does not sort chronologically as a string.
+    WHERE arrow_cast(ingested_at, 'Timestamp(Millisecond, Some("UTC"))') >= arrow_cast({since}, 'Timestamp(Millisecond, Some("UTC"))')
+    ORDER BY arrow_cast(ingested_at, 'Timestamp(Millisecond, Some("UTC"))'), message_id
   destination:
     table: "wa_messages"          # the `type: lance` source of that name in ctx_whatsapp.yaml
     mode: upsert

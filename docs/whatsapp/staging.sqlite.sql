@@ -6,7 +6,10 @@
 -- mismatch.
 --
 -- Timestamps are TEXT and land as ISO-8601 UTC instants
--- ("2025-06-08T20:59:43Z"), which compare and sort correctly as strings.
+-- ("2025-06-08T20:59:43Z"). Meta's timestamps are whole seconds, so those
+-- compare as strings; ingested_at carries milliseconds and a zero fraction
+-- is dropped on write, so the merge jobs compare and order it as a
+-- timestamp (arrow_cast), never as text.
 --
 --   sqlite3 staging.db < docs/whatsapp/staging.sqlite.sql
 
@@ -44,6 +47,16 @@ CREATE TABLE IF NOT EXISTS wa_events_statuses (
     error_code          INTEGER,
     raw                 TEXT    NOT NULL,
     ingested_at         TEXT    NOT NULL
+);
+
+-- Rows the receiver could not map to a route's columns (an unknown message
+-- type, a key missing where the route declared it non-null). Fixed shape;
+-- one table serves every route. Query it, fix the route, re-insert.
+CREATE TABLE IF NOT EXISTS wa_events_dead_letter (
+    route       TEXT NOT NULL,
+    raw         TEXT NOT NULL,
+    error       TEXT NOT NULL,
+    ingested_at TEXT NOT NULL
 );
 
 -- The merge jobs watermark on arrival time.

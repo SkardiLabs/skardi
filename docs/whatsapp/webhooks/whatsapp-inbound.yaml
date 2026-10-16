@@ -21,6 +21,13 @@ spec:
   app_secret_env: WHATSAPP_APP_SECRET
   max_body_bytes: 4194304
 
+  # A row the converter rejects (a new message type lacking a key a route
+  # declares non-null, a timestamp that is not digits) is deterministic:
+  # retrying it can never succeed. With a dead-letter table the delivery is
+  # acknowledged and such rows are quarantined with their error; without one
+  # the whole delivery answers 500 and Meta retries it for a week.
+  dead_letter: { table: staging.main.wa_events_dead_letter }
+
   routes:
     # One row per inbound message. `to_wa_id` is NULL here: inbound rows
     # identify the business side by phone_number_id. The sender's own copy

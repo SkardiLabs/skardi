@@ -11,10 +11,9 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
-use skardi::sources::providers::open_connector::json_to_arrow::ColumnSpec;
+use skardi::sources::providers::open_connector::json_to_arrow::{ColumnDoc, ColumnSpec};
 
 use super::INGESTED_AT_COLUMN;
-use super::columns::ColumnDoc;
 
 /// The `kind:` value that marks a webhook resource file.
 pub const WEBHOOK_KIND: &str = "webhook";
@@ -120,6 +119,10 @@ pub struct WebhookDefinition {
     pub max_body_bytes: usize,
     /// Routes, applied in order to every delivery.
     pub routes: Vec<RouteDefinition>,
+    /// Table that receives rows the converter rejects, with the route, the
+    /// original object, the error, and the arrival time. Without one, a
+    /// rejected row fails the whole delivery with a 500.
+    pub dead_letter: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -156,6 +159,14 @@ struct SpecDoc {
     #[serde(default = "default_max_body_bytes")]
     max_body_bytes: usize,
     routes: Vec<RouteDoc>,
+    #[serde(default)]
+    dead_letter: Option<DeadLetterDoc>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeadLetterDoc {
+    table: String,
 }
 
 fn default_max_body_bytes() -> usize {
@@ -284,6 +295,13 @@ impl WebhookDefinition {
         for route in spec.routes {
             routes.push(convert_route(&name, route)?);
         }
+        let dead_letter = match spec.dead_letter {
+            Some(DeadLetterDoc { table }) if table.trim().is_empty() => {
+                return Err(anyhow!("webhook '{name}': dead_letter.table is empty"));
+            }
+            Some(DeadLetterDoc { table }) => Some(table),
+            None => None,
+        };
 
         Ok(Self {
             name,
@@ -294,6 +312,7 @@ impl WebhookDefinition {
             app_secret,
             max_body_bytes: spec.max_body_bytes,
             routes,
+            dead_letter,
         })
     }
 }
@@ -559,6 +578,39 @@ spec:
         assert_ne!(yaml, MINIMAL, "the case must change the document");
         let err = WebhookDefinition::from_yaml_with_env(&yaml, env_all).unwrap_err();
         assert!(format!("{err:#}").contains(expected), "{err:#}");
+    }
+
+    #[test]
+    fn dead_letter_is_optional_and_its_table_must_not_be_empty() {
+        let def = WebhookDefinition::from_yaml_with_env(MINIMAL, env_all)
+            .unwrap()
+            .unwrap();
+        assert!(def.dead_letter.is_none());
+        let yaml = MINIMAL.replace(
+            "  routes:\n",
+            "  dead_letter: { table: staging.main.wa_events_dead_letter }\n  routes:\n",
+        );
+        let def = WebhookDefinition::from_yaml_with_env(&yaml, env_all)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            def.dead_letter.as_deref(),
+            Some("staging.main.wa_events_dead_letter")
+        );
+        let yaml = MINIMAL.replace("  routes:\n", "  dead_letter: { table: '' }\n  routes:\n");
+        let err = WebhookDefinition::from_yaml_with_env(&yaml, env_all).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("dead_letter.table is empty"),
+            "{err:#}"
+        );
+        let yaml = MINIMAL.replace(
+            "  routes:\n",
+            "  dead_letter: { table: x, mode: append }\n  routes:\n",
+        );
+        assert!(
+            WebhookDefinition::from_yaml_with_env(&yaml, env_all).is_err(),
+            "unknown keys refused"
+        );
     }
 
     #[test]

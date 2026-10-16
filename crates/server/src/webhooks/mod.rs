@@ -18,14 +18,14 @@
 //!
 //! Module layout:
 //! - [`definition`] — the YAML resource and its validation.
-//! - [`columns`] — the `columns:` grammar, a copy of the pack loader's (which
-//!   is private to the engine crate) mapped onto the shared `ColumnSpec`.
+//! - the `columns:` grammar is the source pack's own `ColumnDoc`, shared
+//!   through `skardi-source-pack` so a webhook route and a pack table parse
+//!   one definition.
 //! - [`meta_whatsapp`] — the `meta_whatsapp` provider preset.
 //! - [`registry`] — definitions compiled against the live session at startup,
 //!   including the destination-table preflight.
 //! - [`handlers`] — the axum handlers.
 
-pub mod columns;
 pub mod definition;
 pub mod handlers;
 pub mod meta_whatsapp;

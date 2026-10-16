@@ -43,5 +43,12 @@ CREATE TABLE IF NOT EXISTS wa_events_statuses (
     ingested_at         TIMESTAMPTZ NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS wa_events_dead_letter (
+    route       TEXT        NOT NULL,
+    raw         TEXT        NOT NULL,
+    error       TEXT        NOT NULL,
+    ingested_at TIMESTAMPTZ NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS wa_events_messages_ingested_at ON wa_events_messages (ingested_at);
 CREATE INDEX IF NOT EXISTS wa_events_statuses_ingested_at ON wa_events_statuses (ingested_at);

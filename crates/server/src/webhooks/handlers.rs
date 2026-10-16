@@ -10,20 +10,26 @@
 //!
 //! | status | meaning | provider retries? |
 //! |---|---|---|
-//! | 200 | rows committed (possibly zero) | no |
+//! | 200 | rows committed (possibly zero; rejected rows quarantined when a dead-letter table exists) | no |
 //! | 401 | signature missing or wrong | yes, and it will keep failing — check the app secret |
 //! | 403 | handshake token wrong | n/a (subscription setup) |
 //! | 404 | no such webhook | yes — check the route name |
 //! | 413 | body over `max_body_bytes` | yes |
-//! | 400 | verified body is not a JSON envelope | yes |
-//! | 500 | conversion or write failed after verification | yes, up to seven days |
+//! | 400 | verified body is not a WhatsApp envelope (not JSON, no `entry`, another product's `object`) | yes |
+//! | 500 | the write failed, or rows were rejected and no dead-letter table is configured | yes, up to seven days |
 //!
-//! Nothing is acknowledged early: a 200 means the transaction committed.
+//! A write failure is transient and the retry is what repairs it. A row
+//! the converter rejects is deterministic — every redelivery of that body
+//! fails identically — so with a `dead_letter` table the delivery is
+//! acknowledged and the rejected rows are quarantined with their error;
+//! without one, the 500 is the honest answer, and the docs say so.
+//! Nothing is acknowledged early: a 200 means the transactions committed.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use arrow::record_batch::RecordBatch;
 use axum::Json;
 use axum::body::{Body, to_bytes};
 use axum::extract::{Path, Query, State};
@@ -34,8 +40,10 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use serde_json::{Value, json};
 use skardi::jobs::{DestinationMode, JobDestination, SqlDmlDestination};
 
-use super::meta_whatsapp::{self, HandshakeError, SIGNATURE_HEADER, SignatureError, UnwrapError};
-use super::registry::CompiledWebhook;
+use super::meta_whatsapp::{
+    self, HandshakeError, SIGNATURE_HEADER, SignatureError, UnwrapError, WHATSAPP_OBJECT,
+};
+use super::registry::{CompiledRoute, CompiledWebhook};
 use crate::response::create_error_response;
 use crate::server::AppState;
 
@@ -175,8 +183,9 @@ pub async fn webhook_receive(
     match apply_routes(&state, &name, &webhook, &envelope).await {
         Ok(written) => {
             let total: usize = written.iter().map(|w| w.rows).sum();
+            let quarantined: usize = written.iter().map(|w| w.quarantined).sum();
             tracing::info!(
-                "webhook {name}: delivery accepted: {} row(s) across {} route(s) [{}] waba_ids={:?} in {}ms",
+                "webhook {name}: delivery accepted: {} row(s) across {} route(s) [{}] quarantined={} waba_ids={:?} in {}ms",
                 total,
                 written.len(),
                 written
@@ -184,6 +193,7 @@ pub async fn webhook_receive(
                     .map(|w| format!("{}:{}", w.field, w.rows))
                     .collect::<Vec<_>>()
                     .join(","),
+                quarantined,
                 waba_ids(&envelope),
                 started.elapsed().as_millis()
             );
@@ -194,6 +204,7 @@ pub async fn webhook_receive(
                 "success": true,
                 "webhook": name,
                 "rows": total,
+                "quarantined": quarantined,
                 "routes": written.iter().map(Written::to_json).collect::<Vec<_>>(),
             }))
             .into_response()
@@ -201,21 +212,21 @@ pub async fn webhook_receive(
         Err(RouteFailure { kind, committed }) => {
             let committed_json: Vec<Value> = committed.iter().map(Written::to_json).collect();
             match kind {
-                FailureKind::NotAnEnvelope => {
-                    tracing::warn!("webhook {name}: verified body is not a webhook envelope");
+                FailureKind::Envelope { reason } => {
+                    tracing::warn!("webhook {name}: verified body rejected: {reason}");
                     finish_error(
                         &state,
                         &name,
                         started,
                         StatusCode::BAD_REQUEST,
                         outcome::INVALID_PAYLOAD,
-                        "verified body is JSON but not a webhook envelope (no `entry` array)",
+                        &reason,
                         None,
                     )
                 }
                 FailureKind::Conversion { route, error } => {
                     tracing::error!(
-                        "webhook {name}: route {route}: rows could not be mapped to the declared columns: {error}"
+                        "webhook {name}: route {route}: rows could not be mapped to the declared columns and no dead_letter table is configured: {error}"
                     );
                     finish_error(
                         &state,
@@ -223,7 +234,7 @@ pub async fn webhook_receive(
                         started,
                         StatusCode::INTERNAL_SERVER_ERROR,
                         outcome::CONVERSION_ERROR,
-                        "rows could not be mapped to the declared columns",
+                        "rows could not be mapped to the declared columns (configure `dead_letter` to quarantine them instead)",
                         Some(json!({"route": route, "error": error, "committed": committed_json})),
                     )
                 }
@@ -257,11 +268,12 @@ struct Written {
     field: String,
     table: String,
     rows: usize,
+    quarantined: usize,
 }
 
 impl Written {
     fn to_json(&self) -> Value {
-        json!({"field": self.field, "table": self.table, "rows": self.rows})
+        json!({"field": self.field, "table": self.table, "rows": self.rows, "quarantined": self.quarantined})
     }
 }
 
@@ -272,7 +284,9 @@ struct RouteFailure {
 }
 
 enum FailureKind {
-    NotAnEnvelope,
+    Envelope {
+        reason: String,
+    },
     Conversion {
         route: String,
         error: String,
@@ -300,11 +314,18 @@ async fn apply_routes(
     let ingested_at_ms = chrono::Utc::now().timestamp_millis();
     let mut committed = Vec::with_capacity(webhook.routes.len());
     for route in &webhook.routes {
-        match apply_route(state, route, envelope, ingested_at_ms).await {
+        match apply_route(state, webhook, route, envelope, ingested_at_ms).await {
             Ok(written) => {
                 state
                     .webhook_metrics
                     .record_rows(name, &written.field, written.rows as u64);
+                if written.quarantined > 0 {
+                    state.webhook_metrics.record_quarantined(
+                        name,
+                        &written.field,
+                        written.quarantined as u64,
+                    );
+                }
                 committed.push(written);
             }
             Err(kind) => return Err(RouteFailure { kind, committed }),
@@ -315,40 +336,107 @@ async fn apply_routes(
 
 async fn apply_route(
     state: &AppState,
-    route: &super::registry::CompiledRoute,
+    webhook: &CompiledWebhook,
+    route: &CompiledRoute,
     envelope: &Value,
     ingested_at_ms: i64,
 ) -> Result<Written, FailureKind> {
-    let rows = meta_whatsapp::unwrap_rows(envelope, &route.field, route.rows)
-        .map_err(|UnwrapError::NotAnEnvelope| FailureKind::NotAnEnvelope)?;
-    let count = rows.len();
-    if count > 0 {
-        let batch = route
-            .convert(&rows, ingested_at_ms)
+    let rows = meta_whatsapp::unwrap_rows(envelope, &route.field, route.rows).map_err(|e| {
+        FailureKind::Envelope {
+            reason: match e {
+                UnwrapError::NotAnEnvelope => {
+                    "verified body is JSON but not a webhook envelope (no `entry` array)"
+                        .to_string()
+                }
+                UnwrapError::WrongObject { found } => format!(
+                    "verified body is a '{found}' webhook, not '{WHATSAPP_OBJECT}'; another \
+                     product of the same Meta app is pointed at this URL"
+                ),
+            },
+        }
+    })?;
+
+    let converted =
+        route
+            .convert_rows(&rows, ingested_at_ms)
             .map_err(|e| FailureKind::Conversion {
                 route: route.field.clone(),
                 error: format!("{e:#}"),
             })?;
-        let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
-            batch.schema(),
-            futures::stream::iter(vec![Ok(batch)]),
-        ));
-        let destination =
-            SqlDmlDestination::new(Arc::clone(&state.session_ctx), route.table.clone());
-        destination
-            .write(stream, DestinationMode::Append)
+
+    // A rejected row is deterministic: only a quarantine table makes
+    // acknowledging the delivery honest. Decide before writing anything so
+    // a 500 here leaves this route's table untouched.
+    let dead_letter = match (&converted.rejected[..], &webhook.dead_letter) {
+        ([], _) => None,
+        (_, Some(dead_letter)) => Some(dead_letter),
+        (rejected, None) => {
+            return Err(FailureKind::Conversion {
+                route: route.field.clone(),
+                error: format!(
+                    "{} of {} row(s) rejected; first: {}",
+                    rejected.len(),
+                    rows.len(),
+                    rejected[0].error
+                ),
+            });
+        }
+    };
+
+    let mut written_rows = 0;
+    if let Some(batch) = converted.batch {
+        written_rows = batch.num_rows();
+        write(state, &route.table, batch)
             .await
-            .map_err(|e| FailureKind::Write {
+            .map_err(|error| FailureKind::Write {
                 route: route.field.clone(),
                 table: route.table.clone(),
+                error,
+            })?;
+    }
+    let quarantined = converted.rejected.len();
+    if let Some(dead_letter) = dead_letter {
+        for rejected in &converted.rejected {
+            tracing::warn!(
+                "webhook: route {}: row {} quarantined to {}: {}",
+                route.field,
+                rejected.index,
+                dead_letter.table,
+                rejected.error
+            );
+        }
+        let batch = dead_letter
+            .batch(&route.field, &converted.rejected, ingested_at_ms)
+            .map_err(|e| FailureKind::Conversion {
+                route: route.field.clone(),
                 error: format!("{e:#}"),
+            })?;
+        write(state, &dead_letter.table, batch)
+            .await
+            .map_err(|error| FailureKind::Write {
+                route: route.field.clone(),
+                table: dead_letter.table.clone(),
+                error,
             })?;
     }
     Ok(Written {
         field: route.field.clone(),
         table: route.table.clone(),
-        rows: count,
+        rows: written_rows,
+        quarantined,
     })
+}
+
+async fn write(state: &AppState, table: &str, batch: RecordBatch) -> Result<(), String> {
+    let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+        batch.schema(),
+        futures::stream::iter(vec![Ok(batch)]),
+    ));
+    SqlDmlDestination::new(Arc::clone(&state.session_ctx), table.to_string())
+        .write(stream, DestinationMode::Append)
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("{e:#}"))
 }
 
 /// Distinct `entry[].id` values, for the one-line log. Bounded so a batched

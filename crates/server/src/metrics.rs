@@ -96,6 +96,7 @@ impl PipelineMetrics {
 /// |---------------------------|-----------|-------------------|
 /// | `webhook_requests_total`  | Counter   | `name`, `outcome` |
 /// | `webhook_rows_total`      | Counter   | `name`, `field`   |
+/// | `webhook_quarantined_rows_total` | Counter | `name`, `field` |
 /// | `webhook_latency_ms`      | Histogram | `name`            |
 ///
 /// `outcome` is `ok` for a committed delivery, `handshake_ok` /
@@ -110,6 +111,8 @@ pub struct WebhookMetrics {
     pub requests_total: Counter<u64>,
     /// Rows appended per webhook + route field
     pub rows_total: Counter<u64>,
+    /// Rows the converter rejected and the dead-letter table received
+    pub quarantined_total: Counter<u64>,
     /// End-to-end handler latency in milliseconds
     pub latency_ms: Histogram<f64>,
 }
@@ -136,6 +139,13 @@ impl WebhookMetrics {
                 .with_description("Rows appended by webhook deliveries, per route field")
                 .with_unit("{row}")
                 .build(),
+            quarantined_total: meter
+                .u64_counter("webhook_quarantined_rows_total")
+                .with_description(
+                    "Rows a webhook delivery carried that the converter rejected and the dead-letter table received",
+                )
+                .with_unit("{row}")
+                .build(),
             latency_ms: meter
                 .f64_histogram("webhook_latency_ms")
                 .with_description("Webhook handler latency in milliseconds")
@@ -155,6 +165,17 @@ impl WebhookMetrics {
         );
         self.latency_ms
             .record(latency_ms, &[KeyValue::new("name", name.to_string())]);
+    }
+
+    /// Record rows quarantined for one route of one delivery.
+    pub fn record_quarantined(&self, name: &str, field: &str, rows: u64) {
+        self.quarantined_total.add(
+            rows,
+            &[
+                KeyValue::new("name", name.to_string()),
+                KeyValue::new("field", field.to_string()),
+            ],
+        );
     }
 
     /// Record rows appended for one route of one delivery.

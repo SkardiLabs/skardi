@@ -12,7 +12,7 @@ use hmac::{Hmac, Mac};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use sha2::Sha256;
-use skardi::jobs::JobDefinition;
+use skardi::jobs::{JobDefinition, JobExecutor, JobRunStatus, JobStore, SqliteJobStore};
 use skardi::sources::DataSourceType;
 use skardi_server::auth::layer::AuthLayer;
 use skardi_server::auth::mode::AuthMode;
@@ -38,6 +38,9 @@ const STATUSES_DDL: &str = "CREATE TABLE wa_events_statuses (
     status TEXT NOT NULL, status_at TEXT NOT NULL, recipient_id TEXT NOT NULL,
     conversation_id TEXT, conversation_origin TEXT, pricing_category TEXT, billable BOOLEAN,
     error_code INTEGER, raw TEXT NOT NULL, ingested_at TEXT NOT NULL)";
+
+const DEAD_LETTER_DDL: &str = "CREATE TABLE wa_events_dead_letter (
+    route TEXT NOT NULL, raw TEXT NOT NULL, error TEXT NOT NULL, ingested_at TEXT NOT NULL)";
 
 const WEBHOOK_YAML: &str = r#"
 kind: webhook
@@ -958,4 +961,292 @@ async fn load_server_config_scans_a_webhooks_directory() {
     };
     let config = load_server_config(args).await.unwrap();
     assert!(config.webhooks.is_empty());
+}
+
+/// The example webhook plus a dead-letter table, with `text` non-null so an
+/// image message (no `text.body`) is a rejected row.
+fn dead_letter_yaml() -> String {
+    WEBHOOK_YAML
+        .replace(
+            "  routes:\n",
+            "  dead_letter: { table: staging.main.wa_events_dead_letter }\n  routes:\n",
+        )
+        .replace(
+            "{ name: text,                path: text.body,                type: utf8, nullable: true }",
+            "{ name: text,                path: text.body,                type: utf8, nullable: false }",
+        )
+}
+
+#[tokio::test]
+async fn a_rejected_row_is_quarantined_when_a_dead_letter_table_exists() {
+    let yaml = dead_letter_yaml();
+    assert!(yaml.contains("dead_letter") && yaml.contains("type: utf8, nullable: false }"));
+    let dir = TempDir::new().unwrap();
+    let path = create_db(&dir, &[MESSAGES_DDL, STATUSES_DDL, DEAD_LETTER_DDL]).await;
+    let state = setup_app_state(config(path, &[&yaml])).await.unwrap();
+
+    // One change carrying a text message (converts) and an image message
+    // (no text.body → rejected): the delivery is acknowledged, the good row
+    // lands, the bad one is quarantined with its reason.
+    let mut envelope: Value = serde_json::from_slice(&fixture("text_message")).unwrap();
+    let image: Value = serde_json::from_slice(&fixture("image_message")).unwrap();
+    let image_row = image["entry"][0]["changes"][0]["value"]["messages"][0].clone();
+    envelope["entry"][0]["changes"][0]["value"]["messages"]
+        .as_array_mut()
+        .unwrap()
+        .push(image_row);
+    let body = serde_json::to_vec(&envelope).unwrap();
+    let resp = deliver(
+        &state,
+        "wa-inbound",
+        body.clone(),
+        Some(&sign(&body, APP_SECRET)),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let ack = body_json(resp).await;
+    assert_eq!(ack["rows"], json!(1));
+    assert_eq!(ack["quarantined"], json!(1));
+    assert_eq!(ack["routes"][0]["quarantined"], json!(1));
+
+    let rows = query(
+        &state,
+        "SELECT message_type FROM staging.main.wa_events_messages",
+    )
+    .await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["message_type"], "text");
+    let dead = query(
+        &state,
+        "SELECT route, raw, error, ingested_at FROM staging.main.wa_events_dead_letter",
+    )
+    .await;
+    assert_eq!(dead.len(), 1);
+    assert_eq!(dead[0]["route"], "messages");
+    let raw: Value = serde_json::from_str(dead[0]["raw"].as_str().unwrap()).unwrap();
+    assert_eq!(raw["type"], "image", "the original object, untouched");
+    assert!(raw.get("_waba_id").is_none());
+    let error = dead[0]["error"].as_str().unwrap();
+    assert!(error.contains("text"), "{error}");
+    assert!(!error.contains("Taj Mahal"), "values never appear: {error}");
+    assert!(dead[0]["ingested_at"].as_str().unwrap().ends_with('Z'));
+}
+
+#[tokio::test]
+async fn another_meta_products_envelope_is_a_400_not_a_write() {
+    let (state, _path, _dir) = server().await;
+    let mut envelope: Value = serde_json::from_slice(&fixture("text_message")).unwrap();
+    envelope["object"] = Value::String("page".into());
+    let body = serde_json::to_vec(&envelope).unwrap();
+    let resp = deliver(
+        &state,
+        "wa-inbound",
+        body.clone(),
+        Some(&sign(&body, APP_SECRET)),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let err = body_json(resp).await;
+    assert_eq!(err["error_type"], "invalid_payload");
+    assert!(err["error"].as_str().unwrap().contains("'page'"), "{err}");
+    assert!(
+        query(&state, "SELECT 1 FROM staging.main.wa_events_messages")
+            .await
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn startup_refuses_a_not_null_column_the_route_may_leave_null() {
+    let dir = TempDir::new().unwrap();
+    let ddl = MESSAGES_DDL.replace("text TEXT,", "text TEXT NOT NULL,");
+    assert_ne!(ddl, MESSAGES_DDL);
+    let path = create_db(&dir, &[&ddl, STATUSES_DDL]).await;
+    let err = setup_app_state(config(path, &[WEBHOOK_YAML]))
+        .await
+        .err()
+        .expect("a nullable route column into NOT NULL must fail at startup");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("'text'") && msg.contains("NOT NULL"), "{msg}");
+}
+
+/// Runs the documented merge jobs end to end: a redelivery collapses under
+/// upsert + keep_last, the `{since}` watermark selects on arrival time, the
+/// casts land real timestamps in Lance, and a second run is idempotent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_documented_merge_jobs_dedup_into_lance_and_are_idempotent() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/whatsapp");
+    let ddl = std::fs::read_to_string(root.join("staging.sqlite.sql")).unwrap();
+    let dir = TempDir::new().unwrap();
+    let path = create_db(&dir, &[&ddl]).await;
+    let lake = dir.path().join("lake");
+    std::fs::create_dir(&lake).unwrap();
+
+    let yaml = std::fs::read_to_string(root.join("webhooks/whatsapp-inbound.yaml")).unwrap();
+    let def = WebhookDefinition::from_yaml_with_env(&yaml, |name| match name {
+        "WHATSAPP_VERIFY_TOKEN" => Some(VERIFY_TOKEN.to_string()),
+        "WHATSAPP_APP_SECRET" => Some(APP_SECRET.to_string()),
+        _ => None,
+    })
+    .unwrap()
+    .unwrap();
+    let lance_source = |name: &str| DataSource {
+        name: name.to_string(),
+        source_type: DataSourceType::Lance,
+        path: lake.join(format!("{name}.lance")),
+        connection_string: None,
+        schema: None,
+        options: None,
+        hierarchy_level: HierarchyLevel::Table,
+        access_mode: AccessMode::ReadOnly,
+        enable_cache: false,
+        description: None,
+        open_connector: None,
+        rss: None,
+        graph: None,
+    };
+    let make_config = || {
+        let mut cfg = config(path.clone(), &[]);
+        cfg.webhooks.insert(def.name.clone(), def.clone());
+        cfg.data_sources.push(lance_source("wa_messages"));
+        cfg.data_sources.push(lance_source("wa_statuses"));
+        cfg
+    };
+    let state = setup_app_state(make_config()).await.unwrap();
+
+    let since = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    for name in [
+        "text_message",
+        "image_message",
+        "interactive_list_reply",
+        "interactive_button_reply",
+        "unsupported_message",
+        "status_sent_pmp",
+        "status_delivered",
+        "status_failed",
+        "text_message", // the redelivery
+    ] {
+        let body = fixture(name);
+        let resp = deliver(
+            &state,
+            "whatsapp-inbound",
+            body.clone(),
+            Some(&sign(&body, APP_SECRET)),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "{name}");
+    }
+    assert_eq!(
+        query(
+            &state,
+            "SELECT count(*) AS n FROM staging.main.wa_events_messages"
+        )
+        .await[0]["n"],
+        json!(6)
+    );
+
+    let mut jobs = HashMap::new();
+    for job in ["wa-merge-messages", "wa-merge-statuses"] {
+        let loaded = JobDefinition::load_from_file(
+            root.join(format!("jobs/{job}.yaml")),
+            Arc::clone(&state.session_ctx),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{job}: {e:#}"))
+        .expect("kind: job");
+        jobs.insert(loaded.name().to_string(), loaded);
+    }
+    let written = run_merge_jobs(
+        Arc::clone(&state.session_ctx),
+        jobs.clone(),
+        lake.clone(),
+        since.clone(),
+    )
+    .await;
+    assert_eq!(
+        written["wa-merge-messages"], 6,
+        "every staging row is read on the first merge"
+    );
+
+    // Datasets created by a job register on the next start: build a fresh
+    // state over the same context file and read the lake back.
+    let state2 = setup_app_state(make_config()).await.unwrap();
+    let rows = query(&state2, "SELECT count(*) AS n, arrow_typeof(received_at) AS t, arrow_typeof(ingested_at) AS i FROM wa_messages GROUP BY 2, 3").await;
+    // Meta's reference payloads reuse message ids: the text and image samples
+    // share one, the button reply and the unsupported message share another.
+    // Six staging rows (five fixtures plus the redelivery) therefore hold
+    // three distinct ids, and that is what the upsert must leave.
+    assert_eq!(
+        rows[0]["n"],
+        json!(3),
+        "redelivery and id reuse collapsed under upsert + keep_last"
+    );
+    assert_eq!(rows[0]["t"], json!("Timestamp(ms, \"UTC\")"));
+    assert_eq!(rows[0]["i"], json!("Timestamp(ms, \"UTC\")"));
+    let rows = query(&state2, "SELECT count(*) AS n FROM wa_statuses").await;
+    assert_eq!(rows[0]["n"], json!(3));
+
+    // Same window again: nothing changes.
+    let _ = run_merge_jobs(Arc::clone(&state2.session_ctx), jobs, lake.clone(), since).await;
+    let state3 = setup_app_state(make_config()).await.unwrap();
+    assert_eq!(
+        query(&state3, "SELECT count(*) AS n FROM wa_messages").await[0]["n"],
+        json!(3)
+    );
+    assert_eq!(
+        query(&state3, "SELECT count(*) AS n FROM wa_statuses").await[0]["n"],
+        json!(3)
+    );
+}
+
+/// Submit both documented merge jobs against `ctx` and wait for them.
+async fn run_merge_jobs(
+    ctx: Arc<datafusion::prelude::SessionContext>,
+    jobs: HashMap<String, JobDefinition>,
+    lake: PathBuf,
+    since: String,
+) -> HashMap<&'static str, u64> {
+    let store = Arc::new(SqliteJobStore::open_in_memory().await.unwrap());
+    let types: HashMap<String, DataSourceType> = [
+        ("staging".to_string(), DataSourceType::Sqlite),
+        ("wa_messages".to_string(), DataSourceType::Lance),
+        ("wa_statuses".to_string(), DataSourceType::Lance),
+    ]
+    .into_iter()
+    .collect();
+    let paths: HashMap<String, String> = ["wa_messages", "wa_statuses"]
+        .iter()
+        .map(|n| {
+            (
+                n.to_string(),
+                lake.join(format!("{n}.lance")).display().to_string(),
+            )
+        })
+        .collect();
+    let executor = JobExecutor::new(jobs, store.clone() as Arc<dyn JobStore>, ctx, types, paths);
+    let mut written = HashMap::new();
+    for job in ["wa-merge-messages", "wa-merge-statuses"] {
+        let params: HashMap<String, Value> = [("since".to_string(), json!(since.clone()))]
+            .into_iter()
+            .collect();
+        let run_id = executor
+            .submit(job, params, None)
+            .await
+            .unwrap_or_else(|e| panic!("{job}: {e}"));
+        let run = loop {
+            let run = store.get_run(&run_id).await.unwrap().expect("run exists");
+            match run.status {
+                JobRunStatus::Succeeded | JobRunStatus::Failed => break run,
+                _ => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+            }
+        };
+        assert_eq!(
+            run.status,
+            JobRunStatus::Succeeded,
+            "{job}: {:?}",
+            run.error
+        );
+        written.insert(job, run.rows_written.unwrap_or(0));
+    }
+    written
 }

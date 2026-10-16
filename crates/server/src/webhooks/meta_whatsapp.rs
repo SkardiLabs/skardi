@@ -139,11 +139,17 @@ pub fn verify_signature(
         .map_err(|_| SignatureError::Mismatch)
 }
 
+/// The `object` value every WhatsApp Business Platform delivery carries.
+pub const WHATSAPP_OBJECT: &str = "whatsapp_business_account";
+
 /// Why an envelope could not be unwrapped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnwrapError {
     /// The body is not a JSON object with an `entry` array.
     NotAnEnvelope,
+    /// The envelope belongs to another Meta product (`page`, `instagram`,
+    /// …) that shares the app's callback URL and app secret.
+    WrongObject { found: String },
 }
 
 /// Flatten one delivery into the rows a route selects.
@@ -192,9 +198,20 @@ pub fn unwrap_rows(
     field: &str,
     selector: RowSelector,
 ) -> Result<Vec<Value>, UnwrapError> {
-    let entries = envelope
-        .as_object()
-        .and_then(|o| o.get("entry"))
+    let root = envelope.as_object().ok_or(UnwrapError::NotAnEnvelope)?;
+    // One Meta app can point several products' webhooks at the same URL,
+    // all signed with the same secret; only WhatsApp's envelope is ours.
+    match root.get("object").and_then(Value::as_str) {
+        Some(WHATSAPP_OBJECT) => {}
+        Some(other) => {
+            return Err(UnwrapError::WrongObject {
+                found: other.to_string(),
+            });
+        }
+        None => return Err(UnwrapError::NotAnEnvelope),
+    }
+    let entries = root
+        .get("entry")
         .and_then(Value::as_array)
         .ok_or(UnwrapError::NotAnEnvelope)?;
 
@@ -467,6 +484,7 @@ mod tests {
     fn value_rows_match_the_change_field_label() {
         let delivery = serde_json::json!({
             "object": "whatsapp_business_account",
+            "object": "whatsapp_business_account",
             "entry": [{"id": "W1", "changes": [
                 {"field": "message_template_status_update",
                  "value": {"event": "APPROVED", "message_template_id": 123, "message_template_name": "hello"}},
@@ -525,7 +543,8 @@ mod tests {
     fn a_body_without_an_entry_array_is_not_an_envelope() {
         for body in [
             serde_json::json!({"object": "whatsapp_business_account"}),
-            serde_json::json!({"entry": {}}),
+            serde_json::json!({"object": "whatsapp_business_account", "entry": {}}),
+            serde_json::json!({"entry": []}),
             serde_json::json!([]),
             serde_json::json!("entry"),
         ] {
@@ -535,10 +554,22 @@ mod tests {
             );
         }
         // Malformed entries inside a real envelope are skipped, not fatal.
-        let body = serde_json::json!({"entry": [1, {"id": "W", "changes": [2, {"value": "x"}]}]});
+        let body = serde_json::json!({"object": "whatsapp_business_account",
+                                      "entry": [1, {"id": "W", "changes": [2, {"value": "x"}]}]});
         assert_eq!(
             unwrap_rows(&body, "messages", RowSelector::List),
             Ok(vec![])
+        );
+    }
+
+    #[test]
+    fn another_products_envelope_is_refused_by_its_object() {
+        let body = serde_json::json!({"object": "page", "entry": [{"id": "1", "changes": []}]});
+        assert_eq!(
+            unwrap_rows(&body, "messages", RowSelector::List),
+            Err(UnwrapError::WrongObject {
+                found: "page".to_string()
+            })
         );
     }
 }

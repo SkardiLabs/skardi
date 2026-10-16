@@ -59,6 +59,7 @@ Every `/webhooks/:name` request records:
 |--------|------|--------|-------------|
 | `webhook_requests_total` | Counter | `name`, `outcome` | Deliveries and handshakes by outcome |
 | `webhook_rows_total` | Counter | `name`, `field` | Rows appended, per route field |
+| `webhook_quarantined_rows_total` | Counter | `name`, `field` | Rows the converter rejected and the dead-letter table received |
 | `webhook_latency_ms` | Histogram | `name` | Handler latency (verification through commit) |
 
 `outcome` is `ok`, `handshake_ok`, `handshake_rejected`, `signature_rejected`,

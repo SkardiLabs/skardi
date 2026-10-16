@@ -49,6 +49,7 @@ spec:
   verify_token_env: WHATSAPP_VERIFY_TOKEN
   app_secret_env: WHATSAPP_APP_SECRET
   max_body_bytes: 4194304                # default; Meta sends at most 3 MB
+  dead_letter: { table: staging.main.wa_events_dead_letter }   # optional, recommended
 
   routes:
     - field: messages                    # rows: value.messages[] of every change
@@ -111,6 +112,22 @@ from every log line and debug dump.
 Cap on the request body; a larger delivery is `413`. The default is 4 MiB,
 one megabyte above Meta's documented 3 MB maximum. The minimum is 1 KiB.
 
+### `spec.dead_letter`
+
+Optional. A table that receives rows the converter rejects, with four fixed
+columns in this order: `route` (text), `raw` (the original object as JSON
+text), `error` (the converter's message: column, row, JSON kind — never the
+value), `ingested_at` (timestamp). It is preflighted like a route table.
+
+A rejected row is **deterministic**: a new message type whose payload lacks
+a key a route declares `nullable: false`, or a timestamp that is not
+digits, fails identically on every redelivery. Meta batches deliveries, so
+without a dead-letter table one such row fails the whole POST with a `500`,
+Meta retries it for seven days, and then drops every message and receipt
+that shared the batch. With one, the delivery is acknowledged, the rows that
+convert are written, and the rejected rows are quarantined with their
+reason — query the table, fix the route, re-insert. Configure it.
+
 ### `spec.routes[]`
 
 A delivery is applied to every route, in order. Each route has:
@@ -167,8 +184,11 @@ Identical to a source pack's column grammar:
 | `json` | Utf8 | anything; stored as compact JSON text |
 
 `nullable: true` turns a missing key or a JSON null into NULL. With
-`nullable: false`, a missing key fails the delivery — the server answers
-`500` and the provider retries, so reserve it for keys Meta always sends.
+`nullable: false`, a missing key rejects the row: it is quarantined when a
+`dead_letter` table exists, and otherwise fails the whole delivery with a
+`500` that the provider retries in vain — so reserve it for keys Meta
+always sends (`id`, `from`, `timestamp`, `type` on messages; `id`,
+`status`, `timestamp`, `recipient_id` on receipts).
 
 ### `ingested_at`
 
@@ -192,17 +212,26 @@ Lance with a job (below).
 
 The insert matches columns **by position**, so the table must have exactly
 the route's declared columns, in order, followed by `ingested_at`. The
-server checks this at startup for every route and refuses to start on a
-mismatch, naming the table, the columns it found, and the columns the route
-writes. It also refuses a table that is not registered (the catalog is read
-once, at startup — create the table first), a source that is not
-transactional, and a source that is not `read_write`.
+server checks this at startup for every route (and the dead-letter table)
+and refuses to start on a mismatch, naming the table, the columns it found,
+and the columns the route writes. It also checks that each column's type
+can take what the route produces (a text id into an `INTEGER` column is
+refused; a timestamp into `TEXT` is allowed), that no column the route
+declares nullable is `NOT NULL` in the table (SQLite registration carries
+the constraint; Postgres registration reports every column nullable, so
+there nullability stays your responsibility), and it refuses a table that
+is not registered (the catalog is read once, at startup — create the table
+first), a source that is not transactional, and a source that is not
+`read_write`.
 
-SQLite DDL for the two WhatsApp routes is in
+SQLite DDL for the two WhatsApp routes and the dead-letter table is in
 [docs/whatsapp/staging.sqlite.sql](whatsapp/staging.sqlite.sql); a Postgres
 variant is next to it. Timestamp columns are declared `TEXT` in SQLite and
-land as ISO-8601 UTC instants (`2025-06-08T20:59:43Z`), which compare and
-sort correctly as strings.
+land as ISO-8601 UTC instants (`2025-06-08T20:59:43Z`). Meta's timestamps
+are whole seconds and compare fine as text; `ingested_at` carries
+milliseconds and a zero fraction is dropped on write (`…:00Z` beside
+`…:00.500Z`), which does not sort chronologically as a string — the merge
+jobs compare and order it with `arrow_cast(…)` as a timestamp.
 
 ```yaml
 # ctx.yaml
@@ -231,15 +260,20 @@ only then answer `200` with a count per route.
 | `403` | handshake token wrong (GET only) | n/a |
 | `404` | no webhook with that name | yes — check the route name |
 | `413` | body over `max_body_bytes` | yes |
-| `400` | verified body is not JSON, or not an envelope with an `entry` array | yes |
-| `500` | rows could not be mapped to the declared columns, or the write failed | yes, for up to seven days |
+| `400` | verified body is not JSON, not an envelope with an `entry` array, or another Meta product's envelope (`object` is not `whatsapp_business_account` — a Page or Instagram webhook pointed at the same URL) | yes |
+| `500` | the write failed, or rows were rejected and no `dead_letter` table is configured | yes, for up to seven days |
 
 Nothing is acknowledged early, and nothing is buffered in memory: a `200`
 means the transaction committed. That is deliberate — Meta's retry is the
 only durability guarantee a webhook has, so the server never claims success
 it has not earned.
 
-Two consequences worth knowing:
+Three consequences worth knowing:
+
+- **Rejected rows are deterministic.** Retrying them can never succeed, so
+  with a `dead_letter` table the delivery is acknowledged and they are
+  quarantined; without one the honest answer is the 500 above. The response
+  reports `quarantined` per route either way.
 
 - **Duplicates are normal.** Meta retries on any non-200 and delivers to
   every subscribed app, so the same message can arrive more than once. The
@@ -341,12 +375,25 @@ is never logged.
 
 ---
 
+## Outbound messages
+
+Meta echoes only the *status* of messages your business sends (`statuses`
+rows), never their text, so `wa_messages` is an inbound table. The
+`to_wa_id` and `reply_to_message_id` columns in the example route exist for
+the **sender's own copy**: a process that sends through Open Connector's
+`whatsapp.send_*` actions takes the returned message id and inserts a row
+into the same staging table through a pipeline `INSERT … VALUES {rows}`,
+with `from_wa_id` set to the business number, `to_wa_id` to the customer,
+`message_type` to an agreed value such as `outbound_text`, and
+`reply_to_message_id` when the send used `context.message_id`. The
+unwrapper never produces `_to_wa_id`, so from the webhook alone that column
+is NULL. The merge job does not distinguish directions; ids are unique across
+both. The design spec's "Outbound message content" section has the full
+rationale.
+
 ## What a webhook does not give you
 
-- **Outbound message content.** Meta echoes only the *status* of messages
-  your business sends, never their text. To keep whole conversations, the
-  sender records its own copy at send time (the design doc's
-  "Outbound message content" section describes the row shape).
+- **Outbound message content** — see above; the sender records it.
 - **History from before the subscription.** There is no backfill.
 - **A full list of templates or phone numbers.** Management fields deliver
   change events, not inventories; pull those through Open Connector.

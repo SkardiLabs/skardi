@@ -17,7 +17,7 @@ Meta Cloud API ──POST──► /webhooks/whatsapp-inbound ──► staging.
 | File | What it is |
 |------|------------|
 | [ctx_whatsapp.yaml](ctx_whatsapp.yaml) | The staging SQLite catalog (read-write) and the two Lance datasets |
-| [staging.sqlite.sql](staging.sqlite.sql) | DDL for the two staging tables, in the column order the routes write |
+| [staging.sqlite.sql](staging.sqlite.sql) | DDL for the two staging tables (in the column order the routes write) and the dead-letter table |
 | [staging.postgres.sql](staging.postgres.sql) | The same tables for Postgres |
 | [webhooks/whatsapp-inbound.yaml](webhooks/whatsapp-inbound.yaml) | The webhook: provider preset, secrets, two routes, every column |
 | [jobs/wa-merge-messages.yaml](jobs/wa-merge-messages.yaml) | Dedup messages into Lance on `message_id`, watermarked on `ingested_at` |

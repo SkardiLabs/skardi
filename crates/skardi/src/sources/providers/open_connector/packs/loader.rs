@@ -39,7 +39,7 @@ use crate::sources::providers::open_connector::error::OpenConnectorError;
 // a query planner, and it used to convert to DataFusion's on the way in
 // for no reason other than where the type happened to live.
 use crate::sources::providers::open_connector::json_to_arrow::RowConverter;
-use crate::sources::providers::open_connector::json_to_arrow::{FieldMapping, FieldType};
+use crate::sources::providers::open_connector::json_to_arrow::{ColumnDoc, FieldMapping};
 use crate::sources::providers::open_connector::pagination::{
     AbsentCursor, CursorContinuation, PaginationStrategy,
 };
@@ -491,43 +491,15 @@ fn validate_table(table: &SourcePackTable) -> Result<(), String> {
 }
 
 fn convert_column(table_id: &str, doc: ColumnDoc) -> Result<FieldMapping, String> {
-    let field_type = match (doc.column_type, doc.key) {
-        (ColumnType::Utf8ListFromObjectKey, Some(key)) => {
-            FieldType::Utf8ListFromObjectKey(leak_str(key))
-        }
-        (ColumnType::Utf8ListFromObjectKey, None) => {
-            return Err(format!(
-                "{table_id}: column '{}' has type utf8_list_from_object_key and needs `key`",
-                doc.name
-            ));
-        }
-        (other, Some(_)) => {
-            return Err(format!(
-                "{table_id}: column '{}' declares `key`, which only \
-                 utf8_list_from_object_key accepts (got {other:?})",
-                doc.name
-            ));
-        }
-        (ColumnType::Boolean, None) => FieldType::Boolean,
-        (ColumnType::Int64, None) => FieldType::Int64,
-        (ColumnType::Uint64, None) => FieldType::UInt64,
-        (ColumnType::Float64, None) => FieldType::Float64,
-        (ColumnType::Utf8, None) => FieldType::Utf8,
-        (ColumnType::TimestampMsUtc, None) => FieldType::TimestampMillisUtc,
-        (ColumnType::TimestampSUtc, None) => FieldType::TimestampSecondsUtc,
-        (ColumnType::TimestampMsStringUtc, None) => FieldType::TimestampMillisStringUtc,
-        (ColumnType::TimestampSStringUtc, None) => FieldType::TimestampSecondsStringUtc,
-        (ColumnType::TimestampSFracStringUtc, None) => {
-            FieldType::TimestampSecondsFractionalStringUtc
-        }
-        (ColumnType::Utf8List, None) => FieldType::Utf8List,
-        (ColumnType::Json, None) => FieldType::Json,
-    };
+    // The grammar and its checks are the shared `ColumnDoc`'s (a webhook
+    // route parses the same type); the pack only pins the spec's strings
+    // into the `'static` mapping the engine keeps for the process lifetime.
+    let spec = doc.into_spec(table_id)?;
     Ok(FieldMapping {
-        name: leak_str(doc.name),
-        path: leak_str(doc.path),
-        field_type,
-        nullable: doc.nullable,
+        name: leak_str(spec.name),
+        path: leak_str(spec.path),
+        field_type: spec.field_type,
+        nullable: spec.nullable,
     })
 }
 
@@ -803,52 +775,6 @@ impl PaginationDoc {
             ),
         }
     }
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ColumnDoc {
-    name: String,
-    path: String,
-    #[serde(rename = "type")]
-    column_type: ColumnType,
-    /// Object key to pluck; only valid with `utf8_list_from_object_key`.
-    #[serde(default)]
-    key: Option<String>,
-    nullable: bool,
-}
-
-#[derive(Debug, Deserialize, Clone, Copy)]
-enum ColumnType {
-    #[serde(rename = "boolean")]
-    Boolean,
-    #[serde(rename = "int64")]
-    Int64,
-    #[serde(rename = "uint64")]
-    Uint64,
-    #[serde(rename = "float64")]
-    Float64,
-    #[serde(rename = "utf8")]
-    Utf8,
-    #[serde(rename = "timestamp_ms_utc")]
-    TimestampMsUtc,
-    #[serde(rename = "timestamp_s_utc")]
-    TimestampSUtc,
-    #[serde(rename = "timestamp_ms_string_utc")]
-    TimestampMsStringUtc,
-    #[serde(rename = "timestamp_s_string_utc")]
-    TimestampSStringUtc,
-    /// Fractional epoch-seconds STRING (`"1700000000.123456"`) — Slack's
-    /// message `ts`. Kept distinct from `timestamp_s_string_utc`, which is
-    /// digits-only on purpose so Feishu shape drift fails loudly.
-    #[serde(rename = "timestamp_s_frac_string_utc")]
-    TimestampSFracStringUtc,
-    #[serde(rename = "utf8_list")]
-    Utf8List,
-    #[serde(rename = "utf8_list_from_object_key")]
-    Utf8ListFromObjectKey,
-    #[serde(rename = "json")]
-    Json,
 }
 
 /// Untagged so the YAML scalar's own type selects the variant; order puts
