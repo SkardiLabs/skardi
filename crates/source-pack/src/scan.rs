@@ -577,6 +577,49 @@ mod tests {
         assert_eq!(scan.pages_fetched(), 3, "three gateway requests");
     }
 
+    /// A durable walk fetches one page per process: the saved position must
+    /// survive serialization and drive the next request (cursor and page
+    /// number) in a fresh scan, and a scan that already fetched cannot be
+    /// re-positioned.
+    #[tokio::test]
+    async fn a_saved_position_resumes_the_walk_in_a_fresh_scan() {
+        let gateway = MockGateway::start(|req: &RecordedRequest| {
+            match body_of(req)["input"]["cursor"].as_str() {
+                None => page_of(&[1, 2], Some("c1")),
+                Some("c1") => page_of(&[3, 4], Some("c2")),
+                _ => page_of(&[5], None),
+            }
+        })
+        .await;
+        let pagination = cursor_pagination(AbsentCursor::EndsTheScan);
+        let mut first = scan_against(&gateway, pagination, bounds(10)).await;
+        let envelope = first.fetch_page().await.expect("page 1");
+        let rows = first.rows(&envelope).expect("rows");
+        assert!(first.advance(&envelope, rows).expect("advance"));
+        let saved = serde_json::to_string(&first.position()).expect("serializable");
+
+        let mut second = scan_against(&gateway, pagination, bounds(10))
+            .await
+            .resume(serde_json::from_str(&saved).expect("round-trips"))
+            .expect("a fresh scan resumes");
+        assert_eq!(second.page(), 2);
+        let envelope = second.fetch_page().await.expect("page 2");
+        let rows = second.rows(&envelope).expect("rows");
+        let ids: Vec<u64> = rows.iter().map(|r| r["id"].as_u64().expect("id")).collect();
+        assert_eq!(
+            ids,
+            vec![3, 4],
+            "the resumed request carries the saved cursor"
+        );
+        assert_eq!(body_of(&gateway.requests()[1])["input"]["cursor"], "c1");
+        assert!(second.advance(&envelope, rows).expect("advance"));
+        let next = second.position();
+        assert!(
+            second.resume(next).is_err(),
+            "a scan that fetched cannot be re-positioned"
+        );
+    }
+
     /// **The bound a syncer depends on.** Running out of pages must REFUSE.
     /// Returning the rows gathered so far would hand back a prefix that reads
     /// exactly like a complete collection — and for an ACL walk, a prefix is a
