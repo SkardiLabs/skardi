@@ -327,6 +327,9 @@ pub enum OpenConnectorError {
         status: Option<u16>,
         /// The gateway envelope's `errorCode`, when it sent one.
         error_code: Option<String>,
+        /// Structured provider refusal facts (e.g. a reset cursor or a 404
+        /// hidden inside the gateway's HTTP 400). Never display this payload.
+        data: Option<serde_json::Value>,
         /// The gateway envelope's `message`, when it sent one.
         ///
         /// Provider-influenced text, and carried as a field precisely so a

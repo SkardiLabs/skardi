@@ -622,6 +622,9 @@ impl OpenConnectorClient {
                     action_id: action_id.to_string(),
                     status: Some(status.as_u16()),
                     error_code: envelope_error_code(&body),
+                    data: serde_json::from_str::<Value>(&body)
+                        .ok()
+                        .and_then(|body| body.get("data").cloned()),
                     message: envelope_message(&body),
                     echoed_action_id: envelope_action_id(&body),
                     reason: terminal_reason(status, &body),
@@ -643,6 +646,7 @@ impl OpenConnectorClient {
                 // the HTTP code says nothing about what went wrong.
                 status: None,
                 error_code: envelope.error_code.clone(),
+                data: envelope.data.clone(),
                 message: envelope.message.clone(),
                 echoed_action_id: envelope_action_id(&text),
                 reason: envelope.failure_reason(),
@@ -1668,14 +1672,25 @@ mod structured_failure_tests {
     #[tokio::test]
     async fn a_forbidden_and_a_server_error_are_distinguishable_without_reading_prose() {
         for code in [403u16, 404, 500, 502] {
-            let gateway = MockGateway::start(move |_| MockResponse::new(code, "{}")).await;
+            let gateway = MockGateway::start(move |_| {
+                MockResponse::new(
+                    code,
+                    r#"{"success":false,"data":{"status":409,"error":{".tag":"reset"}}}"#,
+                )
+            })
+            .await;
             let err = client(&gateway)
                 .execute("x.y", &serde_json::json!({}), None)
                 .await
                 .unwrap_err();
             match err {
-                OpenConnectorError::ActionExecutionFailed { status, .. } => {
+                OpenConnectorError::ActionExecutionFailed { status, data, .. } => {
                     assert_eq!(status, Some(code), "status must survive as a field");
+                    assert_eq!(
+                        data.unwrap()["error"][".tag"],
+                        "reset",
+                        "typed refusal survives gateway wrapping"
+                    );
                 }
                 other => panic!("expected ActionExecutionFailed, got {other}"),
             }
