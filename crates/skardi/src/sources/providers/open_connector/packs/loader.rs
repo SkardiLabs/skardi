@@ -138,6 +138,23 @@ fn convert_table(
         };
         fixed_inputs.push((leak_str(key), fixed));
     }
+    let min_page_interval = match doc.min_page_interval_ms {
+        None => None,
+        // Zero is "no pacing" spelled as pacing: refused so a table states
+        // one or the other, not a value that reads as a decision and is not.
+        Some(0) => {
+            return Err(format!(
+                "{id}: min_page_interval_ms is 0; omit it to request pages back to back"
+            ));
+        }
+        Some(ms) if ms > MAX_PAGE_INTERVAL_MS => {
+            return Err(format!(
+                "{id}: min_page_interval_ms is {ms}, above the {MAX_PAGE_INTERVAL_MS}ms \
+                 ceiling; a walk that slow belongs to a scheduler, not a page delay"
+            ));
+        }
+        Some(ms) => Some(std::time::Duration::from_millis(ms)),
+    };
     let action_id = leak_str(doc.action);
     let (pagination, continuation) = doc.pagination.into_parts(action_id);
     let table = SourcePackTable {
@@ -155,6 +172,7 @@ fn convert_table(
         error_path: doc.error_path.map(leak_str),
         expected_fingerprint: doc.fingerprint.map(leak_str),
         continuation,
+        min_page_interval,
     };
     validate_table(&table)?;
     Ok(table)
@@ -559,6 +577,11 @@ enum KindTag {
     Pack,
 }
 
+/// Ceiling on `min_page_interval_ms`. A table paced slower than a page a
+/// minute would turn the scan deadline into the binding constraint for any
+/// real collection; that rate belongs to the caller's schedule.
+const MAX_PAGE_INTERVAL_MS: u64 = 60_000;
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TableDoc {
@@ -577,6 +600,11 @@ struct TableDoc {
     fixed_inputs: BTreeMap<String, FixedValueDoc>,
     #[serde(default)]
     error_path: Option<String>,
+    /// Least start-to-start spacing between page requests, in
+    /// milliseconds; see `SourcePackTable::min_page_interval`. Omitted
+    /// means pages are requested back to back.
+    #[serde(default)]
+    min_page_interval_ms: Option<u64>,
     columns: Vec<ColumnDoc>,
     #[serde(default)]
     filters: Vec<FilterDoc>,
@@ -953,6 +981,44 @@ tables:
                 "inner": { "level": null }
             })
         );
+    }
+
+    fn paced_pack(interval: &str) -> Result<SourcePack, String> {
+        parse_pack(&format!(
+            r#"kind: pack
+pack: demo
+version: 1
+tables:
+  things:
+    action: demo.list
+    row_path: "$.items"
+    pagination: {{ strategy: page_number, page_input: page, page_size_input: perPage, page_size: 10 }}
+{interval}    columns:
+      - {{ name: id, path: id, type: uint64, nullable: false }}
+"#
+        ))
+    }
+
+    #[test]
+    fn a_table_may_declare_a_page_interval() {
+        let pack = paced_pack("    min_page_interval_ms: 3000\n").expect("legal");
+        assert_eq!(
+            pack.tables[0].min_page_interval,
+            Some(std::time::Duration::from_millis(3000))
+        );
+        let unpaced = paced_pack("").expect("legal");
+        assert_eq!(
+            unpaced.tables[0].min_page_interval, None,
+            "omitted means unpaced"
+        );
+    }
+
+    #[test]
+    fn a_zero_or_runaway_page_interval_is_refused() {
+        let zero = paced_pack("    min_page_interval_ms: 0\n").expect_err("zero is not a pace");
+        assert!(zero.contains("min_page_interval_ms is 0"), "{zero}");
+        let slow = paced_pack("    min_page_interval_ms: 60001\n").expect_err("past the ceiling");
+        assert!(slow.contains("above the 60000ms ceiling"), "{slow}");
     }
 
     #[test]

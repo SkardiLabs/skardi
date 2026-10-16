@@ -46,6 +46,12 @@
 //!   (batches of 10), so a page of N rows costs N+1 Gmail calls — 100
 //!   bounds that burst against Gmail's per-user quota; 500 would be a
 //!   501-request page.
+//! - **`messages` is paced to one page per 3s** (`min_page_interval_ms`).
+//!   The page size bounds one burst; it does not bound the walk. Back to
+//!   back, 505-unit pages arriving every ~2.3s average ~300 units/s
+//!   against Gmail's per-user moving average of 250, and the fourth page
+//!   is refused. Three seconds start to start averages ~170 units/s.
+//!   No other table hydrates per row, so none is paced.
 //! - **No filter pushdown anywhere.** Gmail's `q` is a free-text search
 //!   language no SQL predicate maps to faithfully (same call as Notion's
 //!   `query`), and `labelIds` is an array with AND semantics that a
@@ -222,6 +228,26 @@ mod tests {
             .iter()
             .find(|t| t.id.rsplit('.').next() == Some(short))
             .unwrap_or_else(|| panic!("table {short}"))
+    }
+
+    /// Only `messages` hydrates every row with its own Gmail call, so only
+    /// it is paced, and its pace must keep a page's quota cost under Gmail's
+    /// per-user moving average of 250 units/s: 505 units (one list plus 100
+    /// gets at 5 units each) spread over the interval.
+    #[test]
+    fn only_messages_is_paced_and_under_the_per_user_quota() {
+        let interval = table("messages")
+            .min_page_interval
+            .expect("messages is paced");
+        let units_per_page = 5.0 * (1.0 + 100.0);
+        let units_per_second = units_per_page / interval.as_secs_f64();
+        assert!(
+            units_per_second < 250.0,
+            "{units_per_second:.0} units/s is over Gmail's per-user limit"
+        );
+        for short in ["threads", "drafts", "labels", "filters"] {
+            assert_eq!(table(short).min_page_interval, None, "{short}");
+        }
     }
 
     /// Discovery serving the live-captured contracts, so every mock

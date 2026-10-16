@@ -100,6 +100,10 @@ pub struct ScanTarget {
     /// it: this is the per-table response contract, exactly like `pagination`
     /// and `error_path`. Raw scans are always [`RowShape::Array`].
     pub row_shape: RowShape,
+    /// Least start-to-start spacing between page requests (see
+    /// [`SourcePackTable::min_page_interval`]); `None` for raw scans and for
+    /// every table that can be walked at full speed.
+    pub min_page_interval: Option<Duration>,
 }
 
 impl ScanTarget {
@@ -114,6 +118,7 @@ impl ScanTarget {
             source_pack_version,
             continuation: table.continuation.map(ScanContinuation::from),
             row_shape: table.row_shape,
+            min_page_interval: table.min_page_interval,
         }
     }
 }
@@ -161,6 +166,9 @@ pub struct ActionScan {
     bounds: ScanBounds,
     deadline: Instant,
     pages_fetched: u32,
+    /// When the previous page request started, for
+    /// [`ScanTarget::min_page_interval`].
+    last_request_started: Option<Instant>,
 }
 
 impl ActionScan {
@@ -202,6 +210,7 @@ impl ActionScan {
             bounds,
             deadline: Instant::now() + bounds.timeout,
             pages_fetched: 0,
+            last_request_started: None,
         })
     }
 
@@ -310,6 +319,20 @@ impl ActionScan {
                 limit: u64::from(self.bounds.max_pages),
             });
         }
+
+        // Pace before the request, after the budget checks: a page the budget
+        // refuses is never waited for.
+        if let (Some(interval), Some(last)) =
+            (self.target.min_page_interval, self.last_request_started)
+        {
+            let ready = last + interval;
+            if ready >= self.deadline {
+                // Waiting would only end in the same timeout, later.
+                return Err(self.timeout_error());
+            }
+            tokio::time::sleep_until(tokio::time::Instant::from_std(ready)).await;
+        }
+        self.last_request_started = Some(Instant::now());
 
         let page = self.pagination.page();
         let (action_id, input) = self.request();
@@ -435,6 +458,7 @@ mod tests {
             fixed_inputs: &[],
             source_pack_version: 1,
             continuation: None,
+            min_page_interval: None,
             row_shape: RowShape::Array,
         }
     }
@@ -557,6 +581,89 @@ mod tests {
         let ids: Vec<u64> = rows.iter().map(|r| r["id"].as_u64().expect("id")).collect();
         assert_eq!(ids, vec![1, 2, 3, 4, 5], "every page's rows, in order");
         assert_eq!(scan.pages_fetched(), 3, "three gateway requests");
+    }
+
+    async fn paced_scan_against(
+        gateway: &MockGateway,
+        interval: Duration,
+        bounds: ScanBounds,
+    ) -> ActionScan {
+        let client = Arc::new(
+            OpenConnectorClient::new(&gateway.url, "t", Duration::from_secs(5)).expect("client"),
+        );
+        let mut target = target(cursor_pagination(AbsentCursor::EndsTheScan));
+        target.min_page_interval = Some(interval);
+        ActionScan::new(
+            client,
+            target,
+            None,
+            json!({}),
+            Vec::new(),
+            "$.items",
+            bounds,
+        )
+        .expect("binds")
+    }
+
+    fn three_pages(req: &RecordedRequest) -> MockResponse {
+        match body_of(req)["input"]["cursor"].as_str() {
+            None => page_of(&[1], Some("c1")),
+            Some("c1") => page_of(&[2], Some("c2")),
+            _ => page_of(&[3], None),
+        }
+    }
+
+    /// A paced table spaces its requests start to start: three pages are
+    /// two intervals at least, and still every row.
+    #[tokio::test]
+    async fn a_paced_walk_spaces_its_pages() {
+        let gateway = MockGateway::start(three_pages).await;
+        let interval = Duration::from_millis(200);
+        let mut scan = paced_scan_against(&gateway, interval, bounds(10)).await;
+
+        let started = Instant::now();
+        let rows = scan.collect_all().await.expect("walk completes");
+
+        assert_eq!(rows.len(), 3, "pacing never drops a page");
+        assert!(
+            started.elapsed() >= interval * 2,
+            "three pages took {:?}, under two intervals",
+            started.elapsed()
+        );
+    }
+
+    /// A wait the deadline cannot cover is refused at once, and the request
+    /// it would have preceded is never sent: sleeping first would only reach
+    /// the same timeout later.
+    #[tokio::test]
+    async fn a_pace_past_the_deadline_times_out_without_sending() {
+        let gateway = MockGateway::start(three_pages).await;
+        let mut scan = paced_scan_against(
+            &gateway,
+            Duration::from_secs(5),
+            ScanBounds {
+                max_pages: 10,
+                timeout: Duration::from_secs(1),
+            },
+        )
+        .await;
+
+        let started = Instant::now();
+        let err = scan
+            .collect_all()
+            .await
+            .expect_err("the second page cannot fit");
+
+        assert!(
+            matches!(err, OpenConnectorError::ScanTimeout { .. }),
+            "expected ScanTimeout, got {err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(900),
+            "refused after {:?}: it waited instead of failing fast",
+            started.elapsed()
+        );
+        assert_eq!(gateway.requests().len(), 1, "only the first page was sent");
     }
 
     /// **The bound a syncer depends on.** Running out of pages must REFUSE.
