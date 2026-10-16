@@ -11,7 +11,8 @@
 //! wanted.
 //!
 //! The YAML spelling of a column — `{ name, path, type, nullable }` — lives
-//! here too, as [`ColumnDoc`] and [`ColumnType`], so that every place that
+//! here too, as [`ColumnDoc`](crate::schema::ColumnDoc) and
+//! [`ColumnType`](crate::schema::ColumnType), so that every place that
 //! lets a user declare columns (a source pack asset, a webhook route) parses
 //! the same grammar from the same definition. A type added here is a type
 //! added everywhere, and the one spelling rule worth remembering
