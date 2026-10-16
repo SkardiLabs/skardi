@@ -12,6 +12,13 @@ on:
           - patch
           - minor
           - major
+      merge_timeout_minutes:
+        # The job is capped at 360 minutes on GitHub-hosted runners, so the
+        # wait has to leave room for the steps around it.
+        description: "Minutes to wait for the bump PR to be merged (max 330)"
+        required: false
+        type: number
+        default: 180
 
 permissions:
   contents: write
@@ -78,15 +85,26 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Clean up any leftover remote branch from a previous run
-          git push origin --delete "$BRANCH" 2>/dev/null || true
-
-          git checkout -b "$BRANCH"
-
           # Set workspace.package.version and skardi's exact pin on
           # skardi-source-pack (the two are published to crates.io together).
           ./scripts/bump_version.sh "${FULL_VERSION}"
           cargo update -p skardi --precise "${FULL_VERSION}"
+
+          # Main already carries this version: the bump PR from an earlier run
+          # was merged after that run stopped waiting for it. There is nothing
+          # to commit, so skip the PR and the wait and go straight to tagging
+          # and drafting the release.
+          if git diff --quiet -- Cargo.toml Cargo.lock; then
+            echo "already_bumped=true" >> $GITHUB_OUTPUT
+            echo "::notice::main is already at ${FULL_VERSION}; skipping the bump PR and resuming at the tag."
+            exit 0
+          fi
+          echo "already_bumped=false" >> $GITHUB_OUTPUT
+
+          # Clean up any leftover remote branch from a previous run
+          git push origin --delete "$BRANCH" 2>/dev/null || true
+
+          git checkout -b "$BRANCH"
 
           git add Cargo.toml Cargo.lock
           git commit -m "chore: bump version to ${FULL_VERSION}"
@@ -102,17 +120,28 @@ jobs:
           echo "branch=$BRANCH" >> $GITHUB_OUTPUT
           echo "PR created: $PR_URL"
 
-      - name: Wait for PR to be merged (1 hour timeout)
+      - name: Wait for PR to be merged
         id: wait
+        if: steps.pr.outputs.already_bumped != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TIMEOUT_MINUTES: ${{ inputs.merge_timeout_minutes }}
         run: |
           PR_URL="${{ steps.pr.outputs.pr_url }}"
-          TIMEOUT=3600   # 1 hour in seconds
+
+          case "$TIMEOUT_MINUTES" in
+            ''|*[!0-9]*) echo "Error: merge_timeout_minutes must be a whole number, got '$TIMEOUT_MINUTES'."; exit 1 ;;
+          esac
+          if [ "$TIMEOUT_MINUTES" -lt 1 ] || [ "$TIMEOUT_MINUTES" -gt 330 ]; then
+            echo "Error: merge_timeout_minutes must be between 1 and 330, got $TIMEOUT_MINUTES."
+            exit 1
+          fi
+
+          TIMEOUT=$((TIMEOUT_MINUTES * 60))
           INTERVAL=30    # poll every 30 seconds
           ELAPSED=0
 
-          echo "Waiting for PR to be merged: $PR_URL"
+          echo "Waiting up to ${TIMEOUT_MINUTES} minutes for PR to be merged: $PR_URL"
 
           while [ $ELAPSED -lt $TIMEOUT ]; do
             STATE=$(gh pr view "$PR_URL" --json state,mergeStateStatus --jq '.state')
@@ -132,6 +161,7 @@ jobs:
 
           if [ $ELAPSED -ge $TIMEOUT ]; then
             echo "Error: Timed out after ${TIMEOUT}s waiting for PR to be merged."
+            echo "Merge the PR, then run this workflow again with the same bump: it finds main already bumped and resumes at the tag."
             exit 1
           fi
 
@@ -143,7 +173,26 @@ jobs:
           git checkout main
           git pull origin main
 
-          VERSION="v${{ steps.version.outputs.next }}-rc.${{ steps.version.outputs.rc }}"
+          FULL_VERSION="${{ steps.version.outputs.next }}-rc.${{ steps.version.outputs.rc }}"
+          VERSION="v${FULL_VERSION}"
+
+          # Never tag a commit that does not carry the version being released.
+          if ! grep -q "^version = \"${FULL_VERSION}\"$" Cargo.toml; then
+            echo "Error: main's Cargo.toml is not at ${FULL_VERSION}; refusing to tag."
+            exit 1
+          fi
+
+          # An earlier run (or a manual repair) may have pushed the tag already.
+          REMOTE_SHA=$(git ls-remote --tags origin "refs/tags/${VERSION}" | cut -f1)
+          if [ -n "$REMOTE_SHA" ]; then
+            HEAD_SHA=$(git rev-parse HEAD)
+            if [ "$REMOTE_SHA" != "$HEAD_SHA" ]; then
+              echo "::warning::Tag $VERSION already exists on origin at $REMOTE_SHA, not main HEAD $HEAD_SHA; leaving it as is."
+            fi
+            echo "Tag $VERSION already exists on origin; skipping."
+            exit 0
+          fi
+
           git tag "$VERSION"
           git push origin "$VERSION"
           echo "Tagged: $VERSION"
