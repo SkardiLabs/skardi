@@ -20,8 +20,9 @@ curl -fsSL https://raw.githubusercontent.com/SkardiLabs/skardi/main/install.sh |
 ```
 
 Windows (PowerShell). This puts `skardi.exe` in
-`%LOCALAPPDATA%\Programs\skardi\bin` and adds that directory to your user
-`PATH`:
+`%LOCALAPPDATA%\Programs\skardi\bin`, adds that directory to your user
+`PATH`, and, like `install.sh`, offers to set up Claude Code, Codex and
+Cursor (see [MCP Binding](mcp.md#set-up-agents-with-installsh)):
 
 ```powershell
 irm https://raw.githubusercontent.com/SkardiLabs/skardi/main/install.ps1 | iex
