@@ -373,8 +373,8 @@ pub async fn fetch_table_columns(
         let col_name: String = row.try_get("column_name")?;
         let data_type: String = row.try_get("data_type")?;
         let udt_name: String = row.try_get("udt_name")?;
-        let precision: Option<i32> = row.try_get("numeric_precision")?;
-        let scale: Option<i32> = row.try_get("numeric_scale")?;
+        let precision = try_get_opt_int(row, "numeric_precision")?;
+        let scale = try_get_opt_int(row, "numeric_scale")?;
 
         let arrow_type = pg_type_to_arrow(&data_type, &udt_name, precision, scale);
         columns.push((col_name, arrow_type));
@@ -485,6 +485,37 @@ mod tests {
             "NULL filter must not fail extraction; got {err}"
         );
     }
+}
+
+/// Read an optional integer column without assuming its wire width.
+///
+/// On Postgres, `information_schema.columns.numeric_precision` and
+/// `numeric_scale` are `cardinal_number`, which decodes as INT4. A
+/// Postgres-compatible server is free to expose them wider or narrower:
+/// TiDB Cloud's Postgres mode returns INT8 (seen 2026-10-16 — every table on
+/// such a source failed registration with "Rust type `Option<i32>` (as SQL
+/// type `INT4`) is not compatible with SQL type `INT8`", taking the whole
+/// engine down with it, since one failed registration fails boot). The
+/// datafusion-table-providers crate beside this one already reads the same
+/// columns with a width-tolerant decoder (`row_opt_int` in its
+/// `postgresconn.rs`); this is the same posture for the one query that did
+/// not.
+///
+/// A value wider than `i32` is treated as absent rather than an error: a
+/// precision past `i32::MAX` is not a precision Postgres can have, and the
+/// caller already treats `None` as "use the type's default".
+pub fn try_get_opt_int(row: &sqlx::postgres::PgRow, col: &str) -> anyhow::Result<Option<i32>> {
+    let narrow = match row.try_get::<Option<i32>, _>(col) {
+        Ok(v) => return Ok(v),
+        Err(e) => e,
+    };
+    if let Ok(v) = row.try_get::<Option<i64>, _>(col) {
+        return Ok(v.and_then(|v| i32::try_from(v).ok()));
+    }
+    if let Ok(v) = row.try_get::<Option<i16>, _>(col) {
+        return Ok(v.map(i32::from));
+    }
+    Err(anyhow::Error::from(narrow).context(format!("decoding '{col}' as any of INT2/INT4/INT8")))
 }
 
 fn pg_type_to_arrow(
