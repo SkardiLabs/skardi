@@ -36,7 +36,7 @@ use crate::gui::serve_dashboard;
 use crate::handlers::health_check;
 use crate::jobs_handlers::{cancel_job_run, get_job_run, list_job_runs, list_jobs, submit_job_run};
 use crate::logging::QUERY_PLAN_TARGET;
-use crate::metrics::PipelineMetrics;
+use crate::metrics::{PipelineMetrics, WebhookMetrics};
 use crate::pipeline_handlers::{
     execute_pipeline_by_name, get_data_sources, get_pipelines_info, list_pipelines,
     pipeline_health_check,
@@ -45,6 +45,8 @@ use crate::query_audit::QueryAuditStore;
 use crate::query_handlers::execute_query;
 #[cfg(test)]
 use crate::semantics::SemanticsRegistry;
+use crate::webhooks::WebhookRegistry;
+use crate::webhooks::handlers::{webhook_receive, webhook_verify};
 use crate::{OptimizerRegistry, auth::layer::AuthLayer};
 
 /// Shared application state containing pipeline and engine
@@ -76,6 +78,12 @@ pub struct AppState {
     /// OptimizerRegistry that data-source registration fills). Read by
     /// `/data_source` to report each graph source's registration health.
     pub graph_sources: GraphSources,
+    /// Compiled `kind: webhook` resources served at `/webhooks/:name`.
+    /// Empty unless [`AppState::with_webhooks`] installed a registry that
+    /// [`setup_app_state`] built against the runtime session.
+    pub webhooks: Arc<WebhookRegistry>,
+    /// OTel instruments for `/webhooks/:name`.
+    pub webhook_metrics: WebhookMetrics,
 }
 
 impl AppState {
@@ -109,7 +117,17 @@ impl AppState {
             adhoc_policy,
             query_audit,
             graph_sources,
+            webhooks: Arc::new(WebhookRegistry::empty()),
+            webhook_metrics: WebhookMetrics::new(),
         }
+    }
+
+    /// Install the compiled webhook registry. Separate from [`AppState::new`]
+    /// because compiling needs the populated runtime session (destination
+    /// preflight), which the constructor does not have.
+    pub fn with_webhooks(mut self, webhooks: Arc<WebhookRegistry>) -> Self {
+        self.webhooks = webhooks;
+        self
     }
 }
 
@@ -340,6 +358,20 @@ pub async fn setup_app_state(config: ServerConfig) -> Result<AppState> {
         }
     }
 
+    // Compile webhooks against the populated session: every destination
+    // table must exist with the route's exact columns before a single
+    // delivery can be acknowledged, so a mismatch is a startup error.
+    let webhooks = Arc::new(
+        WebhookRegistry::build(&config.webhooks, &config.data_sources, &session_ctx_arc).await?,
+    );
+    if !webhooks.is_empty() {
+        tracing::info!(
+            "Serving {} webhook(s): {:?}",
+            webhooks.names().len(),
+            webhooks.names()
+        );
+    }
+
     // Create shared application state with RwLock for runtime updates
     let app_state = AppState::new(
         config,
@@ -351,7 +383,8 @@ pub async fn setup_app_state(config: ServerConfig) -> Result<AppState> {
         // The registry's map is the one data-source registration filled —
         // sharing the Arc is what makes /data_source's health read live.
         optimizer_registry.graph_sources(),
-    );
+    )
+    .with_webhooks(webhooks);
 
     tracing::info!("Application state setup completed successfully");
 
@@ -581,6 +614,9 @@ pub(crate) fn rest_router(state: AppState) -> Router {
         .route("/jobs/runs", get(list_job_runs))
         .route("/jobs/runs/:run_id", get(get_job_run))
         .route("/jobs/runs/:run_id/cancel", post(cancel_job_run));
+    // Provider deliveries carry no Skardi token: these two handlers do not
+    // call `require_session` and verify the provider's own proof instead.
+    router = router.route("/webhooks/:name", get(webhook_verify).post(webhook_receive));
 
     if state.auth_layer.is_enabled() {
         tracing::info!("Auth enabled: mounting /api/auth/* routes");
@@ -707,12 +743,14 @@ spec:
         let config = ServerConfig {
             pipelines,
             jobs: std::collections::HashMap::new(),
+            webhooks: HashMap::new(),
             data_sources,
             semantics: SemanticsRegistry::default(),
             args: CliArgs {
                 pipeline_path: Some(PathBuf::from("test-pipeline.yaml")),
                 jobs_path: None,
                 jobs_db_path: None,
+                webhooks_path: None,
                 ctx_file: None,
                 semantics_path: None,
                 port: 8080,
@@ -733,12 +771,14 @@ spec:
         ServerConfig {
             pipelines,
             jobs: std::collections::HashMap::new(),
+            webhooks: HashMap::new(),
             data_sources: vec![],
             semantics: SemanticsRegistry::default(),
             args: CliArgs {
                 pipeline_path: Some(PathBuf::from("test-pipeline.yaml")),
                 jobs_path: None,
                 jobs_db_path: None,
+                webhooks_path: None,
                 ctx_file: None,
                 semantics_path: None,
                 port: 8080,
@@ -783,6 +823,7 @@ spec:
             pipeline_path: Some(pipeline_path),
             jobs_path: None,
             jobs_db_path: None,
+            webhooks_path: None,
             ctx_file: None,
             semantics_path: None,
             port: 8080,
@@ -855,6 +896,7 @@ spec:
             pipeline_path: Some(pipeline_path),
             jobs_path: None,
             jobs_db_path: None,
+            webhooks_path: None,
             ctx_file: None,
             semantics_path: None,
             port: 8080,

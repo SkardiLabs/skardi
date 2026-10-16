@@ -373,12 +373,14 @@ mod tests {
         let config = ServerConfig {
             pipelines: Default::default(),
             jobs: Default::default(),
+            webhooks: HashMap::new(),
             data_sources: vec![],
             semantics: SemanticsRegistry::default(),
             args: CliArgs {
                 pipeline_path: Some(PathBuf::from("p.yaml")),
                 jobs_path: None,
                 jobs_db_path: None,
+                webhooks_path: None,
                 ctx_file: None,
                 semantics_path: None,
                 port: 8080,
@@ -434,12 +436,14 @@ mod tests {
         let config = ServerConfig {
             pipelines: Default::default(),
             jobs: Default::default(),
+            webhooks: HashMap::new(),
             data_sources: vec![],
             semantics: SemanticsRegistry::default(),
             args: CliArgs {
                 pipeline_path: Some(PathBuf::from("p.yaml")),
                 jobs_path: None,
                 jobs_db_path: None,
+                webhooks_path: None,
                 ctx_file: None,
                 semantics_path: None,
                 port: 8080,

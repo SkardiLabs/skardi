@@ -19,6 +19,7 @@ pub mod response;
 pub mod server;
 pub mod session_header;
 pub mod telemetry;
+pub mod webhooks;
 
 // Re-export `skardi::semantics` so server code can use `crate::semantics::...`.
 pub use skardi::semantics;

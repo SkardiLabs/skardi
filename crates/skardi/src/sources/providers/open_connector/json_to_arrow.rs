@@ -9,7 +9,7 @@
 // The row-shape DECLARATIONS moved to the pack so a syncer can read a
 // provider's rows without linking Arrow. What stays here is the
 // conversion, which is the only part that wants a `RecordBatch`.
-pub use skardi_source_pack::schema::{ColumnSpec, FieldMapping, FieldType};
+pub use skardi_source_pack::schema::{ColumnDoc, ColumnSpec, ColumnType, FieldMapping, FieldType};
 
 use std::sync::Arc;
 

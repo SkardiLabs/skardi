@@ -35,6 +35,7 @@ use thiserror::Error;
 use crate::OptimizerRegistry;
 use crate::remote_storage::{RemoteStorage, S3Storage};
 use crate::semantics::{SemanticsRegistry, resolve_semantics_source};
+use crate::webhooks::WebhookDefinition;
 pub use skardi::sources::AccessMode;
 pub use skardi::sources::DataSourceType;
 pub use skardi::sources::HierarchyLevel;
@@ -69,6 +70,16 @@ pub struct CliArgs {
         help = "Path to the SQLite job run ledger (default: ~/.skardi/jobs.db)"
     )]
     pub jobs_db_path: Option<PathBuf>,
+
+    /// Path to a `kind: webhook` YAML file or directory of them. Files in
+    /// a directory whose root `kind:` is not `webhook` are silently
+    /// skipped, mirroring `--semantics`. Each file becomes a public
+    /// `GET|POST /webhooks/<name>` route; see docs/webhooks.md.
+    #[arg(
+        long = "webhooks",
+        help = "Path to webhook YAML file or directory containing webhook definitions"
+    )]
+    pub webhooks_path: Option<PathBuf>,
 
     /// Path to context YAML configuration file (optional)
     #[arg(
@@ -138,6 +149,10 @@ pub struct ServerConfig {
     /// Loaded job definitions keyed by name. `kind: job` YAMLs populate
     /// this map; plain pipeline YAMLs do not.
     pub jobs: HashMap<String, JobDefinition>,
+    /// Loaded `kind: webhook` definitions keyed by route name. Compiled
+    /// against the live session (converters, destination preflight) in
+    /// `setup_app_state`, not here.
+    pub webhooks: HashMap<String, WebhookDefinition>,
     /// Data sources to register with DataFusion
     pub data_sources: Vec<DataSource>,
     /// Natural-language descriptions overlaid on top of the catalog,
@@ -666,6 +681,46 @@ pub async fn load_server_config(args: CliArgs) -> Result<ServerConfig> {
         );
     }
 
+    // Load webhook definitions (if a --webhooks path was specified).
+    // Secrets are resolved from the environment here so a missing variable
+    // fails startup rather than the first delivery; destinations are
+    // preflighted later, against the runtime session, in `setup_app_state`.
+    let webhook_files = resolve_pipeline_files(args.webhooks_path.as_ref())
+        .with_context(|| "Failed to resolve webhook files")?;
+    let mut webhooks: HashMap<String, WebhookDefinition> = HashMap::new();
+    for webhook_file in &webhook_files {
+        match WebhookDefinition::load_from_file(webhook_file)? {
+            Some(webhook) => {
+                let name = webhook.name.clone();
+                if webhooks.contains_key(&name) {
+                    return Err(anyhow::anyhow!(
+                        "Duplicate webhook name '{name}' found. Each webhook must have a unique name."
+                    ));
+                }
+                tracing::info!(
+                    "Webhook definition loaded: {} ({} route(s))",
+                    name,
+                    webhook.routes.len()
+                );
+                webhooks.insert(name, webhook);
+            }
+            None => {
+                tracing::debug!("Skipping {:?}: no `kind: webhook` at root", webhook_file);
+            }
+        }
+    }
+    if let Some(webhooks_path) = args.webhooks_path.as_ref()
+        && !webhook_files.is_empty()
+        && webhooks.is_empty()
+    {
+        tracing::warn!(
+            "--webhooks {:?} scanned {} YAML file(s) but none had `kind: webhook` at the root; \
+             no /webhooks/* route will be served",
+            webhooks_path,
+            webhook_files.len(),
+        );
+    }
+
     // Load semantics overlays. The path is either:
     //   1. `--semantics <path>` (explicit override), or
     //   2. auto-discovered next to the ctx file (`<ctx_dir>/semantics/`
@@ -692,6 +747,7 @@ pub async fn load_server_config(args: CliArgs) -> Result<ServerConfig> {
     Ok(ServerConfig {
         pipelines,
         jobs,
+        webhooks,
         data_sources,
         semantics,
         args,
@@ -2378,6 +2434,7 @@ spec:
             pipeline_path: Some(pipeline_path),
             jobs_path: None,
             jobs_db_path: None,
+            webhooks_path: None,
             ctx_file: Some(context_path),
             semantics_path: None,
             port: 8080,
@@ -2406,6 +2463,7 @@ spec:
             pipeline_path: Some(pipeline_path),
             jobs_path: None,
             jobs_db_path: None,
+            webhooks_path: None,
             ctx_file: None,
             semantics_path: None,
             port: 3000,
@@ -2463,6 +2521,7 @@ spec:
             pipeline_path: Some(pipelines_dir),
             jobs_path: None,
             jobs_db_path: None,
+            webhooks_path: None,
             ctx_file: None,
             semantics_path: None,
             port: 3000,
@@ -2494,6 +2553,7 @@ spec:
             pipeline_path: Some(missing_pipeline),
             jobs_path: None,
             jobs_db_path: None,
+            webhooks_path: None,
             ctx_file: None,
             semantics_path: None,
             port: 8080,
@@ -2540,6 +2600,7 @@ spec:
             pipeline_path: Some(pipeline_path),
             jobs_path: None,
             jobs_db_path: None,
+            webhooks_path: None,
             ctx_file: None,
             semantics_path: None,
             port: 8080,
@@ -2563,6 +2624,7 @@ spec:
             pipeline_path: None,
             jobs_path: None,
             jobs_db_path: None,
+            webhooks_path: None,
             ctx_file: None,
             semantics_path: None,
             port: 8080,
