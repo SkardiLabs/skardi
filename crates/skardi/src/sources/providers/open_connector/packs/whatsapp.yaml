@@ -1,6 +1,7 @@
 # WhatsApp Cloud API source pack. Wire contract reconciled against a live
-# Open Connector gateway (v1.9.0, commit 9a2ac5b6, 2026-10-15) and the
-# `whatsapp` executor source. Two things set this provider apart from the
+# Open Connector gateway (v1.9.0 main at 9a2ac5b6 plus
+# oomol-lab/open-connector#739 for `paging.hasMore`, commit 778996a7,
+# 2026-10-16) and the `whatsapp` executor source. Two things set this provider apart from the
 # packs before it:
 #
 # - Inputs are snake_case, not camelCase: `waba_id`, `phone_number_id`,
@@ -16,9 +17,12 @@
 # receiver's job (docs/webhooks.md). This pack is the account side.
 #
 # Pagination: the three cursor tables ride Meta's Graph cursor
-# (`paging.cursors.after`); OC forwards it unchanged and emits no has-more
-# boolean, so termination is Meta's own end-of-collection spelling — the
-# live pass pins which one. Design rationale lives in packs/whatsapp.rs.
+# (`paging.cursors.after`). Meta keeps that cursor on the FINAL page and
+# signals the end only by omitting `paging.next`, so the cursor alone is
+# not a terminal signal; the gateway spells the end out as
+# `paging.hasMore` (false exactly when `next` is absent), and every cursor
+# table declares it as the authoritative has-more. Design rationale lives
+# in packs/whatsapp.rs.
 kind: pack
 pack: whatsapp
 version: 1
@@ -28,11 +32,12 @@ tables:
   phone_numbers:
     action: whatsapp.get_phone_numbers
     row_path: "$.phone_numbers"
-    fingerprint: 741cb04f7a7ac8faaa339b6b9cdad2cf316074d879f744033fc5f600ea959174
+    fingerprint: 0f47823f67fa84ba53e9d2744c833df4dbaf13813aece7f6009745996533043d
     pagination:
       strategy: cursor
       cursor_input: after
       next_cursor_path: "$.paging.cursors.after"
+      has_more_path: "$.paging.hasMore"
       page_size_input: limit
       page_size: 100
     # `waba_id` falls back to the WABA configured on the OC connection
@@ -79,11 +84,12 @@ tables:
   message_templates:
     action: whatsapp.get_message_templates
     row_path: "$.templates"
-    fingerprint: 38741cad371ce0fb949a2474d260b797d80f374ee346c0709e20b5adb317a6df
+    fingerprint: 021a6d0c7122c3cd35f655312e80ef6402717ed71aca83e1c5280d5084fcc036
     pagination:
       strategy: cursor
       cursor_input: after
       next_cursor_path: "$.paging.cursors.after"
+      has_more_path: "$.paging.hasMore"
       page_size_input: limit
       page_size: 100
     # `name_or_content` is Meta's substring search over names and bodies —
@@ -160,11 +166,12 @@ tables:
   template_analytics:
     action: whatsapp.get_template_analytics
     row_path: "$.data_points"
-    fingerprint: 69f419262cbbcb11b055bce3c82e1e3a99141033a67c34e85c25a98ea3afc977
+    fingerprint: 3cdc8d0090afea6a7cc3cc80052926e31cdb12f685000952d4eb1f695118a772
     pagination:
       strategy: cursor
       cursor_input: after
       next_cursor_path: "$.paging.cursors.after"
+      has_more_path: "$.paging.hasMore"
       page_size: 100
     # Meta caps `template_ids` at ten per call; template analytics must
     # also have been enabled on the WABA once (pack doc).

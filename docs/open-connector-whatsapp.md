@@ -22,10 +22,13 @@ gateway's `whatsapp` executors forward Meta's own parameter spellings. And
 its rows are **normalized**: every executor rebuilds its output through a
 `compactObject`, so a field Meta did not send is an omitted key, never an
 explicit null. Everything below is reconciled against a live gateway
-(v1.9.0, commit `9a2ac5b6`, 2026-10-15), with every table's generated input
-set accepted by the gateway's strict schemas. **Live verification against a
-real WABA is in progress**; the verification section at the end states
-exactly what has and has not been observed on the wire.
+(v1.9.0 main at `9a2ac5b6`, plus
+[oomol-lab/open-connector#739](https://github.com/oomol-lab/open-connector/pull/739)
+for the `paging.hasMore` terminal signal, commit `778996a7`, 2026-10-16),
+with every table's generated input set accepted by the gateway's strict
+schemas. **Live verification against a real WABA is in progress**; the
+verification section at the end states exactly what has and has not been
+observed on the wire.
 
 ## Binding
 
@@ -44,6 +47,17 @@ spec:
             connection_alias: acme-waba   # the OC connection holding the token (+ default wabaId)
             tables: [phone_numbers, message_templates, message_analytics, pricing_analytics]
             # `waba_id` may be omitted when the OC connection carries a default WABA.
+            # Leave `granularity` unset in a binding that serves BOTH analytics
+            # tables: a binding's resources reach every table that declares the
+            # key, and the two fields spell it differently (DAY/MONTH versus
+            # DAILY/MONTHLY; only HALF_HOUR is shared). Bind them separately
+            # to set it, as below.
+
+          - name: wa_daily_costs
+            source_pack: whatsapp
+            connection_alias: acme-waba
+            resource: { granularity: DAILY, dimensions: [PRICING_CATEGORY] }
+            tables: [pricing_analytics]
 
           - name: wa_support
             source_pack: whatsapp
@@ -69,7 +83,10 @@ SELECT name, language, status
 FROM saas.wa.message_templates
 WHERE status = 'REJECTED';                 -- pushed to Meta, re-applied locally
 
--- Cost by category over an explicit window, ad hoc, without a binding:
+-- Cost by category over an explicit window: the same table with the
+-- window passed ad hoc instead of from the binding. The action must be
+-- discovered at registration — keep the table bound (as above) or list
+-- `whatsapp.get_pricing_analytics` in `raw_action_allowlist`.
 SELECT pricing_category, sum(volume) AS messages, sum(cost) AS cost
 FROM open_connector_query(
   'saas', 'whatsapp.pricing_analytics',
@@ -124,6 +141,13 @@ Behavior:
   an exact window in its resource JSON. They are not a `period_start >=`
   pushdown because the window is a pair and the loader refuses a filter
   whose input is also a declared resource.
+- **`granularity` is spelled differently by the two analytics fields** —
+  `HALF_HOUR | DAY | MONTH` for `message_analytics`, `HALF_HOUR | DAILY |
+  MONTHLY` for `pricing_analytics`, Meta's own inconsistency, which the
+  gateway's strict schemas enforce. A binding forwards each resource to
+  every table that declares the key, so a binding that serves both tables
+  must not set `granularity` unless it is `HALF_HOUR`; bind the tables
+  separately to set a daily or monthly value.
 - **Template filters are Inexact.** `status`, `category`, and `language` are
   forwarded to Meta's server-side filters, and DataFusion re-applies the
   predicate afterwards: a string enum Meta does not recognise may be
@@ -131,11 +155,16 @@ Behavior:
   substring search over names and bodies, hence a resource. A `name = …`
   predicate is never pushed (the executor has no such input) and stays
   local.
-- **Cursor pagination rides Meta's Graph cursor.** The gateway forwards
-  `after` and re-emits Meta's `paging` object (`cursors.before/after`,
-  `previous`, `next`) with absent keys dropped. Termination is an absent
-  `paging.cursors.after`. A repeated cursor fails as a pagination loop; a
-  scan never silently returns a prefix.
+- **Cursor pagination rides Meta's Graph cursor, terminated by
+  `paging.hasMore`.** Meta keeps `cursors.after` on the *final* page and
+  signals the end only by omitting `next`, so the cursor alone cannot end a
+  walk. The gateway spells the end out as `paging.hasMore` (false exactly
+  when `next` is absent; oomol-lab/open-connector#739), and the three cursor
+  tables declare it as the authoritative has-more: `false` ends the scan
+  even beside a present cursor, `true` beside an absent cursor fails loudly,
+  and a gateway that does not emit the signal at all (older than #739)
+  fails the scan rather than guessing. A repeated cursor fails as a
+  pagination loop; a scan never silently returns a prefix.
 - **`template_analytics` has no page-size input.** The edge pages by cursor
   only; the pack's `page_size` is the `LIMIT` ceiling and is never sent.
   Meta caps `template_ids` at ten per call and accepts only `DAILY`
@@ -158,11 +187,16 @@ Behavior:
 - **Provider errors surface as the gateway's own failure envelope**
   (`authorization_failed`, `rate_limited`, …) naming the action; never as a
   row-path error. `error_path` is unset everywhere.
-- **Action-contract fingerprints are pinned** from live discovery, output
-  and input schemas alike (`packs/fixtures/whatsapp/contracts/`). Any schema
-  change in the gateway's `whatsapp` provider — additive included — fails
-  registration with the table and action named; re-capture and re-pin on a
-  gateway upgrade.
+- **Action-contract fingerprints are pinned** from live discovery
+  (`packs/fixtures/whatsapp/contracts/`). The registration gate hashes the
+  **output** schema only: any change to an action's output — additive
+  included — fails registration with the table and action named, so
+  re-capture and re-pin on a gateway upgrade. Input schemas are captured
+  beside them (`contracts/inputs/`) and checked by the test suite against
+  the tables' generated inputs, which catches a renamed input on
+  re-capture, not live: a gateway upgrade that renames `waba_id` while
+  leaving the output untouched passes registration and then rejects every
+  scan with a 400. Re-run the input pin after a gateway bump.
 
 ## Authorization and permissions
 
@@ -185,7 +219,10 @@ beyond it.
 
 ## Verification
 
-Reconciled against gateway v1.9.0 (commit `9a2ac5b6`) on 2026-10-15:
+Reconciled against gateway v1.9.0 (commit `9a2ac5b6`, 2026-10-15) and
+re-captured for the three paging contracts against
+oomol-lab/open-connector#739 (commit `778996a7`, 2026-10-16), which adds
+`paging.hasMore`; the pack requires a gateway that includes it:
 
 - The six action ids, every input key, every row path, and every column
   path were read from live discovery and the executor source; each table's
@@ -199,12 +236,10 @@ gateway; the maintainer runs it before the pack is advertised as supported):
 
 - registration through the fingerprint gate against live discovery;
 - every mapped column extracting a real non-NULL value;
-- Meta's terminal-page spelling observed with `limit: 1` on
-  `message_templates` and `phone_numbers` — whether the last page omits
-  `cursors.after` or carries it beside an omitted `next`. If it is the
-  latter, the gateway needs a normalized has-more boolean before these
-  tables can terminate soundly, and the pack will declare `has_more_path`
-  against it;
+- real multi-page pagination with `limit: 1` on `message_templates` and
+  `phone_numbers`, observing `hasMore: true` mid-collection and
+  `hasMore: false` on Meta's final page (which, per the Graph API docs,
+  still carries `cursors.after`);
 - the three analytics fields returning rows on a WABA with traffic, and
   `template_analytics` on a WABA with insights enabled.
 

@@ -66,6 +66,10 @@
         "next": {
           "type": "string",
           "description": "URL for the next page, when provided."
+        },
+        "hasMore": {
+          "type": "boolean",
+          "description": "Whether another page exists. Meta returns `next` only when one does, so this is false on the final page even though `cursors.after` is still present."
         }
       },
       "additionalProperties": true,

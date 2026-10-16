@@ -5,10 +5,12 @@
 //!
 //! **The wire contract is Open Connector's, not the Graph API's.** Every
 //! action id, input key, row path, and column below was read off a live
-//! gateway (v1.9.0, commit `9a2ac5b6`, 2026-10-15) and the provider's
-//! executor source (`src/providers/whatsapp/runtime.ts`), then every table's
-//! generated input set was sent to that gateway and reached the credential
-//! wall — the strict schemas (`additionalProperties: false`) accepted them.
+//! gateway (v1.9.0 main at `9a2ac5b6`, 2026-10-15, plus
+//! oomol-lab/open-connector#739 for `paging.hasMore`, commit `778996a7`,
+//! 2026-10-16) and the provider's executor source
+//! (`src/providers/whatsapp/runtime.ts`), then every table's generated input
+//! set was sent to that gateway and reached the credential wall — the strict
+//! schemas (`additionalProperties: false`) accepted them.
 //!
 //! Design decisions, per the integration design spec and the source-pack
 //! admission gate:
@@ -32,17 +34,23 @@
 //!   rule turns it into SQL NULL. Explicit nulls do not occur on the wire;
 //!   the tests pin the omitted spelling, and the null-parent rule is
 //!   pinned as well because the converter's contract covers both.
-//! - **Cursor tables ride Meta's Graph cursor.** `get_phone_numbers`,
-//!   `get_message_templates`, and `get_template_analytics` forward Meta's
-//!   `after` cursor and re-emit Meta's `paging` object
-//!   (`cursors.before/after`, `previous`, `next`) through `normalizePaging`,
-//!   which drops absent keys. OC emits no has-more boolean, so termination
-//!   is Meta's end-of-collection spelling as the engine reads it: an absent
-//!   `paging.cursors.after` ends the scan. Which spelling Meta uses on its
-//!   real final page — an omitted cursor, or a cursor beside an omitted
-//!   `next` — is what the live pass must observe with a one-row page size;
-//!   see the pack doc's verification section. A repeated cursor fails as
-//!   `PaginationLoop`, never as a silent refetch.
+//! - **Cursor tables ride Meta's Graph cursor, terminated by `hasMore`.**
+//!   `get_phone_numbers`, `get_message_templates`, and
+//!   `get_template_analytics` forward Meta's `after` cursor and re-emit
+//!   Meta's `paging` object through `normalizePaging`. Meta keeps
+//!   `cursors.after` on the FINAL page and signals the end only by omitting
+//!   `next` (Graph API documentation: "If not included, this is the last
+//!   page of data"), so the cursor alone cannot terminate a walk — a
+//!   cursor-only declaration would ask for one page past the end and then
+//!   fail as `PaginationLoop` or exhaust its budget. The gateway therefore
+//!   spells the end out as `paging.hasMore` (oomol-lab/open-connector#739,
+//!   `hasMore: next !== undefined`), and every cursor table declares
+//!   `has_more_path: $.paging.hasMore`: `false` ends the scan even beside a
+//!   present cursor, `true` beside an absent cursor fails as
+//!   `PaginationCursorInvalid`, a missing or non-boolean value fails as
+//!   `PaginationHasMoreInvalid`. All three are pinned by e2e tests. A
+//!   repeated cursor still fails as `PaginationLoop`, never as a silent
+//!   refetch.
 //! - **`template_analytics` takes no page-size input.** The edge pages by
 //!   cursor only; its `page_size: 100` is the LIMIT ceiling and never
 //!   reaches the wire (pinned by the exact-key e2e).
@@ -60,7 +68,13 @@
 //!   fix a window in YAML and an ad hoc `open_connector_query` pass one in
 //!   JSON, while a binding that omits them gets OC's rolling 30-day
 //!   default. The breakdown lists (`dimensions`, `metric_types`, …) are
-//!   arrays and pass through with their JSON types intact.
+//!   arrays and pass through with their JSON types intact. One trap, Meta's
+//!   own: `granularity` is `DAY | MONTH` on `analytics` and `DAILY |
+//!   MONTHLY` on `pricing_analytics` (only `HALF_HOUR` is shared). A binding
+//!   forwards a resource to every table that declares the key, so a binding
+//!   serving both tables may set `granularity` only to `HALF_HOUR`; daily
+//!   or monthly values need separate bindings. The pack doc says so, and
+//!   the shared-binding e2e uses `HALF_HOUR` for exactly this reason.
 //! - **Template pushdown is Inexact.** `status`, `category`, and `language`
 //!   are forwarded to Meta's server-side filters as string enums; an
 //!   out-of-domain literal may be answered with the unfiltered listing, so
@@ -85,11 +99,14 @@
 //!   templates, `template_id`, the window bounds), everything else nullable
 //!   — the convention every pack follows, kept here because the
 //!   normalizers drop unknown-at-Meta fields rather than nulling them.
-//! - **Fingerprints pinned from live discovery** (gateway v1.9.0, commit
-//!   `9a2ac5b6`), input schemas pinned beside them
-//!   (`fixtures/whatsapp/contracts/inputs/`) because the gate is
-//!   output-only; a renamed input would otherwise pass registration and
-//!   400 every scan.
+//! - **Fingerprints pinned from live discovery** (gateway as above; the
+//!   three paging contracts carry `hasMore` from #739). The registration
+//!   gate is output-only; input schemas are
+//!   captured beside the outputs (`fixtures/whatsapp/contracts/inputs/`)
+//!   and the test suite checks the generated inputs against them, which
+//!   catches a renamed input on re-capture rather than live — a gateway
+//!   that renames an input while keeping the output passes registration
+//!   and 400s every scan until the pins are re-taken.
 //! - **Fixtures** are executor-shaped pages pending the live pass, which
 //!   replaces them with redacted live captures; the schema-mismatch page is
 //!   synthetic by design and says so.
@@ -104,6 +121,16 @@ use super::loader;
 static PACK: OnceLock<Result<SourcePack, String>> = OnceLock::new();
 
 /// The WhatsApp pack, parsed once from the embedded YAML asset.
+///
+/// # Example
+/// ```
+/// use skardi::sources::providers::open_connector::packs::whatsapp;
+///
+/// let pack = whatsapp::pack().expect("the embedded asset parses");
+/// assert_eq!(pack.name, "whatsapp");
+/// let ids: Vec<&str> = pack.tables.iter().map(|t| t.id).collect();
+/// assert!(ids.contains(&"whatsapp.message_templates"));
+/// ```
 pub fn pack() -> Result<&'static SourcePack, OpenConnectorError> {
     loader::builtin("whatsapp.yaml", include_str!("whatsapp.yaml"), &PACK)
 }
@@ -645,6 +672,31 @@ bindings:
     }
 
     #[test]
+    fn the_two_analytics_fields_disagree_on_granularity_and_share_only_half_hour() {
+        // Pins Meta's inconsistency as a fact the docs can rely on: a binding
+        // that serves both tables may set `granularity` only to the values
+        // in this intersection. If the gateway ever normalizes the spelling,
+        // this test is what tells us the doc caveat can go.
+        let enum_of = |action: &str| -> Vec<String> {
+            let schema: Value = serde_json::from_str(input_contract(action)).unwrap();
+            schema["properties"]["granularity"]["enum"]
+                .as_array()
+                .expect("granularity is an enum")
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect()
+        };
+        let message = enum_of("whatsapp.get_message_analytics");
+        let pricing = enum_of("whatsapp.get_pricing_analytics");
+        let shared: Vec<&String> = message.iter().filter(|g| pricing.contains(g)).collect();
+        assert_eq!(
+            shared,
+            vec!["HALF_HOUR"],
+            "message={message:?} pricing={pricing:?}"
+        );
+    }
+
+    #[test]
     fn columns_the_coverage_walker_cannot_resolve_are_pinned() {
         // Every mapped path is declared by its item schema (the executors'
         // `looseObject`s list the keys they emit), so the fingerprint gate
@@ -672,10 +724,11 @@ bindings:
             let input = request_input(req);
             let page = match input.get("after").and_then(Value::as_str) {
                 None => json!({"phone_numbers": [phone_row("p-1"), phone_row("p-2")],
-                               "paging": {"cursors": {"before": "b1", "after": "c2"}, "next": "https://graph/…"}}),
-                // Meta's terminal page: cursors without `after`, no `next`.
+                               "paging": {"cursors": {"before": "b1", "after": "c2"}, "next": "https://graph/…", "hasMore": true}}),
+                // Meta's terminal page: the cursor is STILL PRESENT and only
+                // `next` is gone — which the gateway spells as hasMore: false.
                 Some("c2") => json!({"phone_numbers": [phone_row("p-3")],
-                                     "paging": {"cursors": {"before": "b2"}}}),
+                                     "paging": {"cursors": {"before": "b2", "after": "c3"}, "hasMore": false}}),
                 Some(other) => return Some(MockResponse::new(400, format!("bad cursor {other}"))),
             };
             Some(MockResponse::ok(&envelope_ok(&page.to_string())))
@@ -701,7 +754,7 @@ bindings:
     }
 
     #[tokio::test]
-    async fn message_templates_scan_terminates_on_an_absent_paging_object() {
+    async fn message_templates_scan_terminates_on_has_more_false_beside_a_present_cursor() {
         let gateway = MockGateway::start(gateway_with(|req| {
             if req.path != "/v1/actions/whatsapp.get_message_templates" {
                 return None;
@@ -709,8 +762,9 @@ bindings:
             let input = request_input(req);
             let page = match input.get("after").and_then(Value::as_str) {
                 None => json!({"templates": [template_row("t-1", "APPROVED")],
-                               "paging": {"cursors": {"before": "b1", "after": "c2"}}}),
-                Some("c2") => json!({"templates": [template_row("t-2", "APPROVED")]}),
+                               "paging": {"cursors": {"before": "b1", "after": "c2"}, "hasMore": true}}),
+                Some("c2") => json!({"templates": [template_row("t-2", "APPROVED")],
+                                     "paging": {"cursors": {"before": "b2", "after": "c3"}, "hasMore": false}}),
                 Some(other) => return Some(MockResponse::new(400, format!("bad cursor {other}"))),
             };
             Some(MockResponse::ok(&envelope_ok(&page.to_string())))
@@ -755,9 +809,9 @@ bindings:
             };
             let page = match input.get("after").and_then(Value::as_str) {
                 None => json!({"data_points": [point("t-1")],
-                               "paging": {"cursors": {"before": "b", "after": "c2"}}}),
+                               "paging": {"cursors": {"before": "b", "after": "c2"}, "hasMore": true}}),
                 Some("c2") => json!({"data_points": [point("t-2")],
-                                     "paging": {"cursors": {"before": "b2"}}}),
+                                     "paging": {"cursors": {"before": "b2", "after": "c3"}, "hasMore": false}}),
                 Some(other) => return Some(MockResponse::new(400, format!("bad cursor {other}"))),
             };
             Some(MockResponse::ok(&envelope_ok(&page.to_string())))
@@ -809,16 +863,19 @@ bindings:
             let input = request_input(req);
             match req.path.as_str() {
                 "/v1/actions/whatsapp.get_message_analytics" => {
-                    assert_eq!(input["granularity"], "MONTH");
+                    // HALF_HOUR is the only granularity both analytics
+                    // fields accept; a shared binding may set no other.
+                    assert_eq!(input["granularity"], "HALF_HOUR");
                     assert_eq!(input["start"], 1759276800, "integers keep their type");
                     Some(MockResponse::ok(&envelope_ok(
-                        &json!({"granularity": "MONTH", "data_points": [
-                            {"start": 1759276800, "end": 1761955200, "sent": 10, "delivered": 9}
+                        &json!({"granularity": "HALF_HOUR", "data_points": [
+                            {"start": 1759276800, "end": 1759278600, "sent": 10, "delivered": 9}
                         ]})
                         .to_string(),
                     )))
                 }
                 "/v1/actions/whatsapp.get_pricing_analytics" => {
+                    assert_eq!(input["granularity"], "HALF_HOUR");
                     assert_eq!(
                         input["dimensions"],
                         json!(["PHONE", "COUNTRY", "PRICING_CATEGORY", "PRICING_TYPE", "TIER"])
@@ -840,7 +897,7 @@ bindings:
             gateway,
             "SKARDI_TEST_OC_WA_ANALYTICS",
             "message_analytics, pricing_analytics",
-            r#"{ start: 1759276800, end: 1761955200, granularity: MONTH, dimensions: [PHONE, COUNTRY, PRICING_CATEGORY, PRICING_TYPE, TIER] }"#,
+            r#"{ start: 1759276800, end: 1761955200, granularity: HALF_HOUR, dimensions: [PHONE, COUNTRY, PRICING_CATEGORY, PRICING_TYPE, TIER] }"#,
         )
         .await;
 
@@ -950,7 +1007,7 @@ bindings:
             }
             Some(MockResponse::ok(&envelope_ok(
                 &json!({"templates": [template_row("t-1", "APPROVED"), template_row("t-2", "REJECTED")],
-                        "paging": {"cursors": {"before": "b"}}})
+                        "paging": {"cursors": {"before": "b", "after": "end"}, "hasMore": false}})
                 .to_string(),
             )))
         }))
@@ -982,7 +1039,7 @@ bindings:
             }
             Some(MockResponse::ok(&envelope_ok(
                 &json!({"templates": [template_row("t-1", "APPROVED"), template_row("t-2", "APPROVED")],
-                        "paging": {"cursors": {"before": "b"}}})
+                        "paging": {"cursors": {"before": "b", "after": "end"}, "hasMore": false}})
                 .to_string(),
             )))
         }))
@@ -1005,6 +1062,76 @@ bindings:
     }
 
     #[tokio::test]
+    async fn has_more_true_beside_an_absent_cursor_fails_loudly() {
+        // The gateway says more pages exist but gives no cursor to fetch
+        // them with: the scan must fail rather than return a prefix.
+        let gateway = MockGateway::start(gateway_with(|req| {
+            if req.path != "/v1/actions/whatsapp.get_phone_numbers" {
+                return None;
+            }
+            Some(MockResponse::ok(&envelope_ok(
+                &json!({"phone_numbers": [phone_row("p-1")],
+                        "paging": {"cursors": {"before": "b"}, "hasMore": true}})
+                .to_string(),
+            )))
+        }))
+        .await;
+        let (_gateway, ctx) = setup_with_gateway(
+            gateway,
+            "SKARDI_TEST_OC_WA_HASMORE_NOCURSOR",
+            "phone_numbers",
+            "",
+        )
+        .await;
+        let err = ctx
+            .sql("SELECT id FROM saas.wa.phone_numbers")
+            .await
+            .expect("plans")
+            .collect()
+            .await
+            .expect_err("has-more without a cursor is a contract violation");
+        let message = err.to_string();
+        assert!(message.contains("has-more"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_missing_has_more_signal_fails_rather_than_guessing() {
+        // A paging object without `hasMore` (an older gateway) is refused:
+        // guessing from the cursor is exactly the unsoundness the signal
+        // exists to remove.
+        let gateway = MockGateway::start(gateway_with(|req| {
+            if req.path != "/v1/actions/whatsapp.get_phone_numbers" {
+                return None;
+            }
+            Some(MockResponse::ok(&envelope_ok(
+                &json!({"phone_numbers": [phone_row("p-1")],
+                        "paging": {"cursors": {"before": "b", "after": "c2"}}})
+                .to_string(),
+            )))
+        }))
+        .await;
+        let (_gateway, ctx) = setup_with_gateway(
+            gateway,
+            "SKARDI_TEST_OC_WA_HASMORE_ABSENT",
+            "phone_numbers",
+            "",
+        )
+        .await;
+        let err = ctx
+            .sql("SELECT id FROM saas.wa.phone_numbers")
+            .await
+            .expect("plans")
+            .collect()
+            .await
+            .expect_err("a missing has-more signal must fail, not refetch");
+        let message = err.to_string();
+        assert!(
+            message.contains("$.paging.hasMore") || message.contains("has-more"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
     async fn limit_stops_cursor_pagination_early() {
         let gateway = MockGateway::start(gateway_with(|req| {
             if req.path != "/v1/actions/whatsapp.get_phone_numbers" {
@@ -1012,7 +1139,7 @@ bindings:
             }
             Some(MockResponse::ok(&envelope_ok(
                 &json!({"phone_numbers": [phone_row("p-1"), phone_row("p-2")],
-                        "paging": {"cursors": {"before": "b", "after": "more"}}})
+                        "paging": {"cursors": {"before": "b", "after": "more"}, "hasMore": true}})
                 .to_string(),
             )))
         }))
@@ -1036,7 +1163,7 @@ bindings:
             }
             Some(MockResponse::ok(&envelope_ok(
                 &json!({"phone_numbers": [phone_row("p-1")],
-                        "paging": {"cursors": {"before": "b", "after": "same"}}})
+                        "paging": {"cursors": {"before": "b", "after": "same"}, "hasMore": true}})
                 .to_string(),
             )))
         }))
@@ -1101,7 +1228,7 @@ bindings:
             }
             Some(MockResponse::ok(&envelope_ok(
                 &json!({"phone_numbers": [phone_row("p-1"), phone_row("p-2")],
-                        "paging": {"cursors": {"before": "b"}}})
+                        "paging": {"cursors": {"before": "b", "after": "end"}, "hasMore": false}})
                 .to_string(),
             )))
         }))

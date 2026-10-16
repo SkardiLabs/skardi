@@ -21,6 +21,7 @@
     "cursors": {
       "before": "a",
       "after": "b"
-    }
+    },
+    "hasMore": false
   }
 }
