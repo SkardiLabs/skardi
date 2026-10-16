@@ -176,20 +176,31 @@ jobs:
           FULL_VERSION="${{ steps.version.outputs.next }}-rc.${{ steps.version.outputs.rc }}"
           VERSION="v${FULL_VERSION}"
 
-          # Never tag a commit that does not carry the version being released.
-          if ! grep -q "^version = \"${FULL_VERSION}\"$" Cargo.toml; then
-            echo "Error: main's Cargo.toml is not at ${FULL_VERSION}; refusing to tag."
+          # An earlier run (or a manual repair) may have pushed the tag already.
+          # The release then goes on the commit that tag names, which need not
+          # be main HEAD; `^{commit}` peels an annotated tag to that commit.
+          if git ls-remote --exit-code --tags origin "refs/tags/${VERSION}" >/dev/null; then
+            git fetch --force origin "refs/tags/${VERSION}:refs/tags/${VERSION}"
+            TARGET=$(git rev-parse "${VERSION}^{commit}")
+            TAG_EXISTS=true
+          else
+            TARGET=$(git rev-parse HEAD)
+            TAG_EXISTS=false
+          fi
+
+          # Never release a commit that does not carry the version being released.
+          MANIFEST=$(git show "${TARGET}:Cargo.toml")
+          if ! grep -q "^version = \"${FULL_VERSION}\"$" <<< "$MANIFEST"; then
+            if [ "$TAG_EXISTS" = true ]; then
+              echo "Error: $VERSION already exists at $TARGET, whose Cargo.toml is not at ${FULL_VERSION}; refusing to release it."
+            else
+              echo "Error: main's Cargo.toml is not at ${FULL_VERSION}; refusing to tag."
+            fi
             exit 1
           fi
 
-          # An earlier run (or a manual repair) may have pushed the tag already.
-          REMOTE_SHA=$(git ls-remote --tags origin "refs/tags/${VERSION}" | cut -f1)
-          if [ -n "$REMOTE_SHA" ]; then
-            HEAD_SHA=$(git rev-parse HEAD)
-            if [ "$REMOTE_SHA" != "$HEAD_SHA" ]; then
-              echo "::warning::Tag $VERSION already exists on origin at $REMOTE_SHA, not main HEAD $HEAD_SHA; leaving it as is."
-            fi
-            echo "Tag $VERSION already exists on origin; skipping."
+          if [ "$TAG_EXISTS" = true ]; then
+            echo "Tag $VERSION already exists on origin at $TARGET; skipping."
             exit 0
           fi
 
