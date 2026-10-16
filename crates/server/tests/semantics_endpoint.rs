@@ -83,12 +83,14 @@ async fn make_state(data_sources: Vec<DataSource>, semantics: SemanticsRegistry)
     let config = ServerConfig {
         pipelines: HashMap::new(),
         jobs: HashMap::new(),
+        webhooks: HashMap::new(),
         data_sources,
         semantics,
         args: CliArgs {
             pipeline_path: None,
             jobs_path: None,
             jobs_db_path: None,
+            webhooks_path: None,
             ctx_file: None,
             semantics_path: None,
             port: 0,

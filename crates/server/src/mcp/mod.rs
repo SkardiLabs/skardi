@@ -99,12 +99,14 @@ mod tests {
         let config = ServerConfig {
             pipelines: HashMap::new(),
             jobs: HashMap::new(),
+            webhooks: HashMap::new(),
             data_sources: vec![],
             semantics: SemanticsRegistry::default(),
             args: CliArgs {
                 pipeline_path: None,
                 jobs_path: None,
                 jobs_db_path: None,
+                webhooks_path: None,
                 ctx_file: None,
                 semantics_path: None,
                 port: 0,

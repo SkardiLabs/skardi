@@ -60,6 +60,12 @@ serde_yaml = { workspace = true }
 skardi = { path = "../skardi" }
 anyhow = "1.0"
 base64 = "0.22"
+# Webhook delivery verification: HMAC-SHA256 over the raw body (Meta's
+# X-Hub-Signature-256) and a constant-time handshake-token comparison.
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+subtle = "2"
 # The /mcp streamable-HTTP binding. default-features = false mirrors the
 # CLI's pin; the transport feature brings rmcp's tower service (no runtime
 # axum dependency — verified against the 3.1.4 source).

@@ -60,10 +60,12 @@ spec:
 
 Every resource YAML carries a `kind:` discriminator at the root. `kind: job`
 tells the loader to treat the file as a job; pipeline YAMLs set
-`kind: pipeline`, contexts set `kind: context`, and alias files set
-`kind: aliases`. A server started with `--jobs <dir>` scans every
-`.yaml` / `.yml` file in the directory and silently skips files that are
-not `kind: job`, so it's safe to intermix pipelines and jobs on disk.
+`kind: pipeline`, contexts set `kind: context`, webhooks set
+`kind: webhook` (loaded by `--webhooks`, see [webhooks.md](webhooks.md)),
+and alias files set `kind: aliases`. A server started with `--jobs <dir>`
+scans every `.yaml` / `.yml` file in the directory and skips files that
+are `kind: pipeline`, so it's safe to intermix pipelines and jobs on disk;
+other kinds are rejected, so keep webhooks in their own directory.
 
 ### `destination.table`
 

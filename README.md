@@ -318,6 +318,10 @@ agents; deploy it next to your data, behind your usual auth.
 - **Offline jobs** — async batch writes (append, or upsert into Lance on merge
   keys) with atomic commit, crash recovery and a run ledger you can list and
   inspect. [docs/jobs.md](docs/jobs.md)
+- **Webhooks** — a `kind: webhook` YAML becomes a public route that verifies a
+  provider's push deliveries (WhatsApp Cloud API today) and appends them to a
+  table, with the same column grammar as a source pack; a job then dedups them
+  into Lance. [docs/webhooks.md](docs/webhooks.md)
 - **Retrieval built in** — KNN, FTS and hybrid RRF in SQL; `candle()` embeddings,
   `chunk()`, `onnx_predict()` and `llm_extract()` as UDFs, so content and vector
   land on the same row atomically. [docs/embeddings/](docs/embeddings/)
@@ -407,7 +411,7 @@ Source-specific demos are linked from the table above.
 
 Reference: [server](docs/server.md) (ad-hoc queries, `ai_context`, the audit
 ledger) · [CLI](docs/cli.md) · [pipelines](docs/pipelines.md) ·
-[jobs](docs/jobs.md) · [semantics](docs/semantics.md) ·
+[jobs](docs/jobs.md) · [webhooks](docs/webhooks.md) · [semantics](docs/semantics.md) ·
 [federated queries](docs/federated-queries.md) ·
 [embeddings](docs/embeddings/) · [chunking](docs/chunk.md) ·
 [ONNX](docs/onnx_predict.md) · [LLM extraction](docs/llm_extract.md) ·

@@ -1,0 +1,28 @@
+# Collapse the append-only staging log of delivery receipts into one row per
+# (message, status) in Lance: a message has at most one sent, one delivered,
+# and one read receipt, plus possibly a failed one. Same watermark rule as
+# wa-merge-messages: {since} is a previous run's start minus an overlap,
+# compared against the receiver's ingested_at, never against Meta's timestamp.
+kind: job
+
+metadata:
+  name: "wa-merge-statuses"
+  version: "1.0.0"
+  description: "Dedup staging.main.wa_events_statuses into the wa_statuses Lance dataset"
+
+spec:
+  query: |
+    SELECT message_id, waba_id, phone_number_id, status,
+           arrow_cast(status_at, 'Timestamp(Millisecond, Some("UTC"))') AS status_at,
+           recipient_id, conversation_id, conversation_origin,
+           pricing_category, billable, error_code, raw,
+           arrow_cast(ingested_at, 'Timestamp(Millisecond, Some("UTC"))') AS ingested_at
+    FROM staging.main.wa_events_statuses
+    WHERE arrow_cast(ingested_at, 'Timestamp(Millisecond, Some("UTC"))') >= arrow_cast({since}, 'Timestamp(Millisecond, Some("UTC"))')
+    ORDER BY arrow_cast(ingested_at, 'Timestamp(Millisecond, Some("UTC"))'), message_id, status
+  destination:
+    table: "wa_statuses"          # the `type: lance` source of that name in ctx_whatsapp.yaml
+    mode: upsert
+    merge_keys: [message_id, status]
+    repeated_keys: keep_last      # keeps the last copy in stream order — hence the ORDER BY
+    create_if_missing: true

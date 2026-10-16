@@ -1,0 +1,39 @@
+# Collapse the append-only staging log of inbound messages into one row per
+# message in Lance. Run it every few minutes with {since} set to the previous
+# run's start time minus a small overlap: the upsert is idempotent, so
+# re-merging the overlap is harmless, while a watermark on Meta's own
+# received_at would skip a retried or backfilled delivery forever.
+#
+#   curl -X POST localhost:8080/jobs/wa-merge-messages/run \
+#        -H 'content-type: application/json' \
+#        -d '{"since": "2026-10-15T00:00:00Z"}'
+kind: job
+
+metadata:
+  name: "wa-merge-messages"
+  version: "1.0.0"
+  description: "Dedup staging.main.wa_events_messages into the wa_messages Lance dataset"
+
+spec:
+  # The staging columns are TEXT in SQLite (ISO-8601 UTC); cast them so the
+  # Lance dataset carries real timestamps. On Postgres staging they are
+  # already TIMESTAMPTZ and the cast is a no-op.
+  query: |
+    SELECT message_id, waba_id, phone_number_id, display_phone_number,
+           from_wa_id, to_wa_id, contact_name,
+           arrow_cast(received_at, 'Timestamp(Millisecond, Some("UTC"))') AS received_at,
+           message_type, text, media_id, media_mime_type, caption,
+           reply_to_message_id, interactive_reply_id, raw,
+           arrow_cast(ingested_at, 'Timestamp(Millisecond, Some("UTC"))') AS ingested_at
+    FROM staging.main.wa_events_messages
+    -- Compare and order as timestamps, not text: SQLite stores ingested_at as
+    -- ISO text whose zero fraction is dropped ("...:00Z" vs "...:00.500Z"),
+    -- which does not sort chronologically as a string.
+    WHERE arrow_cast(ingested_at, 'Timestamp(Millisecond, Some("UTC"))') >= arrow_cast({since}, 'Timestamp(Millisecond, Some("UTC"))')
+    ORDER BY arrow_cast(ingested_at, 'Timestamp(Millisecond, Some("UTC"))'), message_id
+  destination:
+    table: "wa_messages"          # the `type: lance` source of that name in ctx_whatsapp.yaml
+    mode: upsert
+    merge_keys: [message_id]
+    repeated_keys: keep_last      # keeps the last copy in stream order — hence the ORDER BY
+    create_if_missing: true
