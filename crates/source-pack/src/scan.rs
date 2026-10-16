@@ -36,7 +36,7 @@ use serde_json::{Map, Value};
 
 use crate::client::OpenConnectorClient;
 use crate::error::OpenConnectorError;
-use crate::pagination::{CursorContinuation, Pagination, PaginationStrategy};
+use crate::pagination::{CursorContinuation, PagePosition, Pagination, PaginationStrategy};
 use crate::row_path::RowPath;
 use crate::source_pack::{FixedValue, RowShape, SourcePackTable};
 
@@ -203,6 +203,24 @@ impl ActionScan {
             deadline: Instant::now() + bounds.timeout,
             pages_fetched: 0,
         })
+    }
+
+    /// Resume a durable page before any I/O. The caller's accepted-page store
+    /// owns cross-process loop detection; Pagination checks immediate repeats.
+    pub fn resume(mut self, position: PagePosition) -> Result<Self, OpenConnectorError> {
+        if self.pages_fetched != 0 {
+            return Err(OpenConnectorError::PaginationCursorInvalid {
+                path: "<saved position>".into(),
+                page: position.page,
+                found: "cannot resume a scan after fetching".into(),
+            });
+        }
+        self.pagination = Pagination::resume(self.target.pagination, position)?;
+        Ok(self)
+    }
+
+    pub fn position(&self) -> PagePosition {
+        self.pagination.position()
     }
 
     /// What is being scanned. Consumers log and key caches off it, and
