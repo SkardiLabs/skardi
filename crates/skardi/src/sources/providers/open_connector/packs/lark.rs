@@ -339,10 +339,7 @@ mod tests {
             ),
             ("messages", include_str!("fixtures/lark/messages.json")),
             ("tasks", include_str!("fixtures/lark/tasks.json")),
-            (
-                "wiki_nodes",
-                include_str!("fixtures/lark/wiki_nodes.json"),
-            ),
+            ("wiki_nodes", include_str!("fixtures/lark/wiki_nodes.json")),
             (
                 "wiki_spaces",
                 include_str!("fixtures/lark/wiki_spaces.json"),
