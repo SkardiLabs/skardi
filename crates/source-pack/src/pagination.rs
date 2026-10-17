@@ -221,13 +221,25 @@ pub enum PaginationStrategy {
 
 /// Position of the next request in a durable, one-page-at-a-time walk.
 /// Cursors are opaque; Debug deliberately omits their contents. The owner of
-/// a distributed walk must reject previously accepted positions across workers;
-/// an in-process Pagination retains its complete cursor history itself.
+/// a distributed walk must reject previously accepted positions across workers
+/// by [`PagePosition::loop_key`], never by equality: `page` grows on every
+/// step, so a cursor cycle (`A → B → A`) returns the same cursor under a new
+/// page number and equal positions never recur. An in-process Pagination
+/// retains its complete cursor history itself.
 #[derive(Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PagePosition {
     pub page: usize,
     pub token: Option<String>,
+}
+
+impl PagePosition {
+    /// What a durable owner fences on to detect a pagination loop across
+    /// resumed walks: the request's cursor, independent of the page number.
+    /// `None` for the first request of a cursor walk, which has none.
+    pub fn loop_key(&self) -> Option<&str> {
+        self.token.as_deref()
+    }
 }
 
 impl std::fmt::Debug for PagePosition {
@@ -777,6 +789,40 @@ impl Pagination {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_cursor_cycle_across_resumes_repeats_the_loop_key_not_the_position() {
+        // A → B → A, each step a fresh resumed walk: no single Pagination
+        // sees the repeat, and the positions differ by page number, so only
+        // a fence on the loop key catches it.
+        let mut fenced = HashSet::new();
+        let mut position = cursor().position();
+        let mut cycled = false;
+        for next in ["A", "B", "A"] {
+            let mut step = Pagination::resume(cursor().strategy, position.clone()).unwrap();
+            assert!(
+                step.advance(&json!({ "next_cursor": next }), 1, None)
+                    .unwrap()
+            );
+            position = step.position();
+            if !fenced.insert(position.loop_key().unwrap().to_owned()) {
+                cycled = true;
+            }
+        }
+        assert!(
+            cycled,
+            "the repeated cursor must be visible to a durable fence"
+        );
+        assert_eq!(position.loop_key(), Some("A"));
+        assert_ne!(
+            position,
+            PagePosition {
+                page: 2,
+                token: Some("A".into())
+            },
+            "positions are not the fence: the page number moved on"
+        );
+    }
 
     #[test]
     fn durable_page_resume_preserves_stop_signals_and_rejects_stalled_cursor() {
