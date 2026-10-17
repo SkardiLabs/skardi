@@ -1,0 +1,60 @@
+{
+  "items": [
+    {
+      "creator": "ou_0003",
+      "has_child": false,
+      "node_create_time": "1636114726",
+      "node_token": "wikcn0039",
+      "node_type": "origin",
+      "obj_create_time": "1636114726",
+      "obj_edit_time": "1636114726",
+      "obj_token": "wikcn0040",
+      "obj_type": "doc",
+      "origin_node_token": "wikcn0039",
+      "origin_space_id": "700000038",
+      "owner": "ou_0003",
+      "parent_node_token": "",
+      "space_id": "700000038",
+      "title": "Redacted title",
+      "url": "https://example.feishu.cn/wiki/redacted"
+    },
+    {
+      "creator": "ou_0003",
+      "has_child": true,
+      "node_create_time": "1636114726",
+      "node_token": "wikcn0041",
+      "node_type": "origin",
+      "obj_create_time": "1636114726",
+      "obj_edit_time": "1636114726",
+      "obj_token": "wikcn0042",
+      "obj_type": "doc",
+      "origin_node_token": "wikcn0041",
+      "origin_space_id": "700000038",
+      "owner": "ou_0003",
+      "parent_node_token": "",
+      "space_id": "700000038",
+      "title": "Redacted title",
+      "url": "https://example.feishu.cn/wiki/redacted"
+    },
+    {
+      "creator": "ou_0003",
+      "has_child": true,
+      "node_create_time": "1636114726",
+      "node_token": "wikcn0043",
+      "node_type": "origin",
+      "obj_create_time": "1636114726",
+      "obj_edit_time": "1636114726",
+      "obj_token": "wikcn0044",
+      "obj_type": "doc",
+      "origin_node_token": "wikcn0043",
+      "origin_space_id": "700000038",
+      "owner": "ou_0003",
+      "parent_node_token": "",
+      "space_id": "700000038",
+      "title": "Redacted title",
+      "url": "https://example.feishu.cn/wiki/redacted"
+    }
+  ],
+  "hasMore": false,
+  "pageToken": null
+}
