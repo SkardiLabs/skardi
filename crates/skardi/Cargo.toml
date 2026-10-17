@@ -147,7 +147,7 @@ redis = { version = "1.0.0-rc.2", default-features = false, features = ["cluster
 # `tesseract-rs -> zip -> xz2 -> lzma-sys` chain collides with DataFusion's `liblzma-sys`
 # (two crates can't both `links = "lzma"`) and also forces a newer tokio. OCR is still
 # available at runtime via liteparse's HTTP OCR engine (config `ocr_server_url`).
-liteparse = { version = "2.4.0", default-features = false, optional = true }
+liteparse = { version = "=2.4.0", default-features = false, optional = true }
 # Stable fingerprints for Open Connector contracts and document IDs.
 blake3 = "1"
 # include_globs matching for the documents connector.

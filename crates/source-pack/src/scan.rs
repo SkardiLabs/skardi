@@ -36,7 +36,7 @@ use serde_json::{Map, Value};
 
 use crate::client::OpenConnectorClient;
 use crate::error::OpenConnectorError;
-use crate::pagination::{CursorContinuation, Pagination, PaginationStrategy};
+use crate::pagination::{CursorContinuation, PagePosition, Pagination, PaginationStrategy};
 use crate::row_path::RowPath;
 use crate::source_pack::{FixedValue, RowShape, SourcePackTable};
 
@@ -131,8 +131,12 @@ pub struct ScanBounds {
     /// [`OpenConnectorError::ScanBoundsExceeded`], never a quiet stop —
     /// stopping would report a PREFIX of the collection as the whole of it.
     pub max_pages: u32,
-    /// Wall-clock budget for the entire walk, request I/O and client-internal
-    /// retry backoff included.
+    /// Wall-clock budget for this scan's requests, I/O and client-internal
+    /// retry backoff included: the entire walk for an in-process scan, and
+    /// this process's share of it for a [`ActionScan::resume`]d one. A
+    /// durable walk's overall bound belongs to its owner (one page per
+    /// leased work, under the owner's own deadline), not to a wall clock
+    /// carried across processes.
     pub timeout: Duration,
 }
 
@@ -203,6 +207,24 @@ impl ActionScan {
             deadline: Instant::now() + bounds.timeout,
             pages_fetched: 0,
         })
+    }
+
+    /// Resume a durable page before any I/O. The caller's accepted-page store
+    /// owns cross-process loop detection; Pagination checks immediate repeats.
+    pub fn resume(mut self, position: PagePosition) -> Result<Self, OpenConnectorError> {
+        if self.pages_fetched != 0 {
+            return Err(OpenConnectorError::PaginationCursorInvalid {
+                path: "<saved position>".into(),
+                page: position.page,
+                found: "cannot resume a scan after fetching".into(),
+            });
+        }
+        self.pagination = Pagination::resume(self.target.pagination, position)?;
+        Ok(self)
+    }
+
+    pub fn position(&self) -> PagePosition {
+        self.pagination.position()
     }
 
     /// What is being scanned. Consumers log and key caches off it, and
@@ -557,6 +579,49 @@ mod tests {
         let ids: Vec<u64> = rows.iter().map(|r| r["id"].as_u64().expect("id")).collect();
         assert_eq!(ids, vec![1, 2, 3, 4, 5], "every page's rows, in order");
         assert_eq!(scan.pages_fetched(), 3, "three gateway requests");
+    }
+
+    /// A durable walk fetches one page per process: the saved position must
+    /// survive serialization and drive the next request (cursor and page
+    /// number) in a fresh scan, and a scan that already fetched cannot be
+    /// re-positioned.
+    #[tokio::test]
+    async fn a_saved_position_resumes_the_walk_in_a_fresh_scan() {
+        let gateway = MockGateway::start(|req: &RecordedRequest| {
+            match body_of(req)["input"]["cursor"].as_str() {
+                None => page_of(&[1, 2], Some("c1")),
+                Some("c1") => page_of(&[3, 4], Some("c2")),
+                _ => page_of(&[5], None),
+            }
+        })
+        .await;
+        let pagination = cursor_pagination(AbsentCursor::EndsTheScan);
+        let mut first = scan_against(&gateway, pagination, bounds(10)).await;
+        let envelope = first.fetch_page().await.expect("page 1");
+        let rows = first.rows(&envelope).expect("rows");
+        assert!(first.advance(&envelope, rows).expect("advance"));
+        let saved = serde_json::to_string(&first.position()).expect("serializable");
+
+        let mut second = scan_against(&gateway, pagination, bounds(10))
+            .await
+            .resume(serde_json::from_str(&saved).expect("round-trips"))
+            .expect("a fresh scan resumes");
+        assert_eq!(second.page(), 2);
+        let envelope = second.fetch_page().await.expect("page 2");
+        let rows = second.rows(&envelope).expect("rows");
+        let ids: Vec<u64> = rows.iter().map(|r| r["id"].as_u64().expect("id")).collect();
+        assert_eq!(
+            ids,
+            vec![3, 4],
+            "the resumed request carries the saved cursor"
+        );
+        assert_eq!(body_of(&gateway.requests()[1])["input"]["cursor"], "c1");
+        assert!(second.advance(&envelope, rows).expect("advance"));
+        let next = second.position();
+        assert!(
+            second.resume(next).is_err(),
+            "a scan that fetched cannot be re-positioned"
+        );
     }
 
     /// **The bound a syncer depends on.** Running out of pages must REFUSE.

@@ -50,6 +50,8 @@ tables:
       required: [owner, repo]
     fixed_inputs:
       state: all
+      sort: created
+      direction: asc
     columns:
       - { name: id, path: id, type: uint64, nullable: false }
       - { name: number, path: number, type: uint64, nullable: false }
@@ -103,6 +105,8 @@ tables:
       required: [owner, repo]
     fixed_inputs:
       state: all
+      sort: created
+      direction: asc
     columns:
       - { name: id, path: id, type: uint64, nullable: false }
       - { name: number, path: number, type: uint64, nullable: false }
