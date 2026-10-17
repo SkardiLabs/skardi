@@ -50,6 +50,7 @@ pub fn builtin_pack_registry() -> Result<SourcePackRegistry, OpenConnectorError>
         packs::notion::pack()?,
         packs::slack::pack()?,
         packs::feishu::pack()?,
+        packs::lark::pack()?,
         packs::discord::pack()?,
         packs::outlook::pack()?,
         packs::one_drive::pack()?,
@@ -110,8 +111,14 @@ mod tests {
         // (`additionalProperties: true`), so unlike Notion's the fingerprint
         // gate covers only the declared keys; the executor's normalizer
         // emits exactly those, which the live pass confirms column by column.
+        //
+        // `lark.document_content` mirrors `feishu.document_content` exactly:
+        // Lark is Feishu's international edition, and `packs/lark.yaml` is
+        // the feishu pack with every `feishu.*` action renamed `lark.*` (see
+        // the warning at the top of that file about what remains unverified).
         const OBJECT_ROW_TABLES: &[&str] = &[
             "feishu.document_content",
+            "lark.document_content",
             "notion.page_markdown",
             "whatsapp.business_profile",
         ];
@@ -212,6 +219,7 @@ mod tests {
                 "github",
                 "gmail",
                 "google_drive",
+                "lark",
                 "mock",
                 "notion",
                 "one_drive",
@@ -357,6 +365,31 @@ mod tests {
     }
 
     #[test]
+    fn builtin_lark_pack_is_registered() {
+        // Lark mirrors feishu's eight tables exactly, under `lark.*`
+        // actions: see the warning atop packs/lark.yaml for what that
+        // mirroring does and does not vouch for.
+        let registry = super::builtin_pack_registry().expect("embedded assets parse");
+        let pack = registry.require("lark").unwrap();
+        assert_eq!(pack.name, "lark");
+        assert_eq!(pack.version, 1);
+        let ids: Vec<&str> = pack.tables.iter().map(|table| table.id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "lark.chat_members",
+                "lark.chats",
+                "lark.document_blocks",
+                "lark.document_content",
+                "lark.messages",
+                "lark.tasks",
+                "lark.wiki_nodes",
+                "lark.wiki_spaces",
+            ]
+        );
+    }
+
+    #[test]
     fn builtin_whatsapp_pack_is_registered() {
         let registry = super::builtin_pack_registry().expect("embedded assets parse");
         let pack = registry.require("whatsapp").unwrap();
@@ -390,6 +423,7 @@ mod tests {
             "slack",
             "notion",
             "feishu",
+            "lark",
             "discord",
             "outlook",
             "one_drive",

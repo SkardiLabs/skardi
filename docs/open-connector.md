@@ -25,6 +25,9 @@ gateway **runtime token**.
 > freeze), [Feishu](open-connector-feishu.md) (chats, messages,
 > chat members, docx document content and blocks, tasks, wiki —
 > live-verified against a real workspace),
+> [Lark](open-connector-lark.md) (the same eight tables as Feishu under
+> `lark.*` actions — Lark is Feishu's international edition; NOT yet
+> independently live-verified against a real Lark gateway),
 > [Discord](open-connector-discord.md) (guilds, connections, sticker
 > packs — live-verified against a real account; entitlements gated on
 > upstream pagination inputs),
