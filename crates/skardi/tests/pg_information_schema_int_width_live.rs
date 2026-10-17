@@ -20,7 +20,9 @@
 //! ```
 
 use arrow::datatypes::DataType;
-use skardi::sources::providers::sqlx::pg::knn_table_function::fetch_table_columns;
+use skardi::sources::providers::sqlx::pg::knn_table_function::{
+    fetch_table_columns, try_get_opt_int,
+};
 use sqlx::PgPool;
 
 /// `SKARDI_PG_LIVE_URL` for a hand run; otherwise CI's Postgres service, the
@@ -84,31 +86,18 @@ async fn numeric_precision_decodes_at_int4_int8_and_int2_widths() {
     .await
     .expect("probe row");
     assert_eq!(
-        skardi::sources::providers::sqlx::pg::knn_table_function::try_get_opt_int(
-            &row,
-            "numeric_precision"
-        )
-        .unwrap(),
+        try_get_opt_int(&row, "numeric_precision").unwrap(),
         Some(12),
         "INT8 must decode"
     );
     assert_eq!(
-        skardi::sources::providers::sqlx::pg::knn_table_function::try_get_opt_int(
-            &row,
-            "numeric_scale"
-        )
-        .unwrap(),
+        try_get_opt_int(&row, "numeric_scale").unwrap(),
         Some(3),
         "INT2 must decode"
     );
+    assert_eq!(try_get_opt_int(&row, "absent").unwrap(), None);
     assert_eq!(
-        skardi::sources::providers::sqlx::pg::knn_table_function::try_get_opt_int(&row, "absent")
-            .unwrap(),
-        None
-    );
-    assert_eq!(
-        skardi::sources::providers::sqlx::pg::knn_table_function::try_get_opt_int(&row, "too_wide")
-            .unwrap(),
+        try_get_opt_int(&row, "too_wide").unwrap(),
         None,
         "a value no precision can have is absent, not an error"
     );
@@ -117,4 +106,37 @@ async fn numeric_precision_decodes_at_int4_int8_and_int2_widths() {
         .execute(&pool)
         .await
         .expect("cleanup");
+}
+
+/// A column that is not an integer at any width is a hard error, not a
+/// silent `None`: a server handing back `text` or `bool` for
+/// `numeric_precision` is broken in a way the caller must hear about, and
+/// the message has to name the column so the failing table is findable in
+/// the registration log.
+#[rstest::rstest]
+#[case::text("'12'::text")]
+#[case::bool("true::bool")]
+#[case::float("12.0::float8")]
+#[case::numeric("12::numeric")]
+#[tokio::test]
+async fn non_integer_column_is_an_error_naming_the_column(#[case] expr: &str) {
+    let Some(url) = live_url() else { return };
+    let pool = PgPool::connect(&url).await.expect("connect");
+
+    let row = sqlx::query(&format!("SELECT {expr} AS numeric_precision"))
+        .fetch_one(&pool)
+        .await
+        .expect("probe row");
+
+    let err = try_get_opt_int(&row, "numeric_precision")
+        .expect_err("a non-integer column must not decode as an integer");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("decoding 'numeric_precision' as any of INT2/INT4/INT8"),
+        "error must name the column and the widths tried; got: {msg}"
+    );
+    assert!(
+        msg.contains("mismatched types"),
+        "the INT4 decode error must be kept as the cause; got: {msg}"
+    );
 }
