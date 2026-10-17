@@ -1,0 +1,40 @@
+{
+  "items": [
+    {
+      "avatar": "https://img.example/avatar.png",
+      "chat_id": "oc_0001",
+      "chat_mode": "group",
+      "chat_status": "normal",
+      "description": "Redacted description",
+      "external": true,
+      "name": "Redacted name",
+      "tenant_key": "t-0001"
+    },
+    {
+      "avatar": "https://img.example/avatar.png",
+      "chat_id": "oc_0002",
+      "chat_mode": "group",
+      "chat_status": "normal",
+      "description": "",
+      "external": false,
+      "name": "Redacted name",
+      "owner_id": "ou_0003",
+      "owner_id_type": "open_id",
+      "tenant_key": "t-0001"
+    },
+    {
+      "avatar": "https://img.example/avatar.png",
+      "chat_id": "oc_0004",
+      "chat_mode": "topic",
+      "chat_status": "normal",
+      "description": "Redacted description",
+      "external": true,
+      "name": "Redacted name",
+      "owner_id": "ou_0005",
+      "owner_id_type": "open_id",
+      "tenant_key": "t-0001"
+    }
+  ],
+  "hasMore": false,
+  "pageToken": null
+}
