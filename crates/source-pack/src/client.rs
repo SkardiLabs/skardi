@@ -57,7 +57,7 @@ use serde_json::Value;
 use url::Url;
 
 use crate::config::{OpenConnectorConfig, validate_action_id};
-use crate::error::{LastAttempt, OpenConnectorError, TransportFailure};
+use crate::error::{LastAttempt, OpenConnectorError, ProviderData, TransportFailure};
 use crate::http::{clock_jitter_nanos, parse_retry_after};
 use crate::text::truncate_chars;
 
@@ -625,7 +625,7 @@ impl OpenConnectorClient {
                     data: serde_json::from_str::<Value>(&body)
                         .ok()
                         .and_then(|body| body.get("data").cloned())
-                        .map(crate::error::ProviderData),
+                        .map(ProviderData),
                     message: envelope_message(&body),
                     echoed_action_id: envelope_action_id(&body),
                     reason: terminal_reason(status, &body),
@@ -647,7 +647,7 @@ impl OpenConnectorClient {
                 // the HTTP code says nothing about what went wrong.
                 status: None,
                 error_code: envelope.error_code.clone(),
-                data: envelope.data.clone().map(crate::error::ProviderData),
+                data: envelope.data.clone().map(ProviderData),
                 message: envelope.message.clone(),
                 echoed_action_id: envelope_action_id(&text),
                 reason: envelope.failure_reason(),
