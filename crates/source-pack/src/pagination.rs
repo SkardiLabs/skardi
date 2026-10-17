@@ -219,6 +219,38 @@ pub enum PaginationStrategy {
     },
 }
 
+/// Position of the next request in a durable, one-page-at-a-time walk.
+/// Cursors are opaque; Debug deliberately omits their contents. The owner of
+/// a distributed walk must reject previously accepted positions across workers
+/// by [`PagePosition::loop_key`], never by equality: `page` grows on every
+/// step, so a cursor cycle (`A → B → A`) returns the same cursor under a new
+/// page number and equal positions never recur. An in-process Pagination
+/// retains its complete cursor history itself.
+#[derive(Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PagePosition {
+    pub page: usize,
+    pub token: Option<String>,
+}
+
+impl PagePosition {
+    /// What a durable owner fences on to detect a pagination loop across
+    /// resumed walks: the request's cursor, independent of the page number.
+    /// `None` for the first request of a cursor walk, which has none.
+    pub fn loop_key(&self) -> Option<&str> {
+        self.token.as_deref()
+    }
+}
+
+impl std::fmt::Debug for PagePosition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PagePosition")
+            .field("page", &self.page)
+            .field("has_token", &self.token.is_some())
+            .finish()
+    }
+}
+
 /// Mutable pagination state for one scan.
 #[derive(Debug)]
 pub struct Pagination {
@@ -365,6 +397,59 @@ impl Pagination {
             raw_page_size_path,
             has_more_path,
         })
+    }
+
+    /// Restore the next request without reimplementing any termination rule.
+    /// The current token participates in loop detection immediately. Owners
+    /// spanning several processes also fence accepted positions durably.
+    pub fn resume(
+        strategy: PaginationStrategy,
+        position: PagePosition,
+    ) -> Result<Self, OpenConnectorError> {
+        let valid = position.page > 0
+            && match strategy {
+                PaginationStrategy::PageNumber { .. } => {
+                    position
+                        .token
+                        .as_deref()
+                        .and_then(|token| token.parse::<usize>().ok())
+                        == Some(position.page)
+                }
+                PaginationStrategy::SinglePage { .. } => {
+                    position.page == 1 && position.token.is_none()
+                }
+                PaginationStrategy::Cursor { .. } | PaginationStrategy::Keyset { .. } => {
+                    if position.page == 1 {
+                        position.token.is_none()
+                    } else {
+                        position
+                            .token
+                            .as_ref()
+                            .is_some_and(|token| !token.is_empty())
+                    }
+                }
+            };
+        if !valid {
+            return Err(OpenConnectorError::PaginationCursorInvalid {
+                path: "<saved position>".into(),
+                page: position.page,
+                found: "inconsistent saved position".into(),
+            });
+        }
+        let mut pagination = Self::new(strategy)?;
+        pagination.page = position.page;
+        pagination.next_token = position.token;
+        if let Some(token) = &pagination.next_token {
+            pagination.seen_tokens.insert(token.clone());
+        }
+        Ok(pagination)
+    }
+
+    pub fn position(&self) -> PagePosition {
+        PagePosition {
+            page: self.page,
+            token: self.next_token.clone(),
+        }
     }
 
     /// The 1-based number of the page about to be requested.
@@ -704,6 +789,90 @@ impl Pagination {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_cursor_cycle_across_resumes_repeats_the_loop_key_not_the_position() {
+        // A → B → A, each step a fresh resumed walk: no single Pagination
+        // sees the repeat, and the positions differ by page number, so only
+        // a fence on the loop key catches it.
+        let mut fenced = HashSet::new();
+        let mut position = cursor().position();
+        let mut cycled = false;
+        for next in ["A", "B", "A"] {
+            let mut step = Pagination::resume(cursor().strategy, position.clone()).unwrap();
+            assert!(
+                step.advance(&json!({ "next_cursor": next }), 1, None)
+                    .unwrap()
+            );
+            position = step.position();
+            if !fenced.insert(position.loop_key().unwrap().to_owned()) {
+                cycled = true;
+            }
+        }
+        assert!(
+            cycled,
+            "the repeated cursor must be visible to a durable fence"
+        );
+        assert_eq!(position.loop_key(), Some("A"));
+        assert_ne!(
+            position,
+            PagePosition {
+                page: 2,
+                token: Some("A".into())
+            },
+            "positions are not the fence: the page number moved on"
+        );
+    }
+
+    #[test]
+    fn durable_page_resume_preserves_stop_signals_and_rejects_stalled_cursor() {
+        let strategy = PaginationStrategy::PageNumber {
+            page_param: "page",
+            per_page_param: "per_page",
+            per_page: 100,
+            total_pages_path: None,
+            raw_page_size_path: Some("$.pageInfo.fetched"),
+        };
+        let mut first = Pagination::new(strategy).unwrap();
+        assert!(
+            first
+                .advance(&json!({"pageInfo":{"fetched":100}}), 0, None)
+                .unwrap()
+        );
+        let saved = serde_json::to_vec(&first.position()).unwrap();
+        let mut second =
+            Pagination::resume(strategy, serde_json::from_slice(&saved).unwrap()).unwrap();
+        let mut input = Map::new();
+        second.apply(&mut input);
+        assert_eq!(input["page"], 2);
+        assert!(
+            !second
+                .advance(&json!({"pageInfo":{"fetched":20}}), 0, None)
+                .unwrap()
+        );
+        let mut cursor = cursor();
+        assert!(
+            cursor
+                .advance(&json!({"next_cursor":"a"}), 1, None)
+                .unwrap()
+        );
+        let mut restored = Pagination::resume(cursor.strategy, cursor.position()).unwrap();
+        assert!(
+            restored
+                .advance(&json!({"next_cursor":"a"}), 1, None)
+                .is_err()
+        );
+        assert!(
+            Pagination::resume(
+                strategy,
+                PagePosition {
+                    page: 2,
+                    token: Some("1".into())
+                }
+            )
+            .is_err()
+        );
+    }
 
     fn page_number(per_page: u32) -> Pagination {
         Pagination::new(PaginationStrategy::PageNumber {

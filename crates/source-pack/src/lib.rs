@@ -89,4 +89,4 @@ pub mod text;
 
 pub use client::{OpenConnectorClient, TransportPolicy};
 pub use config::OpenConnectorConfig;
-pub use error::{LastAttempt, OpenConnectorError, TransportFailure};
+pub use error::{LastAttempt, OpenConnectorError, ProviderData, TransportFailure};
