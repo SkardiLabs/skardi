@@ -218,46 +218,57 @@ impl JobDefinition {
         let path = path.as_ref();
         let content = fs::read_to_string(path)
             .with_context(|| format!("Failed to read job file: {}", path.display()))?;
+        Self::load_from_yaml(&content, ctx).await.map_err(|error| {
+            let message = format!("{error} (job file {})", path.display());
+            error.context(message)
+        })
+    }
 
-        let root: serde_yaml::Value = serde_yaml::from_str(&content)
-            .with_context(|| format!("Failed to parse job YAML: {}", path.display()))?;
+    /// Load an already-read job YAML using the same validation and schema
+    /// inference as [`Self::load_from_file`]. Returns `None` for a pipeline.
+    ///
+    /// ```no_run
+    /// use std::sync::Arc;
+    /// use datafusion::prelude::SessionContext;
+    /// use skardi::jobs::definition::JobDefinition;
+    /// # async fn example() -> anyhow::Result<()> {
+    /// let yaml = "kind: pipeline";
+    /// let ctx = Arc::new(SessionContext::new());
+    /// assert!(JobDefinition::load_from_yaml(yaml, ctx).await?.is_none());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn load_from_yaml(content: &str, ctx: Arc<SessionContext>) -> Result<Option<Self>> {
+        let root: serde_yaml::Value =
+            serde_yaml::from_str(content).context("Failed to parse job YAML")?;
 
         let kind_value = root.get("kind").ok_or_else(|| {
-            anyhow!(
-                "Missing `kind:` at root of {} — expected `kind: job` or `kind: pipeline`",
-                path.display()
-            )
+            anyhow!("Missing `kind:` at root — expected `kind: job` or `kind: pipeline`")
         })?;
-        let kind: JobKind = serde_yaml::from_value(kind_value.clone())
-            .with_context(|| format!("Invalid `kind:` in {}", path.display()))?;
+        let kind: JobKind =
+            serde_yaml::from_value(kind_value.clone()).context("Invalid `kind:`")?;
 
         if kind != JobKind::Job {
             return Ok(None);
         }
 
-        let spec = root.get("spec").ok_or_else(|| {
-            anyhow!(
-                "`kind: job` YAML {} is missing a `spec:` block",
-                path.display()
-            )
-        })?;
+        let spec = root
+            .get("spec")
+            .ok_or_else(|| anyhow!("`kind: job` YAML is missing a `spec:` block"))?;
 
-        let destination_value = spec.get("destination").ok_or_else(|| {
-            anyhow!(
-                "`kind: job` YAML {} is missing `spec.destination`",
-                path.display()
-            )
-        })?;
+        let destination_value = spec
+            .get("destination")
+            .ok_or_else(|| anyhow!("`kind: job` YAML is missing `spec.destination`"))?;
         let destination: Destination = serde_yaml::from_value(destination_value.clone())
-            .with_context(|| format!("Failed to parse destination block in {}", path.display()))?;
+            .context("Failed to parse destination block")?;
         destination
             .validate()
-            .with_context(|| format!("Invalid destination block in {}", path.display()))?;
+            .context("Invalid destination block")?;
 
         let execution: Execution = match spec.get("execution") {
-            Some(v) => serde_yaml::from_value(v.clone()).with_context(|| {
-                format!("Failed to parse execution block in {}", path.display())
-            })?,
+            Some(v) => {
+                serde_yaml::from_value(v.clone()).context("Failed to parse execution block")?
+            }
             None => Execution::default(),
         };
 
@@ -268,7 +279,7 @@ impl JobDefinition {
         // (which is now strict to `kind: pipeline`).
         let pipeline = StandardPipeline::build_from_parsed(root, ctx)
             .await
-            .with_context(|| format!("Failed to load pipeline section of {}", path.display()))?;
+            .context("Failed to load pipeline section of job YAML")?;
 
         Ok(Some(Self {
             pipeline,
@@ -328,7 +339,18 @@ spec:
     timeout_ms: 60000
 "#;
         let ctx = Arc::new(SessionContext::new());
-        let res = write_and_load(yaml, ctx).await.unwrap().unwrap();
+        let res = write_and_load(yaml, Arc::clone(&ctx))
+            .await
+            .unwrap()
+            .unwrap();
+        let memory = JobDefinition::load_from_yaml(yaml, ctx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(memory.name(), res.name());
+        assert_eq!(memory.sql(), res.sql());
+        assert_eq!(memory.destination.table, res.destination.table);
+        assert_eq!(memory.execution.timeout_ms, res.execution.timeout_ms);
         assert_eq!(res.name(), "ingest-j1");
         assert_eq!(res.destination.table, "target_table");
         assert_eq!(res.destination.mode, DestinationMode::Append);
