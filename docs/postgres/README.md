@@ -75,6 +75,29 @@ curl -X POST http://localhost:8080/pg_user_query/execute \
 1. **PostgreSQL Server** running locally or remotely
 2. **PostgreSQL Database** with test tables
 
+## Connection pools and initialization
+
+Each PostgreSQL source uses a read pool and a separate pool for writes and
+schema introspection. Catalog registration shares those pools across its tables.
+Set their ceilings and initialization budget in the connection URL:
+
+```yaml
+connection_string: "postgres://localhost:5432/mydb?connection_pool_size=2&write_connection_pool_size=2&connection_init_timeout_seconds=30"
+```
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `connection_pool_size` | 10 | Maximum read connections |
+| `write_connection_pool_size` | 10 | Maximum write and introspection connections |
+| `connection_init_timeout_seconds` | 5 | Per-attempt pool construction and catalog introspection budget, in seconds |
+
+All values must be positive integers. These are ceilings, not numbers of
+connections opened eagerly. A configured initialization budget also bounds
+per-table introspection; each initialization operation retains the existing
+three-attempt retry policy. It does not change query execution, statement or
+pool acquisition timeouts. PostgreSQL and PgBouncer backend connection limits
+remain independent of these client pools.
+
 ## Running the Example
 
 1. **Set environment variables**:
