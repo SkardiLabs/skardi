@@ -23,7 +23,7 @@ fn skardi(home: &Path, args: &[&str]) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_skardi"));
     cmd.env("HOME", home)
         .env("SKARDI_CONFIG_DIR", home.join(".skardi"))
-.env_remove("SKARDI_SERVER_URL")
+        .env_remove("SKARDI_SERVER_URL")
         .env_remove("SKARDI_API_TOKEN")
         .env_remove("SKARDI_CONTEXT")
         .args(args);
@@ -300,7 +300,7 @@ fn resolution_refuses_ambiguous_or_conflicting_selections_without_issuing_a_requ
     let out = Command::new(env!("CARGO_BIN_EXE_skardi"))
         .env("HOME", home)
         .env("SKARDI_CONFIG_DIR", home.join(".skardi"))
-.env("SKARDI_SERVER_URL", "http://127.0.0.1:1")
+        .env("SKARDI_SERVER_URL", "http://127.0.0.1:1")
         .env_remove("SKARDI_API_TOKEN")
         .env_remove("SKARDI_CONTEXT")
         .args(["query", "-e", "select 1"])
@@ -318,7 +318,7 @@ fn resolution_refuses_ambiguous_or_conflicting_selections_without_issuing_a_requ
     let out = Command::new(env!("CARGO_BIN_EXE_skardi"))
         .env("HOME", home)
         .env("SKARDI_CONFIG_DIR", home.join(".skardi"))
-.env("SKARDI_CONTEXT", "also-typo")
+        .env("SKARDI_CONTEXT", "also-typo")
         .env_remove("SKARDI_SERVER_URL")
         .env_remove("SKARDI_API_TOKEN")
         .args(["query", "-e", "select 1"])
@@ -336,7 +336,7 @@ fn resolution_refuses_ambiguous_or_conflicting_selections_without_issuing_a_requ
     let out = Command::new(env!("CARGO_BIN_EXE_skardi"))
         .env("HOME", home)
         .env("SKARDI_CONFIG_DIR", home.join(".skardi"))
-.env("SKARDI_API_TOKEN", "stale-token")
+        .env("SKARDI_API_TOKEN", "stale-token")
         .env_remove("SKARDI_SERVER_URL")
         .env_remove("SKARDI_CONTEXT")
         .args(["query", "-e", "select 1"])
@@ -533,7 +533,7 @@ fn token_stdin_reads_a_pipe_and_writes_the_context() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_skardi"))
         .env("HOME", home.path())
         .env("SKARDI_CONFIG_DIR", home.path().join(".skardi"))
-.env_remove("SKARDI_SERVER_URL")
+        .env_remove("SKARDI_SERVER_URL")
         .env_remove("SKARDI_API_TOKEN")
         .env_remove("SKARDI_CONTEXT")
         .args([
@@ -621,7 +621,7 @@ fn token_stdin_returns_before_a_live_writer_closes_the_pipe() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_skardi"))
         .env("HOME", home.path())
         .env("SKARDI_CONFIG_DIR", home.path().join(".skardi"))
-.env_remove("SKARDI_SERVER_URL")
+        .env_remove("SKARDI_SERVER_URL")
         .env_remove("SKARDI_API_TOKEN")
         .env_remove("SKARDI_CONTEXT")
         .args([
