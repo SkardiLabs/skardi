@@ -69,10 +69,9 @@ jobs:
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - name: Test skardi-cli
-        # The release ships a Windows binary, so its tests run on Windows.
-        # The integration tests that redirect HOME are #![cfg(unix)]:
-        # dirs::home_dir() ignores HOME on Windows. Unit tests and the clap
-        # smoke tests still run here.
+        # The release ships a Windows binary, so its tests run on Windows,
+        # integration tests included: they point SKARDI_CONFIG_DIR at a temp
+        # directory, since dirs::home_dir() ignores HOME on Windows.
         run: cargo test -p skardi-cli
       - name: The binary starts
         run: |

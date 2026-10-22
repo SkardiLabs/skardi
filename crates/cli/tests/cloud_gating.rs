@@ -6,8 +6,9 @@
 //! server in front of it can demonstrate that. The message wording and the
 //! (capability, mode) matrix are unit-tested in `cloud.rs`; these are the
 //! wiring tests.
-
-#![cfg(unix)]
+//!
+//! The config file is redirected with `SKARDI_CONFIG_DIR`, which works on
+//! Windows too, where `dirs::home_dir()` ignores `HOME`.
 
 use std::path::Path;
 use std::process::{Command, Output};
@@ -18,6 +19,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 fn skardi(home: &Path, args: &[&str]) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_skardi"));
     cmd.env("HOME", home)
+        .env("SKARDI_CONFIG_DIR", home.join(".skardi"))
         .env_remove("SKARDI_SERVER_URL")
         .env_remove("SKARDI_API_TOKEN")
         .env_remove("SKARDI_CONTEXT")
@@ -29,10 +31,9 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).to_string()
 }
 
-/// Write a single cloud context pointing at `server`, at mode 0600 so the
-/// binary's loose-permission warning stays out of the assertions.
+/// Write a single cloud context pointing at `server`, at mode 0600 on unix so
+/// the binary's loose-permission warning stays out of the assertions.
 fn write_cloud_context(home: &Path, server: &str, token_expires_at: Option<&str>) {
-    use std::os::unix::fs::PermissionsExt as _;
     let dir = home.join(".skardi");
     std::fs::create_dir_all(&dir).unwrap();
     let expiry = match token_expires_at {
@@ -54,7 +55,11 @@ fn write_cloud_context(home: &Path, server: &str, token_expires_at: Option<&str>
         ),
     )
     .unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
 }
 
 #[tokio::test]

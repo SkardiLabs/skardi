@@ -76,6 +76,12 @@ contexts:
     token: skardi_pat_…
 ```
 
+On Windows the file is `%USERPROFILE%\.skardi\config.yaml`. Set
+`SKARDI_CONFIG_DIR` to keep it somewhere else: the CLI then reads and writes
+`$SKARDI_CONFIG_DIR/config.yaml` in place of `~/.skardi/config.yaml`. That is
+also how to give a sandbox or a test its own config on Windows, where the
+home directory cannot be redirected through `HOME`.
+
 Which context a command uses: `--context NAME` > `$SKARDI_CONTEXT` >
 `current-context` > the only context, if the file defines exactly one. With
 several contexts and no pointer, no context is selected and the flags, env

@@ -4,8 +4,6 @@
 //! print to stdout corrupts the JSON-RPC framing and breaks the initialize
 //! handshake below.
 
-#![cfg(unix)]
-
 use rmcp::ServiceExt;
 use rmcp::model::CallToolRequestParams;
 use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
@@ -16,7 +14,9 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 fn spawn_transport(server_url: &str, home: &std::path::Path) -> TokioChildProcess {
     TokioChildProcess::new(
         tokio::process::Command::new(env!("CARGO_BIN_EXE_skardi")).configure(|cmd| {
+            // SKARDI_CONFIG_DIR as well as HOME: Windows ignores HOME.
             cmd.env("HOME", home)
+                .env("SKARDI_CONFIG_DIR", home.join(".skardi"))
                 .env_remove("SKARDI_SERVER_URL")
                 .env_remove("SKARDI_API_TOKEN")
                 .env_remove("SKARDI_CONTEXT")
