@@ -409,3 +409,6 @@ if ($script:fails -gt 0) {
     exit 1
 }
 Write-Host 'all passed'
+# Some cases run the installer to a failing exit on purpose, and the CI
+# runner exits with whatever $LASTEXITCODE is left, so say 0 out loud.
+exit 0
