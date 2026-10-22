@@ -1391,9 +1391,9 @@ async fn a_browser_login_refuses_the_flags_it_cannot_honour(
     #[case] selection: Selection,
     #[case] expected: &str,
 ) {
-    // The consent screen grants exactly one workspace (§11.1), so neither flag
-    // has an honest reading here — and quietly logging into one workspace when
-    // `--all-workspaces` was asked for is a success discovered much later.
+    // The consent screen chooses the workspaces, so neither flag has an honest
+    // reading here — and quietly logging into the set the browser chose when
+    // `--workspace` named another is a success discovered much later.
     let home = TempDir::new().unwrap();
     let mut options = broker_options("http://127.0.0.1:1");
     options.selection = selection;
@@ -1618,6 +1618,163 @@ async fn an_approval_with_no_membership_is_fatal_and_names_the_live_token() {
         .to_string();
     assert!(err.contains("no membership"), "{err}");
     assert!(err.contains("revoke token tok-orphan"), "{err}");
+}
+
+/// An approved exchange for several workspaces (skardi-cloud #1217): ONE token,
+/// `memberships` for each, and `workspaces` with the role the gateway answers
+/// at after the approver's cap.
+fn approved_scoped(gateway_url: &str, token_id: &str, grants: &[(&str, &str)]) -> Value {
+    json!({
+        "status": "approved",
+        "token": format!("skardi_pat_{token_id}"),
+        "token_id": token_id,
+        "expires_at": "2026-11-22T12:00:00Z",
+        "workspace": grants[0].0,
+        "workspaces": grants
+            .iter()
+            .map(|(ws, role)| json!({"workspace": ws, "org_slug": "acme", "role": role}))
+            .collect::<Vec<_>>(),
+        "memberships": grants
+            .iter()
+            .map(|(ws, _)| membership("acme", ws, "active", Some(gateway_url)))
+            .collect::<Vec<_>>(),
+    })
+}
+
+#[tokio::test]
+async fn a_browser_login_approving_several_workspaces_writes_a_context_for_each() {
+    let gw = gateway(200).await;
+    let console = console(
+        200,
+        approved_scoped(&gw.uri(), "tok-1", &[("ws-a", "admin"), ("ws-b", "member")]),
+    )
+    .await;
+    let home = TempDir::new().unwrap();
+
+    let report = login(broker_options(&console.uri()), &config_in(&home))
+        .await
+        .unwrap();
+
+    let names: Vec<_> = report.written.iter().map(|w| w.name.as_str()).collect();
+    assert_eq!(names, ["acme/ws-a", "acme/ws-b"], "the approver's order");
+    // The role reported is the CAPPED one the gateway answers at, not the
+    // membership's own (both memberships here are admin).
+    assert_eq!(report.written[1].role, "member");
+    assert_eq!(report.current_context.as_deref(), Some("acme/ws-a"));
+
+    // One credential, held by every context it reaches.
+    let file = read_yaml(&config_in(&home));
+    for (i, ws) in ["ws-a", "ws-b"].iter().enumerate() {
+        let context = &file["contexts"][i];
+        assert_eq!(context["workspace"].as_str(), Some(*ws));
+        assert_eq!(context["token"].as_str(), Some("skardi_pat_tok-1"));
+        assert_eq!(context["token-id"].as_str(), Some("tok-1"));
+    }
+
+    // Each context was verified through its OWN workspace: reaching one says
+    // nothing about the next.
+    let probed: Vec<_> = gw
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter_map(|r| {
+            r.headers
+                .get("skardi-workspace")
+                .map(|v| v.to_str().unwrap().to_string())
+        })
+        .collect();
+    assert_eq!(probed, ["ws-a", "ws-b"]);
+}
+
+#[tokio::test]
+async fn a_membership_the_approval_does_not_name_gets_no_context() {
+    // `workspaces` is the grant. A membership riding along for any other
+    // workspace would be a context whose token 403s on its first query.
+    let gw = gateway(200).await;
+    let mut body = approved_scoped(&gw.uri(), "tok-1", &[("ws-a", "admin")]);
+    body["memberships"].as_array_mut().unwrap().push(membership(
+        "acme",
+        "ws-stray",
+        "active",
+        Some(&gw.uri()),
+    ));
+    let console = console(200, body).await;
+    let home = TempDir::new().unwrap();
+
+    let report = login(broker_options(&console.uri()), &config_in(&home))
+        .await
+        .unwrap();
+    let names: Vec<_> = report.written.iter().map(|w| w.name.as_str()).collect();
+    assert_eq!(names, ["acme/ws-a"]);
+}
+
+#[tokio::test]
+async fn context_with_several_approved_workspaces_is_refused_and_names_the_live_token() {
+    // `--context` names one context, and only once the browser has chosen is
+    // it known to be wrong — so the credential is reported, not lost.
+    let gw = gateway(200).await;
+    let console = console(
+        200,
+        approved_scoped(&gw.uri(), "tok-1", &[("ws-a", "admin"), ("ws-b", "admin")]),
+    )
+    .await;
+    let home = TempDir::new().unwrap();
+    let mut options = broker_options(&console.uri());
+    options.context_name = Some("mine".to_string());
+
+    let err = format!("{:#}", login(options, &config_in(&home)).await.unwrap_err());
+    assert!(err.contains("--context names ONE context"), "{err}");
+    assert!(err.contains("tok-1"), "{err}");
+    assert!(!config_in(&home).exists(), "nothing was written");
+}
+
+#[tokio::test]
+async fn a_shared_token_still_held_by_another_context_is_not_reported_for_revocation() {
+    // An earlier login approved ws-a and ws-b under one token; this one
+    // approves ws-a alone. Revoking tok-old would cut ws-b off, so it is not
+    // offered for revocation — and it is reported once, not per context, when
+    // nothing holds it any more.
+    let existing = [
+        "contexts:",
+        "  - name: acme/ws-a",
+        "    mode: cloud",
+        "    server: http://gw.example",
+        "    workspace: ws-a",
+        "    token: skardi_pat_old",
+        "    token-id: tok-old",
+        "  - name: acme/ws-b",
+        "    mode: cloud",
+        "    server: http://gw.example",
+        "    workspace: ws-b",
+        "    token: skardi_pat_old",
+        "    token-id: tok-old",
+    ]
+    .join("\n")
+        + "\n";
+
+    for (grants, expected) in [
+        (vec![("ws-a", "admin")], Vec::<String>::new()),
+        (
+            vec![("ws-a", "admin"), ("ws-b", "admin")],
+            vec!["tok-old".to_string()],
+        ),
+    ] {
+        let gw = gateway(200).await;
+        let console = console(200, approved_scoped(&gw.uri(), "tok-2", &grants)).await;
+        let home = TempDir::new().unwrap();
+        let path = config_in(&home);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &existing).unwrap();
+
+        let report = login(broker_options(&console.uri()), &path).await.unwrap();
+        let reported: Vec<_> = report
+            .revoke_failures
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect();
+        assert_eq!(reported, expected, "approving {grants:?}");
+    }
 }
 
 #[tokio::test]
