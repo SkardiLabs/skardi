@@ -102,7 +102,9 @@ jobs:
           # cache-directories note).
           cache-directories: ~/.cache/pdfium-rs
       - name: Install protoc
-        run: sudo apt-get install -y protobuf-compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
       - name: Build documentation
         # `--all-features`, because that is what docs.rs builds
         # (package.metadata.docs.rs sets all-features = true): a featureless
