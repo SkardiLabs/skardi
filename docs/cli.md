@@ -207,7 +207,7 @@ credential for the CLI itself:
 
 | You pass | What happens |
 |---|---|
-| nothing | **Console-brokered** (the default). The CLI opens a page on the console; the console signs you in with whatever it accepts — email or Google — and you approve one workspace |
+| nothing | **Console-brokered** (the default). The CLI opens a page on the console; the console signs you in with whatever it accepts — email or Google — and you approve the workspaces it may reach, each at a role cap |
 | `--client-id <ID>` | **Direct OAuth**. The CLI talks to the identity provider itself and mints per workspace, which is what `--workspace` and `--all-workspaces` need |
 | `--identity dev:<id>` | Dev auth, loopback control planes only |
 
@@ -285,10 +285,17 @@ and writes nothing.
 Two consequences of the token arriving already-minted, both of which the CLI
 reports rather than hides:
 
-- **`--workspace` and `--all-workspaces` are refused on this path.** One
-  approval grants one workspace. The error names both flows that *can* select
-  from the terminal: `--client-id`, and `--identity dev:<id>` against a
-  loopback control plane.
+- **The browser chooses the workspaces, and you get a context for each.** Tick
+  one or more on the consent screen, each at a role cap. The approval mints
+  ONE token reaching all of them, and the CLI writes a `<org>/<workspace>`
+  context per approved workspace, every one holding that token and verified
+  through its own workspace. `current-context` is the first one you ticked;
+  `skardi config use-context` switches.
+- **`--workspace` and `--all-workspaces` are refused on this path**, since the
+  browser chooses. The error names both flows that *can* select from the
+  terminal: `--client-id`, and `--identity dev:<id>` against a loopback
+  control plane. `--context <NAME>` names one context, so it works only when
+  you approve one workspace.
 - **Nothing can be revoked from here.** The credential is a workspace token,
   which authenticates to the gateway and not to the control plane — so where
   the direct-OAuth path revokes, this one prints the token id and tells you to

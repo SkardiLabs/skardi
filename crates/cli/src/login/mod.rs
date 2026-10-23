@@ -291,17 +291,17 @@ pub fn selects_console_broker(identity: Option<&str>, client_id: Option<&str>) -
 /// and nobody knows exists is the outcome §6.5 was written to prevent, and the
 /// id is the only thing that prevents it here.
 async fn console_brokered_login(options: LoginOptions, config_path: &Path) -> Result<LoginReport> {
-    // Refused, not ignored. The consent screen selects exactly one workspace
-    // (§11.1), so there is no honest reading of either flag on this path — and
-    // silently logging into one workspace when `--all-workspaces` was asked
-    // for is the kind of success that gets discovered much later.
+    // Refused, not ignored. The consent screen chooses the workspaces, so there
+    // is no honest reading of either flag on this path — and silently logging
+    // into a set the browser chose when `--workspace` named another is the
+    // kind of success that gets discovered much later.
     match &options.selection {
         Selection::Auto => {}
         Selection::Named(slug) => bail!(
             "--workspace '{slug}' cannot be honoured through a browser login: the console's consent screen chooses the workspace, and it grants exactly one. Approve '{slug}' in the browser, or select it from the terminal with --client-id <ID> (or --identity dev:<id> against a loopback control plane)"
         ),
         Selection::All => bail!(
-            "--all-workspaces cannot be honoured through a browser login: one approval grants one workspace. Run this once per workspace, or select from the terminal with --client-id <ID> (or --identity dev:<id> against a loopback control plane)"
+            "--all-workspaces cannot be honoured through a browser login: the console's consent screen chooses the workspaces. Tick every one you want there and this login writes a context for each, or select from the terminal with --client-id <ID> (or --identity dev:<id> against a loopback control plane)"
         ),
     }
 
@@ -349,37 +349,61 @@ async fn console_brokered_login(options: LoginOptions, config_path: &Path) -> Re
 
     let brokered = poll_for_approval(&http, &options, &opened, &pkce.verifier).await?;
 
-    // §11.2: the membership rides along, so the context is written without a
-    // second round trip. Its absence is exceptional — it means the approved
-    // membership vanished between approval and redemption — and it is fatal
-    // here because the context NAME is `<org>/<workspace>` and the org slug
-    // has nowhere else to come from. The token id is printed because at this
-    // point a credential exists that this CLI cannot revoke.
-    let membership = brokered.memberships.first().cloned().ok_or_else(|| {
-        anyhow!(
+    // §11.2: the memberships ride along, so the contexts are written without a
+    // second round trip — one per approved workspace, every one carrying the
+    // single token the approval minted. Their absence is exceptional — it means
+    // the approved memberships vanished between approval and redemption — and
+    // it is fatal here because a context NAME is `<org>/<workspace>` and the
+    // org slug has nowhere else to come from. The token id is printed because
+    // at this point a credential exists that this CLI cannot revoke.
+    if brokered.memberships.is_empty() {
+        bail!(
             "the console approved workspace '{}' but returned no membership for it, so there is no organization to name the context after. The credential it minted is live and this CLI cannot revoke it — revoke token {} in the console",
             brokered.workspace,
             brokered.token_id
-        )
-    })?;
-
+        );
+    }
+    let memberships = brokered.memberships;
+    let roles = brokered.roles;
     let token = Minted {
         token: brokered.token,
         token_id: brokered.token_id,
         expires_at: brokered.expires_at,
     };
-    let server = resolve_server(&options, &membership).map_err(|err| abandoned(&token, err))?;
-    if !options.no_verify
-        && let Err(err) = verify(&server, &membership, &token, options.verify_timeout).await
-    {
-        return Err(abandoned(&token, err));
+    // `--context` names ONE context. Only known to be wrong now, after the
+    // browser chose the set, so the credential is reported rather than lost:
+    // writing every workspace under one name would leave only the last.
+    if options.context_name.is_some() && memberships.len() > 1 {
+        return Err(abandoned(
+            &token,
+            anyhow!(
+                "--context names ONE context, but {} workspaces were approved — run `skardi login` again without it, or tick a single workspace",
+                memberships.len()
+            ),
+        ));
     }
 
-    let pending = vec![(membership, token, server)];
+    // Each context is verified through its own `Skardi-Workspace`, because the
+    // token reaching one approved workspace says nothing about the next.
+    let mut pending = Vec::with_capacity(memberships.len());
+    for membership in memberships {
+        let server = resolve_server(&options, &membership).map_err(|err| abandoned(&token, err))?;
+        if !options.no_verify
+            && let Err(err) = verify(&server, &membership, &token, options.verify_timeout).await
+        {
+            return Err(abandoned(&token, err));
+        }
+        let shared = Minted {
+            token: token.token.clone(),
+            token_id: token.token_id.clone(),
+            expires_at: token.expires_at.clone(),
+        };
+        pending.push((membership, shared, server));
+    }
+
     let replaced = write_contexts(config_path, &options, &pending).map_err(|err| {
-        // `pending` still owns the token, so read the id off it rather than
-        // moving anything: the write failed, and the credential is stranded.
-        abandoned(&pending[0].1, err)
+        // The write failed, and the credential is stranded.
+        abandoned(&token, err)
     })?;
 
     let mut report = LoginReport::default();
@@ -389,7 +413,11 @@ async fn console_brokered_login(options: LoginOptions, config_path: &Path) -> Re
             name: context_name(&options, membership),
             server: server.clone(),
             workspace: membership.tenant_slug.clone(),
-            role: membership.role.clone(),
+            // What the gateway will answer at, which a role cap can lower.
+            role: roles
+                .get(&membership.tenant_slug)
+                .cloned()
+                .unwrap_or_else(|| membership.role.clone()),
             expires_at: token.expires_at.clone(),
         })
         .collect();
@@ -859,6 +887,18 @@ fn write_contexts(
     if let Some((membership, _, _)) = pending.first() {
         file.current_context = Some(context_name(options, membership));
     }
+    // One token can now back several contexts (a browser login approving
+    // several workspaces), so a replaced id is reported for revocation only
+    // once, and not at all while a context this write left alone still holds
+    // it — revoking it would cut that context off too.
+    replaced.sort();
+    replaced.dedup();
+    replaced.retain(|id| {
+        !file
+            .contexts
+            .iter()
+            .any(|c| c.token_id.as_deref() == Some(id.as_str()))
+    });
     // Recorded so a later `login` with no --control-plane reaches the same
     // place this one did — under the key that matches WHICH place it is.
     //
