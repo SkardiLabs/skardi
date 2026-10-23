@@ -515,3 +515,16 @@ The CLI prints `submitted: <run_id> (pending)`. Follow it with
 non-null `snapshot_id` (the Lance dataset version).
 
 Re-running the same command appends more rows to the same dataset.
+
+## Observing writer input in Rust
+
+Embedded callers can set `JobExecutor::with_output_stream_observer` to wrap
+output streams immediately before the destination writer consumes them. The
+hook receives the destination definition and a `SendableRecordBatchStream` for
+both SQL and Lance, including the first write to a new Lance dataset. It can
+inspect batches lazily without collecting the query result or replacing either
+writer. A wrapper must preserve the schema, rows, errors and cancellation.
+
+These are attempted writes: publish a measurement only after the run succeeds.
+A stream error or destination rollback can consume rows without committing them.
+Executors constructed without an observer retain their existing behavior.
