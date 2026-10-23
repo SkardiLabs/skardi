@@ -320,7 +320,8 @@ agents; deploy it next to your data, behind your usual auth.
   instead of guessing from a schema dump. [docs/semantics.md](docs/semantics.md)
 - **Offline jobs** — async batch writes (append, or upsert into Lance on merge
   keys) with atomic commit, crash recovery and a run ledger you can list and
-  inspect. [docs/jobs.md](docs/jobs.md)
+  inspect. Embedded Rust callers can observe writer-input streams for usage
+  measurement. [docs/jobs.md](docs/jobs.md)
 - **Webhooks** — a `kind: webhook` YAML becomes a public route that verifies a
   provider's push deliveries (WhatsApp Cloud API today) and appends them to a
   table, with the same column grammar as a source pack; a job then dedups them

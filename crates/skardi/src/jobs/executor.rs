@@ -21,6 +21,7 @@
 use anyhow::{Context, Result};
 use arrow::datatypes::Schema;
 use chrono::Utc;
+use datafusion::execution::SendableRecordBatchStream;
 use datafusion::prelude::SessionContext;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
@@ -123,6 +124,26 @@ struct CancelFlag {
     cancelled: Arc<AtomicBool>,
 }
 
+/// Wrap a job's output immediately before its destination consumes it.
+///
+/// An observer can inspect batches lazily without collecting or replacing the
+/// destination writer. Observed rows are attempted writes; only the terminal
+/// job result proves that the destination committed them. The first argument
+/// is the ledger run id, so concurrent writes to one destination stay distinct.
+/// Wrappers must retain
+/// the stream's schema, batches, errors and cancellation behavior.
+///
+/// ```ignore
+/// let observer: Arc<OutputStreamObserver> = Arc::new(|run_id, destination, stream| {
+///     // Select a destination here and wrap its stream with a batch observer.
+///     Ok(stream)
+/// });
+/// let executor = executor.with_output_stream_observer(observer);
+/// ```
+pub type OutputStreamObserver = dyn Fn(&str, &Destination, SendableRecordBatchStream) -> Result<SendableRecordBatchStream>
+    + Send
+    + Sync;
+
 impl CancelFlag {
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
@@ -154,6 +175,7 @@ pub struct JobExecutor {
     /// caller at construction time from the `DataSource` list.
     source_paths: Arc<HashMap<String, String>>,
     cancel_flags: Arc<Mutex<HashMap<String, Arc<CancelFlag>>>>,
+    output_stream_observer: Option<Arc<OutputStreamObserver>>,
 }
 
 impl JobExecutor {
@@ -171,7 +193,19 @@ impl JobExecutor {
             data_source_types: Arc::new(data_source_types),
             source_paths: Arc::new(source_paths),
             cancel_flags: Arc::new(Mutex::new(HashMap::new())),
+            output_stream_observer: None,
         }
+    }
+
+    /// Observe the same writer-input stream for SQL and lake destinations.
+    ///
+    /// See [`OutputStreamObserver`] for the pass-through and commit contract.
+    /// ```ignore
+    /// let executor = executor.with_output_stream_observer(Arc::new(|_, _, stream| Ok(stream)));
+    /// ```
+    pub fn with_output_stream_observer(mut self, observer: Arc<OutputStreamObserver>) -> Self {
+        self.output_stream_observer = Some(observer);
+        self
     }
 
     pub fn store(&self) -> Arc<dyn JobStore> {
@@ -298,6 +332,8 @@ impl JobExecutor {
         let run_id_for_task = run_id.clone();
         let mode = job.destination.mode;
         let timeout_ms = job.execution.timeout_ms;
+        let destination_definition = job.destination;
+        let output_stream_observer = self.output_stream_observer.clone();
         tokio::spawn(async move {
             run_job_task(
                 run_id_for_task,
@@ -309,6 +345,8 @@ impl JobExecutor {
                 timeout_ms,
                 cancel_flag,
                 flags_map,
+                destination_definition,
+                output_stream_observer,
             )
             .await;
         });
@@ -591,6 +629,8 @@ async fn run_job_task(
     timeout_ms: Option<u64>,
     cancel: Arc<CancelFlag>,
     flags_map: Arc<Mutex<HashMap<String, Arc<CancelFlag>>>>,
+    destination_definition: Destination,
+    output_stream_observer: Option<Arc<OutputStreamObserver>>,
 ) {
     let started = Utc::now().to_rfc3339();
     if let Err(e) = store
@@ -625,6 +665,11 @@ async fn run_job_task(
             .await
             .context("Failed to start streaming job output")?;
         let stream = CancellableStream::new(raw_stream, cancel.shared()).boxed();
+        let stream = match output_stream_observer.as_ref() {
+            Some(observer) => observer(&run_id, &destination_definition, stream)
+                .context("Failed to observe job output")?,
+            None => stream,
+        };
         destination
             .write(stream, mode)
             .await
@@ -948,6 +993,163 @@ spec:
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         panic!("run never reached terminal state");
+    }
+
+    #[rstest::rstest]
+    #[case::sql_accept(false, false)]
+    #[case::sql_reject(false, true)]
+    #[case::new_lance_accept(true, false)]
+    #[case::new_lance_reject(true, true)]
+    #[tokio::test]
+    async fn output_observer_sees_sql_and_new_lance_writes_and_propagates_errors(
+        #[case] lake: bool,
+        #[case] reject: bool,
+    ) {
+        use crate::sources::providers::lance::{
+            lance_dataset_exists_at, registration::register_lance_table,
+        };
+        use datafusion::datasource::MemTable;
+        use datafusion::error::DataFusionError;
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use futures::StreamExt;
+        use std::sync::atomic::AtomicUsize;
+
+        let ctx = Arc::new(SessionContext::new());
+        let batch = mk_batch();
+        ctx.register_batch("src", batch.clone()).unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dataset = tmp.path().join("new.lance");
+        let table = if lake { "lake" } else { "dest" };
+        if !lake {
+            ctx.register_table(
+                table,
+                Arc::new(MemTable::try_new(batch.schema(), vec![vec![]]).unwrap()),
+            )
+            .unwrap();
+        }
+        let yaml_path = tmp.path().join("ingest.yaml");
+        std::fs::write(
+            &yaml_path,
+            format!(
+                "kind: job\nmetadata:\n  name: ingest\n  version: '1.0.0'\nspec:\n  query: SELECT id FROM src\n  destination:\n    table: {table}\n    mode: append\n    create_if_missing: true\n"
+            ),
+        )
+        .unwrap();
+        let definition = JobDefinition::load_from_file(&yaml_path, Arc::clone(&ctx))
+            .await
+            .unwrap()
+            .unwrap();
+        let store = Arc::new(
+            super::super::store::SqliteJobStore::open_in_memory()
+                .await
+                .unwrap(),
+        );
+        let seen = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&seen);
+        let observed_run = Arc::new(Mutex::new(None));
+        let captured_run = Arc::clone(&observed_run);
+        let observer: Arc<OutputStreamObserver> = Arc::new(move |run_id, destination, stream| {
+            assert_eq!(destination.table, table);
+            *captured_run.lock().unwrap() = Some(run_id.to_owned());
+            let observed = Arc::clone(&observed);
+            let schema = stream.schema();
+            Ok(Box::pin(RecordBatchStreamAdapter::new(
+                schema,
+                stream.map(move |batch| {
+                    let batch = batch?;
+                    observed.fetch_add(batch.num_rows(), Ordering::SeqCst);
+                    if reject {
+                        return Err(DataFusionError::Execution("observer refused batch".into()));
+                    }
+                    Ok(batch)
+                }),
+            )))
+        });
+        let executor = JobExecutor::new(
+            HashMap::from([("ingest".into(), definition)]),
+            store,
+            Arc::clone(&ctx),
+            if lake {
+                HashMap::from([("lake".into(), DataSourceType::Lance)])
+            } else {
+                HashMap::new()
+            },
+            if lake {
+                HashMap::from([("lake".into(), dataset.to_str().unwrap().into())])
+            } else {
+                HashMap::new()
+            },
+        )
+        .with_output_stream_observer(observer);
+        let run_id = executor
+            .submit("ingest", HashMap::new(), None)
+            .await
+            .unwrap();
+        let terminal = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let run = executor.store.get_run(&run_id).await.unwrap().unwrap();
+                if run.status.is_terminal() {
+                    break run;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("small local writer reaches a terminal result");
+        assert_eq!(seen.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            observed_run.lock().unwrap().as_deref(),
+            Some(run_id.as_str())
+        );
+        if reject {
+            assert_eq!(terminal.status, JobRunStatus::Failed);
+            assert!(terminal.error.unwrap().contains("observer refused batch"));
+            assert!(terminal.rows_written.is_none());
+        } else {
+            assert_eq!(
+                terminal.status,
+                JobRunStatus::Succeeded,
+                "{:?}",
+                terminal.error
+            );
+            assert_eq!(terminal.rows_written, Some(3));
+        }
+        if !lake {
+            let rows: usize = ctx
+                .sql("SELECT * FROM dest")
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap()
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum();
+            assert_eq!(rows, if reject { 0 } else { 3 });
+        } else if reject {
+            assert!(
+                !lance_dataset_exists_at(dataset.to_str().unwrap())
+                    .await
+                    .unwrap(),
+                "a rejected stream must not publish a new dataset"
+            );
+        } else {
+            let mut read = SessionContext::new();
+            register_lance_table(&mut read, "written", dataset.to_str().unwrap(), None)
+                .await
+                .unwrap();
+            let rows: usize = read
+                .sql("SELECT * FROM written")
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap()
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum();
+            assert_eq!(rows, 3);
+        }
     }
 
     #[tokio::test]
