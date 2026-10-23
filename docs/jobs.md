@@ -520,11 +520,16 @@ Re-running the same command appends more rows to the same dataset.
 
 Embedded callers can set `JobExecutor::with_output_stream_observer` to wrap
 output streams immediately before the destination writer consumes them. The
-hook receives the destination definition and a `SendableRecordBatchStream` for
+hook receives the ledger run id, destination definition and a
+`SendableRecordBatchStream` for
 both SQL and Lance, including the first write to a new Lance dataset. It can
 inspect batches lazily without collecting the query result or replacing either
 writer. A wrapper must preserve the schema, rows, errors and cancellation.
 
-These are attempted writes: publish a measurement only after the run succeeds.
-A stream error or destination rollback can consume rows without committing them.
-Executors constructed without an observer retain their existing behavior.
+These are attempted writes: retain measurements by run id and reconcile them
+with that run's ledger result. A successful run committed its write. A
+`cancelled` run with `rows_written` populated and `error = "cancelled after
+commit"` also committed: cancellation arrived after the destination returned.
+An ordinary stream error or destination rollback can consume rows without
+committing them. Executors constructed without an observer retain their existing
+behavior.
