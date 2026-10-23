@@ -6,8 +6,9 @@
 //! minus the browser, and what it proves is the handoff the unit tests cannot
 //! — that a context `login` wrote is one `query` then resolves, sends the
 //! workspace selector for, and `logout` can undo.
-
-#![cfg(unix)]
+//!
+//! The config file is redirected with `SKARDI_CONFIG_DIR`, which works on
+//! Windows too, where `dirs::home_dir()` ignores `HOME`.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -26,6 +27,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 fn skardi(home: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_skardi"))
         .env("HOME", home)
+        .env("SKARDI_CONFIG_DIR", home.join(".skardi"))
         .env_remove("SKARDI_SERVER_URL")
         .env_remove("SKARDI_API_TOKEN")
         .env_remove("SKARDI_CONTEXT")
@@ -50,6 +52,7 @@ fn config_path(home: &Path) -> PathBuf {
     home.join(".skardi").join("config.yaml")
 }
 
+#[cfg(unix)]
 fn mode_of(path: &Path) -> u32 {
     use std::os::unix::fs::PermissionsExt as _;
     std::fs::metadata(path).unwrap().permissions().mode() & 0o777
@@ -125,6 +128,7 @@ async fn login_writes_a_context_that_query_then_uses_and_logout_clears() {
     // The raw PAT is never printed, on either stream.
     assert!(!out(&login).contains("skardi_pat_e2e"));
     assert!(!err(&login).contains("skardi_pat_e2e"));
+    #[cfg(unix)]
     assert_eq!(mode_of(&config_path(home)), 0o600);
 
     // 2. query, with no flags at all: the context login wrote is the one

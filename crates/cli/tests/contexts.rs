@@ -1,16 +1,15 @@
 //! Integration tests for the context model, driving the REAL `skardi` binary.
 //!
-//! Everything here runs with `HOME` pointed at a temp directory, so the tests
-//! exercise the actual `~/.skardi/config.yaml` path — file creation, mode bits,
-//! atomic rewrite, redaction — without touching the developer's own config and
-//! without needing a server. Resolution failures are asserted through the
-//! binary too, because "no request is issued" is part of the contract and only
-//! a real process can demonstrate it.
+//! Everything here runs with `HOME` and `SKARDI_CONFIG_DIR` pointed at a temp
+//! directory, so the tests exercise the actual config file path — file
+//! creation, mode bits, atomic rewrite, redaction — without touching the
+//! developer's own config and without needing a server. Resolution failures
+//! are asserted through the binary too, because "no request is issued" is part
+//! of the contract and only a real process can demonstrate it.
 //!
-//! `dirs::home_dir()` reads `$HOME` on unix, which is what makes the
-//! redirection work; these tests are unix-only for that reason.
-
-#![cfg(unix)]
+//! `SKARDI_CONFIG_DIR` is what redirects the file on Windows, where
+//! `dirs::home_dir()` ignores `HOME`; `HOME` stays set for anything else that
+//! looks there. Mode bits are checked on unix only, since Windows has none.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -23,6 +22,7 @@ use tempfile::TempDir;
 fn skardi(home: &Path, args: &[&str]) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_skardi"));
     cmd.env("HOME", home)
+        .env("SKARDI_CONFIG_DIR", home.join(".skardi"))
         .env_remove("SKARDI_SERVER_URL")
         .env_remove("SKARDI_API_TOKEN")
         .env_remove("SKARDI_CONTEXT")
@@ -42,6 +42,7 @@ fn config_path(home: &Path) -> PathBuf {
     home.join(".skardi").join("config.yaml")
 }
 
+#[cfg(unix)]
 fn mode_of(path: &Path) -> u32 {
     use std::os::unix::fs::PermissionsExt as _;
     std::fs::metadata(path).unwrap().permissions().mode() & 0o777
@@ -59,7 +60,7 @@ fn config_subcommands_create_list_switch_and_delete_contexts() {
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(stdout(&out).contains("no contexts configured"));
 
-    // First set-context creates ~/.skardi/config.yaml, mode 0600.
+    // First set-context creates ~/.skardi/config.yaml, mode 0600 on unix.
     let out = skardi(
         home,
         &[
@@ -75,6 +76,7 @@ fn config_subcommands_create_list_switch_and_delete_contexts() {
     assert!(stdout(&out).contains("created context 'local'"));
     let path = config_path(home);
     assert!(path.is_file(), "config file was created");
+    #[cfg(unix)]
     assert_eq!(
         mode_of(&path),
         0o600,
@@ -297,6 +299,7 @@ fn resolution_refuses_ambiguous_or_conflicting_selections_without_issuing_a_requ
     // .invalid, so a request would have produced the connect code 2.
     let out = Command::new(env!("CARGO_BIN_EXE_skardi"))
         .env("HOME", home)
+        .env("SKARDI_CONFIG_DIR", home.join(".skardi"))
         .env("SKARDI_SERVER_URL", "http://127.0.0.1:1")
         .env_remove("SKARDI_API_TOKEN")
         .env_remove("SKARDI_CONTEXT")
@@ -314,6 +317,7 @@ fn resolution_refuses_ambiguous_or_conflicting_selections_without_issuing_a_requ
     // path had only unit coverage, and it is the one an agent harness sets.
     let out = Command::new(env!("CARGO_BIN_EXE_skardi"))
         .env("HOME", home)
+        .env("SKARDI_CONFIG_DIR", home.join(".skardi"))
         .env("SKARDI_CONTEXT", "also-typo")
         .env_remove("SKARDI_SERVER_URL")
         .env_remove("SKARDI_API_TOKEN")
@@ -331,6 +335,7 @@ fn resolution_refuses_ambiguous_or_conflicting_selections_without_issuing_a_requ
     // assertion at all — only the server half did.
     let out = Command::new(env!("CARGO_BIN_EXE_skardi"))
         .env("HOME", home)
+        .env("SKARDI_CONFIG_DIR", home.join(".skardi"))
         .env("SKARDI_API_TOKEN", "stale-token")
         .env_remove("SKARDI_SERVER_URL")
         .env_remove("SKARDI_CONTEXT")
@@ -527,6 +532,7 @@ fn token_stdin_reads_a_pipe_and_writes_the_context() {
     let home = TempDir::new().expect("tempdir");
     let mut child = Command::new(env!("CARGO_BIN_EXE_skardi"))
         .env("HOME", home.path())
+        .env("SKARDI_CONFIG_DIR", home.path().join(".skardi"))
         .env_remove("SKARDI_SERVER_URL")
         .env_remove("SKARDI_API_TOKEN")
         .env_remove("SKARDI_CONTEXT")
@@ -614,6 +620,7 @@ fn token_stdin_returns_before_a_live_writer_closes_the_pipe() {
     let home = TempDir::new().expect("tempdir");
     let mut child = Command::new(env!("CARGO_BIN_EXE_skardi"))
         .env("HOME", home.path())
+        .env("SKARDI_CONFIG_DIR", home.path().join(".skardi"))
         .env_remove("SKARDI_SERVER_URL")
         .env_remove("SKARDI_API_TOKEN")
         .env_remove("SKARDI_CONTEXT")

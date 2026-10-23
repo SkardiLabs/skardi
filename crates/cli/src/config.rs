@@ -37,6 +37,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -46,6 +47,7 @@ pub const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:8080";
 const SERVER_URL_ENV: &str = "SKARDI_SERVER_URL";
 const API_TOKEN_ENV: &str = "SKARDI_API_TOKEN";
 const CONTEXT_ENV: &str = "SKARDI_CONTEXT";
+const CONFIG_DIR_ENV: &str = "SKARDI_CONFIG_DIR";
 
 /// How old a temp file must be before the sweep treats it as abandoned
 /// rather than as a concurrent writer's work in progress.
@@ -570,9 +572,26 @@ fn non_empty(value: Option<String>) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// `~/.skardi/config.yaml`, or `None` when the home directory is unknowable.
+/// `config.yaml` in `$SKARDI_CONFIG_DIR` when that is set, else
+/// `~/.skardi/config.yaml`; `None` when neither directory is knowable.
+///
+/// The override exists because the home directory cannot always be moved: on
+/// Windows `dirs::home_dir()` asks the shell for the profile folder and reads
+/// neither `HOME` nor `USERPROFILE`, so a test harness or sandbox has no other
+/// way to keep the CLI away from the real credentials file.
 pub fn default_config_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|home| home.join(".skardi").join("config.yaml"))
+    config_path_from(std::env::var_os(CONFIG_DIR_ENV), dirs::home_dir())
+}
+
+/// [`default_config_path`] with its two inputs passed in, so the choice is
+/// testable without touching process-global environment. An empty override
+/// counts as unset, like every other `SKARDI_*` variable.
+fn config_path_from(dir_override: Option<OsString>, home: Option<PathBuf>) -> Option<PathBuf> {
+    let dir = match dir_override.filter(|dir| !dir.is_empty()) {
+        Some(dir) => PathBuf::from(dir),
+        None => home?.join(".skardi"),
+    };
+    Some(dir.join("config.yaml"))
 }
 
 /// The per-context keys this binary reads. Used only to spot a typo in
@@ -896,6 +915,7 @@ fn warn_if_loose_permissions(_path: &Path) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
     use std::io::Write as _;
     use tempfile::{NamedTempFile, TempDir};
 
@@ -1406,6 +1426,24 @@ mod tests {
             "{err:?}"
         );
         assert!(err.to_string().contains("refusing to modify"));
+    }
+
+    #[rstest]
+    #[case::home_when_unset(None, Some("home"), Some("home/.skardi/config.yaml"))]
+    #[case::override_wins_over_home(Some("custom"), Some("home"), Some("custom/config.yaml"))]
+    #[case::override_needs_no_home(Some("custom"), None, Some("custom/config.yaml"))]
+    #[case::empty_override_is_unset(Some(""), Some("home"), Some("home/.skardi/config.yaml"))]
+    #[case::nothing_knowable(None, None, None)]
+    fn config_path_prefers_the_dir_override(
+        #[case] dir_override: Option<&str>,
+        #[case] home: Option<&str>,
+        #[case] expected: Option<&str>,
+    ) {
+        // Paths compare by component, so `/` matches `\` on Windows.
+        assert_eq!(
+            config_path_from(dir_override.map(OsString::from), home.map(PathBuf::from)),
+            expected.map(PathBuf::from)
+        );
     }
 
     #[test]
