@@ -2119,6 +2119,12 @@ async fn register_data_source_for_pass(
                 // `sources/providers/rss/mod.rs` is the single enforcement
                 // point that this arm and the public embedder seam
                 // (`register_rss_tables_with_policy`) both feed into.
+                //
+                // Egress policy too: this arm injects none, so the default is
+                // `AllowAll`, and a ctx that lists `rss.deny_cidrs` gets a
+                // CIDR deny policy installed by that same function. Folding it
+                // in there rather than choosing the entry point here means no
+                // caller can register a config's ranges away.
                 register_rss_tables(
                     session_ctx,
                     &source.name,
@@ -3718,6 +3724,104 @@ spec:
         assert_eq!(col(0), "https://feeds.example.invalid/f.xml");
         assert_eq!(col(1), "https://feeds.example.invalid/f.xml");
         assert_eq!(col(2), "never");
+    }
+
+    /// `rss.deny_cidrs` in a ctx file reaches the fetcher: a subscription to
+    /// the run's own loopback listener and one to cloud metadata are both
+    /// refused before any connection, and say why in `last_error`. Zero
+    /// network when the policy holds — neither target is ever dialled; were
+    /// it not installed, the loopback row would carry a connect error and the
+    /// metadata one a timeout, neither of which names `deny_cidrs`.
+    #[cfg(feature = "rss")]
+    #[tokio::test]
+    async fn test_rss_deny_cidrs_from_context_refuses_targets() {
+        let temp_dir = TempDir::new().unwrap();
+        let context_content = r#"
+kind: context
+metadata:
+  name: rss-context
+  version: 1.0.0
+spec:
+  data_sources:
+    - name: "news"
+      type: "rss"
+      hierarchy_level: catalog
+      access_mode: read_only
+      rss:
+        feeds:
+          - url: "http://127.0.0.1:18080/query"
+            name: loopback
+          - url: "http://169.254.169.254/latest/meta-data/"
+            name: metadata
+        request_timeout_seconds: 2
+        scan_timeout_seconds: 5
+        deny_cidrs:
+          - 127.0.0.0/8
+          - 169.254.0.0/16
+"#;
+        let context_path = temp_dir.path().join("context.yaml");
+        fs::write(&context_path, context_content).unwrap();
+
+        let data_sources = load_context_config(&context_path).unwrap();
+        let mut session_ctx = SessionContext::new();
+        register_data_sources(&mut session_ctx, &data_sources)
+            .await
+            .expect("rss source should register");
+
+        let items = session_ctx
+            .sql("SELECT feed FROM news.main.items")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(items.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
+
+        let batches = session_ctx
+            .sql("SELECT name, last_status, last_error FROM news.main.feeds ORDER BY name")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let mut rows = Vec::new();
+        for batch in &batches {
+            let text = |i: usize| {
+                batch
+                    .column(i)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap()
+                    .clone()
+            };
+            let (name, status, error) = (text(0), text(1), text(2));
+            for row in 0..batch.num_rows() {
+                rows.push((
+                    name.value(row).to_string(),
+                    status.value(row).to_string(),
+                    error.value(row).to_string(),
+                ));
+            }
+        }
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "loopback".to_string(),
+                    "error".to_string(),
+                    "egress blocked: host '127.0.0.1' resolves to deny_cidrs \
+                     127.0.0.0/8 address 127.0.0.1"
+                        .to_string(),
+                ),
+                (
+                    "metadata".to_string(),
+                    "error".to_string(),
+                    "egress blocked: host '169.254.169.254' resolves to deny_cidrs \
+                     169.254.0.0/16 address 169.254.169.254"
+                        .to_string(),
+                ),
+            ]
+        );
     }
 
     #[test]

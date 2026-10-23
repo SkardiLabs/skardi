@@ -94,9 +94,11 @@ pub use opml::resolve_subscriptions;
 // The egress-policy seam, re-exported so an embedder (Skardi Cloud, or an
 // operator running Skardi as a library) can name the trait to implement a
 // destination filter and inject it via `register_rss_tables_with_policy`.
-// OSS ships only `AllowAll`; supplying anything stricter is the caller's.
+// OSS's default is `AllowAll`; supplying anything stricter is the caller's.
+// `DenyCidrs` is the mechanism `RssConfig::deny_cidrs` installs — it carries
+// no ranges of its own.
 #[cfg(feature = "rss")]
-pub use egress::{AllowAll, EgressDenied, EgressPolicy, EgressReason};
+pub use egress::{AllowAll, DenyCidrs, EgressDenied, EgressPolicy, EgressReason};
 
 #[cfg(feature = "rss")]
 use std::sync::Arc;
@@ -198,6 +200,11 @@ const ITEMS_TABLE: &str = "items";
 /// `EgressPolicy` through [`register_rss_tables_with_policy`] (an operator's
 /// own, or Skardi Cloud's at registration) to restrict egress; see
 /// `docs/superpowers/specs/2026-08-03-rss-cloud-egress-design.md`.
+///
+/// The exception is a config whose `deny_cidrs` is non-empty: that installs a
+/// [`DenyCidrs`] policy, with everything injection implies (proxies off). It
+/// is how a stock `skardi-server`, which only ever calls this function, is
+/// given a policy from its ctx. Empty — the default — changes nothing above.
 #[cfg(feature = "rss")]
 pub async fn register_rss_tables(
     session_ctx: &mut SessionContext,
@@ -214,7 +221,8 @@ pub async fn register_rss_tables(
 /// policy, or an operator's own) in place of the `AllowAll` default. OSS ships
 /// no non-`AllowAll` policy itself; this is the entry point an embedder calls
 /// to supply one. In-crate tests use it the same way to prove a refusal
-/// reaches `feeds.last_error`.
+/// reaches `feeds.last_error`. A config that also lists `deny_cidrs` gets
+/// both: an address must pass `policy` and the CIDR list.
 #[cfg(feature = "rss")]
 pub async fn register_rss_tables_with_policy(
     session_ctx: &mut SessionContext,
@@ -274,6 +282,21 @@ async fn register_with_policy(
     // `ConfigError::DataSourceRegistrationFailed`, so nothing is re-stamped
     // here — the same bare call `register_open_connector_tables` makes.
     config.validate()?;
+
+    // `deny_cidrs` is folded in here, not by the server, so every entry point
+    // honors it: a config that lists ranges cannot be registered without them
+    // by calling the policy-less `register_rss_tables`. An empty list leaves
+    // `policy` exactly as given — `None` stays `None`, proxies stay honored.
+    let policy =
+        match (policy, config.deny_cidrs.is_empty()) {
+            (policy, true) => policy,
+            (None, false) => Some(Arc::new(DenyCidrs::new(config.deny_cidrs.iter().copied()))
+                as Arc<dyn EgressPolicy>),
+            (Some(injected), false) => Some(Arc::new(egress::AllOf(vec![
+                Arc::new(DenyCidrs::new(config.deny_cidrs.iter().copied())),
+                injected,
+            ])) as Arc<dyn EgressPolicy>),
+        };
 
     // The one I/O step: an `opml:` path is read here, not by `validate()`.
     let subscriptions = resolve_subscriptions(name, config)?;
