@@ -121,6 +121,21 @@ pub fn parse_allowed_schemas(options: Option<&HashMap<String, String>>) -> Optio
 pub async fn retry_with_timeout<T, F, Fut>(
     label: SourceLabel<'_>,
     op_name: &str,
+    op: F,
+) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    retry_with_timeout_budget(label, op_name, CONNECT_TIMEOUT, op).await
+}
+
+/// Use a source's explicit per-attempt initialization budget without changing
+/// the retry policy shared by connection and introspection operations.
+pub(crate) async fn retry_with_timeout_budget<T, F, Fut>(
+    label: SourceLabel<'_>,
+    op_name: &str,
+    attempt_timeout: Duration,
     mut op: F,
 ) -> Result<T>
 where
@@ -129,7 +144,7 @@ where
 {
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 1..=MAX_RETRIES {
-        match timeout(CONNECT_TIMEOUT, op()).await {
+        match timeout(attempt_timeout, op()).await {
             Ok(Ok(value)) => return Ok(value),
             Ok(Err(e)) => {
                 tracing::warn!(
@@ -146,7 +161,7 @@ where
                 let e = anyhow::anyhow!(
                     "Timed out after {}s during {} for {}. \
                      Check that the upstream is reachable and credentials are correct.",
-                    CONNECT_TIMEOUT.as_secs(),
+                    attempt_timeout.as_secs(),
                     op_name,
                     label
                 );

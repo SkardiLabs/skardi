@@ -333,7 +333,7 @@ agents; deploy it next to your data, behind your usual auth.
 
 | Type | CRUD | Catalog | Notes | Docs |
 |------|------|---------|-------|------|
-| PostgreSQL | Full | Yes | pgvector KNN, FTS (`pg_fts`, plus `tsvector` predicates pushed down from raw SQL) | [docs](docs/postgres/) |
+| PostgreSQL | Full | Yes | pgvector KNN, FTS (`pg_fts`, plus `tsvector` predicates pushed down from raw SQL), configurable read/write pools and initialization budgets | [docs](docs/postgres/) |
 | MySQL | Full | Yes | Table or catalog registration | [docs](docs/mysql/) |
 | SQLite | Full | Yes | sqlite-vec KNN, FTS | [docs](docs/sqlite/) |
 | MongoDB | Full | No | Collections with point lookups | [docs](docs/mongo/) |

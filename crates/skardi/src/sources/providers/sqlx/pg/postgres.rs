@@ -1,6 +1,7 @@
 use crate::sources::DataSourceType;
 use crate::sources::hierarchy::{
-    HierarchyLevel, SourceLabel, build_catalog, parse_allowed_schemas, retry_with_timeout,
+    CONNECT_TIMEOUT, HierarchyLevel, SourceLabel, build_catalog, parse_allowed_schemas,
+    retry_with_timeout_budget,
 };
 use crate::sources::providers::sqlx::pg::knn_table_function::{PgKnnEntry, fetch_table_columns};
 use crate::sources::providers::{CountSafeTable, DatasetEntry, DatasetRegistry};
@@ -30,11 +31,14 @@ use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresC
 use datafusion_table_providers::sql::sql_provider_datafusion::SqlTable;
 use futures::{StreamExt, stream};
 use secrecy::SecretString;
-use sqlx::PgPool;
+use sqlx::{PgPool, postgres::PgPoolOptions};
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
+use std::num::NonZeroU32;
 use std::sync::Arc;
+use std::time::Duration;
+use url::{Url, form_urlencoded};
 
 /// Register PostgreSQL tables or a whole database (catalog) into a DataFusion [`SessionContext`].
 ///
@@ -58,6 +62,12 @@ use std::sync::Arc;
 /// * `allowed_schemas` - Comma-separated schema allow-list (catalog mode only)
 /// * `user_env` - Environment variable name for username (optional)
 /// * `pass_env` - Environment variable name for password (optional)
+///
+/// PostgreSQL URL query parameters can also set `connection_pool_size` (read
+/// maximum), `write_connection_pool_size` (write/introspection maximum), and
+/// `connection_init_timeout_seconds` (per-attempt construction/introspection
+/// budget). Each is a positive integer. Unset options preserve the pool defaults
+/// and the five-second initialization budget.
 pub async fn register_postgres_tables(
     session_ctx: &mut SessionContext,
     name: &str,
@@ -102,17 +112,21 @@ pub async fn register_postgres_tables(
 
 /// Create both connection pools needed for a Postgres source.
 ///
-/// Returns `(read_pool, sqlx_pool)`. The `label` identifies the source (kind + mode + name)
-/// in retry tracing and error context. Each pool's construction is wrapped in
-/// [`retry_with_timeout`] for parity with the MySQL path.
+/// Returns the read pool, write/introspection pool and per-attempt initialization
+/// budget. A pooler may queue initialization behind an active transaction, so its
+/// explicit budget must cover both client construction and later introspection.
 async fn init_postgres_pools(
     connection_string: &str,
     options: Option<&HashMap<String, String>>,
     label: SourceLabel<'_>,
-) -> Result<(Arc<PostgresConnectionPool>, PgPool)> {
-    let pool_params = parse_connection_params(connection_string, options)?;
+) -> Result<(Arc<PostgresConnectionPool>, PgPool, Option<Duration>)> {
+    let settings = PostgresPoolSettings::parse(connection_string)?;
+    let init_timeout = settings.init_timeout.unwrap_or(CONNECT_TIMEOUT);
+    let mut pool_params = parse_connection_params(connection_string, options)?;
+    pool_params.remove("write_connection_pool_size");
+    pool_params.remove("connection_init_timeout_seconds");
     let read_pool = Arc::new(
-        retry_with_timeout(label, "read pool creation", || async {
+        retry_with_timeout_budget(label, "read pool creation", init_timeout, || async {
             PostgresConnectionPool::new(pool_params.clone())
                 .await
                 .map_err(|e| anyhow::anyhow!(e))
@@ -129,15 +143,18 @@ async fn init_postgres_pools(
     // Always build the sqlx pool: needed for schema introspection (handles pgvector and other
     // custom types), and reused for writes and KNN registry population when applicable.
     let sqlx_url = build_sqlx_connection_url(connection_string, options)?;
-    let sqlx_pool = retry_with_timeout(label, "sqlx pool creation", || async {
-        PgPool::connect(&sqlx_url)
-            .await
-            .map_err(|e| anyhow::anyhow!(e))
-    })
-    .await
-    .with_context(|| format!("Failed to create sqlx PgPool for '{}'", label.name))?;
+    let sqlx_pool =
+        retry_with_timeout_budget(label, "sqlx pool creation", init_timeout, || async {
+            settings
+                .sqlx_options()
+                .connect(&sqlx_url)
+                .await
+                .map_err(|e| anyhow::anyhow!(e))
+        })
+        .await
+        .with_context(|| format!("Failed to create sqlx PgPool for '{}'", label.name))?;
 
-    Ok((read_pool, sqlx_pool))
+    Ok((read_pool, sqlx_pool, settings.init_timeout))
 }
 
 /// Build a [`TableProvider`] for one table and optionally register it in the KNN registry.
@@ -152,18 +169,33 @@ async fn build_and_register_table(
     read_write: bool,
     pg_knn_registry: Option<&DatasetRegistry>,
     knn_key: &str,
+    init_timeout: Option<Duration>,
 ) -> Result<Arc<dyn TableProvider>> {
     let table_reference = TableReference::partial(schema, table_name);
-    let table_provider =
-        build_postgres_table_provider(read_pool, table_reference, read_write, sqlx_pool).await?;
-
-    if let Some(registry) = pg_knn_registry {
-        register_table_in_knn_registry(sqlx_pool, registry, knn_key, schema, table_name)
-            .await
-            .with_context(|| format!("Failed to register '{}' in pg_knn registry", knn_key))?;
+    let label = SourceLabel::new(DataSourceType::Postgres, HierarchyLevel::Table, knn_key);
+    let build = || async {
+        let table_provider = build_postgres_table_provider(
+            read_pool,
+            table_reference.clone(),
+            read_write,
+            sqlx_pool,
+        )
+        .await?;
+        if let Some(registry) = pg_knn_registry {
+            register_table_in_knn_registry(sqlx_pool, registry, knn_key, schema, table_name)
+                .await
+                .with_context(|| format!("Failed to register '{}' in pg_knn registry", knn_key))?;
+        }
+        Ok(table_provider)
+    };
+    match init_timeout {
+        Some(budget) => {
+            retry_with_timeout_budget(label, "table introspection", budget, build).await
+        }
+        // Preserve the existing table-registration behavior for consumers that
+        // have not opted into an initialization budget.
+        None => build().await,
     }
-
-    Ok(table_provider)
 }
 
 /// Register one logical table (`options.table`) under `name` in the default catalog.
@@ -191,7 +223,8 @@ async fn register_single_postgres_table(
     })?;
 
     let label = SourceLabel::new(DataSourceType::Postgres, HierarchyLevel::Table, name);
-    let (read_pool, sqlx_pool) = init_postgres_pools(connection_string, options, label).await?;
+    let (read_pool, sqlx_pool, init_timeout) =
+        init_postgres_pools(connection_string, options, label).await?;
 
     let table_provider = build_and_register_table(
         &read_pool,
@@ -201,6 +234,7 @@ async fn register_single_postgres_table(
         read_write,
         pg_knn_registry,
         name,
+        init_timeout,
     )
     .await?;
 
@@ -240,12 +274,16 @@ async fn register_postgres_catalog(
         HierarchyLevel::Catalog,
         catalog_name,
     );
-    let (read_pool, sqlx_pool) = init_postgres_pools(connection_string, options, label).await?;
+    let (read_pool, sqlx_pool, init_timeout) =
+        init_postgres_pools(connection_string, options, label).await?;
 
     let allowed_schemas = parse_allowed_schemas(options);
-    let schema_tables = retry_with_timeout(label, "information_schema introspection", || async {
-        list_postgres_tables_in_catalog(&sqlx_pool, allowed_schemas.as_deref()).await
-    })
+    let schema_tables = retry_with_timeout_budget(
+        label,
+        "information_schema introspection",
+        init_timeout.unwrap_or(CONNECT_TIMEOUT),
+        || async { list_postgres_tables_in_catalog(&sqlx_pool, allowed_schemas.as_deref()).await },
+    )
     .await
     .with_context(|| {
         format!(
@@ -284,6 +322,7 @@ async fn register_postgres_catalog(
                     read_write,
                     knn_registry.as_ref(),
                     &knn_key,
+                    init_timeout,
                 )
                 .await
             }
@@ -974,13 +1013,59 @@ fn quote_pg_ident(s: &str) -> String {
 
 // ─── Connection helpers ─────────────────────────────────────────────────────
 
+const ENGINE_POOL_PARAMETERS: &[&str] = &[
+    "connection_pool_size",
+    "write_connection_pool_size",
+    "connection_init_timeout_seconds",
+];
+
+#[derive(Debug, Default)]
+struct PostgresPoolSettings {
+    write_max: Option<NonZeroU32>,
+    init_timeout: Option<Duration>,
+}
+
+impl PostgresPoolSettings {
+    fn parse(connection_string: &str) -> Result<Self> {
+        let url = Url::parse(connection_string).context("Invalid PostgreSQL connection string")?;
+        let mut settings = Self::default();
+        for (key, value) in url.query_pairs() {
+            if !ENGINE_POOL_PARAMETERS.contains(&key.as_ref()) {
+                continue;
+            }
+            // Refuse zero before bb8/sqlx builders can panic or create a pool
+            // that cannot ever serve a request. Do not include values or DSNs
+            // in option validation errors: they may carry credentials.
+            let value = value
+                .parse::<NonZeroU32>()
+                .with_context(|| format!("PostgreSQL option '{key}' must be a positive integer"))?;
+            match key.as_ref() {
+                "write_connection_pool_size" => settings.write_max = Some(value),
+                "connection_init_timeout_seconds" => {
+                    settings.init_timeout = Some(Duration::from_secs(u64::from(value.get())));
+                }
+                _ => {}
+            }
+        }
+        Ok(settings)
+    }
+
+    fn sqlx_options(&self) -> PgPoolOptions {
+        let options = PgPoolOptions::new();
+        match self.write_max {
+            Some(maximum) => options.max_connections(maximum.get()),
+            None => options,
+        }
+    }
+}
+
 /// Build a sqlx-compatible connection URL from the same parameters used by the
 /// existing provider. Credentials come from environment variables only.
 fn build_sqlx_connection_url(
     connection_string: &str,
     options: Option<&HashMap<String, String>>,
 ) -> Result<String> {
-    let url = url::Url::parse(connection_string)
+    let url = Url::parse(connection_string)
         .with_context(|| format!("Invalid PostgreSQL connection string: {connection_string}"))?;
 
     let host = url.host_str().unwrap_or("localhost");
@@ -1022,10 +1107,17 @@ fn build_sqlx_connection_url(
     }
     result.push_str(&format!("{host}:{port}/{db}"));
 
-    // Forward query parameters (sslmode, etc.)
-    if let Some(query) = url.query() {
+    // Engine controls are not PostgreSQL connection options. Keep them out of
+    // sqlx rather than relying on its handling of unknown URL parameters.
+    let query = form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(
+            url.query_pairs()
+                .filter(|(key, _)| !ENGINE_POOL_PARAMETERS.contains(&key.as_ref())),
+        )
+        .finish();
+    if !query.is_empty() {
         result.push('?');
-        result.push_str(query);
+        result.push_str(&query);
     }
 
     Ok(result)
@@ -1037,7 +1129,7 @@ fn parse_connection_params(
     connection_string: &str,
     options: Option<&HashMap<String, String>>,
 ) -> Result<HashMap<String, SecretString>> {
-    let url = url::Url::parse(connection_string).with_context(|| {
+    let url = Url::parse(connection_string).with_context(|| {
         format!(
             "Invalid PostgreSQL connection string: {}",
             connection_string
@@ -1153,10 +1245,35 @@ mod tests {
 
     #[test]
     fn test_build_sqlx_connection_url_with_query_params() {
-        let url =
-            build_sqlx_connection_url("postgresql://localhost:5432/mydb?sslmode=require", None)
-                .unwrap();
+        let url = build_sqlx_connection_url(
+            "postgresql://localhost:5432/mydb?sslmode=require&connection_pool_size=2&write_connection_pool_size=2&connection_init_timeout_seconds=30",
+            None,
+        )
+        .unwrap();
         assert_eq!(url, "postgres://localhost:5432/mydb?sslmode=require");
+    }
+
+    #[test]
+    fn postgres_pool_controls_preserve_defaults_and_refuse_invalid_budgets() {
+        let defaults = PostgresPoolSettings::parse("postgres://localhost/db").unwrap();
+        assert_eq!(defaults.sqlx_options().get_max_connections(), 10);
+        assert_eq!(defaults.sqlx_options().get_min_connections(), 0);
+        assert_eq!(defaults.init_timeout, None);
+        let configured = PostgresPoolSettings::parse(
+            "postgres://localhost/db?connection_pool_size=2&write_connection_pool_size=2&connection_init_timeout_seconds=30",
+        )
+        .unwrap();
+        assert_eq!(configured.sqlx_options().get_max_connections(), 2);
+        assert_eq!(configured.init_timeout, Some(Duration::from_secs(30)));
+        for key in ENGINE_POOL_PARAMETERS {
+            for invalid in ["0", "-1", "not-an-integer", "4294967296"] {
+                let dsn = format!("postgres://localhost/db?{key}={invalid}");
+                assert!(
+                    PostgresPoolSettings::parse(&dsn).is_err(),
+                    "invalid {key} must fail before opening a database connection"
+                );
+            }
+        }
     }
 
     #[test]
