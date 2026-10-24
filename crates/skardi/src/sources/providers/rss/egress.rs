@@ -75,12 +75,66 @@ impl EgressPolicy for AllowAll {
 /// The reason names the matched range as written in config (normalized to its
 /// network address), so `feeds.last_error` reads e.g. `egress blocked: host
 /// 'evil.example' resolves to deny_cidrs 10.0.0.0/8 address 10.0.0.1`.
+///
+/// # Examples
+///
+/// ```
+/// use std::net::IpAddr;
+///
+/// use ipnet::IpNet;
+/// use skardi::sources::providers::rss::{DenyCidrs, EgressPolicy};
+///
+/// let ranges = ["127.0.0.0/8", "169.254.0.0/16"]
+///     .into_iter()
+///     .map(|range| range.parse::<IpNet>().unwrap());
+/// let policy = DenyCidrs::new(ranges);
+///
+/// // Refused, and the reason names the range that matched.
+/// let metadata: IpAddr = "169.254.169.254".parse().unwrap();
+/// assert_eq!(
+///     policy.check_ip(metadata).unwrap_err(),
+///     "deny_cidrs 169.254.0.0/16"
+/// );
+///
+/// // Outside every listed range, so it is allowed.
+/// let public: IpAddr = "93.184.216.34".parse().unwrap();
+/// assert!(policy.check_ip(public).is_ok());
+/// ```
 #[derive(Debug)]
 pub struct DenyCidrs {
     nets: Vec<IpNet>,
 }
 
 impl DenyCidrs {
+    /// Builds a policy that refuses every address inside `nets`.
+    ///
+    /// Each range is normalized to its network address, so a range written
+    /// with host bits set is stored — and named in the refusal reason — as
+    /// the operator's intent rather than as typed: `10.0.0.1/8` becomes
+    /// `10.0.0.0/8`.
+    ///
+    /// An empty iterator builds a policy that refuses nothing. Registration
+    /// never does so from an empty `deny_cidrs`: it leaves the injected
+    /// policy exactly as given, which is how the `AllowAll` default and the
+    /// system proxy variables it honors survive untouched.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::net::IpAddr;
+    ///
+    /// use ipnet::IpNet;
+    /// use skardi::sources::providers::rss::{DenyCidrs, EgressPolicy};
+    ///
+    /// // Host bits are normalized away, in the policy and in the reason.
+    /// let policy = DenyCidrs::new(["10.0.0.1/8".parse::<IpNet>().unwrap()]);
+    /// let private: IpAddr = "10.1.2.3".parse().unwrap();
+    /// assert_eq!(policy.check_ip(private).unwrap_err(), "deny_cidrs 10.0.0.0/8");
+    ///
+    /// // An empty list refuses nothing.
+    /// let empty = DenyCidrs::new(Vec::<IpNet>::new());
+    /// assert!(empty.check_ip("10.1.2.3".parse().unwrap()).is_ok());
+    /// ```
     pub fn new(nets: impl IntoIterator<Item = IpNet>) -> Self {
         Self {
             nets: nets.into_iter().map(|net| net.trunc()).collect(),
