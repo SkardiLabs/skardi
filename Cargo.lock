@@ -9887,6 +9887,7 @@ dependencies = [
  "iceberg",
  "iceberg-datafusion",
  "iceberg-storage-opendal",
+ "ipnet",
  "lance",
  "lance-index",
  "liteparse",

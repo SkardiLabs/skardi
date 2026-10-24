@@ -108,6 +108,7 @@ spec:
         scan_timeout_seconds: 60
         max_response_bytes: 5242880
         user_agent: "skardi-rss/<version> (+https://github.com/SkardiLabs/skardi)"
+        # deny_cidrs: [127.0.0.0/8, 10.0.0.0/8]  # optional; see Egress policy (SSRF)
 ```
 
 A ready-to-run version of this file lives at
@@ -125,6 +126,7 @@ A ready-to-run version of this file lives at
 | `scan_timeout_seconds` | `60` | Deadline for one whole scan across every subscribed feed. |
 | `max_response_bytes` | `5242880` (5 MiB) | Cap on one **decoded** response body, so a compressed payload cannot inflate past it. |
 | `user_agent` | `skardi-rss/<crate version> (+https://github.com/SkardiLabs/skardi)` | Sent on every request. |
+| `deny_cidrs` | `[]` | Address ranges (CIDR notation, IPv4 or IPv6) the fetcher must never connect to. Empty installs no policy. See [Egress policy](#egress-policy-ssrf) — OSS ships no list. |
 
 Bounds other than `ttl_seconds` must be at least `1`; `user_agent` must be
 non-blank. Unknown keys are rejected at both levels — a misspelled
@@ -589,8 +591,54 @@ Given that, an operator should:
   `NetworkPolicy` denying RFC 1918 / link-local / cloud metadata destinations
   from the process that runs Skardi, plus IMDSv2 with a hop limit on any cloud
   instance it runs on — and/or
-- inject a destination-filtering `EgressPolicy` at the call site that
-  constructs the RSS engine, if embedding Skardi as a library.
+- list the ranges to refuse in the source's `deny_cidrs` (below), if running
+  the stock `skardi-server`, and/or
+- inject a destination-filtering `EgressPolicy` through
+  `register_rss_tables_with_policy`, if embedding Skardi as a library.
+
+### `deny_cidrs`: a policy from config
+
+`deny_cidrs` is the mechanism, not a policy: Skardi supplies no default list
+and refuses nothing until you name ranges. Which ranges are right depends on
+where the server runs, so that choice stays with the operator. A typical list
+for a server whose feeds should only ever be public hosts:
+
+```yaml
+      rss:
+        feeds: [...]
+        deny_cidrs:
+          - 127.0.0.0/8       # loopback — the server's own listeners
+          - '::1/128'
+          - 10.0.0.0/8        # RFC 1918
+          - 172.16.0.0/12
+          - 192.168.0.0/16
+          - 169.254.0.0/16    # link-local, incl. cloud metadata 169.254.169.254
+          - 100.64.0.0/10     # CGNAT
+          - 0.0.0.0/8
+          - 'fc00::/7'        # unique-local
+          - 'fe80::/10'       # IPv6 link-local
+```
+
+(YAML needs the quotes on entries that start with `:` or contain `::`.)
+
+What a non-empty list does:
+
+- Every address the fetcher would connect to is checked — an IP-literal URL,
+  every address a hostname resolves to (at the resolver, so DNS rebinding
+  cannot slip past), and the same again on every redirect hop. An address
+  inside any range is refused; the reason names the range.
+- An IPv4-mapped IPv6 address (`::ffff:10.0.0.1`) is judged as the IPv4 it
+  reaches, so `10.0.0.0/8` refuses it too.
+- **System proxy variables stop being honored for this source.** Through a
+  proxy, the proxy resolves the destination and the check would never see
+  it, so any installed policy turns proxies off. On a network that mandates
+  an outbound proxy, enforce destination policy at that proxy instead.
+- An entry that does not parse fails the config at load, naming
+  `deny_cidrs`; a bare address is not a range — write `10.0.0.1/32`.
+
+`deny_cidrs` applies on every registration path, including an embedder's
+`register_rss_tables_with_policy`: an injected policy and the listed ranges
+both have to allow an address.
 
 Managed, default-on egress governance (the reserved-range refusal this section
 used to describe) is a **Skardi Cloud** feature, not an OSS one — see the
@@ -617,9 +665,15 @@ reads:
 egress blocked: host '192.168.7.7' resolves to private address 192.168.7.7
 ```
 
+or, for a `deny_cidrs` refusal, names the range:
+
+```text
+egress blocked: host '127.0.0.1' resolves to deny_cidrs 127.0.0.0/8 address 127.0.0.1
+```
+
 Under the OSS default this never fires — `AllowAll` refuses nothing, so no
-subscription in OSS degrades this way unless you have injected your own
-denying `EgressPolicy`.
+subscription in OSS degrades this way unless you have listed `deny_cidrs` or
+injected your own denying `EgressPolicy`.
 
 ---
 

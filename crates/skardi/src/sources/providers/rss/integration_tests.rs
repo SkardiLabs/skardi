@@ -5,7 +5,9 @@
 //!
 //! Registration's test seam, [`register_rss_tables_with_policy`], is
 //! `#[cfg(test)] pub(crate)`: it lets this suite inject an `EgressPolicy`,
-//! though every test here uses the same `AllowAll` production ships. An
+//! though every test here uses the same `AllowAll` production ships — except
+//! the `deny_cidrs` group, which registers through [`register_rss_tables`]
+//! exactly as `skardi-server` does and takes its policy from the config. An
 //! external test crate cannot reach a `pub(crate)` item, and widening the
 //! seam to a public entry point would put policy selection on this
 //! provider's public surface for no OSS need. `open_connector`'s own
@@ -35,12 +37,12 @@ use arrow::array::{Array, RecordBatch, UInt16Array};
 use datafusion::prelude::SessionContext;
 
 use super::config::{FeedSubscription, RssConfig, inline_config};
-use super::egress::AllowAll;
+use super::egress::{AllowAll, EgressPolicy};
 use super::fetch::MAX_ATTEMPTS;
-use super::register_rss_tables_with_policy;
 use super::testutil::{
     MockFeedServer, MockResponse, RecordedRequest, str_col, str_opt_col, total_rows,
 };
+use super::{register_rss_tables, register_rss_tables_with_policy};
 use crate::sources::hierarchy::HierarchyLevel;
 
 /// The catalog name every test registers under, so the SQL below reads
@@ -240,6 +242,22 @@ impl TestNews {
     /// test that starts hanging says so in seconds rather than sitting on the
     /// production deadline.
     async fn start(feeds: &[(&str, &str)], tune: impl FnOnce(&mut RssConfig)) -> Self {
+        // The production default: no destination filtering.
+        Self::register(feeds, tune, Some(Arc::new(AllowAll))).await
+    }
+
+    /// [`TestNews::start`], registered the way `skardi-server` registers a
+    /// source: through [`register_rss_tables`], with no injected policy, so
+    /// the only egress policy is whatever the config's `deny_cidrs` installs.
+    async fn start_as_server(feeds: &[(&str, &str)], tune: impl FnOnce(&mut RssConfig)) -> Self {
+        Self::register(feeds, tune, None).await
+    }
+
+    async fn register(
+        feeds: &[(&str, &str)],
+        tune: impl FnOnce(&mut RssConfig),
+        policy: Option<Arc<dyn EgressPolicy>>,
+    ) -> Self {
         let scripts: Scripts = Arc::new(Mutex::new(HashMap::new()));
         let handler_scripts = Arc::clone(&scripts);
         let server = MockFeedServer::start(move |request| {
@@ -283,16 +301,29 @@ impl TestNews {
         tune(&mut config);
 
         let mut ctx = SessionContext::new();
-        register_rss_tables_with_policy(
-            &mut ctx,
-            SOURCE,
-            Some(&config),
-            false,
-            HierarchyLevel::Catalog,
-            // The production default: no destination filtering.
-            Arc::new(AllowAll),
-        )
-        .await
+        match policy {
+            Some(policy) => {
+                register_rss_tables_with_policy(
+                    &mut ctx,
+                    SOURCE,
+                    Some(&config),
+                    false,
+                    HierarchyLevel::Catalog,
+                    policy,
+                )
+                .await
+            }
+            None => {
+                register_rss_tables(
+                    &mut ctx,
+                    SOURCE,
+                    Some(&config),
+                    false,
+                    HierarchyLevel::Catalog,
+                )
+                .await
+            }
+        }
         .expect("registration succeeds");
 
         Self {
@@ -1320,4 +1351,183 @@ async fn absence_check_pattern_works() {
         warmed_requests,
         "the anti-join's scans were served from cache, so the state it read is the warmed one"
     );
+}
+
+// ---------------------------------------------------------------------------
+// `deny_cidrs` — the egress policy a stock server takes from its ctx
+// ---------------------------------------------------------------------------
+
+/// `deny_cidrs` parsed from the YAML an operator writes, so the tests below
+/// exercise the same deserialization a ctx file goes through.
+fn deny_cidrs(cidrs: &[&str]) -> Vec<ipnet::IpNet> {
+    let quoted: Vec<String> = cidrs.iter().map(|c| format!("'{c}'")).collect();
+    serde_yaml::from_str(&format!("[{}]", quoted.join(", "))).expect("CIDR list parses")
+}
+
+/// One `feeds` row per subscription, by name: `(last_status, last_error)`.
+async fn feed_health(news: &TestNews) -> HashMap<String, (String, Option<String>)> {
+    let feeds = news
+        .sql("SELECT name, last_status, last_error FROM news.main.feeds ORDER BY name")
+        .await;
+    col(&feeds, "name")
+        .into_iter()
+        .zip(col(&feeds, "last_status"))
+        .zip(opt_col(&feeds, "last_error"))
+        .map(|((name, status), error)| (name, (status, error)))
+        .collect()
+}
+
+/// The ranges refuse IP-literal subscriptions (V4, and V4 spelled as mapped
+/// v6) and a redirect hop into them, each recorded as that feed's error,
+/// while a feed outside every range is fetched as usual. Nothing refused is
+/// ever connected to: the only requests the mock sees are the healthy feed's
+/// and the redirecting hop's own.
+#[tokio::test]
+async fn deny_cidrs_refuse_literals_and_redirect_hops_and_spare_other_feeds() {
+    let news = TestNews::start_as_server(
+        &[
+            ("ok", "/ok.xml"),
+            ("private", "http://10.0.0.1/feed.xml"),
+            ("mapped", "http://[::ffff:10.0.0.1]:9/feed.xml"),
+            ("metadata", "http://169.254.169.254/latest/meta-data/"),
+            ("redirected", "/hop.xml"),
+        ],
+        |config| config.deny_cidrs = deny_cidrs(&["10.0.0.0/8", "169.254.0.0/16"]),
+    )
+    .await;
+    // A public feed that 302s into a refused range: the hop is checked before
+    // the next request is built, so the target is never reached.
+    news.script(
+        "/hop.xml",
+        FeedScript::always(Canned::status(302).with_header("location", "http://10.0.0.1/feed.xml")),
+    );
+
+    let items = news.sql("SELECT feed FROM news.main.items").await;
+    assert_eq!(
+        sorted(col(&items, "feed")),
+        vec!["ok"],
+        "only the feed outside every range contributes rows"
+    );
+
+    let health = feed_health(&news).await;
+    assert_eq!(health["ok"], ("fresh".to_string(), None));
+    // The message names the host as the URL parser normalized it, so the
+    // mapped literal is spelled the way `url` serializes it.
+    let mapped_host = url::Url::parse("http://[::ffff:10.0.0.1]:9/")
+        .unwrap()
+        .host_str()
+        .unwrap()
+        .to_string();
+    for (feed, host, range, ip) in [
+        ("private", "10.0.0.1", "10.0.0.0/8", "10.0.0.1"),
+        ("mapped", mapped_host.as_str(), "10.0.0.0/8", "10.0.0.1"),
+        (
+            "metadata",
+            "169.254.169.254",
+            "169.254.0.0/16",
+            "169.254.169.254",
+        ),
+        ("redirected", "10.0.0.1", "10.0.0.0/8", "10.0.0.1"),
+    ] {
+        let (status, error) = &health[feed];
+        assert_eq!(status, "error", "{feed}");
+        assert_eq!(
+            error.as_deref(),
+            Some(
+                format!(
+                    "egress blocked: host '{host}' resolves to deny_cidrs {range} address {ip}"
+                )
+                .as_str()
+            ),
+            "{feed}"
+        );
+    }
+
+    assert_eq!(
+        sorted(news.paths()),
+        vec!["/hop.xml", "/ok.xml"],
+        "a refused target is never connected to, and a refusal is not retried"
+    );
+}
+
+/// The P1 case: loopback, where the run's own unauthenticated listeners live
+/// and which no `NetworkPolicy` sees. The subscription is the mock server
+/// itself — reachable, as the next test shows — and it is never asked.
+#[tokio::test]
+async fn deny_cidrs_refuse_loopback_literal() {
+    let news = TestNews::start_as_server(&[("self", "/f.xml")], |config| {
+        config.deny_cidrs = deny_cidrs(&["127.0.0.0/8", "::1/128"]);
+    })
+    .await;
+
+    let items = news.sql("SELECT feed FROM news.main.items").await;
+    assert_eq!(total_rows(&items), 0);
+    let (status, error) = &feed_health(&news).await["self"];
+    assert_eq!(status, "error");
+    assert_contains(
+        error.as_deref().expect("a refusal is recorded"),
+        "resolves to deny_cidrs 127.0.0.0/8 address 127.0.0.1",
+    );
+    assert_eq!(news.request_count(), 0, "the loopback listener was reached");
+}
+
+/// The resolver path: a *hostname* whose answer falls in a refused range is
+/// refused inside `PolicyDns`, before reqwest connects. `localhost` resolves to
+/// 127.0.0.1, `::1` or both depending on the host, and both are listed, so the
+/// refusal does not depend on which. Port 9 is never dialled; if it were, the
+/// error would be a connect failure, not this one.
+#[tokio::test]
+async fn deny_cidrs_refuse_a_hostname_resolving_into_a_range() {
+    let news = TestNews::start_as_server(&[("named", "http://localhost:9/f.xml")], |config| {
+        config.deny_cidrs = deny_cidrs(&["127.0.0.0/8", "::1/128"]);
+    })
+    .await;
+
+    let items = news.sql("SELECT feed FROM news.main.items").await;
+    assert_eq!(total_rows(&items), 0);
+    let (status, error) = &feed_health(&news).await["named"];
+    assert_eq!(status, "error");
+    let error = error.as_deref().expect("a refusal is recorded");
+    assert_contains(
+        error,
+        "egress blocked: host 'localhost' resolves to deny_cidrs ",
+    );
+}
+
+/// No `deny_cidrs`, no policy: the same loopback subscription the test above
+/// refuses is fetched, because the OSS default is still `AllowAll`.
+#[tokio::test]
+async fn without_deny_cidrs_a_server_registration_filters_nothing() {
+    let news = TestNews::start_as_server(&[("self", "/f.xml")], |config| {
+        assert!(config.deny_cidrs.is_empty(), "the default is no ranges");
+    })
+    .await;
+
+    let items = news.sql("SELECT feed FROM news.main.items").await;
+    assert_eq!(col(&items, "feed"), vec!["self"]);
+    assert_eq!(
+        feed_health(&news).await["self"],
+        ("fresh".to_string(), None)
+    );
+    assert_eq!(news.paths(), vec!["/f.xml"]);
+}
+
+/// An embedder that injects its own policy does not thereby switch the
+/// config's ranges off: both apply. Injected here is `AllowAll`, the policy
+/// that would otherwise let the loopback subscription through.
+#[tokio::test]
+async fn deny_cidrs_still_apply_alongside_an_injected_policy() {
+    let news = TestNews::start(&[("self", "/f.xml")], |config| {
+        config.deny_cidrs = deny_cidrs(&["127.0.0.0/8"]);
+    })
+    .await;
+
+    news.sql("SELECT feed FROM news.main.items").await;
+    let (status, error) = &feed_health(&news).await["self"];
+    assert_eq!(status, "error");
+    assert_contains(
+        error.as_deref().expect("a refusal is recorded"),
+        "deny_cidrs 127.0.0.0/8",
+    );
+    assert_eq!(news.request_count(), 0);
 }
