@@ -81,8 +81,7 @@ impl EgressPolicy for AllowAll {
 /// ```
 /// use std::net::IpAddr;
 ///
-/// use ipnet::IpNet;
-/// use skardi::sources::providers::rss::{DenyCidrs, EgressPolicy};
+/// use skardi::sources::providers::rss::{DenyCidrs, EgressPolicy, IpNet};
 ///
 /// let ranges = ["127.0.0.0/8", "169.254.0.0/16"]
 ///     .into_iter()
@@ -123,8 +122,7 @@ impl DenyCidrs {
     /// ```
     /// use std::net::IpAddr;
     ///
-    /// use ipnet::IpNet;
-    /// use skardi::sources::providers::rss::{DenyCidrs, EgressPolicy};
+    /// use skardi::sources::providers::rss::{DenyCidrs, EgressPolicy, IpNet};
     ///
     /// // Host bits are normalized away, in the policy and in the reason.
     /// let policy = DenyCidrs::new(["10.0.0.1/8".parse::<IpNet>().unwrap()]);

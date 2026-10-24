@@ -99,6 +99,12 @@ pub use opml::resolve_subscriptions;
 // no ranges of its own.
 #[cfg(feature = "rss")]
 pub use egress::{AllowAll, DenyCidrs, EgressDenied, EgressPolicy, EgressReason};
+// `RssConfig::deny_cidrs` and `DenyCidrs::new` both speak `ipnet::IpNet`, so
+// `ipnet` is part of this crate's public API whether or not it is named here.
+// Naming it spares a caller a second Cargo dependency whose version it would
+// have to keep compatible with ours by hand. Ungated, like the config field:
+// that one exists in builds without the `rss` feature too.
+pub use ipnet::IpNet;
 
 #[cfg(feature = "rss")]
 use std::sync::Arc;
