@@ -102,7 +102,12 @@ jobs:
           # cache-directories note).
           cache-directories: ~/.cache/pdfium-rs
       - name: Install protoc
-        run: sudo apt-get install -y protobuf-compiler
+        # Update first, as every other install in these workflows does: the
+        # runner image's package index goes stale, and installing from it asks
+        # the mirror for versions it has already replaced (404, exit 100).
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
       - name: Build documentation
         # `--all-features`, because that is what docs.rs builds
         # (package.metadata.docs.rs sets all-features = true): a featureless
