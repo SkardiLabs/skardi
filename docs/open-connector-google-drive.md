@@ -45,6 +45,14 @@ decimal *string*), and columns named from Google's docs
 gateway's camelCase strict schema (`pageSize`, `pageToken`, `driveId`,
 `q`, `fileId`; a wrong key is a hard 400).
 
+The `files.list` contract fixture now includes the connector's optional
+`sharedWithMeTime`, `shortcutDetails` and `incompleteSearch` observations,
+captured on 2026-10-27 from an isolated gateway at OC
+`b80814d179587df2c083edf153475989173ac337`. These are metadata, not new SQL
+columns. Missing completeness stays unknown, never a synthesized `false`.
+This schema requires that connector change: an older gateway is refused by
+the normal fingerprint check. Cloud pins are a separate rollout decision.
+
 ## Binding
 
 ```yaml

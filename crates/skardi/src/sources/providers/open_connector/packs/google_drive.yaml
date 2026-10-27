@@ -78,7 +78,7 @@ tables:
   files:
     action: googledrive.files.list
     row_path: "$.files"
-    fingerprint: 1780dbdea3118e36ea078f4bb3f48cf1055395b0ba876dc341bd592cf716f8f8
+    fingerprint: f3776c0e946abb79c6ce540e10bf0f9e54efb72fc0554742997f195d6090e500
     pagination:
       strategy: cursor
       cursor_input: pageToken

@@ -155,6 +155,29 @@
             "type": "boolean",
             "description": "Whether the file has been trashed."
           },
+          "sharedWithMeTime": {
+            "type": "string",
+            "description": "When the file was shared with the authenticated user, when Drive reports it."
+          },
+          "shortcutDetails": {
+            "type": "object",
+            "properties": {
+              "targetId": {
+                "type": "string",
+                "description": "The ID of the shortcut target."
+              },
+              "targetMimeType": {
+                "type": "string",
+                "description": "The MIME type of the shortcut target."
+              },
+              "targetResourceKey": {
+                "type": "string",
+                "description": "The resource key needed to access the shortcut target, when returned."
+              }
+            },
+            "additionalProperties": false,
+            "description": "The shortcut target observed by Drive. Absent for ordinary files or when not returned."
+          },
           "ownedByMe": {
             "type": "boolean",
             "description": "Whether the authenticated user owns the file."
@@ -187,6 +210,10 @@
         "additionalProperties": false
       },
       "description": "The list of files matching the search query."
+    },
+    "incompleteSearch": {
+      "type": "boolean",
+      "description": "Whether Drive could not search every requested corpus. Absent means Drive did not report completeness."
     },
     "nextPageToken": {
       "anyOf": [
