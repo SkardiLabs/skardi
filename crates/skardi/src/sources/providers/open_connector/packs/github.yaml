@@ -59,6 +59,7 @@ tables:
       - { name: state, path: state, type: utf8, nullable: false }
       - { name: body, path: body, type: utf8, nullable: true }
       - { name: author_login, path: user.login, type: utf8, nullable: true }
+      - { name: author_id, path: user.id, type: uint64, nullable: true }
       - { name: assignees, path: assignees, type: utf8_list_from_object_key, key: login, nullable: true }
       - { name: labels, path: labels, type: utf8_list_from_object_key, key: name, nullable: true }
       - { name: comments, path: comments, type: uint64, nullable: true }
@@ -88,6 +89,7 @@ tables:
       - { name: id, path: id, type: uint64, nullable: false }
       - { name: body, path: body, type: utf8, nullable: true }
       - { name: author_login, path: user.login, type: utf8, nullable: true }
+      - { name: author_id, path: user.id, type: uint64, nullable: true }
       - { name: created_at, path: created_at, type: timestamp_ms_utc, nullable: true }
       - { name: updated_at, path: updated_at, type: timestamp_ms_utc, nullable: true }
       - { name: html_url, path: html_url, type: utf8, nullable: true }
@@ -114,6 +116,7 @@ tables:
       - { name: state, path: state, type: utf8, nullable: false }
       - { name: body, path: body, type: utf8, nullable: true }
       - { name: author_login, path: user.login, type: utf8, nullable: true }
+      - { name: author_id, path: user.id, type: uint64, nullable: true }
       - { name: draft, path: draft, type: boolean, nullable: true }
       - { name: head_ref, path: head.ref, type: utf8, nullable: true }
       - { name: base_ref, path: base.ref, type: utf8, nullable: true }
@@ -140,6 +143,7 @@ tables:
       - { name: id, path: id, type: uint64, nullable: false }
       - { name: state, path: state, type: utf8, nullable: false }
       - { name: author_login, path: user.login, type: utf8, nullable: true }
+      - { name: author_id, path: user.id, type: uint64, nullable: true }
       - { name: body, path: body, type: utf8, nullable: true }
       - { name: commit_id, path: commit_id, type: utf8, nullable: true }
       - { name: submitted_at, path: submitted_at, type: timestamp_ms_utc, nullable: true }
@@ -160,6 +164,7 @@ tables:
       - { name: sha, path: sha, type: utf8, nullable: false }
       - { name: message, path: commit.message, type: utf8, nullable: true }
       - { name: author_login, path: author.login, type: utf8, nullable: true }
+      - { name: author_id, path: author.id, type: uint64, nullable: true }
       - { name: author_name, path: commit.author.name, type: utf8, nullable: true }
       - { name: authored_at, path: commit.author.date, type: timestamp_ms_utc, nullable: true }
       - { name: committed_at, path: commit.committer.date, type: timestamp_ms_utc, nullable: true }
@@ -209,6 +214,7 @@ tables:
       - { name: prerelease, path: prerelease, type: boolean, nullable: true }
       - { name: body, path: body, type: utf8, nullable: true }
       - { name: author_login, path: author.login, type: utf8, nullable: true }
+      - { name: author_id, path: author.id, type: uint64, nullable: true }
       - { name: created_at, path: created_at, type: timestamp_ms_utc, nullable: true }
       - { name: published_at, path: published_at, type: timestamp_ms_utc, nullable: true }
       - { name: html_url, path: html_url, type: utf8, nullable: true }

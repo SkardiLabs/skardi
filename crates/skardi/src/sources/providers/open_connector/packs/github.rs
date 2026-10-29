@@ -195,7 +195,7 @@ mod tests {
             (
                 "issue_comments",
                 include_str!("fixtures/github/contracts/list_issue_comments.json"),
-                &["author_login"],
+                &["author_login", "author_id"],
             ),
             (
                 "pull_requests",
@@ -212,7 +212,7 @@ mod tests {
             (
                 "reviews",
                 include_str!("fixtures/github/contracts/list_pull_request_reviews.json"),
-                &["author_login"],
+                &["author_login", "author_id"],
             ),
             (
                 "commits",
@@ -423,6 +423,10 @@ bindings:
         assert!(utf8(&batch, "body").is_null(1));
         assert_eq!(utf8(&batch, "author_login").value(0), "octocat");
         assert!(utf8(&batch, "author_login").is_null(1));
+        // The author's immutable account id beside the renameable login: an
+        // identity can be matched to a connected account exactly.
+        assert_eq!(u64s(&batch, "author_id").value(0), 583231);
+        assert!(u64s(&batch, "author_id").is_null(1));
 
         // Object lists pluck the declared key; empty arrays stay empty lists.
         assert_eq!(
