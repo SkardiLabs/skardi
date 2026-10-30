@@ -97,6 +97,12 @@ pub struct LoginOptions {
     pub token_name: String,
     /// Injected so the expiry a test asserts is not the wall clock.
     pub now: DateTime<Utc>,
+    /// `--control`: ask the approver for the token pair (agent onboarding
+    /// §2.1). Brokered flow only.
+    pub control: bool,
+    /// `--setup`/`--name`/`--industry`: what the consent page prefills for a
+    /// person with no org yet (§2.5). Brokered flow only.
+    pub setup: Option<console_broker::Setup>,
 }
 
 /// One context this run wrote.
@@ -127,6 +133,26 @@ pub struct LoginReport {
     /// `(token id, reason)` for a replacement revocation that failed. Reported
     /// but not fatal: the new context is already good (§6.5).
     pub revoke_failures: Vec<(String, String)>,
+    /// When the `control` token of a pair stops working. `Some` only when
+    /// `--control` was asked for AND approved; the token itself is never in
+    /// a report.
+    pub control_expires_at: Option<String>,
+    /// `--control` was asked for and the approval came back without it: the
+    /// box was unticked, or the approver's role is not admin. The context is
+    /// still written — queries work — and the command exits 6 (§2.4.2).
+    pub control_missing: bool,
+    /// The workspace's MCP server, as the exchange named it.
+    pub mcp_url: Option<String>,
+    /// The context whose pair this login named as `replaces_pair_id` when
+    /// that is NOT the context it wrote: the exchange revoked a pair some
+    /// other context still holds, so that context needs a login of its own.
+    pub replaced_pair_elsewhere: Option<String>,
+}
+
+/// A credential a context held before this run overwrote it.
+struct Replaced {
+    token_id: String,
+    pair_id: Option<String>,
 }
 
 /// A PAT this run created, retained so the saga can revoke it.
@@ -138,6 +164,16 @@ struct MintedRef {
 /// Run the whole flow. `config_path` is a parameter so tests write to a temp
 /// directory instead of the developer's own config.
 pub async fn login(options: LoginOptions, config_path: &Path) -> Result<LoginReport> {
+    // The pair and the inline setup exist only on the console's consent page:
+    // the direct flow mints with an ID token and never shows a person a page
+    // that could ask either question. Refused rather than ignored, because
+    // a `--control` silently dropped is an agent that later finds it cannot
+    // connect anything and has no idea why.
+    if !uses_console_broker(&options) && (options.control || options.setup.is_some()) {
+        bail!(
+            "--control and --setup are answered on the console's approval page, so they work only with the browser login — drop --client-id/--identity"
+        );
+    }
     // With neither `--identity` nor a client id, the console brokers (design
     // 2026-09-08 §9). That path is not a different way to get a bearer — it
     // returns a PAT that is already minted and already scoped, so it skips
@@ -229,6 +265,7 @@ pub async fn login(options: LoginOptions, config_path: &Path) -> Result<LoginRep
 
     match write_contexts(config_path, &options, &pending) {
         Ok(replaced) => {
+            let replaced = replaced.into_iter().map(|r| r.token_id).collect();
             report.written = pending
                 .iter()
                 .map(|(membership, token, server)| WrittenContext {
@@ -307,6 +344,16 @@ async fn console_brokered_login(options: LoginOptions, config_path: &Path) -> Re
 
     let http = control_plane::client(control_plane::CONTROL_PLANE_TIMEOUT)?;
     let pkce = pkce::Pkce::generate()?;
+    // The pair this login replaces (§2.1.1): the one held by the context it
+    // will most likely overwrite — `--context` when named, else the current
+    // one. The exchange revokes it only where the approving identity owns it,
+    // so naming the wrong one revokes nothing that is not the approver's.
+    // `--keep-old-token` keeps the predecessor, as it does for a single token.
+    let replaces = if options.keep_old_token {
+        None
+    } else {
+        pair_to_replace(config_path, options.context_name.as_deref())
+    };
     // The same ceiling check the saga does, for the same reason: `DateTime +
     // TimeDelta` panics on overflow and `parse_expires` cannot catch every
     // case, because its bound is `TimeDelta`'s range and not `DateTime`'s.
@@ -325,6 +372,11 @@ async fn console_brokered_login(options: LoginOptions, config_path: &Path) -> Re
         // path mints under — one name for one machine, whichever flow wrote it.
         &options.token_name,
         &token_expires_at,
+        &console_broker::OpenExtras {
+            control: options.control,
+            setup: options.setup.clone(),
+            replaces_pair_id: replaces.as_ref().map(|(_, pair_id)| pair_id.clone()),
+        },
     )
     .await?;
     let url = console_broker::approval_url(&options.control_plane, &opened.request_id);
@@ -367,6 +419,7 @@ async fn console_brokered_login(options: LoginOptions, config_path: &Path) -> Re
         token: brokered.token,
         token_id: brokered.token_id,
         expires_at: brokered.expires_at,
+        control: brokered.control,
     };
     let server = resolve_server(&options, &membership).map_err(|err| abandoned(&token, err))?;
     if !options.no_verify
@@ -394,17 +447,32 @@ async fn console_brokered_login(options: LoginOptions, config_path: &Path) -> Re
         })
         .collect();
     report.current_context = report.written.first().map(|w| w.name.clone());
+    let (membership, token, _) = &pending[0];
+    report.mcp_url = membership.mcp_url.clone();
+    report.control_expires_at = token.control.as_ref().and_then(|c| c.expires_at.clone());
+    report.control_missing = options.control && token.control.is_none();
+    let sent_pair = replaces.as_ref().map(|(_, pair_id)| pair_id.as_str());
+    if let Some((named, _)) = &replaces
+        && report.current_context.as_deref() != Some(named.as_str())
+    {
+        report.replaced_pair_elsewhere = Some(named.clone());
+    }
 
-    // The replacement rule, minus the revoke this path cannot perform. Routed
-    // through `revoke_failures` because that is already the channel that
-    // prints "revoke it in the console" — the outcome is identical to a revoke
-    // that failed, and the reason is stated rather than left as a bare id.
-    for token_id in replaced {
+    // The replacement rule. A credential whose pair this login named was
+    // revoked by the exchange itself (§2.1.1), under the approver's session —
+    // the one authority that may revoke a token here. Anything else is the
+    // revoke this path cannot perform, routed through `revoke_failures`
+    // because that is already the channel that prints "revoke it in the
+    // console": the outcome is identical to a revoke that failed, and the
+    // reason is stated rather than left as a bare id.
+    for old in replaced {
         if options.keep_old_token {
-            report.replaced_kept.push(token_id);
+            report.replaced_kept.push(old.token_id);
+        } else if old.pair_id.is_some() && old.pair_id.as_deref() == sent_pair {
+            report.replaced_revoked.push(old.token_id);
         } else {
             report.revoke_failures.push((
-                token_id,
+                old.token_id,
                 "a browser login holds only a PAT, which cannot revoke tokens at the control plane"
                     .to_string(),
             ));
@@ -518,6 +586,23 @@ async fn poll_for_approval(
 /// connection mid-approval, not to keep trying at a console that is gone. At
 /// the default poll interval this is a few seconds of grace.
 const MAX_TRANSPORT_FAILURES: u32 = 3;
+
+/// `(context name, pair id)` of the pair a brokered login should replace: the
+/// context `--context` names, else the current one, when it is a cloud
+/// context holding a `pair-id`. Read-only and best effort — a file that does
+/// not parse yet is the next step's problem, and it says so there.
+fn pair_to_replace(config_path: &Path, context_name: Option<&str>) -> Option<(String, String)> {
+    let file = config::load(config_path)?;
+    let name = context_name
+        .map(str::to_string)
+        .or_else(|| file.current_context.clone())?;
+    let context = file.contexts.iter().find(|c| c.name == name)?;
+    if context.mode != ContextMode::Cloud {
+        return None;
+    }
+    let pair_id = context.pair_id.as_deref()?.trim();
+    (!pair_id.is_empty()).then(|| (name, pair_id.to_string()))
+}
 
 /// Attach the "this credential is live and unrevokable" note to a failure that
 /// happens after the exchange succeeded.
@@ -819,14 +904,14 @@ fn context_name(options: &LoginOptions, membership: &Membership) -> String {
 
 /// Write every verified context and point `current-context` at the first.
 ///
-/// Returns the token ids of credentials this write REPLACED, for §6.5's
-/// replacement revocation. The whole file is written once, so a partial set of
-/// contexts cannot land.
+/// Returns the credentials this write REPLACED — each token id, and the pair
+/// it belonged to — for §6.5's replacement revocation. The whole file is
+/// written once, so a partial set of contexts cannot land.
 fn write_contexts(
     path: &Path,
     options: &LoginOptions,
     pending: &[(Membership, Minted, String)],
-) -> Result<Vec<String>> {
+) -> Result<Vec<Replaced>> {
     let mut file: ContextsFile = config::load_for_mutation(path)?;
     file.promote_legacy_spec();
     let mut replaced = Vec::new();
@@ -837,7 +922,10 @@ fn write_contexts(
         if let Some(index) = existing {
             // Retained BEFORE the overwrite: after it, the id is gone.
             if let Some(token_id) = file.contexts[index].token_id.clone() {
-                replaced.push(token_id);
+                replaced.push(Replaced {
+                    token_id,
+                    pair_id: file.contexts[index].pair_id.clone(),
+                });
             }
         }
         let index = existing.unwrap_or_else(|| {
@@ -854,6 +942,16 @@ fn write_contexts(
         context.token = Some(token.token.clone());
         context.token_id = Some(token.token_id.clone());
         context.token_expires_at = token.expires_at.clone();
+        // Every pair field is ASSIGNED, never merged: a re-login approved
+        // without `control` must not leave the previous pair's control token
+        // beside a new `token`, where an agent would keep driving a grant the
+        // person did not renew. The previous pair was revoked by the exchange
+        // or is about to expire; either way it is not this login's.
+        let control = token.control.as_ref();
+        context.control_token = control.map(|c| c.token.clone());
+        context.control_token_expires_at = control.and_then(|c| c.expires_at.clone());
+        context.pair_id = control.and_then(|c| c.pair_id.clone());
+        context.mcp_url = membership.mcp_url.clone();
     }
 
     if let Some((membership, _, _)) = pending.first() {

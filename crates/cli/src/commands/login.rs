@@ -6,10 +6,37 @@
 //! options and remains testable without a process.
 
 use crate::config::{self, ContextsFile};
+use crate::exit::Exit;
+use crate::login::console_broker::Setup;
 use crate::login::{self, LoginOptions, LoginReport, Selection, control_plane, oauth};
 use anyhow::{Context as _, Result, bail};
-use clap::Args;
+use clap::{Args, ValueEnum};
 use std::path::Path;
+
+/// The exit code for a `login --control` approved without `control` (agent
+/// onboarding §2.4.2): the context is written, and the agent learns it cannot
+/// connect anything without parsing a sentence.
+pub const EXIT_NO_CONTROL: u8 = 6;
+
+/// What `login --control` says when the approval came back without it. The
+/// first clause is the design's (§2.4.2); the rest is what to do about it.
+pub const NO_CONTROL_MESSAGE: &str = "approved without control: the box was unticked, or your role is not admin; ask an admin to connect sources. The context was written, so queries work. To connect data sources yourself, run `skardi login --control` again and tick \"may connect data sources\" when you approve";
+
+/// `--setup`'s two values: `/setup`'s org profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum SetupProfile {
+    Personal,
+    Team,
+}
+
+impl SetupProfile {
+    fn as_str(self) -> &'static str {
+        match self {
+            SetupProfile::Personal => "personal",
+            SetupProfile::Team => "team",
+        }
+    }
+}
 
 /// `--control-plane`'s environment step (§6.1 step 1).
 const CONTROL_PLANE_ENV: &str = "SKARDI_CONTROL_PLANE_URL";
@@ -82,6 +109,26 @@ pub struct LoginArgs {
     /// keep the credential a re-login replaces, instead of revoking it
     #[arg(long)]
     pub keep_old_token: bool,
+
+    /// ask the approver for a 24-hour `control` token beside the query
+    /// token, so `skardi integrations` can connect data sources. Exits 6 when
+    /// the approval comes back without it. Browser login only
+    #[arg(long)]
+    pub control: bool,
+
+    /// for a person with no account yet: create a personal or team
+    /// workspace on the approval page. Needs --name. Browser login only
+    #[arg(long, value_enum, value_name = "PROFILE", requires = "name")]
+    pub setup: Option<SetupProfile>,
+
+    /// the new workspace's name, which its members will see (with --setup)
+    #[arg(long, value_name = "NAME", requires = "setup")]
+    pub name: Option<String>,
+
+    /// the new workspace's industry, one of the console's setup values
+    /// (with --setup)
+    #[arg(long, value_name = "INDUSTRY", requires = "setup")]
+    pub industry: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -124,7 +171,41 @@ pub async fn run(
     let options = options_from(&args, flag_context, flag_server, &path)?;
     let report = login::login(options, &path).await?;
     print_report(&report);
+    if report.control_missing {
+        return Err(Exit {
+            code: EXIT_NO_CONTROL,
+            message: Some(NO_CONTROL_MESSAGE.to_string()),
+        }
+        .into());
+    }
     Ok(())
+}
+
+/// `--setup`/`--name`/`--industry` as the request carries them.
+///
+/// The name's bounds are `/setup`'s (1–100 characters); checked here so a
+/// typo costs nothing, and checked again by the server, which owns them —
+/// as it owns the industry list, which this binary does not copy.
+fn setup_from(args: &LoginArgs) -> Result<Option<Setup>> {
+    let Some(profile) = args.setup else {
+        return Ok(None);
+    };
+    let name = args.name.as_deref().unwrap_or_default().trim().to_string();
+    let length = name.chars().count();
+    if length == 0 || length > 100 {
+        bail!("--name must be 1 to 100 characters, not {length}");
+    }
+    let industry = args
+        .industry
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    Ok(Some(Setup {
+        profile: profile.as_str().to_string(),
+        name,
+        industry,
+    }))
 }
 
 /// Assemble [`LoginOptions`] from flags, environment, and the config file.
@@ -199,6 +280,8 @@ fn options_from(
         verify_timeout: control_plane::CONTROL_PLANE_TIMEOUT,
         token_name: login::default_token_name(),
         now: chrono::Utc::now(),
+        control: args.control,
+        setup: setup_from(args)?,
     })
 }
 
@@ -366,6 +449,25 @@ fn render_report(report: &LoginReport) -> String {
     if let Some(current) = &report.current_context {
         let _ = writeln!(out, "current context is now {current}");
     }
+    // Never the token: when it stops working is what a person plans around.
+    if let Some(at) = &report.control_expires_at {
+        let _ = writeln!(
+            out,
+            "control granted until {at}: `skardi integrations` can connect data sources until then"
+        );
+    }
+    if let Some(url) = &report.mcp_url {
+        let _ = writeln!(
+            out,
+            "MCP server: {url} — run `skardi mcp register claude-code` to add it to Claude Code"
+        );
+    }
+    if let Some(name) = &report.replaced_pair_elsewhere {
+        let _ = writeln!(
+            out,
+            "this login replaced the credentials context {name} held, which the exchange revoked if they were yours — run `skardi login --context {name}` to sign it in again"
+        );
+    }
     for token_id in &report.replaced_revoked {
         let _ = writeln!(
             out,
@@ -405,6 +507,10 @@ mod tests {
             i_know_this_is_dev_auth: false,
             no_verify: false,
             keep_old_token: false,
+            control: false,
+            setup: None,
+            name: None,
+            industry: None,
         }
     }
 
@@ -481,6 +587,7 @@ mod tests {
             replaced_revoked: vec!["tok-old".to_string()],
             replaced_kept: vec!["tok-kept".to_string()],
             revoke_failures: vec![("tok-stuck".to_string(), "HTTP 500".to_string())],
+            ..LoginReport::default()
         };
 
         let rendered = render_report(&report);

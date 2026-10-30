@@ -429,6 +429,16 @@ fn render_view(path: &Path, show_tokens: bool) -> Result<String> {
             config::describe_parse_error(&err)
         ),
     };
+    // The `control` token is redacted whatever was asked (agent onboarding
+    // §2.1.1): `--show-tokens` is how a person copies their query token, and
+    // an agent told to "show me the config" must not come away holding the
+    // one credential that reaches the control plane. The `token` it shows
+    // instead is the pair's data-plane half, the `mcp_token`.
+    for context in &mut file.contexts {
+        if let Some(token) = &context.control_token {
+            context.control_token = Some(redact(token));
+        }
+    }
     if !show_tokens {
         for context in &mut file.contexts {
             if let Some(token) = &context.token {
@@ -771,6 +781,31 @@ mod tests {
         let err = use_context(&path, "any").unwrap_err();
         // The "(none)" arm — a listing with nothing to list.
         assert!(err.to_string().contains("Available: (none)"), "{err}");
+    }
+
+    /// `--show-tokens` prints the query token (the pair's mcp_token) and
+    /// NEVER the control token (agent onboarding §2.1.1).
+    #[test]
+    fn show_tokens_shows_the_mcp_token_and_redacts_the_control_token() {
+        let (_dir, path) = temp();
+        write(
+            &path,
+            "contexts:\n\
+             \x20 - name: acme/prod\n    mode: cloud\n    server: https://gw\n    workspace: acme-prod\n\
+             \x20   token: skardi_pat_mcp_value\n\
+             \x20   control-token: skardi_pat_control_value\n\
+             \x20   control-token-expires-at: 2026-10-31T12:00:00Z\n\
+             \x20   pair-id: pair-1\n",
+        );
+        for show_tokens in [false, true] {
+            let body = render_view(&path, show_tokens).unwrap();
+            assert!(!body.contains("skardi_pat_control_value"), "{body}");
+            assert!(body.contains("control-token: (redacted)"), "{body}");
+            // Not a credential: when it stops working, and which login it is.
+            assert!(body.contains("2026-10-31T12:00:00Z"), "{body}");
+            assert!(body.contains("pair-1"), "{body}");
+            assert_eq!(body.contains("skardi_pat_mcp_value"), show_tokens, "{body}");
+        }
     }
 
     #[test]

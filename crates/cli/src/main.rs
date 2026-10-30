@@ -15,6 +15,7 @@ use commands::login::{LoginArgs, LogoutArgs};
 use commands::pipeline::PipelineCmd;
 use commands::query::ContextFlags;
 use config::ClientConfig;
+use exit::Exit;
 use identity::{ClientIdentity, Surface};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -23,6 +24,7 @@ mod client;
 mod cloud;
 mod commands;
 mod config;
+mod exit;
 mod identity;
 mod login;
 mod mcp;
@@ -215,6 +217,14 @@ async fn main() -> ExitCode {
     match dispatch(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
+            // A command that chose its own code (`login --control`'s 6) also
+            // says whether anything is left to print.
+            if let Some(exit) = err.downcast_ref::<Exit>() {
+                if let Some(message) = &exit.message {
+                    eprintln!("error: {message}");
+                }
+                return ExitCode::from(exit.code);
+            }
             eprintln!("error: {err:#}");
             match err.downcast_ref::<ApiError>() {
                 Some(ApiError::Connect { .. }) => ExitCode::from(2),

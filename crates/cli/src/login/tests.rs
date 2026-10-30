@@ -125,6 +125,8 @@ fn options(control_plane: &str, server_override: Option<&str>) -> LoginOptions {
         poll_interval: std::time::Duration::from_millis(1),
         token_name: "cli@test-host".to_string(),
         now: at("2026-08-24T12:00:00Z"),
+        control: false,
+        setup: None,
     }
 }
 
@@ -2033,4 +2035,306 @@ fn the_console_broker_is_the_default_and_either_credential_flag_opts_out() {
         Some("client-123.apps.googleusercontent.com")
     )));
     assert!(!super::uses_console_broker(&base(Some("dev:alice"), None)));
+}
+
+// ─── The token pair (agent onboarding §2.1, §2.5) ──────────────────────────
+
+/// An exchange approved WITH `control`: the pair beside the token every CLI
+/// reads, and the MCP URL on the membership.
+fn approved_with_control(gateway_url: &str, token_id: &str, pair_id: &str) -> Value {
+    let mut body = approved("my-ws", gateway_url, token_id);
+    body["control_token"] = json!("skardi_pat_control_secret");
+    body["control_token_id"] = json!("tok-control");
+    body["control_expires_at"] = json!("2026-08-25T12:00:00Z");
+    body["pair_id"] = json!(pair_id);
+    body["memberships"][0]["mcp_url"] = json!(format!("{gateway_url}/mcp"));
+    body
+}
+
+fn opened_body(requests: &[Request]) -> Value {
+    requests
+        .iter()
+        .find(|r| r.url.path() == "/api/global/v1/cli-login/requests")
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .expect("the flow opens a request")
+}
+
+fn control_options(console_base: &str) -> LoginOptions {
+    let mut options = broker_options(console_base);
+    options.control = true;
+    options
+}
+
+#[tokio::test]
+async fn a_control_login_asks_for_control_and_stores_the_pair() {
+    let gw = gateway(200).await;
+    let console = console(200, approved_with_control(&gw.uri(), "tok-mcp", "pair-1")).await;
+    let home = TempDir::new().unwrap();
+
+    let report = login(control_options(&console.uri()), &config_in(&home))
+        .await
+        .unwrap();
+
+    let opened = opened_body(&console.received_requests().await.unwrap());
+    assert_eq!(opened["control"], json!(true));
+
+    // The existing `token` key holds the mcp_token, so every data-plane
+    // command — and every older CLI — keeps working unchanged (§2.4.2).
+    let file = read_yaml(&config_in(&home));
+    let context = &file["contexts"][0];
+    assert_eq!(context["token"].as_str(), Some("skardi_pat_tok-mcp"));
+    assert_eq!(context["token-id"].as_str(), Some("tok-mcp"));
+    assert_eq!(
+        context["control-token"].as_str(),
+        Some("skardi_pat_control_secret")
+    );
+    assert_eq!(
+        context["control-token-expires-at"].as_str(),
+        Some("2026-08-25T12:00:00Z")
+    );
+    assert_eq!(context["pair-id"].as_str(), Some("pair-1"));
+    assert_eq!(
+        context["mcp-url"].as_str(),
+        Some(format!("{}/mcp", gw.uri()).as_str())
+    );
+
+    assert!(!report.control_missing);
+    assert_eq!(
+        report.control_expires_at.as_deref(),
+        Some("2026-08-25T12:00:00Z")
+    );
+    // The report carries no token value, so printing it cannot leak one.
+    assert!(!format!("{report:?}").contains("control_secret"));
+
+    // The post-login probe used the mcp token, never the control token.
+    let probe = &gw.received_requests().await.unwrap()[0];
+    assert_eq!(
+        probe.headers.get("authorization").unwrap(),
+        "Bearer skardi_pat_tok-mcp"
+    );
+}
+
+/// Approved without `control` — the box unticked, or a member's cap: the
+/// context is still written so queries work, and the report says control is
+/// missing, which the command turns into exit 6.
+#[tokio::test]
+async fn a_control_login_approved_without_control_writes_the_context_and_reports_it() {
+    let gw = gateway(200).await;
+    let console = console(200, approved("my-ws", &gw.uri(), "tok-1")).await;
+    let home = TempDir::new().unwrap();
+
+    let report = login(control_options(&console.uri()), &config_in(&home))
+        .await
+        .unwrap();
+
+    assert!(report.control_missing);
+    assert_eq!(report.control_expires_at, None);
+    let file = read_yaml(&config_in(&home));
+    let context = &file["contexts"][0];
+    assert_eq!(context["token"].as_str(), Some("skardi_pat_tok-1"));
+    assert!(context.get("control-token").is_none(), "{file:?}");
+    assert!(context.get("pair-id").is_none(), "{file:?}");
+}
+
+/// A plain login sends exactly today's body: a server older than the pair is
+/// `deny_unknown_fields`, so even `"control": false` would break it.
+#[tokio::test]
+async fn a_plain_login_sends_none_of_the_new_fields() {
+    let gw = gateway(200).await;
+    let console = console(200, approved("my-ws", &gw.uri(), "tok-1")).await;
+    let home = TempDir::new().unwrap();
+    let report = login(broker_options(&console.uri()), &config_in(&home))
+        .await
+        .unwrap();
+    assert!(!report.control_missing, "control was not asked for");
+
+    let opened = opened_body(&console.received_requests().await.unwrap());
+    let keys: Vec<&String> = opened.as_object().unwrap().keys().collect();
+    assert_eq!(keys, ["challenge", "client_desc", "token_expires_at"]);
+}
+
+#[tokio::test]
+async fn setup_rides_the_open_call() {
+    let gw = gateway(200).await;
+    let console = console(200, approved_with_control(&gw.uri(), "tok-1", "pair-1")).await;
+    let home = TempDir::new().unwrap();
+    let mut options = control_options(&console.uri());
+    options.setup = Some(super::console_broker::Setup {
+        profile: "personal".to_string(),
+        name: "Alice".to_string(),
+        industry: None,
+    });
+    login(options, &config_in(&home)).await.unwrap();
+
+    let opened = opened_body(&console.received_requests().await.unwrap());
+    assert_eq!(
+        opened["setup"],
+        json!({"profile": "personal", "name": "Alice", "industry": null})
+    );
+    assert_eq!(opened["control"], json!(true));
+}
+
+/// A re-login names the context's pair as `replaces_pair_id`; the exchange
+/// revokes it under the approver's session, so the report counts the old
+/// token as revoked rather than as one the user must revoke by hand.
+#[tokio::test]
+async fn a_relogin_sends_replaces_pair_id_and_reports_the_old_pair_revoked() {
+    let gw = gateway(200).await;
+    let console = console(200, approved_with_control(&gw.uri(), "tok-new", "pair-new")).await;
+    let home = TempDir::new().unwrap();
+    let path = config_in(&home);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        format!(
+            "current-context: acme/my-ws\n{}    pair-id: pair-old\n    control-token: skardi_pat_old_control\n",
+            existing_cloud_context()
+        ),
+    )
+    .unwrap();
+
+    let report = login(control_options(&console.uri()), &path).await.unwrap();
+
+    let opened = opened_body(&console.received_requests().await.unwrap());
+    assert_eq!(opened["replaces_pair_id"], json!("pair-old"));
+    assert_eq!(report.replaced_revoked, vec!["tok-old".to_string()]);
+    assert!(report.revoke_failures.is_empty(), "{report:?}");
+    assert_eq!(report.replaced_pair_elsewhere, None);
+
+    let raw = std::fs::read_to_string(&path).unwrap();
+    assert!(!raw.contains("skardi_pat_old_control"), "{raw}");
+    let file = read_yaml(&path);
+    assert_eq!(file["contexts"][0]["pair-id"].as_str(), Some("pair-new"));
+}
+
+/// A re-login approved WITHOUT control must not leave the previous pair's
+/// control token beside the new query token.
+#[tokio::test]
+async fn a_relogin_without_control_drops_the_previous_control_token() {
+    let gw = gateway(200).await;
+    let console = console(200, approved("my-ws", &gw.uri(), "tok-new")).await;
+    let home = TempDir::new().unwrap();
+    let path = config_in(&home);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        format!(
+            "{}    pair-id: pair-old\n    control-token: skardi_pat_old_control\n    control-token-expires-at: 2026-08-25T00:00:00Z\n",
+            existing_cloud_context()
+        ),
+    )
+    .unwrap();
+
+    login(broker_options(&console.uri()), &path).await.unwrap();
+
+    let raw = std::fs::read_to_string(&path).unwrap();
+    assert!(!raw.contains("control-token"), "{raw}");
+    assert!(!raw.contains("pair-old"), "{raw}");
+}
+
+/// `--keep-old-token` keeps the predecessor pair too: nothing is named for
+/// the exchange to revoke.
+#[tokio::test]
+async fn keep_old_token_names_no_pair_to_replace() {
+    let gw = gateway(200).await;
+    let console = console(200, approved_with_control(&gw.uri(), "tok-new", "pair-new")).await;
+    let home = TempDir::new().unwrap();
+    let path = config_in(&home);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        format!(
+            "current-context: acme/my-ws\n{}    pair-id: pair-old\n",
+            existing_cloud_context()
+        ),
+    )
+    .unwrap();
+    let mut options = control_options(&console.uri());
+    options.keep_old_token = true;
+    let report = login(options, &path).await.unwrap();
+
+    let opened = opened_body(&console.received_requests().await.unwrap());
+    assert!(opened.get("replaces_pair_id").is_none(), "{opened}");
+    assert_eq!(report.replaced_kept, vec!["tok-old".to_string()]);
+}
+
+/// The pair named is the current context's; when the approval lands in a
+/// DIFFERENT context, the one whose pair was revoked is named in the report.
+#[tokio::test]
+async fn a_pair_replaced_in_another_context_is_reported() {
+    let gw = gateway(200).await;
+    let console = console(200, approved_with_control(&gw.uri(), "tok-new", "pair-new")).await;
+    let home = TempDir::new().unwrap();
+    let path = config_in(&home);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        "current-context: acme/other\ncontexts:\n  - name: acme/other\n    mode: cloud\n    server: http://gw.example\n    workspace: other\n    token: skardi_pat_other\n    token-id: tok-other\n    pair-id: pair-other\n",
+    )
+    .unwrap();
+    let report = login(control_options(&console.uri()), &path).await.unwrap();
+    assert_eq!(
+        report.replaced_pair_elsewhere.as_deref(),
+        Some("acme/other")
+    );
+}
+
+/// A server older than this answers the unknown field with `422
+/// invalid_body` (skardi-global's JSON extractor) — the design expected
+/// `400` — and either one says the server is too old for the flag.
+#[rstest]
+#[case::unprocessable(422)]
+#[case::bad_request(400)]
+#[tokio::test]
+async fn an_older_server_refusing_the_new_fields_is_reported_as_too_old(#[case] status: u16) {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/global/v1/cli-login/requests"))
+        .respond_with(ResponseTemplate::new(status).set_body_json(json!({
+            "error": {"code": "invalid_body", "message": "unknown field `control`"}
+        })))
+        .mount(&server)
+        .await;
+    let home = TempDir::new().unwrap();
+    let err = login(control_options(&server.uri()), &config_in(&home))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("too old for --control"), "{err}");
+    assert!(!config_in(&home).exists());
+}
+
+/// Without a new field in the request, the same refusal is not blamed on the
+/// server's age.
+#[tokio::test]
+async fn a_plain_logins_invalid_body_is_not_called_too_old() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/global/v1/cli-login/requests"))
+        .respond_with(ResponseTemplate::new(422).set_body_json(json!({
+            "error": {"code": "invalid_body", "message": "bad challenge"}
+        })))
+        .mount(&server)
+        .await;
+    let home = TempDir::new().unwrap();
+    let err = login(broker_options(&server.uri()), &config_in(&home))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(!err.contains("too old"), "{err}");
+    assert!(err.contains("bad challenge"), "{err}");
+}
+
+/// `--control` and `--setup` are answered on the console's page, which the
+/// direct flow never shows.
+#[tokio::test]
+async fn the_direct_flow_refuses_control_and_setup() {
+    let home = TempDir::new().unwrap();
+    let mut options = options("http://127.0.0.1:1", None);
+    options.control = true;
+    let err = login(options, &config_in(&home))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("--control"), "{err}");
 }

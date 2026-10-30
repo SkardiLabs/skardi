@@ -49,7 +49,7 @@ use serde_json::{Value, json};
 use std::fmt;
 use std::time::Duration;
 
-use super::control_plane::Membership;
+use super::control_plane::{ControlGrant, Membership};
 
 /// Where the CLI-login routes live on the console.
 ///
@@ -83,6 +83,8 @@ pub struct Opened {
 ///
 /// Carries the raw PAT, so no `#[derive(Debug)]` — see the manual impl below.
 pub struct Brokered {
+    /// The data-plane token — the pair's `mcp_token` when `control` was
+    /// approved, and today's only token otherwise.
     pub token: String,
     /// The revoke handle. Cannot be used by this CLI (see the module docs), and
     /// is retained anyway: it goes into the context so a later login can name
@@ -96,6 +98,9 @@ pub struct Brokered {
     /// second round trip. Empty is tolerated: `workspace` is authoritative,
     /// and this is what lets the context carry an org slug and a role.
     pub memberships: Vec<Membership>,
+    /// The pair's `control` token, present only when the approver ticked
+    /// `control` (agent onboarding §2.1.1).
+    pub control: Option<ControlGrant>,
 }
 
 /// Hand-written, for the same reason `Minted`'s is: the raw token must not be
@@ -108,7 +113,53 @@ impl fmt::Debug for Brokered {
             .field("expires_at", &self.expires_at)
             .field("workspace", &self.workspace)
             .field("memberships", &self.memberships)
+            .field("control", &self.control)
             .finish()
+    }
+}
+
+/// `/setup`'s three fields, carried on the request so the consent page can
+/// create a brand-new person's org inline (agent onboarding §2.5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Setup {
+    /// `personal` or `team`.
+    pub profile: String,
+    pub name: String,
+    pub industry: Option<String>,
+}
+
+/// What a request asks for beyond today's login (agent onboarding §2.5, A.4).
+///
+/// Each field is sent ONLY when it says something. The server's open body is
+/// `deny_unknown_fields`, so a server older than the agent-onboarding change
+/// refuses any of them by name — and sending `"control": false` by default
+/// would have broken `skardi login` against every such server for nobody's
+/// benefit.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OpenExtras {
+    /// `--control`: ask for the token pair.
+    pub control: bool,
+    /// `--setup`, `--name`, `--industry`.
+    pub setup: Option<Setup>,
+    /// The `pair_id` of the login this one replaces, read off the context.
+    pub replaces_pair_id: Option<String>,
+}
+
+impl OpenExtras {
+    /// The flags behind the fields this request carries, for the message an
+    /// older server earns: it names what to drop.
+    fn flags(&self) -> Vec<&'static str> {
+        let mut flags = Vec::new();
+        if self.control {
+            flags.push("--control");
+        }
+        if self.setup.is_some() {
+            flags.push("--setup");
+        }
+        if self.replaces_pair_id.is_some() {
+            flags.push("replacing the previous login's pair (pair-id in the context)");
+        }
+        flags
     }
 }
 
@@ -125,14 +176,42 @@ pub async fn open_request(
     challenge: &str,
     client_desc: &str,
     token_expires_at: &str,
+    extras: &OpenExtras,
 ) -> Result<Opened> {
     let url = format!("{}{BFF_PREFIX}/requests", trim(console_base));
-    let body = json!({
+    let mut body = json!({
         "challenge": challenge,
         "client_desc": client_desc,
         "token_expires_at": token_expires_at,
     });
-    let value = post(http, &url, body).await?;
+    if extras.control {
+        body["control"] = json!(true);
+    }
+    if let Some(setup) = &extras.setup {
+        body["setup"] = json!({
+            "profile": setup.profile,
+            "name": setup.name,
+            "industry": setup.industry,
+        });
+    }
+    if let Some(pair_id) = &extras.replaces_pair_id {
+        body["replaces_pair_id"] = json!(pair_id);
+    }
+    let value = match post(http, &url, body).await {
+        Ok(value) => value,
+        // A server that predates these fields refuses the unknown key. The
+        // design expected `400`; skardi-global's JSON extractor answers `422
+        // invalid_body`, so both are read as "too old" — but only when this
+        // request carried a field such a server cannot know, since a plain
+        // login's `invalid_body` means something else.
+        Err(err) if !extras.flags().is_empty() && is_unknown_field_refusal(&err) => {
+            bail!(
+                "this control plane is too old for {}: it refused the login request's new fields. Run `skardi login` without them, or ask the operator to upgrade skardi-cloud",
+                extras.flags().join(", ")
+            )
+        }
+        Err(err) => return Err(err),
+    };
     let opened: Opened = serde_json::from_value(value)
         .context("the console's CLI-login response was not the expected shape")?;
     if opened.request_id.is_empty() || opened.confirm.is_empty() {
@@ -171,12 +250,25 @@ pub async fn poll_once(
         Some("approved") => {
             let parsed: ExchangeBody = serde_json::from_value(value)
                 .context("the console's CLI-login exchange was not the expected shape")?;
+            // All or nothing: a `control_token` without the pair id that
+            // names it could never be replaced by a later login, so a
+            // half-shaped answer is kept as no grant at all — which the
+            // caller then reports as an approval without `control`.
+            let control = match (parsed.control_token, parsed.pair_id) {
+                (Some(token), Some(pair_id)) => Some(ControlGrant {
+                    token,
+                    expires_at: parsed.control_expires_at,
+                    pair_id: Some(pair_id),
+                }),
+                _ => None,
+            };
             Ok(Some(Brokered {
                 token: parsed.token,
                 token_id: parsed.token_id,
                 expires_at: parsed.expires_at,
                 workspace: parsed.workspace,
                 memberships: parsed.memberships,
+                control,
             }))
         }
         // A status this CLI does not know is a control plane newer than it is.
@@ -198,6 +290,12 @@ struct ExchangeBody {
     workspace: String,
     #[serde(default)]
     memberships: Vec<Membership>,
+    #[serde(default)]
+    control_token: Option<String>,
+    #[serde(default)]
+    control_expires_at: Option<String>,
+    #[serde(default)]
+    pair_id: Option<String>,
 }
 
 /// Cap on a console response body — the same "something is very wrong" bound
@@ -250,6 +348,33 @@ impl Failure {
     fn with(self, message: impl fmt::Display + Send + Sync + 'static) -> anyhow::Error {
         anyhow::Error::new(self).context(message)
     }
+}
+
+/// A refusal the console relayed, kept beside the sentence a user reads so
+/// a caller can branch on the code without parsing prose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Refusal {
+    status: u16,
+    code: String,
+}
+
+impl fmt::Display for Refusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} (HTTP {})", self.code, self.status)
+    }
+}
+
+impl std::error::Error for Refusal {}
+
+/// Whether `err` is the refusal a server gives a body field it does not
+/// know: `invalid_body`, at `400` (what the design names) or `422` (what
+/// skardi-global's JSON extractor answers).
+fn is_unknown_field_refusal(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause.downcast_ref::<Refusal>().is_some_and(|refusal| {
+            refusal.code == "invalid_body" && matches!(refusal.status, 400 | 422)
+        })
+    })
 }
 
 /// Whether `err` reports a request that no longer exists.
@@ -324,14 +449,24 @@ async fn post(http: &Client, url: &str, body: Value) -> Result<Value> {
         "verifier_mismatch" => Err(anyhow!(
             "the console refused this CLI's proof of ownership for the login request — start a fresh `skardi login` rather than reusing a request id"
         )),
-        _ if message.is_empty() => Err(anyhow!(
-            "the console refused the CLI-login request (HTTP {})",
-            status.as_u16()
-        )),
-        _ => Err(anyhow!(
-            "the console refused the CLI-login request: {message} (HTTP {})",
-            status.as_u16()
-        )),
+        _ => {
+            let sentence = if message.is_empty() {
+                format!(
+                    "the console refused the CLI-login request (HTTP {})",
+                    status.as_u16()
+                )
+            } else {
+                format!(
+                    "the console refused the CLI-login request: {message} (HTTP {})",
+                    status.as_u16()
+                )
+            };
+            Err(anyhow::Error::new(Refusal {
+                status: status.as_u16(),
+                code: code.clone(),
+            })
+            .context(sentence))
+        }
     }
 }
 
@@ -397,6 +532,7 @@ mod tests {
     use super::{
         Brokered, Failure, MAX_SNIPPET_CHARS, is_gone, is_transport, parse_error, snippet,
     };
+    use crate::login::control_plane::ControlGrant;
 
     /// The raw PAT must not be reachable through an `{err:?}` rendering or a
     /// stray log line, so `Debug` is hand-written — and that is worth pinning
@@ -409,9 +545,15 @@ mod tests {
             expires_at: Some("2026-11-22T12:00:00Z".to_string()),
             workspace: "acme-prod".to_string(),
             memberships: Vec::new(),
+            control: Some(ControlGrant {
+                token: "skardi_pat_the_control_secret".to_string(),
+                expires_at: None,
+                pair_id: Some("pair-1".to_string()),
+            }),
         };
         let rendered = format!("{brokered:?}");
         assert!(!rendered.contains("the_real_secret"), "{rendered}");
+        assert!(!rendered.contains("the_control_secret"), "{rendered}");
         assert!(rendered.contains("(redacted)"), "{rendered}");
         // What a caller legitimately needs to see, including the id that is
         // the only handle on an abandoned credential.
