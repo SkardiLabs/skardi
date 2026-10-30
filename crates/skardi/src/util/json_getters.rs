@@ -23,7 +23,16 @@
 //! (Design: `docs/superpowers/specs/2026-08-08-graph-engine-bypass-design.md`,
 //! milestone 4 — the carried-in obligation this module discharges.)
 
+use std::any::Any;
+use std::sync::Arc;
+
+use arrow::array::new_empty_array;
+use arrow::datatypes::{DataType, FieldRef};
 use datafusion::error::Result as DFResult;
+use datafusion::logical_expr::{
+    ColumnarValue, ExpressionPlacement, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF,
+    ScalarUDFImpl, Signature,
+};
 use datafusion::prelude::SessionContext;
 use datafusion_functions_json::udfs;
 
@@ -48,6 +57,8 @@ use datafusion_functions_json::udfs;
 /// # Ok(())
 /// # }
 /// ```
+/// Empty dynamic-path batches keep their declared type; nonempty calls use
+/// the upstream implementation unchanged.
 pub fn register_json_getter_udfs(ctx: &SessionContext) -> DFResult<()> {
     // The exact set `register_all` registers, listed individually so the
     // rewriter/planner pair it installs afterwards can never sneak in.
@@ -63,15 +74,71 @@ pub fn register_json_getter_udfs(ctx: &SessionContext) -> DFResult<()> {
         udfs::json_contains_udf(),
         udfs::json_length_udf(),
         udfs::json_object_keys_udf(),
-        udfs::json_from_scalar_udf(),
     ] {
-        ctx.register_udf((*udf).clone());
+        ctx.register_udf(ScalarUDF::new_from_impl(EmptyPathBatch(udf)));
     }
+    ctx.register_udf((*udfs::json_from_scalar_udf()).clone());
     Ok(())
+}
+
+/// The upstream scalar-JSON/array-path helper constructs a run-end array with
+/// a single run of length `path.len()`. A zero-row batch would make that run
+/// end zero, which Arrow rejects (datafusion-functions-json 0.53.1,
+/// `common.rs::invoke_scalar_array`). Keep all nonempty calls upstream.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct EmptyPathBatch(Arc<ScalarUDF>);
+
+impl ScalarUDFImpl for EmptyPathBatch {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+
+    fn aliases(&self) -> &[String] {
+        self.0.aliases()
+    }
+
+    fn signature(&self) -> &Signature {
+        self.0.signature()
+    }
+
+    fn return_type(&self, arg_types: &[DataType]) -> DFResult<DataType> {
+        self.0.return_type(arg_types)
+    }
+
+    fn return_field_from_args(&self, args: ReturnFieldArgs) -> DFResult<FieldRef> {
+        self.0.return_field_from_args(args)
+    }
+
+    fn placement(&self, args: &[ExpressionPlacement]) -> ExpressionPlacement {
+        self.0.placement(args)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        if matches!(args.args.first(), Some(ColumnarValue::Scalar(_)))
+            && args
+                .args
+                .iter()
+                .skip(1)
+                .any(|arg| matches!(arg, ColumnarValue::Array(path) if path.is_empty()))
+        {
+            return Ok(ColumnarValue::Array(new_empty_array(args.return_type())));
+        }
+        self.0.invoke_with_args(args)
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use arrow::array::StringArray;
+    use arrow::datatypes::{Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use datafusion::datasource::MemTable;
+    use datafusion::prelude::SessionConfig;
+
     use super::*;
 
     #[tokio::test]
@@ -91,6 +158,43 @@ mod tests {
             .downcast_ref::<arrow::array::StringArray>()
             .expect("string column");
         assert_eq!(col.value(0), "x");
+    }
+
+    #[tokio::test]
+    async fn scalar_json_dynamic_paths_accept_an_empty_batch_after_a_row() {
+        let config = SessionConfig::new().set_bool("datafusion.execution.coalesce_batches", false);
+        let ctx = SessionContext::new_with_config(config);
+        let schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Utf8, false)]));
+        let row = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StringArray::from(vec!["a"]))],
+        )
+        .unwrap();
+        let empty = RecordBatch::new_empty(Arc::clone(&schema));
+        let input = MemTable::try_new(schema, vec![vec![row, empty]]).unwrap();
+        ctx.register_table("paths", Arc::new(input)).unwrap();
+        for sql in [
+            "SELECT json_get_str('{\"a\":\"value\"}', key) AS value FROM paths",
+            "SELECT json_get_str('{\"a\":{\"b\":\"value\"}}', key, 'b') AS value FROM paths",
+        ] {
+            // Prove that each path shape reaches the affected upstream call.
+            ctx.register_udf((*udfs::json_get_str_udf()).clone());
+            let error = ctx.sql(sql).await.unwrap().collect().await.unwrap_err();
+            assert!(error.to_string().contains("run_ends"), "{sql}: {error}");
+
+            register_json_getter_udfs(&ctx).unwrap();
+            let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+            assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+            let row = batches.iter().find(|batch| batch.num_rows() == 1).unwrap();
+            assert_eq!(
+                row.column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .value(0),
+                "value"
+            );
+        }
     }
 
     /// The federation-pushdown contract (module doc): with ONLY the getter
