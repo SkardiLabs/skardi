@@ -7,7 +7,7 @@ use crate::sources::hierarchy::{
 use crate::sources::providers::sqlx::pg::knn_table_function::{PgKnnEntry, fetch_table_columns};
 use crate::sources::providers::{CountSafeTable, DatasetEntry, DatasetRegistry};
 use anyhow::{Context, Result};
-use arrow::array::{RecordBatch, UInt64Array};
+use arrow::array::{Array, Int64Array, ListArray, RecordBatch, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::Session;
@@ -24,6 +24,9 @@ use datafusion::physical_plan::{
 };
 use datafusion::prelude::SessionContext;
 use datafusion::sql::TableReference;
+use datafusion::sql::sqlparser::{
+    ast, dialect::PostgreSqlDialect as ParserDialect, parser::Parser,
+};
 use datafusion::sql::unparser::Unparser;
 use datafusion_table_providers::postgres::DynPostgresConnectionPool;
 use datafusion_table_providers::sql::arrow_sql_gen::statement::InsertBuilder;
@@ -845,15 +848,7 @@ impl ExecutionPlan for SqlxPostgresInsertExec {
                     let filtered_batch = filter_batch_columns(&batch, &auto_gen_cols)?;
                     let num_rows = filtered_batch.num_rows() as u64;
 
-                    // Build INSERT SQL using InsertBuilder from datafusion-table-providers
-                    let batches = vec![filtered_batch];
-                    let insert_sql = InsertBuilder::new(&table_ref, &batches)
-                        .build_postgres(None)
-                        .map_err(|e| {
-                            DataFusionError::Execution(format!(
-                                "Failed to build INSERT statement: {e}"
-                            ))
-                        })?;
+                    let insert_sql = build_insert_sql(&table_ref, &filtered_batch)?;
 
                     // Execute via sqlx within the transaction
                     sqlx::query(&insert_sql)
@@ -881,6 +876,86 @@ impl ExecutionPlan for SqlxPostgresInsertExec {
             stream::once(future),
         )))
     }
+}
+
+/// Preserve bigint-array child validity through the existing INSERT builder.
+/// Its primitive-list conversion reads value(i), including the storage value
+/// beneath NULL children. Repair only those typed VALUES cells; all other SQL
+/// still comes from the builder and uses the same transaction.
+fn build_insert_sql(table: &TableReference, batch: &RecordBatch) -> DataFusionResult<String> {
+    let batches = vec![batch.clone()];
+    let sql = InsertBuilder::new(table, &batches)
+        .build_postgres(None)
+        .map_err(|e| {
+            DataFusionError::Execution(format!("Failed to build INSERT statement: {e}"))
+        })?;
+    let mut repairs = Vec::new();
+    for (column_index, column) in batch.columns().iter().enumerate() {
+        if !matches!(column.data_type(), DataType::List(child) if child.data_type() == &DataType::Int64)
+        {
+            continue;
+        }
+        let lists = column.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
+            DataFusionError::Internal("bigint list column has no ListArray".into())
+        })?;
+        for (row_index, values) in lists.iter().enumerate() {
+            let Some(values) = values else { continue };
+            if values.null_count() == 0 {
+                continue;
+            }
+            let values = values
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| {
+                    DataFusionError::Internal("bigint list has non-Int64 children".into())
+                })?;
+            let values = values
+                .iter()
+                .map(|value| value.map_or_else(|| "NULL".into(), |value| value.to_string()))
+                .collect::<Vec<_>>()
+                .join(",");
+            // Only typed i64 values and NULL enter this expression, never
+            // user text or a positional string replacement of generated SQL.
+            let expression = Parser::new(&ParserDialect {})
+                .try_with_sql(&format!("ARRAY[{values}]::bigint[]"))
+                .and_then(|mut parser| parser.parse_expr())
+                .map_err(|e| {
+                    DataFusionError::Execution(format!("Failed to render bigint array: {e}"))
+                })?;
+            repairs.push((row_index, column_index, expression));
+        }
+    }
+    if repairs.is_empty() {
+        return Ok(sql);
+    }
+    let mut statements = Parser::parse_sql(&ParserDialect {}, &sql).map_err(|e| {
+        DataFusionError::Execution(format!("Failed to parse generated INSERT: {e}"))
+    })?;
+    let [ast::Statement::Insert(insert)] = statements.as_mut_slice() else {
+        return Err(DataFusionError::Internal(
+            "INSERT builder returned an unexpected statement".into(),
+        ));
+    };
+    let Some(ast::SetExpr::Values(values)) = insert.source.as_mut().map(|q| q.body.as_mut()) else {
+        return Err(DataFusionError::Internal(
+            "INSERT builder returned no VALUES".into(),
+        ));
+    };
+    if values.rows.len() != batch.num_rows()
+        || insert.columns.len() != batch.num_columns()
+        || values
+            .rows
+            .iter()
+            .any(|row| row.len() != batch.num_columns())
+    {
+        return Err(DataFusionError::Internal(
+            "INSERT builder changed the batch's row or column count".into(),
+        ));
+    }
+    for (row, column, expression) in repairs {
+        values.rows[row][column] = expression;
+    }
+    Ok(statements[0].to_string())
 }
 
 /// Project out auto-generated columns from a RecordBatch.
@@ -2212,7 +2287,8 @@ mod tests {
         .unwrap();
         query_all(
             &ctx,
-            "INSERT INTO probe (id, readers) VALUES (5, [10, 9223372036854775807, NULL])",
+            "INSERT INTO probe (id, readers) VALUES
+             (5, [10, 9223372036854775807, NULL]), (6, []), (7, NULL)",
         )
         .await;
         let batches = query_all(&ctx, "SELECT readers FROM probe WHERE id = 5").await;
@@ -2234,6 +2310,19 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Some(10), Some(i64::MAX), None]
         );
+        let empty_and_null = query_all(
+            &ctx,
+            "SELECT readers FROM probe WHERE id IN (6,7) ORDER BY id",
+        )
+        .await;
+        let arrays = empty_and_null[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert!(!arrays.is_null(0));
+        assert_eq!(arrays.value_length(0), 0);
+        assert!(arrays.is_null(1));
         let row = sqlx::query("SELECT readers FROM public.acl_array_probe WHERE id = 5")
             .fetch_one(&pool)
             .await
