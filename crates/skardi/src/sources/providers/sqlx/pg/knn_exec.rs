@@ -325,7 +325,7 @@ impl PgKnnExec {
     /// The raw distance expression appears in ORDER BY so pgvector indexes
     /// (HNSW / IVFFlat) can be utilised. The `::float8` cast is only applied
     /// in the SELECT list (`_score` column) to avoid breaking index matching.
-    fn build_query(&self) -> String {
+    pub(super) fn build_query(&self) -> String {
         let cols = self.select_columns();
         let vec_col = format!("\"{}\"", self.vector_col.replace('"', "\"\""));
         let where_clause = self

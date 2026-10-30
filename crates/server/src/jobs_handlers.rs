@@ -141,6 +141,7 @@ fn job_run_to_json(run: &JobRun) -> Value {
         "rows_written": run.rows_written,
         "snapshot_id": run.snapshot_id,
         "error": run.error,
+        "provider_failure": run.provider_failure,
     })
 }
 
@@ -476,4 +477,47 @@ pub async fn list_jobs(
         "jobs": items,
         "count": items.len(),
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use skardi::jobs::{JobProviderFailure, JobRunStatus};
+
+    #[test]
+    fn job_status_keeps_optional_provider_pacing_separate_from_the_message() {
+        let mut run = JobRun {
+            id: "run-1".to_string(),
+            job_name: "ingest".to_string(),
+            parameters: "{}".to_string(),
+            status: JobRunStatus::Failed,
+            created_at: "2026-10-30T00:00:00Z".to_string(),
+            started_at: None,
+            finished_at: None,
+            rows_written: None,
+            snapshot_id: None,
+            error: Some("Upstream refused the request".to_string()),
+            provider_failure: Some(JobProviderFailure {
+                code: "quota_exhausted".to_string(),
+                retry_after_ms: Some(2_678_400_000),
+            }),
+            submission_id: None,
+        };
+        assert_eq!(
+            job_run_to_json(&run)["provider_failure"],
+            serde_json::json!({
+                "code": "quota_exhausted", "retry_after_ms": 2_678_400_000u32,
+            })
+        );
+        run.provider_failure = None;
+        assert!(job_run_to_json(&run)["provider_failure"].is_null());
+        let old_row = serde_json::to_value(&run).unwrap();
+        assert!(old_row.get("provider_failure").is_none());
+        assert!(
+            serde_json::from_value::<JobRun>(old_row)
+                .unwrap()
+                .provider_failure
+                .is_none()
+        );
+    }
 }

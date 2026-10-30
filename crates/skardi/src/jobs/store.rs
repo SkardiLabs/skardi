@@ -33,7 +33,8 @@ const INIT_SCHEMA_SQL: &str = "CREATE TABLE IF NOT EXISTS job_runs (
     rows_written  INTEGER,
     snapshot_id   TEXT,
     error         TEXT,
-    submission_id TEXT
+    submission_id TEXT,
+    provider_failure TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_job_runs_name_created
     ON job_runs (job_name, created_at DESC);
@@ -72,7 +73,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_job_runs_submission_id_unique
 /// Columns that `CREATE TABLE IF NOT EXISTS` cannot retrofit onto a ledger
 /// written before they existed, reconciled by [`ensure_added_columns`] on
 /// every open.
-const ADDED_COLUMNS: [&str; 1] = ["submission_id"];
+const ADDED_COLUMNS: [&str; 2] = ["submission_id", "provider_failure"];
 
 /// How long a write waits for another connection's lock before giving up.
 ///
@@ -224,6 +225,23 @@ impl JobRunStatus {
     }
 }
 
+/// Provider pacing facts a job caller can consume without parsing its error message.
+///
+/// # Example
+/// ```
+/// use skardi::jobs::JobProviderFailure;
+/// let failure = JobProviderFailure {
+///     code: "quota_exhausted".to_string(),
+///     retry_after_ms: Some(172_800_000),
+/// };
+/// assert_eq!(failure.retry_after_ms, Some(172_800_000));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobProviderFailure {
+    pub code: String,
+    pub retry_after_ms: Option<u32>,
+}
+
 /// One row of the run ledger.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobRun {
@@ -243,6 +261,9 @@ pub struct JobRun {
     /// string). For DB destinations this is typically null.
     pub snapshot_id: Option<String>,
     pub error: Option<String>,
+    /// Allowlisted typed provider facts; never an upstream response or message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_failure: Option<JobProviderFailure>,
     /// Opaque correlation token supplied by whoever submitted the run, stored
     /// verbatim and never interpreted here.
     ///
@@ -281,6 +302,7 @@ pub trait JobStore: Send + Sync {
         rows_written: Option<u64>,
         snapshot_id: Option<String>,
         error: Option<String>,
+        provider_failure: Option<JobProviderFailure>,
     ) -> Result<()>;
     /// Rewrite any non-terminal row to `Failed` with `reason` as the error
     /// message. Called on server startup so crash-killed runs don't stay
@@ -398,7 +420,7 @@ impl SqliteJobStore {
             })
             .await
             .map_err(|e| {
-                anyhow::anyhow!("Failed to migrate jobs.db schema (submission_id): {e}")
+                anyhow::anyhow!("Failed to migrate jobs.db schema (added columns): {e}")
             })?;
         Ok(())
     }
@@ -413,6 +435,18 @@ fn row_to_job_run(row: &Row<'_>) -> rusqlite::Result<JobRun> {
             Box::new(std::io::Error::other(e.to_string())),
         )
     })?;
+    let provider_failure = row
+        .get::<_, Option<String>>("provider_failure")?
+        .map(|value| {
+            serde_json::from_str(&value).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    11,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })
+        })
+        .transpose()?;
     Ok(JobRun {
         id: row.get("id")?,
         job_name: row.get("job_name")?,
@@ -424,6 +458,7 @@ fn row_to_job_run(row: &Row<'_>) -> rusqlite::Result<JobRun> {
         rows_written: row.get::<_, Option<i64>>("rows_written")?.map(|v| v as u64),
         snapshot_id: row.get("snapshot_id")?,
         error: row.get("error")?,
+        provider_failure,
         submission_id: row.get("submission_id")?,
     })
 }
@@ -432,13 +467,18 @@ fn row_to_job_run(row: &Row<'_>) -> rusqlite::Result<JobRun> {
 impl JobStore for SqliteJobStore {
     async fn create_run(&self, run: &JobRun) -> Result<()> {
         let run = run.clone();
+        let provider_failure = run
+            .provider_failure
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
         self.conn
             .call(move |conn| -> std::result::Result<(), rusqlite::Error> {
                 conn.execute(
                     "INSERT INTO job_runs
                          (id, job_name, parameters, status, created_at, started_at,
-                          finished_at, rows_written, snapshot_id, error, submission_id)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                          finished_at, rows_written, snapshot_id, error, submission_id, provider_failure)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                     rusqlite::params![
                         run.id,
                         run.job_name,
@@ -451,6 +491,7 @@ impl JobStore for SqliteJobStore {
                         run.snapshot_id,
                         run.error,
                         run.submission_id,
+                        provider_failure,
                     ],
                 )?;
                 Ok(())
@@ -468,7 +509,7 @@ impl JobStore for SqliteJobStore {
                 move |conn| -> std::result::Result<Option<JobRun>, rusqlite::Error> {
                     let mut stmt = conn.prepare(
                         "SELECT id, job_name, parameters, status, created_at, started_at,
-                            finished_at, rows_written, snapshot_id, error, submission_id
+                            finished_at, rows_written, snapshot_id, error, submission_id, provider_failure
                      FROM job_runs
                      WHERE id = ?1",
                     )?;
@@ -492,7 +533,7 @@ impl JobStore for SqliteJobStore {
                 move |conn| -> std::result::Result<Option<JobRun>, rusqlite::Error> {
                     let mut stmt = conn.prepare(
                         "SELECT id, job_name, parameters, status, created_at, started_at,
-                            finished_at, rows_written, snapshot_id, error, submission_id
+                            finished_at, rows_written, snapshot_id, error, submission_id, provider_failure
                      FROM job_runs
                      WHERE submission_id = ?1
                      ORDER BY created_at DESC
@@ -520,7 +561,7 @@ impl JobStore for SqliteJobStore {
                     let (sql, params): (&str, Vec<rusqlite::types::Value>) = match &job_name {
                         Some(name) => (
                             "SELECT id, job_name, parameters, status, created_at, started_at,
-                                    finished_at, rows_written, snapshot_id, error, submission_id
+                                    finished_at, rows_written, snapshot_id, error, submission_id, provider_failure
                              FROM job_runs
                              WHERE job_name = ?1
                              ORDER BY created_at DESC
@@ -532,7 +573,7 @@ impl JobStore for SqliteJobStore {
                         ),
                         None => (
                             "SELECT id, job_name, parameters, status, created_at, started_at,
-                                    finished_at, rows_written, snapshot_id, error, submission_id
+                                    finished_at, rows_written, snapshot_id, error, submission_id, provider_failure
                              FROM job_runs
                              ORDER BY created_at DESC
                              LIMIT ?1",
@@ -562,9 +603,19 @@ impl JobStore for SqliteJobStore {
         rows_written: Option<u64>,
         snapshot_id: Option<String>,
         error: Option<String>,
+        provider_failure: Option<JobProviderFailure>,
     ) -> Result<()> {
         let run_id = run_id.to_string();
         let status_str = status.as_str().to_string();
+        let provider_failure = if status == JobRunStatus::Failed {
+            provider_failure
+        } else {
+            None
+        };
+        let provider_failure = provider_failure
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
         self.conn
             .call(move |conn| -> std::result::Result<(), rusqlite::Error> {
                 conn.execute(
@@ -574,7 +625,8 @@ impl JobStore for SqliteJobStore {
                          finished_at  = COALESCE(?4, finished_at),
                          rows_written = COALESCE(?5, rows_written),
                          snapshot_id  = COALESCE(?6, snapshot_id),
-                         error        = COALESCE(?7, error)
+                         error        = COALESCE(?7, error),
+                         provider_failure = ?8
                      WHERE id = ?1",
                     rusqlite::params![
                         run_id,
@@ -584,6 +636,7 @@ impl JobStore for SqliteJobStore {
                         rows_written.map(|v| v as i64),
                         snapshot_id,
                         error,
+                        provider_failure,
                     ],
                 )?;
                 Ok(())
@@ -603,7 +656,8 @@ impl JobStore for SqliteJobStore {
                     "UPDATE job_runs
                      SET status = 'failed',
                          finished_at = ?1,
-                         error = ?2
+                         error = ?2,
+                         provider_failure = NULL
                      WHERE status IN ('pending', 'running')",
                     rusqlite::params![now, reason],
                 )?;
@@ -635,6 +689,7 @@ mod tests {
             rows_written: None,
             snapshot_id: None,
             error: None,
+            provider_failure: None,
             submission_id: submission_id.map(str::to_string),
         }
     }
@@ -686,6 +741,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -701,6 +757,7 @@ mod tests {
                 Some("2026-04-21T00:02:00Z".to_string()),
                 Some(123),
                 Some("7".to_string()),
+                None,
                 None,
             )
             .await
@@ -839,6 +896,7 @@ mod tests {
         let old = s.get_run("old-run").await.unwrap().unwrap();
         assert_eq!(old.job_name, "ingest");
         assert!(old.submission_id.is_none());
+        assert!(old.provider_failure.is_none());
 
         // And the migrated ledger accepts attributed writes.
         s.create_run(&sample_run_with_submission(
@@ -855,6 +913,66 @@ mod tests {
                 .unwrap()
                 .id,
             "new-run"
+        );
+
+        let failure = JobProviderFailure {
+            code: "quota_exhausted".to_string(),
+            retry_after_ms: Some(2_678_400_000),
+        };
+        s.update_status(
+            "new-run",
+            JobRunStatus::Failed,
+            None,
+            None,
+            None,
+            None,
+            Some("provider refused the request".to_string()),
+            Some(failure.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            s.get_run("new-run")
+                .await
+                .unwrap()
+                .unwrap()
+                .provider_failure,
+            Some(failure.clone())
+        );
+        assert_eq!(
+            s.get_run_by_submission_id("audit-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .provider_failure,
+            Some(failure.clone())
+        );
+        assert!(
+            s.list_runs(Some("ingest"), 10)
+                .await
+                .unwrap()
+                .iter()
+                .any(|run| run.provider_failure.as_ref() == Some(&failure))
+        );
+        s.update_status(
+            "new-run",
+            JobRunStatus::Succeeded,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(failure),
+        )
+        .await
+        .unwrap();
+        assert!(
+            s.get_run("new-run")
+                .await
+                .unwrap()
+                .unwrap()
+                .provider_failure
+                .is_none()
         );
 
         // The partial index is applied in the same guarded step as the ALTER,
