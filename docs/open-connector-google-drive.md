@@ -45,6 +45,20 @@ decimal *string*), and columns named from Google's docs
 gateway's camelCase strict schema (`pageSize`, `pageToken`, `driveId`,
 `q`, `fileId`; a wrong key is a hard 400).
 
+The `files.list` contract fixture includes the connector's optional
+`sharedWithMeTime`, `shortcutDetails`, `incompleteSearch` and binary-content
+observations. It is copied from the generated runtime catalog at OC
+`4bfdad30f3c1962b11499a5683af99c13a432ec9`. Sharing and completeness remain
+metadata rather than SQL columns. Missing completeness stays unknown, never
+a synthesized `false`. An older gateway is refused by the normal fingerprint
+check. Cloud pins are a separate rollout decision.
+
+The files table also exposes nullable `md5_checksum` and `head_revision_id`
+columns from the connector's optional binary-content observations. Native
+Workspace files and any response that omits them produce SQL NULL. These
+fields do not establish a content-only revision for native Docs, Sheets or
+Slides.
+
 ## Binding
 
 ```yaml
@@ -108,7 +122,7 @@ FROM saas.contract_acl.file_permissions;
 
 Action `googledrive.files.list` — the only action that sees the whole
 corpus. With no resource, the table is **every file the connected
-account can reach**. Fourteen columns:
+account can reach**. Sixteen columns:
 
 | column | wire path | type |
 |---|---|---|
@@ -119,6 +133,8 @@ account can reach**. Fourteen columns:
 | `created_time` | `createdTime` | timestamp(ms, UTC) |
 | `modified_time` | `modifiedTime` | timestamp(ms, UTC) |
 | `size_bytes` | `sizeBytes` | int64 |
+| `md5_checksum` | `md5Checksum` | utf8, nullable |
+| `head_revision_id` | `headRevisionId` | utf8, nullable |
 | `drive_id` | `driveId` | utf8 |
 | `parents` | `parents` | list of utf8 |
 | `owner_display_names` | `owners[].displayName` | list of utf8 |

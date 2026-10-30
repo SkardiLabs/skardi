@@ -78,7 +78,7 @@ tables:
   files:
     action: googledrive.files.list
     row_path: "$.files"
-    fingerprint: 1780dbdea3118e36ea078f4bb3f48cf1055395b0ba876dc341bd592cf716f8f8
+    fingerprint: 1ffb2e425c4616ba57fc837ff498426e600dda4bcc2c8310489c9df21f298a87
     pagination:
       strategy: cursor
       cursor_input: pageToken
@@ -154,6 +154,9 @@ tables:
       # epoch-millis alike (see gmail.yaml's message_timestamp).
       - { name: created_time, path: createdTime, type: timestamp_ms_utc, nullable: true }
       - { name: modified_time, path: modifiedTime, type: timestamp_ms_utc, nullable: true }
+      # Binary-content observations; absent on native Workspace files.
+      - { name: md5_checksum, path: md5Checksum, type: utf8, nullable: true }
+      - { name: head_revision_id, path: headRevisionId, type: utf8, nullable: true }
       # A normalization win worth naming: Google's REST API returns
       # `size` as a decimal STRING; the executor's `parseSizeBytes`
       # emits a real number (or null for anything without a byte size of
