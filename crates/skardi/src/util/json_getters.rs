@@ -118,10 +118,13 @@ impl ScalarUDFImpl for EmptyPathBatch {
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        if matches!(
-            args.args.as_slice(),
-            [ColumnarValue::Scalar(_), ColumnarValue::Array(path)] if path.is_empty()
-        ) {
+        if matches!(args.args.first(), Some(ColumnarValue::Scalar(_)))
+            && args
+                .args
+                .iter()
+                .skip(1)
+                .any(|arg| matches!(arg, ColumnarValue::Array(path) if path.is_empty()))
+        {
             return Ok(ColumnarValue::Array(new_empty_array(args.return_type())));
         }
         self.0.invoke_with_args(args)
@@ -170,25 +173,28 @@ mod tests {
         let empty = RecordBatch::new_empty(Arc::clone(&schema));
         let input = MemTable::try_new(schema, vec![vec![row, empty]]).unwrap();
         ctx.register_table("paths", Arc::new(input)).unwrap();
-        let sql = "SELECT json_get_str('{\"a\":\"value\"}', key) AS value FROM paths";
+        for sql in [
+            "SELECT json_get_str('{\"a\":\"value\"}', key) AS value FROM paths",
+            "SELECT json_get_str('{\"a\":{\"b\":\"value\"}}', key, 'b') AS value FROM paths",
+        ] {
+            // Prove that each path shape reaches the affected upstream call.
+            ctx.register_udf((*udfs::json_get_str_udf()).clone());
+            let error = ctx.sql(sql).await.unwrap().collect().await.unwrap_err();
+            assert!(error.to_string().contains("run_ends"), "{sql}: {error}");
 
-        // Prove that this input reaches the affected upstream execution path.
-        ctx.register_udf((*udfs::json_get_str_udf()).clone());
-        let error = ctx.sql(sql).await.unwrap().collect().await.unwrap_err();
-        assert!(error.to_string().contains("run_ends"), "{error}");
-
-        register_json_getter_udfs(&ctx).unwrap();
-        let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
-        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
-        let row = batches.iter().find(|batch| batch.num_rows() == 1).unwrap();
-        assert_eq!(
-            row.column(0)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap()
-                .value(0),
-            "value"
-        );
+            register_json_getter_udfs(&ctx).unwrap();
+            let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+            assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+            let row = batches.iter().find(|batch| batch.num_rows() == 1).unwrap();
+            assert_eq!(
+                row.column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .value(0),
+                "value"
+            );
+        }
     }
 
     /// The federation-pushdown contract (module doc): with ONLY the getter
