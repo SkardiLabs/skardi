@@ -16,8 +16,9 @@
 use super::control::Control;
 use super::{AgentError, EXIT_HANDOFF_ENDED, EXIT_REFUSED, EXIT_UNAVAILABLE, EXIT_USAGE, Outcome};
 use serde_json::{Value, json};
+use std::future::Future;
 use std::time::Duration;
-use tokio::time::{Instant, sleep};
+use tokio::time::{Instant, sleep, timeout_at};
 
 /// How a wait paces itself and when it gives up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +57,33 @@ impl Polling {
         self.deadline = deadline;
         self
     }
+
+    /// The instant a wait starting now must end by.
+    ///
+    /// `--timeout` takes any number of hours, and `Instant + Duration` panics
+    /// past the clock's range, so a deadline too far out to represent is
+    /// clamped to one that is merely very far out.
+    pub fn deadline_from_now(&self) -> Instant {
+        let now = Instant::now();
+        now.checked_add(self.deadline)
+            .unwrap_or_else(|| now + FAR_FUTURE)
+    }
+}
+
+/// What an unrepresentable `--timeout` is clamped to: a year, which no
+/// handoff or install outlives.
+const FAR_FUTURE: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
+/// Run one request of a wait within what is left of its budget: `None` when
+/// the deadline came first, and the request is dropped mid-flight.
+///
+/// The deadline is checked between requests too, but that alone does not
+/// bound the command: one `GET` to a stalled gateway can hold for the control
+/// client's whole 130-second timeout, and a `429`'s `Retry-After` is slept
+/// INSIDE the request. Wrapping the request covers both, so `--timeout 5s`
+/// means five seconds.
+pub async fn within<F: Future>(deadline: Instant, request: F) -> Option<F::Output> {
+    timeout_at(deadline, request).await.ok()
 }
 
 /// Consecutive transport failures a wait rides out before reporting the
@@ -124,12 +152,15 @@ pub async fn wait(
 ) -> Result<Outcome, AgentError> {
     let id = check_handoff_id(raw_id)?;
     let path = format!("/handoffs/{id}");
-    let started = Instant::now();
+    let deadline = polling.deadline_from_now();
     let mut interval = polling.first;
     let mut transport_failures = 0;
     let mut last: Option<Value> = None;
     loop {
-        match control.get(&path, &[]).await {
+        let Some(answer) = within(deadline, control.get(&path, &[])).await else {
+            return Err(still_open(&id, last, polling.deadline));
+        };
+        match answer {
             Ok(view) => {
                 transport_failures = 0;
                 let state = view
@@ -161,7 +192,7 @@ pub async fn wait(
             }
             Err(err) => return Err(err),
         }
-        if started.elapsed() + interval > polling.deadline {
+        if Instant::now() + interval > deadline {
             return Err(still_open(&id, last, polling.deadline));
         }
         sleep(interval).await;
@@ -224,22 +255,29 @@ fn still_open(id: &str, last: Option<Value>, deadline: Duration) -> AgentError {
         .and_then(Value::as_str)
         .map(|at| format!("; the link stays usable until {at}"))
         .unwrap_or_default();
-    AgentError::local(
-        EXIT_HANDOFF_ENDED,
-        "still_open",
+    // No answer at all within the budget says nothing about the person: the
+    // control plane was too slow to ask. Still `still_open`, the deadline's
+    // one outcome, but not worded as though the handoff had been read.
+    let message = if last.is_some() {
         format!(
             "the person has not finished on the handoff page after {}s{until}. Ask whether they are still working on it, then wait again",
             deadline.as_secs()
-        ),
-    )
-    .with_field("handoff", last.unwrap_or(json!(null)))
-    .with_next(format!("skardi handoff wait {id}"))
+        )
+    } else {
+        format!(
+            "the control plane did not say how the handoff stands within {}s; nothing ended it, so wait again",
+            deadline.as_secs()
+        )
+    };
+    AgentError::local(EXIT_HANDOFF_ENDED, "still_open", message)
+        .with_field("handoff", last.unwrap_or(json!(null)))
+        .with_next(format!("skardi handoff wait {id}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::{EXIT_HANDOFF_ENDED, EXIT_USAGE};
+    use crate::agent::{EXIT_HANDOFF_ENDED, EXIT_REFUSED, EXIT_UNAVAILABLE, EXIT_USAGE};
     use rstest::rstest;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -369,6 +407,116 @@ mod tests {
     #[case::words("soon")]
     fn bad_timeouts_are_usage_errors(#[case] raw: &str) {
         assert_eq!(parse_timeout(raw).unwrap_err().exit, EXIT_USAGE);
+    }
+
+    /// `--timeout` bounds the command: a gateway that holds one `GET` for
+    /// longer than the whole budget is cut off at the deadline, rather than
+    /// after the control client's own 130 seconds.
+    #[tokio::test]
+    async fn a_stalled_gateway_cannot_hold_the_wait_past_its_timeout() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(view("opened"))
+                    .set_delay(Duration::from_secs(30)),
+            )
+            .mount(&server)
+            .await;
+        let started = std::time::Instant::now();
+        let err = wait(&control(&server), ID, fast()).await.unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(err.exit, EXIT_HANDOFF_ENDED);
+        assert_eq!(err.code(), "still_open");
+        // Nothing was read, so nothing is claimed about the person.
+        assert!(err.message().contains("did not say"), "{err:?}");
+        assert_eq!(err.error["handoff"], Value::Null);
+        assert_eq!(
+            err.next.as_deref(),
+            Some(format!("skardi handoff wait {ID}").as_str())
+        );
+    }
+
+    /// A `Retry-After` is slept inside the request, so it is bounded by the
+    /// same deadline: a thirty-second wait does not outlive a short budget.
+    #[tokio::test]
+    async fn a_rate_limit_wait_longer_than_the_budget_ends_at_the_deadline() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "30")
+                    .set_body_json(json!({"error": {"code": "rate_limited", "message": "slow"}})),
+            )
+            .mount(&server)
+            .await;
+        // The production `Retry-After` unit: one second per second.
+        let control = Control::new(&server.uri(), "acme-prod", "skardi_pat_ctl").unwrap();
+        let started = std::time::Instant::now();
+        let err = wait(&control, ID, fast()).await.unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(err.code(), "still_open");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    /// A few transport failures in a row are ridden out (a gateway rolling
+    /// mid-wait); past that the wait ends as unreachable, exit 5.
+    #[tokio::test]
+    async fn persistent_transport_failures_end_the_wait_as_unreachable() {
+        // Nothing listens on port 1, so every poll is a transport failure.
+        let control = Control::new("http://127.0.0.1:1", "acme-prod", "skardi_pat_ctl").unwrap();
+        let err = wait(&control, ID, fast()).await.unwrap_err();
+        assert_eq!(err.exit, EXIT_UNAVAILABLE);
+        assert_eq!(err.code(), "control_plane_unreachable");
+    }
+
+    #[tokio::test]
+    async fn a_completed_handoff_without_an_alias_is_an_invalid_response() {
+        let server = gateway_answering(&[view("completed")]).await;
+        let err = wait(&control(&server), ID, fast()).await.unwrap_err();
+        assert_eq!(err.exit, EXIT_UNAVAILABLE);
+        assert_eq!(err.code(), "invalid_response");
+        assert_eq!(err.error["handoff"]["state"], "completed");
+    }
+
+    #[tokio::test]
+    async fn a_state_this_cli_does_not_know_is_named_not_polled_forever() {
+        let server = gateway_answering(&[view("archived")]).await;
+        let err = wait(&control(&server), ID, fast()).await.unwrap_err();
+        assert_eq!(err.exit, EXIT_REFUSED);
+        assert_eq!(err.code(), "unexpected_handoff_state");
+        assert!(err.message().contains("archived"), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_refusal_while_waiting_is_reported_at_once() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(
+                json!({"error": {"code": "handoff_not_found", "message": "no such handoff"}}),
+            ))
+            .mount(&server)
+            .await;
+        let err = wait(&control(&server), ID, fast()).await.unwrap_err();
+        assert_eq!(err.exit, EXIT_REFUSED);
+        assert_eq!(err.code(), "handoff_not_found");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    /// `--timeout` takes any number of hours; a deadline past the clock's
+    /// range is clamped rather than a panic.
+    #[test]
+    fn an_unrepresentable_deadline_is_clamped_not_a_panic() {
+        let polling = Polling::HANDOFF.with_deadline(Duration::from_secs(u64::MAX));
+        assert!(polling.deadline_from_now() > Instant::now() + Duration::from_secs(3600));
     }
 
     #[tokio::test]

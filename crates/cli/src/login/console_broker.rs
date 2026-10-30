@@ -250,18 +250,7 @@ pub async fn poll_once(
         Some("approved") => {
             let parsed: ExchangeBody = serde_json::from_value(value)
                 .context("the console's CLI-login exchange was not the expected shape")?;
-            // All or nothing: a `control_token` without the pair id that
-            // names it could never be replaced by a later login, so a
-            // half-shaped answer is kept as no grant at all — which the
-            // caller then reports as an approval without `control`.
-            let control = match (parsed.control_token, parsed.pair_id) {
-                (Some(token), Some(pair_id)) => Some(ControlGrant {
-                    token,
-                    expires_at: parsed.control_expires_at,
-                    pair_id: Some(pair_id),
-                }),
-                _ => None,
-            };
+            let control = control_grant(&parsed, console_base)?;
             Ok(Some(Brokered {
                 token: parsed.token,
                 token_id: parsed.token_id,
@@ -281,6 +270,55 @@ pub async fn poll_once(
     }
 }
 
+/// The pair's `control` half of an approved exchange: all of it, or none.
+///
+/// `control_token` and `pair_id` come together or not at all. A half-shaped
+/// answer (a skewed rollout, a console older than its control plane) is NOT
+/// read as "approved without control": the server may have minted a control
+/// token that lives 24 hours, and dropping it quietly would leave that
+/// credential live with nothing on this machine naming it — and the agent,
+/// told control was declined, would run `login --control` and mint another.
+/// So it fails the login, writes nothing, and names every id it was given and
+/// the page that revokes them. The token itself is never printed.
+fn control_grant(parsed: &ExchangeBody, console_base: &str) -> Result<Option<ControlGrant>> {
+    match (&parsed.control_token, &parsed.pair_id) {
+        (Some(token), Some(pair_id)) => {
+            return Ok(Some(ControlGrant {
+                token: token.clone(),
+                expires_at: parsed.control_expires_at.clone(),
+                pair_id: Some(pair_id.clone()),
+            }));
+        }
+        (None, None)
+            if parsed.control_token_id.is_none() && parsed.control_expires_at.is_none() =>
+        {
+            return Ok(None);
+        }
+        _ => {}
+    }
+    let what = match (&parsed.control_token, &parsed.pair_id) {
+        (Some(_), None) => "a control token with no pair id",
+        (None, Some(_)) => "a pair id with no control token",
+        _ => "control metadata with no control token",
+    };
+    let page = format!("{}/account/agent-access", trim(console_base));
+    let page = match &parsed.pair_id {
+        Some(pair_id) => format!("{page}?pair={}", crate::client::encode_component(pair_id)),
+        None => page,
+    };
+    let mut ids = vec![format!("query token {}", parsed.token_id)];
+    if let Some(id) = &parsed.control_token_id {
+        ids.push(format!("control token {id}"));
+    }
+    if let Some(pair_id) = &parsed.pair_id {
+        ids.push(format!("pair {pair_id}"));
+    }
+    bail!(
+        "the console approved this login but returned only part of a control grant ({what}), so this CLI kept none of it and wrote no context. A control token may be live for 24 hours with nothing on this machine holding it: revoke this login at {page} ({}). The console and the control plane are likely on different versions; run `skardi login --control` again once they agree",
+        ids.join(", ")
+    )
+}
+
 #[derive(Deserialize)]
 struct ExchangeBody {
     token: String,
@@ -292,6 +330,10 @@ struct ExchangeBody {
     memberships: Vec<Membership>,
     #[serde(default)]
     control_token: Option<String>,
+    /// Read only to be NAMED when the grant is half-shaped: the id is what
+    /// the person revokes it by.
+    #[serde(default)]
+    control_token_id: Option<String>,
     #[serde(default)]
     control_expires_at: Option<String>,
     #[serde(default)]

@@ -2338,3 +2338,57 @@ async fn the_direct_flow_refuses_control_and_setup() {
         .to_string();
     assert!(err.contains("--control"), "{err}");
 }
+
+/// A half-shaped control grant (a skewed rollout: a console or control plane
+/// older than the other) is an invalid answer, not "approved without
+/// control". The CLI writes nothing, fails non-zero rather than exit 6 (whose
+/// recovery would mint yet another pair), and names every id it was given and
+/// the page that revokes them — never the token.
+#[rstest]
+#[case::token_without_pair(
+    &["control_token", "control_token_id", "control_expires_at"],
+    "a control token with no pair id",
+    None
+)]
+#[case::pair_without_token(&["pair_id"], "a pair id with no control token", Some("pair-1"))]
+#[case::id_alone(&["control_token_id"], "control metadata with no control token", None)]
+#[tokio::test]
+async fn a_half_shaped_control_grant_fails_the_login_and_names_what_to_revoke(
+    #[case] fields: &[&str],
+    #[case] what: &str,
+    #[case] pair: Option<&str>,
+) {
+    let gw = gateway(200).await;
+    let full = approved_with_control(&gw.uri(), "tok-mcp", "pair-1");
+    let mut body = approved("my-ws", &gw.uri(), "tok-mcp");
+    for field in fields {
+        body[*field] = full[*field].clone();
+    }
+    let console = console(200, body).await;
+    let home = TempDir::new().unwrap();
+
+    let err = login(control_options(&console.uri()), &config_in(&home))
+        .await
+        .unwrap_err();
+    let rendered = format!("{err:#}");
+    assert!(rendered.contains(what), "{rendered}");
+    assert!(
+        !rendered.contains("skardi_pat_control_secret"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("query token tok-mcp"), "{rendered}");
+    let page = format!("{}/account/agent-access", console.uri());
+    match pair {
+        Some(pair) => assert!(
+            rendered.contains(&format!("{page}?pair={pair}")),
+            "{rendered}"
+        ),
+        None => assert!(rendered.contains(&page), "{rendered}"),
+    }
+    if fields.contains(&"control_token_id") {
+        assert!(rendered.contains("control token tok-control"), "{rendered}");
+    }
+    // Not an exit-6 "approved without control": a plain failure.
+    assert!(err.downcast_ref::<crate::exit::Exit>().is_none());
+    assert!(!config_in(&home).exists(), "nothing is written");
+}

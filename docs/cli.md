@@ -313,6 +313,13 @@ or your role is not admin — the context is still written, so queries work,
 and `login` exits **6** saying so: re-run `skardi login --control` and tick
 the box, or ask an admin to connect sources.
 
+An approval that carries only **part** of a pair (a control token with no
+`pair_id`, or the reverse — a console and control plane on different
+versions) is not read as "without control": a control token may have been
+minted that nothing would hold. The login fails (exit `1`), writes nothing,
+and names the ids it was given and the `/account/agent-access` page where
+that login is revoked. It never prints the token.
+
 `--setup personal|team` and `--name` (and optionally `--industry`) prefill
 the approval page's signup form for a person who has no account yet, so the
 same browser pass creates the workspace. Someone with an account, or someone
@@ -838,6 +845,20 @@ source's Manage page in the console.
 `still_open` at the deadline, and `expired`, `denied` or `abandoned` when the
 handoff ended without a connection. A completed handoff should be installed
 within the hour, or the staged connection is reclaimed.
+
+**`--timeout` bounds the whole command**, on `handoff wait` and `install`
+alike: a request to a gateway that stalls, and a `429`'s `Retry-After`, are
+cut off at the deadline too, so `--timeout 5s` returns in about five seconds
+— `still_open` for a wait, `install_pending` for an install.
+
+**`install` can always be resumed.** Every install carries a request id, its
+idempotency key, generated before the submit. Whenever the outcome is
+uncertain — the submit timed out, lost its connection or met a 5xx (any
+exit `5`), or the operation was still running at the deadline — the error
+carries that `request_id` and its `next` is the same install with
+`--request-id <id>`, which the control plane answers with the existing
+operation rather than installing twice. A refusal (exit `3`) names no replay:
+nothing was installed.
 
 **`documents add`** declares the file (its name, type, sha256 and length)
 with the control token, uploads the bytes to the gateway's data plane with

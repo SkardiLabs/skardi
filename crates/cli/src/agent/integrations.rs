@@ -15,7 +15,7 @@
 //! (§2.2.5).
 
 use super::control::{Control, SCOPE_FORMAT, SCOPE_FORMAT_HEADER};
-use super::handoff::{Polling, check_handoff_id};
+use super::handoff::{Polling, check_handoff_id, within};
 use super::{AgentError, EXIT_REFUSED, EXIT_UNAVAILABLE, EXIT_USAGE, Outcome, scope, shell_quote};
 use crate::client::encode_component;
 use serde_json::{Value, json};
@@ -297,6 +297,11 @@ pub async fn candidates(
 /// given: re-running with the id an earlier run printed returns that
 /// operation rather than submitting again, which is how a run that hit its
 /// deadline picks up where it stopped.
+///
+/// The id is minted BEFORE the submit and named by every failure the install
+/// may have outlived (see [`resumable`]): a submit whose answer was lost may
+/// still have committed, and a run that then minted a fresh id would install
+/// twice. `polling.deadline` bounds the whole command, submit included.
 pub async fn install(
     control: &Control,
     alias: &str,
@@ -318,24 +323,6 @@ pub async fn install(
         "connection_version_id": version,
         "scope": scope,
     });
-    let submitted = control
-        .post(
-            "/installs",
-            Some(&body),
-            &[(SCOPE_FORMAT_HEADER, SCOPE_FORMAT)],
-        )
-        .await?;
-    let Some(operation_id) = submitted
-        .get("operation_id")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-    else {
-        return Err(AgentError::local(
-            EXIT_UNAVAILABLE,
-            "invalid_response",
-            "the control plane accepted the install but returned no operation id",
-        ));
-    };
     let retry = format!(
         "skardi integrations install {} --connection-version {} --scope {} --request-id {}",
         shell_quote(&alias),
@@ -343,9 +330,49 @@ pub async fn install(
         shell_quote(scope_raw.trim()),
         shell_quote(&request_id)
     );
+    let resume = |err: AgentError| resumable(err, &request_id, &retry);
+    let still_running = |operation: Option<Value>| {
+        let mut err = AgentError::local(
+            EXIT_UNAVAILABLE,
+            "install_pending",
+            format!(
+                "the install of {alias} is still running after {}s; run the same install again with its request id to keep waiting — it will not submit twice",
+                polling.deadline.as_secs()
+            ),
+        )
+        .with_field("request_id", json!(request_id))
+        .with_next(retry.clone());
+        if let Some(operation) = operation {
+            err = err.with_field("operation", operation);
+        }
+        err
+    };
+
+    let deadline = polling.deadline_from_now();
+    let submitted = within(
+        deadline,
+        control.post(
+            "/installs",
+            Some(&body),
+            &[(SCOPE_FORMAT_HEADER, SCOPE_FORMAT)],
+        ),
+    )
+    .await
+    .ok_or_else(|| still_running(None))?
+    .map_err(resume)?;
+    let Some(operation_id) = submitted
+        .get("operation_id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
+        return Err(resume(AgentError::local(
+            EXIT_UNAVAILABLE,
+            "invalid_response",
+            "the control plane accepted the install but returned no operation id",
+        )));
+    };
 
     let path = format!("/installs/{}", encode_component(&operation_id));
-    let started = Instant::now();
     let mut interval = polling.first;
     let mut operation = submitted;
     loop {
@@ -383,22 +410,40 @@ pub async fn install(
             }
             _ => {}
         }
-        if started.elapsed() + interval > polling.deadline {
-            return Err(AgentError::local(
-                EXIT_UNAVAILABLE,
-                "install_pending",
-                format!(
-                    "the install of {alias} is still running after {}s; run the same install again with its request id to keep waiting — it will not submit twice",
-                    polling.deadline.as_secs()
-                ),
-            )
-            .with_field("operation", operation)
-            .with_next(retry));
+        if Instant::now() + interval > deadline {
+            return Err(still_running(Some(operation)));
         }
         sleep(interval).await;
         interval = polling.grow(interval);
-        operation = control.get(&path, &[]).await?;
+        operation = match within(deadline, control.get(&path, &[])).await {
+            Some(answer) => answer.map_err(resume)?,
+            None => return Err(still_running(Some(operation))),
+        };
     }
+}
+
+/// An install failure that does not say the install did not happen.
+///
+/// Exit 5 is "no answer, or a 5xx": a submit that timed out, lost its
+/// connection, or met a `502` from the door may have committed upstream all
+/// the same, and a poll that failed says nothing about the operation. Such a
+/// failure carries the request id and, as `next`, the same install with
+/// `--request-id`, which the server answers with the existing operation rather
+/// than a second one. A refusal (exit 3, 6) is the server saying no, and is
+/// left as it is.
+fn resumable(err: AgentError, request_id: &str, retry: &str) -> AgentError {
+    if err.exit != EXIT_UNAVAILABLE {
+        return err;
+    }
+    let message = format!(
+        "{} — the install may have been submitted all the same: run the same install again with --request-id {request_id} to pick it up; it will not submit twice",
+        err.message()
+    );
+    let mut err = err
+        .with_field("message", json!(message))
+        .with_field("request_id", json!(request_id));
+    err.next = Some(retry.to_string());
+    err
 }
 
 /// Row 7: the person declined in chat, or `permissions` closed the door —
@@ -960,6 +1005,202 @@ mod tests {
         let seen = server.received_requests().await.unwrap();
         let body: Value = serde_json::from_slice(&requests_to(&seen, "/installs")[0].body).unwrap();
         assert_eq!(body["request_id"], "req-7");
+    }
+
+    /// The request id the install POST carried.
+    async fn posted_request_id(server: &MockServer) -> String {
+        let seen = server.received_requests().await.unwrap();
+        let body: Value = serde_json::from_slice(&requests_to(&seen, "/installs")[0].body).unwrap();
+        body["request_id"].as_str().unwrap().to_string()
+    }
+
+    fn replay(request_id: &str) -> String {
+        format!(
+            "skardi integrations install acme-github --connection-version {VERSION} --scope '{{\"issues\":null}}' --request-id {request_id}"
+        )
+    }
+
+    /// Finding: a submit whose answer is lost may have committed. The error
+    /// names the id this run generated, and the run that resumes it, so the
+    /// retry is the same install rather than a second one.
+    #[rstest]
+    #[case::door_503(503, json!({"error": {"code": "control_plane_unavailable", "message": "down"}}), "control_plane_unavailable")]
+    #[case::proxy_502(502, json!("bad gateway"), "http_502")]
+    #[tokio::test]
+    async fn a_5xx_submit_names_its_request_id_and_the_replay(
+        #[case] status: u16,
+        #[case] body: Value,
+        #[case] code: &str,
+    ) {
+        let server = MockServer::start().await;
+        answer(&server, "POST", "/installs", status, body).await;
+        let err = install(
+            &control(&server),
+            "acme-github",
+            VERSION,
+            r#"{"issues":null}"#,
+            None,
+            fast(),
+        )
+        .await
+        .unwrap_err();
+        let id = posted_request_id(&server).await;
+        assert_eq!(err.exit, EXIT_UNAVAILABLE);
+        assert_eq!(err.code(), code);
+        assert_eq!(err.error["request_id"], id.as_str());
+        assert_eq!(err.next.as_deref(), Some(replay(&id).as_str()));
+        assert!(err.message().contains("--request-id"), "{err:?}");
+    }
+
+    /// A submit that outlives `--timeout` is cut there, and is just as
+    /// uncertain as a lost answer: it names the id and the replay.
+    #[tokio::test]
+    async fn a_submit_that_outlives_the_timeout_names_its_request_id_and_the_replay() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!("{WS}/installs")))
+            .respond_with(
+                ResponseTemplate::new(202)
+                    .set_body_json(json!({"operation_id": "op-1", "state": "pending"}))
+                    .set_delay(Duration::from_secs(30)),
+            )
+            .mount(&server)
+            .await;
+        let started = std::time::Instant::now();
+        let err = install(
+            &control(&server),
+            "acme-github",
+            VERSION,
+            r#"{"issues":null}"#,
+            None,
+            fast(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "took {:?}",
+            started.elapsed()
+        );
+        let id = posted_request_id(&server).await;
+        assert_eq!(err.exit, EXIT_UNAVAILABLE);
+        assert_eq!(err.code(), "install_pending");
+        assert_eq!(err.error["request_id"], id.as_str());
+        assert_eq!(err.next.as_deref(), Some(replay(&id).as_str()));
+    }
+
+    /// No gateway at all: the same hint, since a connection that failed
+    /// mid-request may still have delivered it.
+    #[tokio::test]
+    async fn an_unreachable_submit_names_its_request_id_and_the_replay() {
+        let control = Control::new("http://127.0.0.1:1", "acme-prod", CONTROL).unwrap();
+        let err = install(
+            &control,
+            "acme-github",
+            VERSION,
+            r#"{"issues":null}"#,
+            Some("req-9"),
+            fast(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), "control_plane_unreachable");
+        assert_eq!(err.error["request_id"], "req-9");
+        assert_eq!(err.next.as_deref(), Some(replay("req-9").as_str()));
+        assert!(!err.message().contains(CONTROL), "{err:?}");
+    }
+
+    /// A poll that stalls past the deadline, or fails, after a submit that
+    /// committed: the operation is running, and the replay picks it up.
+    #[rstest]
+    #[case::stalled(ResponseTemplate::new(200).set_body_json(json!({"operation_id": "op-1", "state": "pending"})).set_delay(Duration::from_secs(30)), "install_pending")]
+    #[case::failed(ResponseTemplate::new(503).set_body_json(json!({"error": {"code": "control_plane_unavailable", "message": "down"}})), "control_plane_unavailable")]
+    #[tokio::test]
+    async fn a_poll_that_fails_after_the_submit_names_the_replay(
+        #[case] poll: ResponseTemplate,
+        #[case] code: &str,
+    ) {
+        let server = MockServer::start().await;
+        answer(
+            &server,
+            "POST",
+            "/installs",
+            202,
+            json!({"operation_id": "op-1", "state": "pending"}),
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(path(format!("{WS}/installs/op-1")))
+            .respond_with(poll)
+            .mount(&server)
+            .await;
+        let started = std::time::Instant::now();
+        let err = install(
+            &control(&server),
+            "acme-github",
+            VERSION,
+            r#"{"issues":null}"#,
+            Some("req-7"),
+            fast(),
+        )
+        .await
+        .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(err.code(), code);
+        assert_eq!(err.exit, EXIT_UNAVAILABLE);
+        assert_eq!(err.error["request_id"], "req-7");
+        assert_eq!(err.next.as_deref(), Some(replay("req-7").as_str()));
+    }
+
+    /// A refusal is the server saying no, and is not dressed as resumable.
+    #[tokio::test]
+    async fn a_refused_submit_names_no_replay() {
+        let server = MockServer::start().await;
+        answer(
+            &server,
+            "POST",
+            "/installs",
+            409,
+            json!({"error": {"code": "scope_would_remove", "message": "no"}}),
+        )
+        .await;
+        let err = install(
+            &control(&server),
+            "acme-github",
+            VERSION,
+            r#"{"issues":null}"#,
+            None,
+            fast(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.next, None);
+        assert!(err.error.get("request_id").is_none(), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn an_accepted_install_without_an_operation_id_names_the_replay() {
+        let server = MockServer::start().await;
+        answer(
+            &server,
+            "POST",
+            "/installs",
+            202,
+            json!({"state": "pending"}),
+        )
+        .await;
+        let err = install(
+            &control(&server),
+            "acme-github",
+            VERSION,
+            r#"{"issues":null}"#,
+            Some("req-3"),
+            fast(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), "invalid_response");
+        assert_eq!(err.next.as_deref(), Some(replay("req-3").as_str()));
     }
 
     #[tokio::test]
