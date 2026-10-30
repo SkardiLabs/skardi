@@ -2079,7 +2079,8 @@ mod tests {
         .await
         .expect("CI PostgreSQL service");
         sqlx::raw_sql(
-            "DROP TABLE IF EXISTS public.acl_array_probe;
+            "CREATE EXTENSION IF NOT EXISTS vector;
+             DROP TABLE IF EXISTS public.acl_array_probe;
              CREATE TABLE public.acl_array_probe (
                id BIGINT, readers BIGINT[], other TEXT[],
                body TEXT DEFAULT 'fixture', embedding vector(2) DEFAULT '[0,0]'
@@ -2104,6 +2105,12 @@ mod tests {
             DataType::Utf8,
             "other arrays keep their existing mapping"
         );
+        // Only the mapping is under test for other array types; their existing
+        // Utf8 fallback is not a new array decoder for table/search scans.
+        sqlx::query("ALTER TABLE public.acl_array_probe DROP COLUMN other")
+            .execute(&pool)
+            .await
+            .unwrap();
 
         for budget in [None, Some(1)] {
             let mut options = HashMap::from([
