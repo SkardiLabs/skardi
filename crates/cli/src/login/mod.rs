@@ -141,12 +141,26 @@ pub struct LoginReport {
     /// box was unticked, or the approver's role is not admin. The context is
     /// still written — queries work — and the command exits 6 (§2.4.2).
     pub control_missing: bool,
-    /// The workspace's MCP server, as the exchange named it.
+    /// The workspace's MCP server, as the context records it: the
+    /// exchange's, or one derived from the gateway the context queries when
+    /// an override put that elsewhere (see `mcp_url_for`).
     pub mcp_url: Option<String>,
+    /// The MCP URL the exchange named, when it was set aside because
+    /// `--server` or `$SKARDI_GATEWAY_URL` sent this context's queries to a
+    /// different origin. Reported, so the substitution is never silent.
+    pub mcp_url_set_aside: Option<String>,
     /// The context whose pair this login named as `replaces_pair_id` when
     /// that is NOT the context it wrote: the exchange revoked a pair some
     /// other context still holds, so that context needs a login of its own.
     pub replaced_pair_elsewhere: Option<String>,
+    /// `(token id, pair id)` for each replaced credential that was one half
+    /// of a `login --control` pair. Its control token is the other half, and
+    /// no context holds it after the overwrite, so the pair id is the only
+    /// handle left on it: the report names it whatever became of the token.
+    pub replaced_pairs: Vec<(String, String)>,
+    /// The console that revokes a pair (`/account/agent-access?pair=`):
+    /// the one this login went through, or the one the config file records.
+    pub console: Option<String>,
 }
 
 /// A credential a context held before this run overwrote it.
@@ -265,7 +279,11 @@ pub async fn login(options: LoginOptions, config_path: &Path) -> Result<LoginRep
 
     match write_contexts(config_path, &options, &pending) {
         Ok(replaced) => {
-            let replaced = replaced.into_iter().map(|r| r.token_id).collect();
+            record_mcp_url(&mut report, &pending);
+            report.replaced_pairs = pairs_of(&replaced);
+            // A pair context was written by a browser login, which recorded
+            // its console; that is where a pair left live is revoked.
+            report.console = config::load(config_path).and_then(|file| file.console);
             report.written = pending
                 .iter()
                 .map(|(membership, token, server)| WrittenContext {
@@ -447,8 +465,10 @@ async fn console_brokered_login(options: LoginOptions, config_path: &Path) -> Re
         })
         .collect();
     report.current_context = report.written.first().map(|w| w.name.clone());
-    let (membership, token, _) = &pending[0];
-    report.mcp_url = membership.mcp_url.clone();
+    record_mcp_url(&mut report, &pending);
+    report.replaced_pairs = pairs_of(&replaced);
+    report.console = Some(options.control_plane.clone());
+    let (_, token, _) = &pending[0];
     report.control_expires_at = token.control.as_ref().and_then(|c| c.expires_at.clone());
     report.control_missing = options.control && token.control.is_none();
     let sent_pair = replaces.as_ref().map(|(_, pair_id)| pair_id.as_str());
@@ -902,6 +922,53 @@ fn context_name(options: &LoginOptions, membership: &Membership) -> String {
         .unwrap_or_else(|| membership.context_name())
 }
 
+/// The MCP URL to record beside `server`, and the exchange's own when it was
+/// set aside.
+///
+/// The exchange names the MCP server on the gateway IT knows (§2.9.2). When
+/// `--server` or `$SKARDI_GATEWAY_URL` won instead, queries go to that
+/// gateway, and recording the exchange's URL would have `mcp register` hand
+/// the same token to a different deployment — a host the person never named
+/// for it. So when the two origins differ, the URL is the gateway this
+/// context actually queries plus `/mcp`, and the exchange's is returned to
+/// be reported. Same origin (or no override), the exchange's stands. No URL
+/// from the exchange means the deployment has no gateway URL set, and none
+/// is invented (`mcp register` names the missing setting).
+fn mcp_url_for(server: &str, membership: &Membership) -> (Option<String>, Option<String>) {
+    let Some(named) = membership
+        .mcp_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+    else {
+        return (None, None);
+    };
+    let origin = |url: &str| reqwest::Url::parse(url).ok().map(|url| url.origin());
+    match (origin(named), origin(server)) {
+        (Some(a), Some(b)) if a == b => (Some(named.to_string()), None),
+        _ => (
+            Some(format!("{}/mcp", server.trim().trim_end_matches('/'))),
+            Some(named.to_string()),
+        ),
+    }
+}
+
+/// The first context's MCP URL, as written, into the report — and the
+/// exchange's, when it was set aside.
+fn record_mcp_url(report: &mut LoginReport, pending: &[(Membership, Minted, String)]) {
+    if let Some((membership, _, server)) = pending.first() {
+        (report.mcp_url, report.mcp_url_set_aside) = mcp_url_for(server, membership);
+    }
+}
+
+/// `(token id, pair id)` of each replaced credential that belonged to a pair.
+fn pairs_of(replaced: &[Replaced]) -> Vec<(String, String)> {
+    replaced
+        .iter()
+        .filter_map(|r| Some((r.token_id.clone(), r.pair_id.clone()?)))
+        .collect()
+}
+
 /// Write every verified context and point `current-context` at the first.
 ///
 /// Returns the credentials this write REPLACED — each token id, and the pair
@@ -951,7 +1018,7 @@ fn write_contexts(
         context.control_token = control.map(|c| c.token.clone());
         context.control_token_expires_at = control.and_then(|c| c.expires_at.clone());
         context.pair_id = control.and_then(|c| c.pair_id.clone());
-        context.mcp_url = membership.mcp_url.clone();
+        context.mcp_url = mcp_url_for(server, membership).0;
     }
 
     if let Some((membership, _, _)) = pending.first() {
@@ -1014,13 +1081,20 @@ async fn rollback(
 /// token it replaced, unless `--keep-old-token` retains it for an agent that
 /// is mid-task. A failure here is reported, not fatal — the new context is
 /// already good.
+///
+/// A replaced credential that was half of a `login --control` pair is revoked
+/// by its own token id like any other: skardi-global revokes a pair's tokens
+/// together (`revoke_pat`, onboarding design §2.1.1), so the control token
+/// goes with it. The pair id is in [`LoginReport::replaced_pairs`] either
+/// way, so a revoke that fails, or one `--keep-old-token` skips, still names
+/// the control token it leaves live.
 async fn revoke_replaced(
     cp: &ControlPlane,
-    replaced: Vec<String>,
+    replaced: Vec<Replaced>,
     options: &LoginOptions,
     report: &mut LoginReport,
 ) {
-    for token_id in replaced {
+    for Replaced { token_id, .. } in replaced {
         if options.keep_old_token {
             report.replaced_kept.push(token_id);
             continue;

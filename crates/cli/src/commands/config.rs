@@ -434,11 +434,18 @@ fn render_view(path: &Path, show_tokens: bool) -> Result<String> {
     // an agent told to "show me the config" must not come away holding the
     // one credential that reaches the control plane. The `token` it shows
     // instead is the pair's data-plane half, the `mcp_token`.
+    //
+    // By name as well as by field: a key this binary does not model — a
+    // hand-typed `Control-Token:`, or a newer CLI's control credential — is
+    // preserved in `extra`, and `--show-tokens` skips the general credential
+    // sweep below, so it would otherwise print in full.
     for context in &mut file.contexts {
         if let Some(token) = &context.control_token {
             context.control_token = Some(redact(token));
         }
+        redact_control_extras(&mut context.extra);
     }
+    redact_control_extras(&mut file.extra);
     if !show_tokens {
         for context in &mut file.contexts {
             if let Some(token) = &context.token {
@@ -472,6 +479,26 @@ fn redact_sensitive_extras(extra: &mut BTreeMap<String, serde_yaml::Value>) {
     for (key, value) in extra.iter_mut() {
         let lowered = key.to_ascii_lowercase();
         if SENSITIVE.iter().any(|needle| lowered.contains(needle)) {
+            *value = serde_yaml::Value::String("(redacted)".to_string());
+        }
+    }
+}
+
+/// Redact any unmodeled key that names a CONTROL credential, whatever was
+/// asked: `control` together with `token`, `secret` or `credential`, matched
+/// without case and with `-` and `_` ignored — so `Control-Token`,
+/// `control_token` and `controlSecret` all count.
+fn redact_control_extras(extra: &mut BTreeMap<String, serde_yaml::Value>) {
+    const CREDENTIAL: [&str; 3] = ["token", "secret", "credential"];
+    for (key, value) in extra.iter_mut() {
+        let normalized: String = key
+            .chars()
+            .filter(|c| !matches!(c, '-' | '_'))
+            .collect::<String>()
+            .to_ascii_lowercase();
+        if normalized.contains("control")
+            && CREDENTIAL.iter().any(|needle| normalized.contains(needle))
+        {
             *value = serde_yaml::Value::String("(redacted)".to_string());
         }
     }
@@ -806,6 +833,54 @@ mod tests {
             assert!(body.contains("pair-1"), "{body}");
             assert_eq!(body.contains("skardi_pat_mcp_value"), show_tokens, "{body}");
         }
+    }
+
+    /// Codex on #311: a control credential under a key the model does not
+    /// know lands in `extra`, which `--show-tokens` used to print in full.
+    /// It is redacted in either mode now, while the ordinary query token and
+    /// an unrelated extra still show with `--show-tokens`.
+    #[rstest]
+    #[case::case_typo("Control-Token")]
+    #[case::snake("control_token")]
+    #[case::camel("controlSecret")]
+    #[case::credential("CONTROL_CREDENTIAL")]
+    fn show_tokens_never_prints_a_control_credential_under_any_spelling(#[case] key: &str) {
+        let (_dir, path) = temp();
+        write(
+            &path,
+            &format!(
+                "{key}: top_level_control_value\n\
+                 contexts:\n\
+                 \x20 - name: acme/prod\n    mode: cloud\n    server: https://gw\n    workspace: acme-prod\n\
+                 \x20   token: skardi_pat_mcp_value\n\
+                 \x20   {key}: skardi_pat_control_value\n\
+                 \x20   refresh-token: an_ordinary_extra\n"
+            ),
+        );
+        for show_tokens in [false, true] {
+            let body = render_view(&path, show_tokens).unwrap();
+            assert!(!body.contains("skardi_pat_control_value"), "{body}");
+            assert!(!body.contains("top_level_control_value"), "{body}");
+            assert!(body.contains(&format!("{key}: (redacted)")), "{body}");
+            assert_eq!(body.contains("skardi_pat_mcp_value"), show_tokens, "{body}");
+            assert_eq!(body.contains("an_ordinary_extra"), show_tokens, "{body}");
+        }
+    }
+
+    /// Only a control CREDENTIAL: a key that merely mentions control, or a
+    /// credential that is not a control one, is left to the usual rule.
+    #[rstest]
+    #[case::not_a_credential("control-plane", true)]
+    #[case::not_control("api-token", true)]
+    #[case::control_token("x-control-token", false)]
+    fn the_control_rule_needs_both_words(#[case] key: &str, #[case] shown: bool) {
+        let mut extra = BTreeMap::new();
+        extra.insert(key.to_string(), serde_yaml::Value::String("v".to_string()));
+        redact_control_extras(&mut extra);
+        assert_eq!(
+            extra[key] == serde_yaml::Value::String("v".to_string()),
+            shown
+        );
     }
 
     #[test]

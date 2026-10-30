@@ -151,8 +151,11 @@ skardi config view
 ```
 
 `--show-tokens` prints every token **except a `control-token`**, which is
-always `(redacted)`: it is the one credential that reaches skardi-cloud's
-control surface, and nothing the CLI prints carries it (see
+always `(redacted)` — as is any key that names a control credential however
+it is spelled (`Control-Token`, `control_token`, `controlSecret`: `control`
+with `token`, `secret` or `credential`, case and `-`/`_` ignored): it is the
+one credential that reaches skardi-cloud's control surface, and nothing the
+CLI prints carries it (see
 [Connecting data sources from an agent](#connecting-data-sources-from-an-agent--integrations-handoff-documents)).
 
 The file is written atomically and `0600`, since it holds credentials; a
@@ -306,7 +309,7 @@ only to an admin of the workspace. Approved, the context holds:
 | `token`, `token-id`, `token-expires-at` | the **MCP token**, which has no control-plane reach and lives 90 days: every `query`, the documents upload, and what `mcp register` writes. The same key every older CLI reads, so nothing else changes |
 | `control-token`, `control-token-expires-at` | the **control token**, accepted only by the gateway's `/control/v1`, for **24 hours**: what the `integrations`, `handoff` and `documents` commands send. **No command prints it**, `--json` and `config view --show-tokens` included |
 | `pair-id` | which login the pair came from |
-| `mcp-url` | the workspace's MCP server, as the control plane named it |
+| `mcp-url` | the workspace's MCP server, as the control plane named it — unless `--server` or `$SKARDI_GATEWAY_URL` sent this context's queries to a different origin, in which case it is that gateway's `/mcp`, and `login` says it set the control plane's aside. The token is only ever registered against the gateway it queries |
 
 When the approval comes back **without** `control` — the box was unticked,
 or your role is not admin — the context is still written, so queries work,
@@ -330,6 +333,13 @@ as `replaces_pair_id`, and the control plane revokes that pair when you
 approve — the only way a browser login's credentials are revoked from the
 command line, since the CLI holds only tokens and no token may revoke one.
 `--keep-old-token` skips it.
+
+A pair context overwritten by a login through `--client-id` or `--identity`
+is revoked by its query token's id, and the control plane revokes a pair's
+two tokens together. Either way the replaced `pair-id` is named in the
+output: if the revoke failed, or `--keep-old-token` kept it, `login` warns
+that its control token stays live and names
+`/account/agent-access?pair=<id>` on the console, where it is revoked.
 
 These flags exist only on the console-brokered path, and a control plane
 older than them refuses the request (`invalid_body`); the CLI says the

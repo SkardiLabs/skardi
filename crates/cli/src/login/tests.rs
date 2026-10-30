@@ -2392,3 +2392,168 @@ async fn a_half_shaped_control_grant_fails_the_login_and_names_what_to_revoke(
     assert!(err.downcast_ref::<crate::exit::Exit>().is_none());
     assert!(!config_in(&home).exists(), "nothing is written");
 }
+
+/// Codex on #311: a `login --control` context overwritten by the DIRECT flow
+/// (`--identity`/`--client-id`), which sends no `replaces_pair_id`. Its
+/// `token-id` is the pair's mcp token; revoking it revokes the pair on the
+/// server, control token included (`revoke_pat` takes the partner). Whatever
+/// becomes of that revoke, the pair id is reported — it is the only handle
+/// left on the control token once the context is overwritten.
+#[rstest]
+#[case::revoked(204, false)]
+#[case::revoke_failed(500, false)]
+#[case::kept(204, true)]
+#[tokio::test]
+async fn a_pair_context_overwritten_by_the_direct_flow_keeps_its_pair_in_the_report(
+    #[case] revoke_status: u16,
+    #[case] keep_old: bool,
+) {
+    let gw = gateway(200).await;
+    let cp = control_plane_with(vec![membership(
+        "acme",
+        "acme-prod",
+        "active",
+        Some(&gw.uri()),
+    )])
+    .await;
+    mint_ok(&cp, "acme-prod", "tok-new").await;
+    revoke_answers(&cp, revoke_status).await;
+    let home = TempDir::new().unwrap();
+    let path = config_in(&home);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        "console: https://console.example\n\
+         current-context: acme/acme-prod\n\
+         contexts:\n\
+         \x20 - name: acme/acme-prod\n\
+         \x20   mode: cloud\n\
+         \x20   server: http://old.example\n\
+         \x20   workspace: acme-prod\n\
+         \x20   token: skardi_pat_old_mcp\n\
+         \x20   token-id: tok-old\n\
+         \x20   control-token: skardi_pat_old_control\n\
+         \x20   control-token-expires-at: 2026-08-25T00:00:00Z\n\
+         \x20   pair-id: pair-old\n",
+    )
+    .unwrap();
+
+    let mut options = options(&cp.uri(), None);
+    options.keep_old_token = keep_old;
+    let report = login(options, &path).await.unwrap();
+
+    assert_eq!(
+        report.replaced_pairs,
+        [("tok-old".to_string(), "pair-old".to_string())]
+    );
+    assert_eq!(report.console.as_deref(), Some("https://console.example"));
+    let revoked = revoked_ids(&cp.received_requests().await.unwrap());
+    match (revoke_status, keep_old) {
+        (_, true) => {
+            assert!(revoked.is_empty());
+            assert_eq!(report.replaced_kept, ["tok-old"]);
+        }
+        (204, false) => {
+            // The mcp token's id: the server revokes its partner with it.
+            assert_eq!(revoked, ["tok-old"]);
+            assert_eq!(report.replaced_revoked, ["tok-old"]);
+        }
+        _ => {
+            assert_eq!(report.revoke_failures[0].0, "tok-old");
+            assert!(report.replaced_revoked.is_empty());
+        }
+    }
+    // The old control token is no longer on disk either way.
+    let raw = std::fs::read_to_string(&path).unwrap();
+    assert!(!raw.contains("skardi_pat_old_control"), "{raw}");
+}
+
+/// Codex on #311: with `--server` (or `$SKARDI_GATEWAY_URL`) overriding the
+/// membership's gateway, queries go to the override — so the recorded MCP
+/// URL must too, or `mcp register` would configure the token against the
+/// deployment the person did NOT name. The exchange's URL is reported.
+#[tokio::test]
+async fn an_overriding_gateway_is_where_the_recorded_mcp_url_points() {
+    let gw = gateway(200).await;
+    let console = console(
+        200,
+        approved_with_control("https://elsewhere.example", "tok-1", "pair-1"),
+    )
+    .await;
+    let home = TempDir::new().unwrap();
+    let mut options = control_options(&console.uri());
+    options.server_override = Some(format!("{}/", gw.uri()));
+
+    let report = login(options, &config_in(&home)).await.unwrap();
+
+    let expected = format!("{}/mcp", gw.uri());
+    let file = read_yaml(&config_in(&home));
+    assert_eq!(
+        file["contexts"][0]["mcp-url"].as_str(),
+        Some(expected.as_str())
+    );
+    assert_eq!(report.mcp_url.as_deref(), Some(expected.as_str()));
+    assert_eq!(
+        report.mcp_url_set_aside.as_deref(),
+        Some("https://elsewhere.example/mcp")
+    );
+    // The probe went to the override, which is what the URL now follows.
+    assert_eq!(gw.received_requests().await.unwrap().len(), 1);
+}
+
+/// The env override is the same case, through the direct flow.
+#[tokio::test]
+async fn an_env_gateway_is_where_the_recorded_mcp_url_points() {
+    let gw = gateway(200).await;
+    let mut listed = membership(
+        "acme",
+        "acme-prod",
+        "active",
+        Some("https://elsewhere.example"),
+    );
+    listed["mcp_url"] = json!("https://elsewhere.example/mcp");
+    let cp = control_plane_with(vec![listed]).await;
+    mint_ok(&cp, "acme-prod", "tok-1").await;
+    let home = TempDir::new().unwrap();
+    let mut options = options(&cp.uri(), None);
+    options.env_gateway_url = Some(gw.uri());
+
+    let report = login(options, &config_in(&home)).await.unwrap();
+
+    let expected = format!("{}/mcp", gw.uri());
+    let file = read_yaml(&config_in(&home));
+    assert_eq!(
+        file["contexts"][0]["mcp-url"].as_str(),
+        Some(expected.as_str())
+    );
+    assert_eq!(
+        report.mcp_url_set_aside.as_deref(),
+        Some("https://elsewhere.example/mcp")
+    );
+}
+
+/// An override on the SAME origin changes nothing: the exchange's URL is
+/// kept as it was named, and nothing is reported as set aside.
+#[test]
+fn an_override_on_the_same_origin_keeps_the_exchanges_mcp_url() {
+    let mut named = parsed("acme", "acme-prod", None);
+    named.mcp_url = Some("https://gw.example/mcp".to_string());
+    assert_eq!(
+        super::mcp_url_for("https://gw.example:443/", &named),
+        (Some("https://gw.example/mcp".to_string()), None)
+    );
+    // A different port is a different origin.
+    assert_eq!(
+        super::mcp_url_for("https://gw.example:8443", &named),
+        (
+            Some("https://gw.example:8443/mcp".to_string()),
+            Some("https://gw.example/mcp".to_string())
+        )
+    );
+    // No URL from the exchange: none is invented.
+    named.mcp_url = None;
+    assert_eq!(
+        super::mcp_url_for("https://other.example", &named),
+        (None, None)
+    );
+}

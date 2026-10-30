@@ -416,12 +416,53 @@ pub(super) fn control_plane_for_revoke(
 /// then asserted directly, instead of only through a subprocess's stdout.
 fn print_report(report: &LoginReport) {
     print!("{}", render_report(report));
+    eprint!("{}", render_warnings(report));
+}
+
+/// What `print_report` puts on stderr: what this login could not clean up.
+///
+/// Not failures of the login (§6.5) — the new context is already good — so
+/// they warn beside the summary rather than joining it.
+fn render_warnings(report: &LoginReport) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
     for (token_id, reason) in &report.revoke_failures {
-        // Not a failure of the login (§6.5): the new context is already good,
-        // so this warns on stderr rather than joining the summary.
-        eprintln!(
+        let _ = writeln!(
+            out,
             "warning: could not revoke the replaced credential {token_id} ({reason}) — revoke it in the console"
         );
+    }
+    // A replaced credential that was half of a `login --control` pair and was
+    // NOT revoked leaves the pair's control token live for up to 24 hours,
+    // and no context holds it any more: the pair id is the one handle left,
+    // so it is named with the page that revokes it.
+    for (token_id, pair_id) in &report.replaced_pairs {
+        if report.replaced_revoked.contains(token_id) {
+            continue;
+        }
+        let page = agent_access(report.console.as_deref(), pair_id);
+        let _ = writeln!(
+            out,
+            "warning: {token_id} was part of the `login --control` pair {pair_id}, whose control token stays live until it expires (24 hours after that login) — revoke the pair at {page}"
+        );
+    }
+    out
+}
+
+/// The console page that revokes `pair_id`, or its path when no console is
+/// on record.
+fn agent_access(console: Option<&str>, pair_id: &str) -> String {
+    let path = format!(
+        "/account/agent-access?pair={}",
+        crate::client::encode_component(pair_id)
+    );
+    match console
+        .map(|c| c.trim().trim_end_matches('/'))
+        .filter(|c| !c.is_empty())
+    {
+        Some(console) => format!("{console}{path}"),
+        None => format!("the console's {path}"),
     }
 }
 
@@ -462,6 +503,12 @@ fn render_report(report: &LoginReport) -> String {
             "MCP server: {url} — run `skardi mcp register claude-code` to add it to Claude Code"
         );
     }
+    if let Some(named) = &report.mcp_url_set_aside {
+        let _ = writeln!(
+            out,
+            "  (the control plane named {named}, but this context queries the gateway --server or $SKARDI_GATEWAY_URL chose, so its MCP server is taken from there)"
+        );
+    }
     if let Some(name) = &report.replaced_pair_elsewhere {
         let _ = writeln!(
             out,
@@ -473,6 +520,12 @@ fn render_report(report: &LoginReport) -> String {
             out,
             "revoked the credential this login replaced ({token_id})"
         );
+        if let Some((_, pair_id)) = report.replaced_pairs.iter().find(|(id, _)| id == token_id) {
+            let _ = writeln!(
+                out,
+                "  and its control token with it: revoking either token of a `login --control` pair revokes both (pair {pair_id})"
+            );
+        }
     }
     for token_id in &report.replaced_kept {
         let _ = writeln!(
@@ -486,8 +539,8 @@ fn render_report(report: &LoginReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_CONSOLE, LoginArgs, UrlKind, default_notice, options_from, render_report,
-        resolve_control_plane,
+        DEFAULT_CONSOLE, LoginArgs, SetupProfile, UrlKind, default_notice, options_from,
+        render_report, render_warnings, resolve_control_plane, setup_from,
     };
     use crate::config::ContextsFile;
     use crate::login::{LoginReport, Selection, WrittenContext};
@@ -831,5 +884,128 @@ mod tests {
             .to_string();
         assert!(err.contains("control-plane:"), "{err}");
         assert!(!err.contains("console:"), "{err}");
+    }
+
+    // ─── The agent-onboarding additions (§2.1, §2.5) ────────────────────────
+
+    /// `--control` and `--setup`/`--name`/`--industry` reach the options as
+    /// the request carries them: a trimmed name, and a blank industry as
+    /// none rather than an empty value the server would refuse.
+    #[test]
+    fn control_and_setup_reach_the_options() {
+        let missing = Path::new("/nonexistent/skardi/config.yaml");
+        let mut args = login_args();
+        args.control = true;
+        args.setup = Some(SetupProfile::Team);
+        args.name = Some("  Acme Research  ".to_string());
+        args.industry = Some("   ".to_string());
+        let options = options_from(&args, None, None, missing).unwrap();
+        assert!(options.control);
+        let setup = options.setup.unwrap();
+        assert_eq!(setup.profile, "team");
+        assert_eq!(setup.name, "Acme Research");
+        assert_eq!(setup.industry, None);
+
+        args.setup = Some(SetupProfile::Personal);
+        args.industry = Some(" finance ".to_string());
+        let setup = setup_from(&args).unwrap().unwrap();
+        assert_eq!(setup.profile, "personal");
+        assert_eq!(setup.industry.as_deref(), Some("finance"));
+
+        // No --setup, no setup — whatever else was typed.
+        assert_eq!(setup_from(&login_args()).unwrap(), None);
+    }
+
+    /// `/setup`'s bounds on the name, checked before a browser opens.
+    #[rstest]
+    #[case::blank("   ", 0)]
+    #[case::too_long(&"n".repeat(101), 101)]
+    fn a_setup_name_outside_the_bounds_is_refused(#[case] name: &str, #[case] length: usize) {
+        let mut args = login_args();
+        args.setup = Some(SetupProfile::Personal);
+        args.name = Some(name.to_string());
+        let err = setup_from(&args).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            format!("--name must be 1 to 100 characters, not {length}")
+        );
+    }
+
+    fn written() -> WrittenContext {
+        WrittenContext {
+            name: "acme/prod".to_string(),
+            server: "https://gw.example".to_string(),
+            workspace: "acme-prod".to_string(),
+            role: "admin".to_string(),
+            expires_at: None,
+        }
+    }
+
+    /// What a `login --control` says beyond today's summary: when control
+    /// ends (never the token), the MCP server and where its URL came from,
+    /// and a replaced pair revoked along with its query token.
+    #[test]
+    fn a_control_login_reports_the_grant_the_mcp_server_and_the_pair_it_replaced() {
+        let report = LoginReport {
+            written: vec![written()],
+            current_context: Some("acme/prod".to_string()),
+            control_expires_at: Some("2026-10-31T12:00:00Z".to_string()),
+            mcp_url: Some("https://gw.example/mcp".to_string()),
+            mcp_url_set_aside: Some("https://elsewhere.example/mcp".to_string()),
+            replaced_pair_elsewhere: Some("acme/other".to_string()),
+            replaced_revoked: vec!["tok-old".to_string()],
+            replaced_pairs: vec![("tok-old".to_string(), "pair-old".to_string())],
+            ..LoginReport::default()
+        };
+        let rendered = render_report(&report);
+        for line in [
+            "control granted until 2026-10-31T12:00:00Z",
+            "MCP server: https://gw.example/mcp — run `skardi mcp register claude-code`",
+            "the control plane named https://elsewhere.example/mcp, but this context queries the gateway --server or $SKARDI_GATEWAY_URL chose",
+            "replaced the credentials context acme/other held",
+            "run `skardi login --context acme/other`",
+            "revoked the credential this login replaced (tok-old)\n  and its control token with it",
+            "(pair pair-old)",
+        ] {
+            assert!(rendered.contains(line), "missing {line:?} in:\n{rendered}");
+        }
+        // A revoked pair is not also a warning.
+        assert_eq!(render_warnings(&report), "");
+    }
+
+    /// Codex on #311: a pair whose query token was NOT revoked — the revoke
+    /// failed, or `--keep-old-token` — leaves a live control token nothing
+    /// holds. Its pair is named, with the page that revokes it.
+    #[test]
+    fn a_pair_left_live_is_named_with_the_page_that_revokes_it() {
+        let report = LoginReport {
+            written: vec![written()],
+            revoke_failures: vec![("tok-stuck".to_string(), "HTTP 500".to_string())],
+            replaced_kept: vec!["tok-kept".to_string()],
+            replaced_pairs: vec![
+                ("tok-stuck".to_string(), "pair-1".to_string()),
+                ("tok-kept".to_string(), "pair 2".to_string()),
+            ],
+            console: Some("https://console.example/".to_string()),
+            ..LoginReport::default()
+        };
+        let warnings = render_warnings(&report);
+        assert_eq!(
+            warnings,
+            "warning: could not revoke the replaced credential tok-stuck (HTTP 500) — revoke it in the console\n\
+             warning: tok-stuck was part of the `login --control` pair pair-1, whose control token stays live until it expires (24 hours after that login) — revoke the pair at https://console.example/account/agent-access?pair=pair-1\n\
+             warning: tok-kept was part of the `login --control` pair pair 2, whose control token stays live until it expires (24 hours after that login) — revoke the pair at https://console.example/account/agent-access?pair=pair%202\n"
+        );
+        // No console on record: the page is still named, by its path.
+        let report = LoginReport {
+            console: None,
+            ..report
+        };
+        assert!(
+            render_warnings(&report)
+                .contains("revoke the pair at the console's /account/agent-access?pair=pair-1"),
+            "{}",
+            render_warnings(&report)
+        );
     }
 }
