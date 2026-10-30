@@ -14,7 +14,6 @@ use datafusion::sql::unparser::dialect::{Dialect, IntervalStyle, PostgreSqlDiale
 ///
 /// `governed_array_key_budget` is a measured tuning value, not a limit on readable keys.
 /// Until a caller supplies it, integer-array overlap uses PostgreSQL's `&&`.
-
 #[derive(Debug, Clone, Default)]
 pub(super) struct GovernedPostgresDialect {
     governed_array_key_budget: Option<usize>,
