@@ -276,7 +276,7 @@ mod tests {
         // native files and folders retain their actual omission spelling.
         page["files"][0]["md5Checksum"] = json!("8b1a9953c4611296a827abf8c47804d7");
         page["files"][0]["headRevisionId"] = json!("revision-1");
-        let batch = convert_first_page(table("files"), &page.to_string());
+        let batch = convert_first_page(table("files"), &page);
         assert_eq!(batch.num_rows(), 6);
 
         // Row 0 — a shared My Drive file, fully populated: real byte
