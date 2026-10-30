@@ -820,9 +820,9 @@ mod tests {
     fn empty_page_keeps_schema_stable() {
         // An empty first page must still produce the full declared
         // schema, or a first-page-empty scan would change shape. The
-        // widths are this pack's column counts: 14 / 13 / 11.
+        // widths are this pack's column counts: 16 / 13 / 11.
         for (short, row_key, columns) in [
-            ("files", "files", 14),
+            ("files", "files", 16),
             ("drives", "drives", 13),
             ("file_permissions", "permissions", 11),
         ] {
