@@ -57,6 +57,8 @@ use datafusion_functions_json::udfs;
 /// # Ok(())
 /// # }
 /// ```
+/// Empty dynamic-path batches keep their declared type; nonempty calls use
+/// the upstream implementation unchanged.
 pub fn register_json_getter_udfs(ctx: &SessionContext) -> DFResult<()> {
     // The exact set `register_all` registers, listed individually so the
     // rewriter/planner pair it installs afterwards can never sneak in.
