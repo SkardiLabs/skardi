@@ -7,6 +7,7 @@ pub mod health;
 pub mod jobs;
 pub mod login;
 pub mod logout;
+pub mod mcp_register;
 pub mod pipeline;
 pub mod query;
 pub mod run;
