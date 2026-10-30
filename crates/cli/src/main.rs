@@ -9,6 +9,7 @@ use clap::error::ErrorKind;
 use clap::{Parser, Subcommand};
 use client::{ApiClient, ApiError};
 use cloud::Capability;
+use commands::agent::{AgentCmd, DocumentsArgs, HandoffArgs, IntegrationsArgs};
 use commands::config::ConfigCmd;
 use commands::jobs::JobCmd;
 use commands::login::{LoginArgs, LogoutArgs};
@@ -21,6 +22,7 @@ use identity::{ClientIdentity, Surface};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+mod agent;
 mod client;
 mod cloud;
 mod commands;
@@ -195,6 +197,17 @@ enum Commands {
         #[command(subcommand)]
         cmd: Option<McpCmd>,
     },
+
+    /// Connect a skardi-cloud workspace's data sources: what an agent runs
+    /// after `skardi login --control`. Each command prints the next one.
+    Integrations(IntegrationsArgs),
+
+    /// Wait on a handoff: the page where the person consents or pastes a
+    /// secret for `integrations connect`.
+    Handoff(HandoffArgs),
+
+    /// Upload local files into a personal skardi-cloud workspace.
+    Documents(DocumentsArgs),
 }
 
 #[tokio::main]
@@ -214,6 +227,26 @@ async fn main() -> ExitCode {
                     return ExitCode::SUCCESS;
                 }
                 _ => {
+                    // The agent commands publish their own table (design
+                    // 2026-10-27 §2.4.2), in which a usage error is 2 — and a
+                    // `--json` caller is owed the envelope on stdout, not
+                    // clap's text alone.
+                    let args: Vec<String> = std::env::args().skip(1).collect();
+                    let agent = commands::agent::subcommand_of(args.iter().cloned())
+                        .is_some_and(|sub| commands::agent::AGENT_COMMANDS.contains(&sub.as_str()));
+                    if agent {
+                        if args.iter().any(|a| a == "--json") {
+                            let envelope = serde_json::json!({
+                                "ok": false,
+                                "error": { "code": "usage", "message": e.to_string().trim() },
+                                "next": null,
+                            });
+                            println!("{envelope}");
+                        } else {
+                            let _ = e.print();
+                        }
+                        return ExitCode::from(agent::EXIT_USAGE);
+                    }
                     let _ = e.print();
                     return ExitCode::FAILURE;
                 }
@@ -223,8 +256,9 @@ async fn main() -> ExitCode {
     match dispatch(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            // A command that chose its own code (`login --control`'s 6) also
-            // says whether anything is left to print.
+            // A command that chose its own code (the agent-onboarding table,
+            // `login --control`'s 6) also says whether anything is left to
+            // print: the agent commands have already printed their envelope.
             if let Some(exit) = err.downcast_ref::<Exit>() {
                 if let Some(message) = &exit.message {
                     eprintln!("error: {message}");
@@ -280,6 +314,39 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         // exists FOR a cloud context.
         Commands::Mcp { cmd: Some(cmd) } => {
             return commands::mcp_register::run(cmd, cli.context);
+        }
+        // The agent commands resolve their own context: they need the
+        // control token, which no other command reads, and they report every
+        // failure through their own output contract.
+        Commands::Integrations(args) => {
+            return commands::agent::run(
+                AgentCmd::Integrations(args.cmd),
+                args.json,
+                cli.server,
+                cli.token,
+                cli.context,
+            )
+            .await;
+        }
+        Commands::Handoff(args) => {
+            return commands::agent::run(
+                AgentCmd::Handoff(args.cmd),
+                args.json,
+                cli.server,
+                cli.token,
+                cli.context,
+            )
+            .await;
+        }
+        Commands::Documents(args) => {
+            return commands::agent::run(
+                AgentCmd::Documents(args.cmd),
+                args.json,
+                cli.server,
+                cli.token,
+                cli.context,
+            )
+            .await;
         }
         _ => {}
     }
@@ -354,7 +421,10 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Commands::Config { .. }
         | Commands::Login(_)
         | Commands::Logout(_)
-        | Commands::Mcp { cmd: Some(_) } => Ok(()),
+        | Commands::Mcp { cmd: Some(_) }
+        | Commands::Integrations(_)
+        | Commands::Handoff(_)
+        | Commands::Documents(_) => Ok(()),
     };
 
     outcome.map_err(|err| cloud::diagnose(err, capability, &config))
@@ -377,7 +447,10 @@ fn capability_of(command: &Commands) -> Option<Capability> {
         Commands::Config { .. }
         | Commands::Login(_)
         | Commands::Logout(_)
-        | Commands::Mcp { cmd: Some(_) } => None,
+        | Commands::Mcp { cmd: Some(_) }
+        | Commands::Integrations(_)
+        | Commands::Handoff(_)
+        | Commands::Documents(_) => None,
     }
 }
 
@@ -419,6 +492,9 @@ mod tests {
             vec!["skardi", "login"],
             vec!["skardi", "logout"],
             vec!["skardi", "mcp", "register", "claude-code"],
+            vec!["skardi", "integrations", "list"],
+            vec!["skardi", "handoff", "wait", "h1"],
+            vec!["skardi", "documents", "add", "a.pdf"],
         ] {
             let cli = super::Cli::try_parse_from(&argv).expect("parses");
             assert_eq!(capability_of(&cli.command), None, "argv: {argv:?}");
@@ -501,7 +577,10 @@ mod tests {
                 | Commands::Job { .. }
                 | Commands::Schema
                 | Commands::Health { .. }
-                | Commands::Mcp { .. } => true,
+                | Commands::Mcp { .. }
+                | Commands::Integrations(_)
+                | Commands::Handoff(_)
+                | Commands::Documents(_) => true,
             }
         }
         let cli = super::Cli::try_parse_from(["skardi", "schema"]).unwrap();

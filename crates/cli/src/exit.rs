@@ -20,6 +20,16 @@ pub struct Exit {
     pub message: Option<String>,
 }
 
+impl Exit {
+    /// Already reported; only the code is left to deliver.
+    pub fn reported(code: u8) -> Exit {
+        Exit {
+            code,
+            message: None,
+        }
+    }
+}
+
 impl fmt::Display for Exit {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.message {
