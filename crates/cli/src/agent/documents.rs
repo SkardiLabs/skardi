@@ -291,7 +291,7 @@ struct Snapshot {
 /// in async code) — a large file is seconds of disk and SHA-256.
 async fn snapshot(path: &Path) -> Result<Snapshot, AgentError> {
     let owned: PathBuf = path.to_path_buf();
-    tokio::task::spawn_blocking(move || read_snapshot(&owned, || {}))
+    tokio::task::spawn_blocking(move || read_snapshot(&owned, MAX_DOCUMENT_BYTES, || {}))
         .await
         .map_err(|err| {
             AgentError::usage(
@@ -301,9 +301,11 @@ async fn snapshot(path: &Path) -> Result<Snapshot, AgentError> {
         })?
 }
 
-/// The blocking half of [`snapshot`]. `between` runs after the read and
-/// before the check that the file held still, so a test can change it there.
-fn read_snapshot(path: &Path, between: impl FnOnce()) -> Result<Snapshot, AgentError> {
+/// The blocking half of [`snapshot`], reading at most `limit` bytes
+/// ([`MAX_DOCUMENT_BYTES`]; a parameter so a test need not write a gigabyte).
+/// `between` runs after the read and before the check that the file held
+/// still, so a test can change it there.
+fn read_snapshot(path: &Path, limit: u64, between: impl FnOnce()) -> Result<Snapshot, AgentError> {
     let unreadable = |err: std::io::Error| {
         AgentError::usage(
             "file_unreadable",
@@ -339,16 +341,16 @@ fn read_snapshot(path: &Path, between: impl FnOnce()) -> Result<Snapshot, AgentE
     };
     let file = std::fs::File::open(path).map_err(unreadable)?;
     let before = file.metadata().map_err(unreadable)?;
-    if before.len() > MAX_DOCUMENT_BYTES {
+    if before.len() > limit {
         return Err(too_large());
     }
     let mut bytes = Vec::with_capacity(usize::try_from(before.len()).unwrap_or(0));
     // `take` one past the ceiling: a file growing while it is read is caught
     // by the check below, and is never read without bound.
-    file.take(MAX_DOCUMENT_BYTES + 1)
+    file.take(limit.saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(unreadable)?;
-    if bytes.len() as u64 > MAX_DOCUMENT_BYTES {
+    if bytes.len() as u64 > limit {
         return Err(too_large());
     }
     between();
@@ -685,6 +687,59 @@ mod tests {
         );
     }
 
+    /// The folding edges: runs collapse to one hyphen, hyphens before the
+    /// extension and at either end go, and a name with no ASCII stem left is
+    /// the hash of itself alone.
+    #[rstest]
+    #[case::runs("a  --  b.md", "a-b.md")]
+    #[case::before_extension("draft (v2) .txt", "draft-v2.txt")]
+    #[case::trailing_without_extension("notes!!", "notes")]
+    fn folding_collapses_and_trims(#[case] picked: &str, #[case] stored: &str) {
+        assert_eq!(storage_filename(picked), stored);
+    }
+
+    #[test]
+    fn a_name_with_no_ascii_stem_is_its_hash() {
+        let stored = storage_filename("报告.pdf");
+        assert_eq!(stored.len(), 8 + ".pdf".len(), "{stored}");
+        assert!(stored.ends_with(".pdf"), "{stored}");
+        assert_eq!(filename_refusal(&stored), None);
+    }
+
+    /// Each refusal names its reason, so the error says what to rename.
+    #[rstest]
+    #[case::empty("", "is empty")]
+    #[case::too_long(&format!("{}.pdf", "a".repeat(252)), "is longer than 255 bytes")]
+    #[case::control("a\u{7}b.pdf", "contains a control character")]
+    #[case::leading_underscore("_draft.pdf", "contains an unsupported character")]
+    #[case::wrong_type("archive.zip", "is not one of the accepted types")]
+    fn each_refusal_names_its_reason(#[case] stored: &str, #[case] reason: &str) {
+        let refused = filename_refusal(stored).unwrap_or_default();
+        assert!(refused.starts_with(reason), "{stored:?}: {refused}");
+    }
+
+    /// A stem that folds to nothing is named `document`, and a name with no
+    /// extension keeps none.
+    #[rstest]
+    #[case::no_stem("---.pdf", "document-pdf")]
+    #[case::no_extension("notes", "notes")]
+    fn source_names_at_the_edges(#[case] stored: &str, #[case] source: &str) {
+        assert_eq!(source_name(stored), source);
+    }
+
+    #[test]
+    fn the_data_planes_debug_shows_no_token() {
+        let data = DataPlane {
+            gateway: "https://gw.example".to_string(),
+            workspace: "acme-prod".to_string(),
+            mcp_token: MCP.to_string(),
+            retry_wait: Duration::from_millis(1),
+        };
+        let rendered = format!("{data:?}");
+        assert!(!rendered.contains(MCP), "{rendered}");
+        assert!(rendered.contains("(redacted)"), "{rendered}");
+    }
+
     #[rstest]
     #[case::pdf("a.pdf", Some("application/pdf"))]
     #[case::upper("A.PNG", Some("image/png"))]
@@ -993,7 +1048,7 @@ mod tests {
     fn a_file_that_changes_while_it_is_read_is_refused(#[case] change: fn(&Path)) {
         let dir = TempDir::new().unwrap();
         let file = write_file(&dir, "notes.md", b"# hello\n");
-        let Err(err) = read_snapshot(&file, || change(&file)) else {
+        let Err(err) = read_snapshot(&file, MAX_DOCUMENT_BYTES, || change(&file)) else {
             panic!("a changing file was snapshotted");
         };
         assert_eq!(err.code(), "file_changed");
@@ -1012,7 +1067,7 @@ mod tests {
     fn a_snapshot_is_the_file_and_its_digest() {
         let dir = TempDir::new().unwrap();
         let file = write_file(&dir, "Q3 (final).pdf", b"%PDF-1.7");
-        let Ok(snapshot) = read_snapshot(&file, || {}) else {
+        let Ok(snapshot) = read_snapshot(&file, MAX_DOCUMENT_BYTES, || {}) else {
             panic!("a still file is snapshotted");
         };
         assert_eq!(snapshot.bytes, b"%PDF-1.7");
@@ -1024,22 +1079,21 @@ mod tests {
         assert_eq!(snapshot.declared.content_type, "application/pdf");
     }
 
-    /// Over the largest per-file cap any plan has, refused from its length
-    /// alone — the file is sparse, so nothing is read or allocated.
-    #[tokio::test]
-    async fn a_file_over_the_ceiling_is_refused_before_it_is_read() {
-        let server = MockServer::start().await;
+    /// Over the per-file cap, refused from its length alone, before a byte
+    /// is read: the message names the cap any plan accepts.
+    #[test]
+    fn a_file_over_the_ceiling_is_refused_before_it_is_read() {
         let dir = TempDir::new().unwrap();
-        let file = dir.path().join("huge.pdf");
-        std::fs::File::create(&file)
-            .unwrap()
-            .set_len(MAX_DOCUMENT_BYTES + 1)
-            .unwrap();
-        let (control, data) = sides(&server);
-        let err = add(&control, &data, &file).await.unwrap_err();
+        let file = write_file(&dir, "huge.pdf", b"12345");
+        let read = std::cell::Cell::new(false);
+        let Err(err) = read_snapshot(&file, 4, || read.set(true)) else {
+            panic!("a file over the limit was snapshotted");
+        };
         assert_eq!(err.code(), "file_too_large");
         assert!(err.message().contains("1024 MiB"), "{err:?}");
-        assert!(server.received_requests().await.unwrap().is_empty());
+        assert!(!read.get(), "refused from the metadata, before the read");
+        // At the limit exactly, it is read.
+        assert!(read_snapshot(&file, 5, || {}).is_ok());
     }
 
     #[tokio::test]
@@ -1052,6 +1106,164 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code(), "file_unreadable");
         assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    /// A gateway answering the declaration, and the sync, as it should.
+    async fn declaring(server: &MockServer) {
+        Mock::given(method("POST"))
+            .and(path_is(format!("{WS}/saas-sources")))
+            .respond_with(
+                ResponseTemplate::new(201).set_body_json(
+                    json!({"source_name": "notes-md", "schema_name": "doc_notes_md"}),
+                ),
+            )
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_is(format!("{WS}/saas-sources/notes-md/sync")))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({})))
+            .mount(server)
+            .await;
+    }
+
+    fn puts(seen: &[wiremock::Request]) -> usize {
+        seen.iter()
+            .filter(|r| r.method == wiremock::http::Method::PUT)
+            .count()
+    }
+
+    /// A workspace that is not serving yet is refused before anything is
+    /// declared: a declaration there would only be refused with a message
+    /// about the install.
+    #[tokio::test]
+    async fn a_workspace_still_provisioning_is_refused_before_the_declaration() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_is(WS))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"tenant_slug": "acme-prod", "provisioning_state": "provisioning"}),
+            ))
+            .mount(&server)
+            .await;
+        let dir = TempDir::new().unwrap();
+        let file = write_file(&dir, "notes.md", b"x");
+        let (control, data) = sides(&server);
+        let err = add(&control, &data, &file).await.unwrap_err();
+        assert_eq!(err.code(), "workspace_not_active");
+        assert_eq!(err.exit, EXIT_REFUSED);
+        assert!(err.message().contains("provisioning"), "{err:?}");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    /// A declaration answered without a schema has nowhere to upload to.
+    #[tokio::test]
+    async fn a_declaration_without_a_schema_uploads_nothing() {
+        let server = gateway().await;
+        Mock::given(method("POST"))
+            .and(path_is(format!("{WS}/saas-sources")))
+            .respond_with(
+                ResponseTemplate::new(201).set_body_json(json!({"source_name": "notes-md"})),
+            )
+            .mount(&server)
+            .await;
+        let dir = TempDir::new().unwrap();
+        let file = write_file(&dir, "notes.md", b"x");
+        let (control, data) = sides(&server);
+        let err = add(&control, &data, &file).await.unwrap_err();
+        assert_eq!(err.code(), "invalid_response");
+        assert_eq!(err.exit, EXIT_UNAVAILABLE);
+        assert_eq!(puts(&server.received_requests().await.unwrap()), 0);
+    }
+
+    /// A gateway that cannot be reached, or answers 502-504, is retried
+    /// once like the engine's lag; still failing, the source is named as
+    /// stranded, since it exists without its file.
+    #[rstest]
+    #[case::bad_gateway(Some(502))]
+    #[case::unreachable(None)]
+    #[tokio::test]
+    async fn an_unreachable_data_plane_is_retried_once_then_names_the_stranded_source(
+        #[case] status: Option<u16>,
+    ) {
+        let server = gateway().await;
+        declaring(&server).await;
+        let dir = TempDir::new().unwrap();
+        let file = write_file(&dir, "notes.md", b"x");
+        let (control, mut data) = sides(&server);
+        let code = match status {
+            Some(status) => {
+                Mock::given(method("PUT"))
+                    .respond_with(ResponseTemplate::new(status).set_body_string("<html>"))
+                    .mount(&server)
+                    .await;
+                format!("http_{status}")
+            }
+            None => {
+                data.gateway = "http://127.0.0.1:1".to_string();
+                "gateway_unreachable".to_string()
+            }
+        };
+        let err = add(&control, &data, &file).await.unwrap_err();
+        assert_eq!(err.code(), code);
+        assert_eq!(err.exit, EXIT_UNAVAILABLE);
+        assert_eq!(err.error["source_name"], "notes-md");
+        assert!(err.message().contains("exists without its file"), "{err:?}");
+        assert!(!err.message().contains(MCP), "{err:?}");
+        if status.is_some() {
+            assert_eq!(puts(&server.received_requests().await.unwrap()), 2);
+        }
+    }
+
+    /// A query token that cannot be a header value is not sent, and not
+    /// retried.
+    #[tokio::test]
+    async fn an_unsendable_query_token_is_named_without_being_retried() {
+        let server = gateway().await;
+        declaring(&server).await;
+        let dir = TempDir::new().unwrap();
+        let file = write_file(&dir, "notes.md", b"x");
+        let (control, mut data) = sides(&server);
+        data.mcp_token = "skardi_pat_\nbroken".to_string();
+        let err = add(&control, &data, &file).await.unwrap_err();
+        assert_eq!(err.code(), "token_unsendable");
+        assert!(!err.message().contains("broken"), "{err:?}");
+        assert_eq!(puts(&server.received_requests().await.unwrap()), 0);
+    }
+
+    /// The upload landed but the run could not be asked for: the error says
+    /// which command asks for it.
+    #[tokio::test]
+    async fn a_failed_sync_names_the_command_that_retries_it() {
+        let server = gateway().await;
+        Mock::given(method("POST"))
+            .and(path_is(format!("{WS}/saas-sources")))
+            .respond_with(
+                ResponseTemplate::new(201).set_body_json(
+                    json!({"source_name": "notes-md", "schema_name": "doc_notes_md"}),
+                ),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"success": true})))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_is(format!("{WS}/saas-sources/notes-md/sync")))
+            .respond_with(ResponseTemplate::new(503).set_body_json(
+                json!({"error": {"code": "control_plane_unavailable", "message": "down"}}),
+            ))
+            .mount(&server)
+            .await;
+        let dir = TempDir::new().unwrap();
+        let file = write_file(&dir, "notes.md", b"x");
+        let (control, data) = sides(&server);
+        let err = add(&control, &data, &file).await.unwrap_err();
+        assert_eq!(err.code(), "control_plane_unavailable");
+        assert_eq!(
+            err.next.as_deref(),
+            Some("skardi integrations sync notes-md")
+        );
     }
 
     #[tokio::test]

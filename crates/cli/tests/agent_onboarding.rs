@@ -582,3 +582,41 @@ async fn mcp_register_refuses_the_global_flags_it_cannot_honour() {
     .await;
     assert_eq!(output.status.code(), Some(0), "{output:?}");
 }
+
+/// A usage error under an agent command is the table's `2` in both modes:
+/// clap's text on stderr in plain mode, the envelope on stdout with
+/// `--json`. `--token` is one too — the control token comes from `login
+/// --control` alone — and is refused before anything is sent.
+#[tokio::test]
+async fn usage_errors_are_exit_2_in_either_mode() {
+    let gw = MockServer::start().await;
+    Mock::given(path_regex(".*"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&gw)
+        .await;
+    let home = TempDir::new().unwrap();
+    seed(home.path(), &gw.uri(), Some(CONTROL));
+
+    // clap: `--target` is required.
+    let plain = run(home.path(), &["integrations", "connect", "notion"]).await;
+    assert_eq!(plain.status.code(), Some(2), "{plain:?}");
+    assert!(stdout(&plain).is_empty(), "{plain:?}");
+    assert!(stderr(&plain).contains("--target"), "{plain:?}");
+
+    // `--token`, refused by the command itself.
+    let output = run(
+        home.path(),
+        &[
+            "--token",
+            "skardi_pat_typed",
+            "integrations",
+            "list",
+            "--json",
+        ],
+    )
+    .await;
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let envelope: Value = serde_json::from_str(stdout(&output).trim()).unwrap();
+    assert_eq!(envelope["error"]["code"], "token_flag_not_accepted");
+    assert!(gw.received_requests().await.unwrap().is_empty());
+}

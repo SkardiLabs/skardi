@@ -472,8 +472,11 @@ mod tests {
     #[tokio::test]
     async fn persistent_transport_failures_end_the_wait_as_unreachable() {
         // Nothing listens on port 1, so every poll is a transport failure.
+        // A long deadline: Windows takes about two seconds to refuse a
+        // loopback connection, which a short one would cut off first.
         let control = Control::new("http://127.0.0.1:1", "acme-prod", "skardi_pat_ctl").unwrap();
-        let err = wait(&control, ID, fast()).await.unwrap_err();
+        let polling = fast().with_deadline(Duration::from_secs(60));
+        let err = wait(&control, ID, polling).await.unwrap_err();
         assert_eq!(err.exit, EXIT_UNAVAILABLE);
         assert_eq!(err.code(), "control_plane_unreachable");
     }

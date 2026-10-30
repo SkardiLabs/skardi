@@ -1094,13 +1094,15 @@ mod tests {
     #[tokio::test]
     async fn an_unreachable_submit_names_its_request_id_and_the_replay() {
         let control = Control::new("http://127.0.0.1:1", "acme-prod", CONTROL).unwrap();
+        // A long deadline: Windows takes about two seconds to refuse a
+        // loopback connection, which a short one would cut off first.
         let err = install(
             &control,
             "acme-github",
             VERSION,
             r#"{"issues":null}"#,
             Some("req-9"),
-            fast(),
+            fast().with_deadline(Duration::from_secs(60)),
         )
         .await
         .unwrap_err();
@@ -1201,6 +1203,210 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.code(), "invalid_response");
         assert_eq!(err.next.as_deref(), Some(replay("req-3").as_str()));
+    }
+
+    /// A deadline shorter than the next interval ends the install at once
+    /// rather than sleeping past it, still naming the replay.
+    #[tokio::test]
+    async fn a_deadline_shorter_than_the_next_interval_is_not_slept_through() {
+        let server = MockServer::start().await;
+        answer(
+            &server,
+            "POST",
+            "/installs",
+            202,
+            json!({"operation_id": "op-1", "state": "pending"}),
+        )
+        .await;
+        let polling = Polling {
+            first: Duration::from_secs(30),
+            max: Duration::from_secs(30),
+            deadline: Duration::from_millis(200),
+        };
+        let started = std::time::Instant::now();
+        let err = install(
+            &control(&server),
+            "acme-github",
+            VERSION,
+            r#"{"issues":null}"#,
+            Some("req-1"),
+            polling,
+        )
+        .await
+        .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(err.code(), "install_pending");
+        assert_eq!(err.error["operation"]["state"], "pending");
+        assert_eq!(err.next.as_deref(), Some(replay("req-1").as_str()));
+    }
+
+    #[test]
+    fn install_polling_takes_the_timeout_or_the_ten_minute_default() {
+        assert_eq!(install_polling(None), Polling::INSTALL);
+        assert_eq!(
+            install_polling(Some(Duration::from_secs(5))).deadline,
+            Duration::from_secs(5)
+        );
+        assert_eq!(Polling::INSTALL.deadline, Duration::from_secs(600));
+    }
+
+    /// An install with nothing to sync yet says so, beside the success.
+    #[tokio::test]
+    async fn a_done_install_with_a_link_owed_notes_it() {
+        let server = MockServer::start().await;
+        answer(
+            &server,
+            "POST",
+            "/installs",
+            202,
+            json!({"operation_id": "op-1", "state": "done", "link_owed": true}),
+        )
+        .await;
+        let outcome = install(
+            &control(&server),
+            "acme-github",
+            VERSION,
+            r#"{"issues":null}"#,
+            None,
+            fast(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            outcome.notes[0].contains("nothing to sync yet"),
+            "{outcome:?}"
+        );
+    }
+
+    /// The handoff page asks for different things by kind; the sentence
+    /// tells the agent which to relay.
+    #[rstest]
+    #[case::credential("secret_drop_credential", "paste the token on that page")]
+    #[case::oauth_client("secret_drop_oauth_client", "create an app at the provider")]
+    #[case::consent("provider_consent", "consent at the provider")]
+    #[tokio::test]
+    async fn connect_says_what_the_page_asks_for(#[case] kind: &str, #[case] says: &str) {
+        let server = MockServer::start().await;
+        answer(
+            &server,
+            "POST",
+            "/handoffs",
+            201,
+            json!({"handoff_id": HANDOFF, "kind": kind, "page_url": "https://console.example/h"}),
+        )
+        .await;
+        let outcome = connect(&control(&server), "github", "new").await.unwrap();
+        assert!(outcome.sentence.contains(says), "{}", outcome.sentence);
+        // No `expires_at`, no dangling clause about it.
+        assert!(
+            !outcome.sentence.contains("works until"),
+            "{}",
+            outcome.sentence
+        );
+    }
+
+    #[tokio::test]
+    async fn a_handoff_without_its_link_is_an_invalid_response() {
+        let server = MockServer::start().await;
+        answer(
+            &server,
+            "POST",
+            "/handoffs",
+            201,
+            json!({"handoff_id": HANDOFF}),
+        )
+        .await;
+        let err = connect(&control(&server), "notion", "new")
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "invalid_response");
+        assert_eq!(err.exit, EXIT_UNAVAILABLE);
+    }
+
+    /// Blank arguments are usage errors, caught before a request.
+    #[rstest]
+    #[case::saas("  ", "new", "invalid_saas")]
+    #[case::target("notion", " ", "target_required")]
+    #[tokio::test]
+    async fn connect_refuses_blank_arguments_locally(
+        #[case] saas: &str,
+        #[case] target: &str,
+        #[case] code: &str,
+    ) {
+        let server = MockServer::start().await;
+        let err = connect(&control(&server), saas, target).await.unwrap_err();
+        assert_eq!(err.code(), code);
+        assert_eq!(err.exit, EXIT_USAGE);
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_blank_alias_or_source_is_a_usage_error() {
+        let server = MockServer::start().await;
+        let err = permissions(&control(&server), " ", VERSION)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "invalid_alias");
+        let err = sync(&control(&server), " ").await.unwrap_err();
+        assert_eq!(err.code(), "invalid_source");
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    /// `items` answering a refusal is a source with none to name; answering
+    /// a 5xx is a failure of `status`.
+    #[tokio::test]
+    async fn status_fails_when_items_fail_with_the_control_plane() {
+        let server = MockServer::start().await;
+        for (route, body) in [
+            (
+                "/saas-sources/acme-notion",
+                json!({"source_name": "acme-notion"}),
+            ),
+            (
+                "/saas-sources/acme-notion/health",
+                json!({"phase": "active"}),
+            ),
+            ("/saas-sources/acme-notion/runs", json!([{"run_id": "r1"}])),
+        ] {
+            answer(&server, "GET", route, 200, body).await;
+        }
+        answer(
+            &server,
+            "GET",
+            "/saas-sources/acme-notion/items",
+            503,
+            json!({"error": {"code": "control_plane_unavailable", "message": "down"}}),
+        )
+        .await;
+        let err = status(&control(&server), Some("acme-notion"), false)
+            .await
+            .unwrap_err();
+        assert_eq!(err.exit, EXIT_UNAVAILABLE);
+    }
+
+    /// A source that has run names no next step.
+    #[tokio::test]
+    async fn status_of_a_source_that_ran_names_no_next_step() {
+        let server = MockServer::start().await;
+        for (route, body) in [
+            (
+                "/saas-sources/acme-notion",
+                json!({"source_name": "acme-notion"}),
+            ),
+            (
+                "/saas-sources/acme-notion/health",
+                json!({"phase": "active"}),
+            ),
+            ("/saas-sources/acme-notion/runs", json!([{"run_id": "r1"}])),
+            ("/saas-sources/acme-notion/items", json!([])),
+        ] {
+            answer(&server, "GET", route, 200, body).await;
+        }
+        let outcome = status(&control(&server), Some("acme-notion"), false)
+            .await
+            .unwrap();
+        assert_eq!(outcome.next, None);
+        assert_eq!(outcome.sentence, "acme-notion:");
     }
 
     #[tokio::test]

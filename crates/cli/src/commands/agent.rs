@@ -310,7 +310,85 @@ pub fn subcommand_of<I: IntoIterator<Item = String>>(args: I) -> Option<String> 
 
 #[cfg(test)]
 mod tests {
-    use super::subcommand_of;
+    use super::*;
+    use crate::agent::{EXIT_HANDOFF_ENDED, EXIT_USAGE};
+    use serde_json::json;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const HANDOFF: &str = "4b9f3c1e-8a2d-4c6b-9e0f-1a2b3c4d5e6f";
+
+    fn context(gateway: &str, mcp_token: Option<&str>) -> AgentContext {
+        AgentContext {
+            name: "acme/prod".to_string(),
+            gateway: gateway.to_string(),
+            workspace: "acme-prod".to_string(),
+            control_token: Some("skardi_pat_ctl".to_string()),
+            control_expires_at: None,
+            mcp_token: mcp_token.map(str::to_string),
+        }
+    }
+
+    /// `handoff wait --timeout` replaces the 30-minute default: a handoff
+    /// still open is `still_open` after the budget given, not after half an
+    /// hour.
+    #[tokio::test]
+    async fn handoff_wait_takes_its_timeout() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"state": "opened"})))
+            .mount(&server)
+            .await;
+        let cmd = AgentCmd::Handoff(HandoffCmd::Wait {
+            id: HANDOFF.to_string(),
+            timeout: Some("1s".to_string()),
+        });
+        let started = std::time::Instant::now();
+        let err = execute(cmd, &context(&server.uri(), Some("q")))
+            .await
+            .unwrap_err();
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(err.exit, EXIT_HANDOFF_ENDED);
+        assert_eq!(err.code(), "still_open");
+    }
+
+    /// A malformed `--timeout` is a usage error, before any request.
+    #[rstest::rstest]
+    #[case::wait(AgentCmd::Handoff(HandoffCmd::Wait { id: HANDOFF.to_string(), timeout: Some("soon".to_string()) }))]
+    #[case::install(AgentCmd::Integrations(IntegrationsCmd::Install {
+        alias: "a".to_string(),
+        connection_version: "0e6a3d2c-0000-4000-8000-000000000001".to_string(),
+        scope: r#"{"issues":null}"#.to_string(),
+        request_id: None,
+        timeout: Some("0".to_string()),
+    }))]
+    #[tokio::test]
+    async fn a_bad_timeout_is_a_usage_error_before_any_request(#[case] cmd: AgentCmd) {
+        let server = MockServer::start().await;
+        let err = execute(cmd, &context(&server.uri(), Some("q")))
+            .await
+            .unwrap_err();
+        assert_eq!(err.exit, EXIT_USAGE);
+        assert_eq!(err.code(), "invalid_timeout");
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    /// `documents add` uploads with the query token; a context without one
+    /// is exit 6, before the file is read or anything is sent.
+    #[tokio::test]
+    async fn documents_add_without_a_query_token_is_exit_6() {
+        let server = MockServer::start().await;
+        let cmd = AgentCmd::Documents(DocumentsCmd::Add {
+            file: PathBuf::from("/nonexistent/notes.md"),
+        });
+        let err = execute(cmd, &context(&server.uri(), None))
+            .await
+            .unwrap_err();
+        assert_eq!(err.exit, EXIT_NO_CONTROL);
+        assert_eq!(err.code(), "query_token_missing");
+        assert_eq!(err.next.as_deref(), Some(LOGIN_CONTROL));
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
 
     #[test]
     fn the_subcommand_is_found_past_global_flags() {

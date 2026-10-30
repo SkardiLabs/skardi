@@ -2557,3 +2557,59 @@ fn an_override_on_the_same_origin_keeps_the_exchanges_mcp_url() {
         (None, None)
     );
 }
+
+/// Every field the older server could not know is named in the "too old"
+/// message, so the person knows what to drop — including a re-login's
+/// `replaces_pair_id`, which no flag of theirs asked for.
+#[tokio::test]
+async fn too_old_names_every_new_field_the_request_carried() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/global/v1/cli-login/requests"))
+        .respond_with(ResponseTemplate::new(422).set_body_json(json!({
+            "error": {"code": "invalid_body", "message": "unknown field `setup`"}
+        })))
+        .mount(&server)
+        .await;
+    let home = TempDir::new().unwrap();
+    let path = config_in(&home);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        format!(
+            "current-context: acme/my-ws\n{}    pair-id: pair-old\n",
+            existing_cloud_context()
+        ),
+    )
+    .unwrap();
+    let mut options = broker_options(&server.uri());
+    options.setup = Some(super::console_broker::Setup {
+        profile: "personal".to_string(),
+        name: "Alice".to_string(),
+        industry: None,
+    });
+    let err = login(options, &path).await.unwrap_err().to_string();
+    assert!(
+        err.contains("too old for --setup, replacing the previous login's pair"),
+        "{err}"
+    );
+}
+
+/// The pair to replace is read only off a CLOUD context: a server-mode one
+/// carrying a stray `pair-id` names nothing for the exchange to revoke.
+#[tokio::test]
+async fn a_server_context_names_no_pair_to_replace() {
+    let gw = gateway(200).await;
+    let console = console(200, approved("my-ws", &gw.uri(), "tok-1")).await;
+    let home = TempDir::new().unwrap();
+    let path = config_in(&home);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        "current-context: local\ncontexts:\n  - name: local\n    server: http://127.0.0.1:8080\n    pair-id: pair-stray\n",
+    )
+    .unwrap();
+    login(broker_options(&console.uri()), &path).await.unwrap();
+    let opened = opened_body(&console.received_requests().await.unwrap());
+    assert!(opened.get("replaces_pair_id").is_none(), "{opened}");
+}

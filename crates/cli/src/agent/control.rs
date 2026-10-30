@@ -448,6 +448,115 @@ mod tests {
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
+    /// A `Retry-After` past the longest wait, or none at all, is reported at
+    /// once: sleeping a minute or more is not a retry, it is a hang.
+    #[rstest]
+    #[case::too_long(Some("61"))]
+    #[case::absent(None)]
+    #[tokio::test]
+    async fn a_rate_limit_without_a_usable_wait_is_reported_at_once(
+        #[case] retry_after: Option<&str>,
+    ) {
+        let server = MockServer::start().await;
+        let mut refusal = ResponseTemplate::new(429)
+            .set_body_json(json!({"error": {"code": "rate_limited", "message": "slow down"}}));
+        if let Some(seconds) = retry_after {
+            refusal = refusal.insert_header("retry-after", seconds);
+        }
+        Mock::given(method("GET"))
+            .respond_with(refusal)
+            .mount(&server)
+            .await;
+        // The production unit, so 61 really is past the 60-second cap.
+        let control = Control::new(&server.uri(), "acme-prod", CONTROL).unwrap();
+        let started = std::time::Instant::now();
+        let err = control.get("/connections", &[]).await.unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(err.code(), "rate_limited");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    /// A stored control token that cannot be a header value is exit 6:
+    /// the remedy is a new login, not a retry.
+    #[test]
+    fn an_unsendable_control_token_is_exit_6() {
+        let Err(err) = Control::new("https://gw.example", "acme-prod", "skardi_pat_\nbroken")
+        else {
+            panic!("a token with a newline was accepted as a header");
+        };
+        assert_eq!(err.exit, EXIT_NO_CONTROL);
+        assert_eq!(err.code(), "control_token_unsendable");
+        assert_eq!(err.next.as_deref(), Some(LOGIN_CONTROL));
+        assert!(!err.message().contains("broken"), "{err:?}");
+    }
+
+    /// What a success body can be: JSON, nothing (a `202` with no body), or
+    /// something that is not JSON at all — which is a broken door, exit 5.
+    #[rstest]
+    #[case::json(ResponseTemplate::new(200).set_body_json(json!({"a": 1})), Ok(json!({"a": 1})))]
+    #[case::empty(ResponseTemplate::new(202), Ok(Value::Null))]
+    #[case::not_json(ResponseTemplate::new(200).set_body_string("<html>ok</html>"), Err("invalid_response"))]
+    #[tokio::test]
+    async fn success_bodies_are_json_or_nothing(
+        #[case] response: ResponseTemplate,
+        #[case] expected: Result<Value, &str>,
+    ) {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(response)
+            .mount(&server)
+            .await;
+        let answer = control(&server).post("/x/sync", None, &[]).await;
+        match (answer, expected) {
+            (Ok(body), Ok(expected)) => assert_eq!(body, expected),
+            (Err(err), Err(code)) => {
+                assert_eq!(err.code(), code);
+                assert_eq!(err.exit, EXIT_UNAVAILABLE);
+            }
+            (answer, expected) => panic!("{answer:?} is not {expected:?}"),
+        }
+    }
+
+    /// The body is buffered only up to a cap: an answer past it is refused
+    /// rather than held.
+    #[tokio::test]
+    async fn an_oversized_answer_is_refused() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b' '; MAX_BODY_BYTES + 1]))
+            .mount(&server)
+            .await;
+        let err = control(&server).get("", &[]).await.unwrap_err();
+        assert_eq!(err.code(), "response_too_large");
+        assert_eq!(err.exit, EXIT_UNAVAILABLE);
+    }
+
+    /// A refusal that is not the envelope becomes one, its message the
+    /// body's first line — said plainly when there is none, cut when it runs
+    /// long.
+    #[rstest]
+    #[case::empty("", "the control plane answered HTTP 500")]
+    #[case::first_line("upstream timed out\n<html>…", "upstream timed out")]
+    fn a_bare_refusal_is_described_by_its_first_line(#[case] body: &str, #[case] message: &str) {
+        let err = refusal(500, body, None);
+        assert_eq!(err.code(), "http_500");
+        assert_eq!(err.message(), message);
+    }
+
+    #[test]
+    fn a_long_bare_refusal_is_truncated() {
+        let err = refusal(502, &"x".repeat(MAX_SNIPPET_CHARS + 50), None);
+        assert!(
+            err.message().ends_with("… (truncated)"),
+            "{}",
+            err.message()
+        );
+        assert_eq!(
+            err.message().chars().count(),
+            MAX_SNIPPET_CHARS + "… (truncated)".chars().count()
+        );
+    }
+
     #[tokio::test]
     async fn an_unreachable_gateway_is_exit_5() {
         let control = Control::new("http://127.0.0.1:1", "acme-prod", CONTROL).unwrap();

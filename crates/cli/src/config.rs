@@ -1692,4 +1692,54 @@ mod tests {
         assert_eq!(format!("[{:<8}]", ContextMode::Cloud), "[cloud   ]");
         assert_eq!(format!("{}", ContextMode::Server), "server");
     }
+
+    /// `Context`'s `Debug` is hand-written so neither credential reaches a
+    /// log line or a panic message through `{:?}` (agent onboarding §5.0,
+    /// invariant 10) — nor an unmodeled key's value, which may be one. What
+    /// identifies the context and its login is still shown.
+    #[test]
+    fn a_contexts_debug_shows_no_credential() {
+        let mut extra = BTreeMap::new();
+        extra.insert(
+            "refresh-token".to_string(),
+            serde_yaml::Value::String("extra_secret_value".to_string()),
+        );
+        let context = Context {
+            name: "acme/prod".to_string(),
+            mode: ContextMode::Cloud,
+            server: Some("https://gw.example".to_string()),
+            workspace: Some("acme-prod".to_string()),
+            user: Some("alice@example.com".to_string()),
+            token: Some("skardi_pat_mcp_secret".to_string()),
+            token_id: Some("tok-mcp".to_string()),
+            token_expires_at: Some("2027-01-01T00:00:00Z".to_string()),
+            control_token: Some("skardi_pat_control_secret".to_string()),
+            control_token_expires_at: Some("2026-10-31T12:00:00Z".to_string()),
+            pair_id: Some("pair-1".to_string()),
+            mcp_url: Some("https://gw.example/mcp".to_string()),
+            extra,
+        };
+        let rendered = format!("{context:?}");
+        for secret in [
+            "skardi_pat_mcp_secret",
+            "skardi_pat_control_secret",
+            "extra_secret_value",
+        ] {
+            assert!(!rendered.contains(secret), "{rendered}");
+        }
+        for shown in [
+            "acme/prod",
+            "tok-mcp",
+            "2026-10-31T12:00:00Z",
+            "pair-1",
+            "https://gw.example/mcp",
+            "refresh-token",
+            "(redacted)",
+        ] {
+            assert!(rendered.contains(shown), "missing {shown}: {rendered}");
+        }
+        // An absent credential reads as absent, not as redacted.
+        let bare = format!("{:?}", Context::default());
+        assert!(bare.contains("token: None"), "{bare}");
+    }
 }

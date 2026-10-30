@@ -430,6 +430,55 @@ mod tests {
         assert!(err.contains("SKARDI_GLOBAL_GATEWAY_URL"), "{err}");
     }
 
+    /// Which contexts can be registered: a cloud one holding a token. The
+    /// rest are refused with what to do instead.
+    #[rstest::rstest]
+    #[case::server_mode("mode: server", "not a skardi-cloud context")]
+    #[case::no_token("mode: cloud\n    token: '  '", "holds no token")]
+    fn a_context_that_cannot_be_registered_says_why(#[case] fields: &str, #[case] says: &str) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            format!(
+                "current-context: acme/prod\ncontexts:\n  - name: acme/prod\n    {fields}\n    server: https://gw.example\n    workspace: acme-prod\n    mcp-url: https://gw.example/mcp\n"
+            ),
+        )
+        .unwrap();
+        let err = register_at(&path, &args(None, true), None, None, OsStr::new("claude"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(says), "{err}");
+    }
+
+    #[test]
+    fn no_selected_context_or_no_file_says_so() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.yaml");
+        let err = register_at(&path, &args(None, true), None, None, OsStr::new("claude"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("run `skardi login` first"), "{err}");
+
+        std::fs::write(&path, "contexts: []\n").unwrap();
+        let err = register_at(&path, &args(None, true), None, None, OsStr::new("claude"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no context selected"), "{err}");
+    }
+
+    #[test]
+    fn the_servers_debug_shows_no_token() {
+        let server = Server {
+            url: "https://gw.example/mcp".to_string(),
+            token: MCP.to_string(),
+            workspace: Some("acme-prod".to_string()),
+        };
+        let rendered = format!("{server:?}");
+        assert!(!rendered.contains(MCP), "{rendered}");
+        assert!(rendered.contains("https://gw.example/mcp"), "{rendered}");
+    }
+
     #[test]
     fn another_client_is_pointed_at_print() {
         let dir = TempDir::new().unwrap();
@@ -672,7 +721,28 @@ esac
         );
     }
 
-    /// The old entry is gone but the new one cannot take its name: the
+    /// The removal fails AND the staged copy will not come back out: both
+    /// the old entry and the new one are left, and the error says so.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_removal_whose_cleanup_also_fails_names_both_entries() {
+        let dir = TempDir::new().unwrap();
+        let path = config(&dir, Some("https://gw.example/mcp"));
+        let fake = FakeClaude::new()
+            .holding("user", "skardi", OLD)
+            .failing("remove", "user", "skardi")
+            .failing("remove", "user", "skardi-pending");
+
+        let err = format!("{:#}", fake.register(&path).unwrap_err());
+        assert!(
+            err.contains("left registered as `skardi-pending` beside it"),
+            "{err}"
+        );
+        assert_eq!(fake.entry("user", "skardi").as_deref(), Some(OLD));
+        assert!(fake.entry("user", "skardi-pending").is_some());
+    }
+
+    /// The old entry is gone but the new one cannot take its name: the    /// The old entry is gone but the new one cannot take its name: the
     /// server is still registered, as `skardi-pending`, and the error says
     /// so rather than "registered".
     #[cfg(unix)]

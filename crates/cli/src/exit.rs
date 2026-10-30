@@ -40,3 +40,23 @@ impl fmt::Display for Exit {
 }
 
 impl std::error::Error for Exit {}
+
+#[cfg(test)]
+mod tests {
+    use super::Exit;
+
+    /// What an `Exit` reads as when something prints it as an error — a
+    /// context chain, a test's `{err}` — rather than through `main`.
+    #[test]
+    fn an_exit_reads_as_its_message_or_its_code() {
+        let with_message = Exit {
+            code: 6,
+            message: Some("approved without control".to_string()),
+        };
+        assert_eq!(with_message.to_string(), "approved without control");
+        assert_eq!(Exit::reported(4).to_string(), "exit 4");
+        assert_eq!(Exit::reported(4).message, None);
+        let err: anyhow::Error = Exit::reported(5).into();
+        assert_eq!(err.downcast_ref::<Exit>().map(|e| e.code), Some(5));
+    }
+}
