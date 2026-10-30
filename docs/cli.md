@@ -877,7 +877,12 @@ nothing was installed.
 **`documents add`** declares the file (its name, type, sha256 and length)
 with the control token, uploads the bytes to the gateway's data plane with
 the MCP token, retries once while the workspace's engine picks up the new
-source, and asks for the first run. A team workspace refuses it
+source, and asks for the first run. The file is read **once**, before
+anything is declared, and those bytes are what is hashed and sent — so
+editing it afterwards cannot make the upload disagree with its declaration.
+A file that changes *while* it is read is refused (`file_changed`) before
+anything is created, and one over 1 GiB, the largest any plan accepts, is
+refused from its size alone (`file_too_large`). A team workspace refuses it
 (`team_upload_not_agent_callable`): there, every member would read the file,
 so it is uploaded in the console.
 

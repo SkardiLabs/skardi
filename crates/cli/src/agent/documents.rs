@@ -11,7 +11,9 @@
 //!    nothing a team can read), copied through;
 //! 3. the gateway's data-plane `PUT /documents/:schema_name`, under the
 //!    **mcp** token with `Skardi-Workspace`: the bytes, which the engine holds
-//!    to the declared digest and length. One retry on
+//!    to the declared digest and length — so they are the very bytes that
+//!    were hashed, read once before anything was declared (see
+//!    [`snapshot`]). One retry on
 //!    `unknown-document-source`, the engine not having caught up with the new
 //!    source yet, which its next tick closes;
 //! 4. `POST …/saas-sources/:source/sync` — an uploaded file has no cadence, so
@@ -30,7 +32,7 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// The tables a Documents source declares, as the console's install does.
@@ -45,6 +47,12 @@ pub const UPLOAD_RETRY_WAIT: Duration = Duration::from_secs(20);
 
 /// An upload's own ceiling: a real file over whatever link the person has.
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+/// The largest file this reads: 1 GiB, the contract's per-file ceiling
+/// (`DOCUMENT_BYTE_LENGTH_CEILING`, the enterprise plan's cap). Every plan's
+/// cap sits at or under it and the engine refuses a larger body, so a file
+/// over it could never be uploaded — and it bounds the snapshot this holds.
+pub const MAX_DOCUMENT_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// The accepted types, by extension: the console's `DOCUMENT_TYPES`.
 const DOCUMENT_TYPES: [(&str, &str); 10] = [
@@ -257,7 +265,7 @@ impl std::fmt::Debug for DataPlane {
     }
 }
 
-/// What the file is, read once to hash it and once more to send it.
+/// What the file is, as declared: its names, type, digest and length.
 struct Declared {
     display_label: String,
     stored: String,
@@ -267,9 +275,35 @@ struct Declared {
     byte_length: u64,
 }
 
-/// Hash the file as a stream, so a large file is not held in memory before
-/// the server has accepted its length.
-fn declare_file(path: &Path) -> Result<Declared, AgentError> {
+/// The file, read once: its declaration and the very bytes it describes.
+///
+/// One read, not one to hash and another to send. The engine holds the
+/// upload to the declared digest, so a file that changed between two reads
+/// was refused only after its source had been created, stranding the
+/// source. Sending what was hashed makes a later change irrelevant, and a
+/// change DURING the read is caught before anything is created.
+struct Snapshot {
+    declared: Declared,
+    bytes: Vec<u8>,
+}
+
+/// Read and hash the file off the async runtime (AGENTS.md: no blocking I/O
+/// in async code) — a large file is seconds of disk and SHA-256.
+async fn snapshot(path: &Path) -> Result<Snapshot, AgentError> {
+    let owned: PathBuf = path.to_path_buf();
+    tokio::task::spawn_blocking(move || read_snapshot(&owned, || {}))
+        .await
+        .map_err(|err| {
+            AgentError::usage(
+                "file_unreadable",
+                format!("reading {} failed: {err}", path.display()),
+            )
+        })?
+}
+
+/// The blocking half of [`snapshot`]. `between` runs after the read and
+/// before the check that the file held still, so a test can change it there.
+fn read_snapshot(path: &Path, between: impl FnOnce()) -> Result<Snapshot, AgentError> {
     let unreadable = |err: std::io::Error| {
         AgentError::usage(
             "file_unreadable",
@@ -293,36 +327,65 @@ fn declare_file(path: &Path) -> Result<Declared, AgentError> {
         ));
     }
     let content_type = content_type(&stored).expect("filename_refusal checked the type");
-    let mut file = std::fs::File::open(path).map_err(unreadable)?;
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; 64 * 1024];
-    let mut byte_length = 0u64;
-    loop {
-        let read = file.read(&mut buf).map_err(unreadable)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buf[..read]);
-        byte_length += read as u64;
+
+    let too_large = || {
+        AgentError::usage(
+            "file_too_large",
+            format!(
+                "{display_label} is larger than {} MiB, the most any plan accepts for one file",
+                MAX_DOCUMENT_BYTES / (1024 * 1024)
+            ),
+        )
+    };
+    let file = std::fs::File::open(path).map_err(unreadable)?;
+    let before = file.metadata().map_err(unreadable)?;
+    if before.len() > MAX_DOCUMENT_BYTES {
+        return Err(too_large());
     }
-    let sha256 = hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    Ok(Declared {
-        source_name: source_name(&stored),
-        display_label,
-        stored,
-        content_type,
-        sha256,
-        byte_length,
+    let mut bytes = Vec::with_capacity(usize::try_from(before.len()).unwrap_or(0));
+    // `take` one past the ceiling: a file growing while it is read is caught
+    // by the check below, and is never read without bound.
+    file.take(MAX_DOCUMENT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(unreadable)?;
+    if bytes.len() as u64 > MAX_DOCUMENT_BYTES {
+        return Err(too_large());
+    }
+    between();
+    // Read by PATH, after: an edit in place changes the length or the mtime,
+    // and a replace-by-rename hands the path a different file. Either way
+    // the bytes read may be a mix of before and after, which is not a
+    // document anyone wrote — so nothing is declared from them.
+    let after = std::fs::metadata(path).map_err(unreadable)?;
+    let held_still = after.len() == bytes.len() as u64
+        && before.len() == after.len()
+        && before.modified().ok() == after.modified().ok();
+    if !held_still {
+        return Err(AgentError::usage(
+            "file_changed",
+            format!(
+                "{} changed while it was being read, so nothing was uploaded or created. Upload it once nothing is writing to it",
+                path.display()
+            ),
+        ));
+    }
+    let sha256 = sha256_hex(&bytes);
+    Ok(Snapshot {
+        declared: Declared {
+            source_name: source_name(&stored),
+            display_label,
+            stored,
+            content_type,
+            sha256,
+            byte_length: bytes.len() as u64,
+        },
+        bytes,
     })
 }
 
 /// Row 10.
 pub async fn add(control: &Control, data: &DataPlane, path: &Path) -> Result<Outcome, AgentError> {
-    let declared = declare_file(path)?;
+    let Snapshot { declared, bytes } = snapshot(path).await?;
 
     // ① The workspace must be serving. Asked first because a declaration
     // against a provisioning workspace would be refused anyway, with a
@@ -367,17 +430,7 @@ pub async fn add(control: &Control, data: &DataPlane, path: &Path) -> Result<Out
         ));
     };
 
-    // ③ The bytes, read only now: the server has accepted the length, which
-    // the workspace's plan caps, so this is bounded by the plan.
-    let bytes = std::fs::read(path).map_err(|err| {
-        stranded(
-            &source_name,
-            AgentError::usage(
-                "file_unreadable",
-                format!("cannot read {}: {err}", path.display()),
-            ),
-        )
-    })?;
+    // ③ The bytes: the snapshot's, which are what was declared.
     let mut attempt = 0;
     loop {
         match upload(data, schema_name, declared.content_type, bytes.clone()).await {
@@ -641,7 +694,7 @@ mod tests {
         assert_eq!(content_type(name), expected);
     }
 
-    fn write_file(dir: &TempDir, name: &str, contents: &[u8]) -> std::path::PathBuf {
+    fn write_file(dir: &TempDir, name: &str, contents: &[u8]) -> PathBuf {
         let path = dir.path().join(name);
         std::fs::write(&path, contents).unwrap();
         path
@@ -858,6 +911,147 @@ mod tests {
         assert_eq!(err.exit, exit);
         assert!(err.error.get("message").is_some());
         assert!(err.error.get("success").is_none());
+    }
+
+    /// Rewrites the file the moment its declaration arrives — the window
+    /// between hashing and uploading that a second read used to leave open
+    /// — then answers as the control plane does.
+    struct RewriteOnDeclare {
+        file: PathBuf,
+    }
+
+    impl wiremock::Respond for RewriteOnDeclare {
+        fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+            std::fs::write(&self.file, b"# rewritten after it was declared\n").unwrap();
+            ResponseTemplate::new(201)
+                .set_body_json(json!({"source_name": "notes-md", "schema_name": "doc_notes_md"}))
+        }
+    }
+
+    /// Codex on #311: the file was read once to hash it and again to send
+    /// it, so a change in between uploaded bytes that did not match the
+    /// declared digest, after the source existed. Now the bytes sent are the
+    /// bytes hashed, whatever happens to the file after.
+    #[tokio::test]
+    async fn the_upload_sends_the_bytes_that_were_declared_even_if_the_file_changes() {
+        let server = gateway().await;
+        let dir = TempDir::new().unwrap();
+        let file = write_file(&dir, "notes.md", b"# hello\n");
+        Mock::given(method("POST"))
+            .and(path_is(format!("{WS}/saas-sources")))
+            .respond_with(RewriteOnDeclare { file: file.clone() })
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path_is("/documents/doc_notes_md"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"success": true})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_is(format!("{WS}/saas-sources/notes-md/sync")))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({})))
+            .mount(&server)
+            .await;
+
+        let (control, data) = sides(&server);
+        add(&control, &data, &file).await.unwrap();
+
+        let seen = server.received_requests().await.unwrap();
+        let declared: Value = seen
+            .iter()
+            .find(|r| r.url.path() == format!("{WS}/saas-sources"))
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .unwrap();
+        let put = seen
+            .iter()
+            .find(|r| r.method == wiremock::http::Method::PUT)
+            .unwrap();
+        assert_eq!(put.body, b"# hello\n");
+        assert_eq!(
+            declared["upstream_resource"]["sha256"],
+            sha256_hex(&put.body)
+        );
+        assert_eq!(declared["byte_length"], put.body.len());
+        assert!(std::fs::read(&file).unwrap().starts_with(b"# rewritten"));
+    }
+
+    /// A file written to WHILE it is read is a mix of two versions: refused,
+    /// with a sentence saying so, before anything is declared.
+    #[rstest]
+    #[case::appended(|file: &Path| {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new().append(true).open(file).unwrap();
+        f.write_all(b"more").unwrap();
+    })]
+    #[case::replaced(|file: &Path| {
+        let swap = file.with_extension("swap");
+        std::fs::write(&swap, b"a different document, longer").unwrap();
+        std::fs::rename(&swap, file).unwrap();
+    })]
+    fn a_file_that_changes_while_it_is_read_is_refused(#[case] change: fn(&Path)) {
+        let dir = TempDir::new().unwrap();
+        let file = write_file(&dir, "notes.md", b"# hello\n");
+        let Err(err) = read_snapshot(&file, || change(&file)) else {
+            panic!("a changing file was snapshotted");
+        };
+        assert_eq!(err.code(), "file_changed");
+        assert_eq!(err.exit, crate::agent::EXIT_USAGE);
+        assert!(
+            err.message().contains("changed while it was being read"),
+            "{err:?}"
+        );
+        assert!(
+            err.message().contains("nothing was uploaded or created"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_is_the_file_and_its_digest() {
+        let dir = TempDir::new().unwrap();
+        let file = write_file(&dir, "Q3 (final).pdf", b"%PDF-1.7");
+        let Ok(snapshot) = read_snapshot(&file, || {}) else {
+            panic!("a still file is snapshotted");
+        };
+        assert_eq!(snapshot.bytes, b"%PDF-1.7");
+        assert_eq!(snapshot.declared.sha256, sha256_hex(b"%PDF-1.7"));
+        assert_eq!(snapshot.declared.byte_length, 8);
+        assert_eq!(snapshot.declared.display_label, "Q3 (final).pdf");
+        assert_eq!(snapshot.declared.stored, "Q3-final.pdf");
+        assert_eq!(snapshot.declared.source_name, "q3-final-pdf");
+        assert_eq!(snapshot.declared.content_type, "application/pdf");
+    }
+
+    /// Over the largest per-file cap any plan has, refused from its length
+    /// alone — the file is sparse, so nothing is read or allocated.
+    #[tokio::test]
+    async fn a_file_over_the_ceiling_is_refused_before_it_is_read() {
+        let server = MockServer::start().await;
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("huge.pdf");
+        std::fs::File::create(&file)
+            .unwrap()
+            .set_len(MAX_DOCUMENT_BYTES + 1)
+            .unwrap();
+        let (control, data) = sides(&server);
+        let err = add(&control, &data, &file).await.unwrap_err();
+        assert_eq!(err.code(), "file_too_large");
+        assert!(err.message().contains("1024 MiB"), "{err:?}");
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_missing_file_issues_no_request() {
+        let server = MockServer::start().await;
+        let dir = TempDir::new().unwrap();
+        let (control, data) = sides(&server);
+        let err = add(&control, &data, &dir.path().join("gone.md"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "file_unreadable");
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]
