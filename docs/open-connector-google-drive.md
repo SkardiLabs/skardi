@@ -122,7 +122,7 @@ FROM saas.contract_acl.file_permissions;
 
 Action `googledrive.files.list` — the only action that sees the whole
 corpus. With no resource, the table is **every file the connected
-account can reach**. Fourteen columns:
+account can reach**. Sixteen columns:
 
 | column | wire path | type |
 |---|---|---|
@@ -133,6 +133,8 @@ account can reach**. Fourteen columns:
 | `created_time` | `createdTime` | timestamp(ms, UTC) |
 | `modified_time` | `modifiedTime` | timestamp(ms, UTC) |
 | `size_bytes` | `sizeBytes` | int64 |
+| `md5_checksum` | `md5Checksum` | utf8, nullable |
+| `head_revision_id` | `headRevisionId` | utf8, nullable |
 | `drive_id` | `driveId` | utf8 |
 | `parents` | `parents` | list of utf8 |
 | `owner_display_names` | `owners[].displayName` | list of utf8 |
