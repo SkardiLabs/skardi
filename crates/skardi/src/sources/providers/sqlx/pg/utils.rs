@@ -40,7 +40,7 @@ pub fn rows_to_batch(rows: &[sqlx::postgres::PgRow], schema: &SchemaRef) -> DFRe
 
 /// Build a single Arrow array column from the named column across all rows.
 ///
-/// Supports Int32, Int64, List<Int64>, Float32, Float64, Boolean, Decimal128 (cast via
+/// Supports Int32, Int64, `List<Int64>`, Float32, Float64, Boolean, Decimal128 (cast via
 /// float8), and a Utf8 catch-all for everything else.
 pub fn build_column(
     rows: &[sqlx::postgres::PgRow],
