@@ -270,10 +270,13 @@ mod tests {
         // every shape the seeded phase-4 corpus produced — a shared
         // My Drive file, a shared-drive file, a trashed file, a native
         // Google Doc, a starred CJK-named file and a folder.
-        let batch = convert_fixture(
-            table("files"),
-            include_str!("fixtures/google_drive/files.json"),
-        );
+        let mut page: Value =
+            serde_json::from_str(include_str!("fixtures/google_drive/files.json")).unwrap();
+        // Synthetic binary observations overlay the captured row shapes;
+        // native files and folders retain their actual omission spelling.
+        page["files"][0]["md5Checksum"] = json!("8b1a9953c4611296a827abf8c47804d7");
+        page["files"][0]["headRevisionId"] = json!("revision-1");
+        let batch = convert_first_page(table("files"), &page.to_string());
         assert_eq!(batch.num_rows(), 6);
 
         // Row 0 — a shared My Drive file, fully populated: real byte
@@ -286,6 +289,15 @@ mod tests {
         assert_eq!(utf8(&batch, "mime_type").value(0), "text/plain");
         assert_eq!(int64(&batch, "size_bytes").value(0), 63);
         assert!(utf8(&batch, "drive_id").is_null(0));
+        assert_eq!(
+            utf8(&batch, "md5_checksum").value(0),
+            "8b1a9953c4611296a827abf8c47804d7"
+        );
+        assert_eq!(utf8(&batch, "head_revision_id").value(0), "revision-1");
+        for row in [1, 3, 5] {
+            assert!(utf8(&batch, "md5_checksum").is_null(row));
+            assert!(utf8(&batch, "head_revision_id").is_null(row));
+        }
         assert!(
             utf8(&batch, "web_view_link")
                 .value(0)

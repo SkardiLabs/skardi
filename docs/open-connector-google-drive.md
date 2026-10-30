@@ -45,13 +45,19 @@ decimal *string*), and columns named from Google's docs
 gateway's camelCase strict schema (`pageSize`, `pageToken`, `driveId`,
 `q`, `fileId`; a wrong key is a hard 400).
 
-The `files.list` contract fixture now includes the connector's optional
-`sharedWithMeTime`, `shortcutDetails` and `incompleteSearch` observations,
-captured on 2026-10-27 from an isolated gateway at OC
-`b80814d179587df2c083edf153475989173ac337`. These are metadata, not new SQL
-columns. Missing completeness stays unknown, never a synthesized `false`.
-This schema requires that connector change: an older gateway is refused by
-the normal fingerprint check. Cloud pins are a separate rollout decision.
+The `files.list` contract fixture includes the connector's optional
+`sharedWithMeTime`, `shortcutDetails`, `incompleteSearch` and binary-content
+observations. It is copied from the generated runtime catalog at OC
+`4bfdad30f3c1962b11499a5683af99c13a432ec9`. Sharing and completeness remain
+metadata rather than SQL columns. Missing completeness stays unknown, never
+a synthesized `false`. An older gateway is refused by the normal fingerprint
+check. Cloud pins are a separate rollout decision.
+
+The files table also exposes nullable `md5_checksum` and `head_revision_id`
+columns from the connector's optional binary-content observations. Native
+Workspace files and any response that omits them produce SQL NULL. These
+fields do not establish a content-only revision for native Docs, Sheets or
+Slides.
 
 ## Binding
 

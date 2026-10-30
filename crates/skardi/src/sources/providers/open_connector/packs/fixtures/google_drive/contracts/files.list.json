@@ -155,6 +155,14 @@
             "type": "boolean",
             "description": "Whether the file has been trashed."
           },
+          "md5Checksum": {
+            "type": "string",
+            "description": "The content's MD5 checksum, when Drive reports it. Only available for binary files."
+          },
+          "headRevisionId": {
+            "type": "string",
+            "description": "The head revision ID, when Drive reports it. Only available for binary files."
+          },
           "sharedWithMeTime": {
             "type": "string",
             "description": "When the file was shared with the authenticated user, when Drive reports it."
