@@ -36,7 +36,6 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
 use std::num::NonZeroU32;
-use std::slice::from_ref;
 use std::sync::Arc;
 use std::time::Duration;
 use url::{Url, form_urlencoded};
@@ -897,7 +896,8 @@ fn build_insert_sql(table: &TableReference, batch: &RecordBatch) -> DataFusionRe
             )));
         }
     }
-    InsertBuilder::new(table, from_ref(batch))
+    let batches = vec![batch.clone()];
+    InsertBuilder::new(table, &batches)
         .build_postgres(None)
         .map_err(|e| DataFusionError::Execution(format!("Failed to build INSERT statement: {e}")))
 }
