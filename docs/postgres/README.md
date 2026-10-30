@@ -72,8 +72,11 @@ curl -X POST http://localhost:8080/pg_user_query/execute \
 
 ## Integer arrays and membership filters
 
-`bigint[]` columns read and write as Arrow `List<Int64>` with a nullable child
-named `item`. Other PostgreSQL arrays keep their existing type mapping.
+One-dimensional `bigint[]` columns read and write as Arrow `List<Int64>` with a
+nullable child named `item`. Empty arrays and an entire array set to SQL `NULL`
+round-trip. NULL elements inside an array are unsupported by the upstream table
+reader, so INSERT rejects them before building SQL rather than substituting zero.
+Multidimensional arrays and other PostgreSQL arrays keep their existing behavior.
 
 For a constant integer list, `array_has_any(readers, [10, 20])` pushes down as
 PostgreSQL array overlap (`&&`). Bigint-column `IN` and `NOT IN` predicates keep

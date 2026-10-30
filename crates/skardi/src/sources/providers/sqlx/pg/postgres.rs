@@ -7,7 +7,7 @@ use crate::sources::hierarchy::{
 use crate::sources::providers::sqlx::pg::knn_table_function::{PgKnnEntry, fetch_table_columns};
 use crate::sources::providers::{CountSafeTable, DatasetEntry, DatasetRegistry};
 use anyhow::{Context, Result};
-use arrow::array::{Array, Int64Array, ListArray, RecordBatch, UInt64Array};
+use arrow::array::{ListArray, RecordBatch, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::Session;
@@ -24,9 +24,6 @@ use datafusion::physical_plan::{
 };
 use datafusion::prelude::SessionContext;
 use datafusion::sql::TableReference;
-use datafusion::sql::sqlparser::{
-    ast, dialect::PostgreSqlDialect as ParserDialect, parser::Parser,
-};
 use datafusion::sql::unparser::Unparser;
 use datafusion_table_providers::postgres::DynPostgresConnectionPool;
 use datafusion_table_providers::sql::arrow_sql_gen::statement::InsertBuilder;
@@ -39,6 +36,7 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
 use std::num::NonZeroU32;
+use std::slice::from_ref;
 use std::sync::Arc;
 use std::time::Duration;
 use url::{Url, form_urlencoded};
@@ -878,19 +876,11 @@ impl ExecutionPlan for SqlxPostgresInsertExec {
     }
 }
 
-/// Preserve bigint-array child validity through the existing INSERT builder.
-/// Its primitive-list conversion reads value(i), including the storage value
-/// beneath NULL children. Repair only those typed VALUES cells; all other SQL
-/// still comes from the builder and uses the same transaction.
+/// The upstream primitive-list builder replaces NULL children with their
+/// storage values, while its reader cannot decode them. Refuse that unsupported
+/// input before building SQL instead of silently inserting a zero.
 fn build_insert_sql(table: &TableReference, batch: &RecordBatch) -> DataFusionResult<String> {
-    let batches = vec![batch.clone()];
-    let sql = InsertBuilder::new(table, &batches)
-        .build_postgres(None)
-        .map_err(|e| {
-            DataFusionError::Execution(format!("Failed to build INSERT statement: {e}"))
-        })?;
-    let mut repairs = Vec::new();
-    for (column_index, column) in batch.columns().iter().enumerate() {
+    for (index, column) in batch.columns().iter().enumerate() {
         if !matches!(column.data_type(), DataType::List(child) if child.data_type() == &DataType::Int64)
         {
             continue;
@@ -898,64 +888,18 @@ fn build_insert_sql(table: &TableReference, batch: &RecordBatch) -> DataFusionRe
         let lists = column.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
             DataFusionError::Internal("bigint list column has no ListArray".into())
         })?;
-        for (row_index, values) in lists.iter().enumerate() {
-            let Some(values) = values else { continue };
-            if values.null_count() == 0 {
-                continue;
-            }
-            let values = values
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| {
-                    DataFusionError::Internal("bigint list has non-Int64 children".into())
-                })?;
-            let values = values
-                .iter()
-                .map(|value| value.map_or_else(|| "NULL".into(), |value| value.to_string()))
-                .collect::<Vec<_>>()
-                .join(",");
-            // Only typed i64 values and NULL enter this expression, never
-            // user text or a positional string replacement of generated SQL.
-            let expression = Parser::new(&ParserDialect {})
-                .try_with_sql(&format!("ARRAY[{values}]::bigint[]"))
-                .and_then(|mut parser| parser.parse_expr())
-                .map_err(|e| {
-                    DataFusionError::Execution(format!("Failed to render bigint array: {e}"))
-                })?;
-            repairs.push((row_index, column_index, expression));
+        // Iterate logical list rows: slices may retain unrelated NULL children
+        // outside their offsets, and an outer NULL is a supported SQL NULL.
+        if lists.iter().flatten().any(|values| values.null_count() > 0) {
+            return Err(DataFusionError::NotImplemented(format!(
+                "PostgreSQL bigint[] INSERT does not support NULL elements (column {})",
+                batch.schema().field(index).name()
+            )));
         }
     }
-    if repairs.is_empty() {
-        return Ok(sql);
-    }
-    let mut statements = Parser::parse_sql(&ParserDialect {}, &sql).map_err(|e| {
-        DataFusionError::Execution(format!("Failed to parse generated INSERT: {e}"))
-    })?;
-    let [ast::Statement::Insert(insert)] = statements.as_mut_slice() else {
-        return Err(DataFusionError::Internal(
-            "INSERT builder returned an unexpected statement".into(),
-        ));
-    };
-    let Some(ast::SetExpr::Values(values)) = insert.source.as_mut().map(|q| q.body.as_mut()) else {
-        return Err(DataFusionError::Internal(
-            "INSERT builder returned no VALUES".into(),
-        ));
-    };
-    if values.rows.len() != batch.num_rows()
-        || insert.columns.len() != batch.num_columns()
-        || values
-            .rows
-            .iter()
-            .any(|row| row.len() != batch.num_columns())
-    {
-        return Err(DataFusionError::Internal(
-            "INSERT builder changed the batch's row or column count".into(),
-        ));
-    }
-    for (row, column, expression) in repairs {
-        values.rows[row][column] = expression;
-    }
-    Ok(statements[0].to_string())
+    InsertBuilder::new(table, from_ref(batch))
+        .build_postgres(None)
+        .map_err(|e| DataFusionError::Execution(format!("Failed to build INSERT statement: {e}")))
 }
 
 /// Project out auto-generated columns from a RecordBatch.
@@ -1336,10 +1280,12 @@ mod tests {
         Array, BooleanArray, Float64Array, Int16Array, Int32Array, Int64Array, ListArray,
         StringArray,
     };
+    use arrow::datatypes::Int64Type;
     use datafusion::common::Column;
+    use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::logical_expr::{Operator, TableProviderFilterPushDown};
-    use datafusion::physical_plan::displayable;
     use datafusion::physical_plan::empty::EmptyExec;
+    use datafusion::physical_plan::{collect, displayable};
     use secrecy::ExposeSecret;
     use sqlx::postgres::PgPoolOptions;
     use std::sync::{Mutex, RwLock};
@@ -2288,7 +2234,7 @@ mod tests {
         query_all(
             &ctx,
             "INSERT INTO probe (id, readers) VALUES
-             (5, [10, 9223372036854775807, NULL]), (6, []), (7, NULL)",
+             (5, [10, 9223372036854775807]), (6, []), (7, NULL)",
         )
         .await;
         let batches = query_all(&ctx, "SELECT readers FROM probe WHERE id = 5").await;
@@ -2308,7 +2254,7 @@ mod tests {
                 .unwrap()
                 .iter()
                 .collect::<Vec<_>>(),
-            vec![Some(10), Some(i64::MAX), None]
+            vec![Some(10), Some(i64::MAX)]
         );
         let empty_and_null = query_all(
             &ctx,
@@ -2338,6 +2284,55 @@ mod tests {
                 .column(0)
                 .to_data(),
             list.to_data()
+        );
+        // The first batch is a slice whose backing child array has a NULL
+        // outside its offsets. It is valid and is inserted before the second
+        // batch fails; the whole existing INSERT transaction must roll back.
+        let lists = ListArray::from_iter_primitive::<Int64Type, _, _>([
+            Some(vec![Some(10), None]),
+            Some(vec![Some(8)]),
+        ]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("readers", lists.data_type().clone(), true),
+        ]));
+        let good = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![8])),
+                Arc::new(lists.slice(1, 1)),
+            ],
+        )
+        .unwrap();
+        let bad = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![9])),
+                Arc::new(lists.slice(0, 1)),
+            ],
+        )
+        .unwrap();
+        let table = TableReference::partial("public", "acl_array_probe");
+        assert!(build_insert_sql(&table, &good).is_ok());
+        let input = MemorySourceConfig::try_new_exec(&[vec![good, bad]], schema, None).unwrap();
+        let writer =
+            SqlxPostgresInsertExec::new(pool.clone(), table, vec![], input, InsertOp::Append);
+        let error = collect(Arc::new(writer), ctx.task_ctx()).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("bigint[] INSERT does not support NULL elements"),
+            "{error}"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM public.acl_array_probe WHERE id IN (8,9)"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0,
+            "a rejected NULL child must not leave either batch committed"
         );
         sqlx::query("DROP TABLE public.acl_array_probe")
             .execute(&pool)
