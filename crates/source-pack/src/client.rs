@@ -671,9 +671,9 @@ impl OpenConnectorClient {
     }
 
     /// Send one request with bounded retries. `terminal_error` maps a
-    /// non-retryable HTTP status and its (bounded) body to the
-    /// method-specific error variant; `policy` decides which failures may be
-    /// retried at all (see [`RetryPolicy`]).
+    /// non-retryable HTTP status, or an action's final retryable refusal,
+    /// and its (bounded) body to the method-specific error variant; `policy`
+    /// decides which failures may be retried at all (see [`RetryPolicy`]).
     ///
     /// Retried statuses wait for `Retry-After` when present, else
     /// exponential backoff with jitter; both are capped at [`MAX_RETRY_WAIT`].
@@ -708,6 +708,13 @@ impl OpenConnectorClient {
                             );
                             tokio::time::sleep(wait).await;
                             continue;
+                        }
+                        if policy == RetryPolicy::NonIdempotent {
+                            // Action callers schedule their next work from the
+                            // final refusal's code and reset hint. A bare 429
+                            // discards monthly-quota evidence from that decision.
+                            let body = read_snippet(response, ERROR_SNIPPET_BYTES).await;
+                            return Err(terminal_error(status, body));
                         }
                     } else {
                         // Terminal status: read only a snippet for the
@@ -1589,6 +1596,52 @@ mod tests {
             .expect("execute");
         assert_eq!(value, serde_json::json!({"ok": true}));
         assert_eq!(gateway.requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn execute_final_429_preserves_quota_code_and_reset_without_retry() {
+        let quota_data = serde_json::json!({
+            "status": 429,
+            "details": {
+                "providerStatus": 429,
+                "providerCode": 99991403,
+                "retryAfterSeconds": 172800
+            }
+        });
+        let body = serde_json::json!({
+            "success": false,
+            "message": "This month's API call quota has been exceeded",
+            "errorCode": "quota_exhausted",
+            "data": quota_data.clone(),
+            "meta": {"actionId": "lark.list_chats"}
+        })
+        .to_string();
+        let gateway = MockGateway::start(move |_| {
+            MockResponse::new(429, body.clone()).with_header("retry-after", "172800")
+        })
+        .await;
+
+        let err = test_client(&gateway, 1)
+            .execute("lark.list_chats", &serde_json::json!({}), None)
+            .await
+            .unwrap_err();
+        match err {
+            OpenConnectorError::ActionExecutionFailed {
+                status,
+                error_code,
+                data,
+                ..
+            } => {
+                assert_eq!(status, Some(429));
+                assert_eq!(error_code.as_deref(), Some("quota_exhausted"));
+                assert_eq!(data.expect("provider reset details").0, quota_data);
+            }
+            other => panic!("expected ActionExecutionFailed, got {other}"),
+        }
+        let requests = gateway.requests();
+        assert_eq!(requests.len(), 1, "max_attempts: 1 must disable retries");
+        assert_eq!(requests[0].method, "POST");
+        assert_eq!(requests[0].path, "/v1/actions/lark.list_chats");
     }
 
     #[tokio::test]
