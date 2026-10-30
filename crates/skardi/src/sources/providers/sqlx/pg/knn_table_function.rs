@@ -24,6 +24,7 @@
 //! The score is the raw pgvector distance value for the chosen metric — lower is more similar
 //! (for `inner_product` the score is negative).
 
+use super::dialect::GovernedPostgresDialect;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
@@ -32,7 +33,6 @@ use datafusion::datasource::TableType;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::sql::unparser::Unparser;
-use datafusion::sql::unparser::dialect::PostgreSqlDialect;
 use sqlx::PgPool;
 use sqlx::Row;
 use std::any::Any;
@@ -323,7 +323,8 @@ fn build_vector_fetch_sql(expr: &Expr) -> DFResult<String> {
         .name()
         .replace('"', "\"\"");
 
-    let unparser = Unparser::new(&PostgreSqlDialect {});
+    let dialect = GovernedPostgresDialect::default();
+    let unparser = Unparser::new(&dialect);
     let inner_sql = unparser
         .plan_to_sql(subquery.subquery.as_ref())
         .map_err(|e| {
@@ -532,6 +533,9 @@ fn pg_type_to_arrow(
     match data_type {
         "smallint" | "integer" => DataType::Int32,
         "bigint" => DataType::Int64,
+        "ARRAY" if udt_name == "_int8" => {
+            DataType::List(Arc::new(Field::new("item", DataType::Int64, true)))
+        }
         "real" => DataType::Float32,
         "double precision" => DataType::Float64,
         // Use Decimal128 to match what datafusion-table-providers returns when reading.

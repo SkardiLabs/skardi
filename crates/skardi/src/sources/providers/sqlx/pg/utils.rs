@@ -1,14 +1,14 @@
 //! Shared utilities for PostgreSQL providers (pg_knn, pg_fts).
 
+use super::dialect::GovernedPostgresDialect;
 use arrow::array::{
     ArrayRef, BooleanBuilder, Decimal128Builder, Float32Builder, Float64Builder, Int32Builder,
-    Int64Builder, RecordBatch, StringBuilder,
+    Int64Builder, ListBuilder, RecordBatch, StringBuilder,
 };
 use arrow::datatypes::{DataType, SchemaRef};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::Expr;
 use datafusion::sql::unparser::Unparser;
-use datafusion::sql::unparser::dialect::PostgreSqlDialect;
 use sqlx::Row;
 use std::sync::Arc;
 
@@ -18,7 +18,8 @@ use std::sync::Arc;
 /// Returns `None` for expressions that cannot be reliably converted, so the
 /// caller can skip pushdown for those filters rather than generating invalid SQL.
 pub fn expr_to_pg_sql(expr: &Expr) -> Option<String> {
-    let unparser = Unparser::new(&PostgreSqlDialect {});
+    let dialect = GovernedPostgresDialect::default();
+    let unparser = Unparser::new(&dialect);
     unparser.expr_to_sql(expr).ok().map(|ast| ast.to_string())
 }
 
@@ -39,7 +40,7 @@ pub fn rows_to_batch(rows: &[sqlx::postgres::PgRow], schema: &SchemaRef) -> DFRe
 
 /// Build a single Arrow array column from the named column across all rows.
 ///
-/// Supports Int32, Int64, Float32, Float64, Boolean, Decimal128 (cast via
+/// Supports Int32, Int64, List<Int64>, Float32, Float64, Boolean, Decimal128 (cast via
 /// float8), and a Utf8 catch-all for everything else.
 pub fn build_column(
     rows: &[sqlx::postgres::PgRow],
@@ -75,6 +76,24 @@ pub fn build_column(
                 );
             }
             Arc::new(b.finish())
+        }
+        DataType::List(field) if field.data_type() == &DataType::Int64 => {
+            let mut builder = ListBuilder::new(Int64Builder::new()).with_field(field.clone());
+            for row in rows {
+                match row
+                    .try_get::<Option<Vec<Option<i64>>>, _>(col)
+                    .map_err(|error| decode_err(col, "List<Int64>", error))?
+                {
+                    Some(values) => {
+                        for value in values {
+                            builder.values().append_option(value);
+                        }
+                        builder.append(true);
+                    }
+                    None => builder.append(false),
+                }
+            }
+            Arc::new(builder.finish())
         }
         DataType::Float32 => {
             let mut b = Float32Builder::new();

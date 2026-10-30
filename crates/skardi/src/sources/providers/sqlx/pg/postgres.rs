@@ -1,3 +1,4 @@
+use super::dialect::GovernedPostgresDialect;
 use crate::sources::DataSourceType;
 use crate::sources::hierarchy::{
     CONNECT_TIMEOUT, HierarchyLevel, SourceLabel, build_catalog, parse_allowed_schemas,
@@ -24,7 +25,6 @@ use datafusion::physical_plan::{
 use datafusion::prelude::SessionContext;
 use datafusion::sql::TableReference;
 use datafusion::sql::unparser::Unparser;
-use datafusion::sql::unparser::dialect::PostgreSqlDialect;
 use datafusion_table_providers::postgres::DynPostgresConnectionPool;
 use datafusion_table_providers::sql::arrow_sql_gen::statement::InsertBuilder;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
@@ -60,6 +60,7 @@ use url::{Url, form_urlencoded};
 /// * `table` - Table name (required in table mode)
 /// * `schema` - Schema name (default: "public")
 /// * `allowed_schemas` - Comma-separated schema allow-list (catalog mode only)
+/// * `governed_array_key_budget` - Measured array-overlap/unnest crossover (optional)
 /// * `user_env` - Environment variable name for username (optional)
 /// * `pass_env` - Environment variable name for password (optional)
 ///
@@ -170,6 +171,7 @@ async fn build_and_register_table(
     pg_knn_registry: Option<&DatasetRegistry>,
     knn_key: &str,
     init_timeout: Option<Duration>,
+    array_key_budget: Option<usize>,
 ) -> Result<Arc<dyn TableProvider>> {
     let table_reference = TableReference::partial(schema, table_name);
     let label = SourceLabel::new(DataSourceType::Postgres, HierarchyLevel::Table, knn_key);
@@ -179,6 +181,7 @@ async fn build_and_register_table(
             table_reference.clone(),
             read_write,
             sqlx_pool,
+            array_key_budget,
         )
         .await?;
         if let Some(registry) = pg_knn_registry {
@@ -235,6 +238,7 @@ async fn register_single_postgres_table(
         pg_knn_registry,
         name,
         init_timeout,
+        array_key_budget(options)?,
     )
     .await?;
 
@@ -300,6 +304,7 @@ async fn register_postgres_catalog(
     }
 
     let table_count = schema_tables.len();
+    let array_key_budget = array_key_budget(options)?;
     let catalog_name_owned = catalog_name.to_string();
     let knn_registry = pg_knn_registry.map(Arc::clone);
 
@@ -323,6 +328,7 @@ async fn register_postgres_catalog(
                     knn_registry.as_ref(),
                     &knn_key,
                     init_timeout,
+                    array_key_budget,
                 )
                 .await
             }
@@ -350,6 +356,7 @@ async fn build_postgres_table_provider(
     table_reference: TableReference,
     read_write: bool,
     sqlx_pool: &PgPool,
+    array_key_budget: Option<usize>,
 ) -> Result<Arc<dyn TableProvider>> {
     let schema_name = table_reference
         .schema()
@@ -400,7 +407,7 @@ async fn build_postgres_table_provider(
     let read_provider: Arc<dyn TableProvider> = Arc::new(CountSafeTable {
         inner: Arc::new(
             SqlTable::new_with_schema("postgres", &dyn_pool, schema, table_reference.clone())
-                .with_dialect(Arc::new(PostgreSqlDialect {})),
+                .with_dialect(Arc::new(GovernedPostgresDialect::new(array_key_budget))),
         ),
     });
 
@@ -653,7 +660,8 @@ impl TableProvider for SqlxPostgresTableProvider {
             ));
         }
 
-        let unparser = Unparser::new(&PostgreSqlDialect {});
+        let dialect = GovernedPostgresDialect::default();
+        let unparser = Unparser::new(&dialect);
         let set_clause = assignments
             .iter()
             .map(|(col, expr)| {
@@ -994,7 +1002,8 @@ fn build_where_clause(filters: &[Expr]) -> DataFusionResult<String> {
     if filters.is_empty() {
         return Ok(String::new());
     }
-    let unparser = Unparser::new(&PostgreSqlDialect {});
+    let dialect = GovernedPostgresDialect::default();
+    let unparser = Unparser::new(&dialect);
     let parts = filters
         .iter()
         .map(|e| {
@@ -1004,6 +1013,18 @@ fn build_where_clause(filters: &[Expr]) -> DataFusionResult<String> {
         })
         .collect::<DataFusionResult<Vec<_>>>()?;
     Ok(format!(" WHERE {}", parts.join(" AND ")))
+}
+
+/// No guessed crossover: callers opt in with their measured GIN key budget.
+fn array_key_budget(options: Option<&HashMap<String, String>>) -> Result<Option<usize>> {
+    options
+        .and_then(|options| options.get("governed_array_key_budget"))
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .context("PostgreSQL governed_array_key_budget must be a non-negative integer")
+        })
+        .transpose()
 }
 
 /// Quotes a PostgreSQL identifier with double quotes, escaping embedded double-quotes.
@@ -1225,7 +1246,8 @@ mod tests {
     use super::*;
     use crate::sources::providers::sqlx::pg::register_pg_fts_udfs;
     use arrow::array::{
-        BooleanArray, Float64Array, Int16Array, Int32Array, Int64Array, StringArray,
+        Array, BooleanArray, Float64Array, Int16Array, Int32Array, Int64Array, ListArray,
+        StringArray,
     };
     use datafusion::common::Column;
     use datafusion::logical_expr::{Operator, TableProviderFilterPushDown};
@@ -2017,6 +2039,172 @@ mod tests {
 
     fn total_rows(batches: &[RecordBatch]) -> usize {
         batches.iter().map(|b| b.num_rows()).sum()
+    }
+
+    // Covers the real schema/insert/scan path: string snapshots alone cannot
+    // detect a List child-name mismatch or SQL that PostgreSQL rejects.
+    #[tokio::test]
+    async fn bigint_arrays_round_trip_and_membership_pushdown_preserves_nulls() {
+        let (Ok(user), Ok(password)) = (std::env::var("PG_USER"), std::env::var("PG_PASSWORD"))
+        else {
+            return;
+        };
+        let pool = PgPool::connect(&format!(
+            "postgres://{user}:{password}@127.0.0.1:5432/mydb?sslmode=disable"
+        ))
+        .await
+        .expect("CI PostgreSQL service");
+        sqlx::raw_sql(
+            "DROP TABLE IF EXISTS public.acl_array_probe;
+             CREATE TABLE public.acl_array_probe (id BIGINT, readers BIGINT[], other TEXT[]);
+             INSERT INTO public.acl_array_probe VALUES
+               (1, '{10,20}', '{a}'), (2, '{30}', '{b}'), (3, '{}', '{}'),
+               (4, NULL, NULL), (NULL, '{20,NULL}', NULL);",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed membership fixture");
+
+        let columns = fetch_table_columns(&pool, "public", "acl_array_probe")
+            .await
+            .unwrap();
+        assert_eq!(
+            columns[1].1,
+            DataType::List(Arc::new(Field::new("item", DataType::Int64, true)))
+        );
+        assert_eq!(
+            columns[2].1,
+            DataType::Utf8,
+            "other arrays keep their existing mapping"
+        );
+
+        for budget in [None, Some(1)] {
+            let mut options = HashMap::from([
+                ("table".to_string(), "acl_array_probe".to_string()),
+                ("user_env".to_string(), "PG_USER".to_string()),
+                ("pass_env".to_string(), "PG_PASSWORD".to_string()),
+            ]);
+            if let Some(budget) = budget {
+                options.insert("governed_array_key_budget".to_string(), budget.to_string());
+            }
+            let mut ctx = SessionContext::new();
+            register_postgres_tables(
+                &mut ctx,
+                "probe",
+                "postgresql://127.0.0.1:5432/mydb?sslmode=disable",
+                Some(&options),
+                false,
+                None,
+                HierarchyLevel::Table,
+            )
+            .await
+            .unwrap();
+
+            for (predicate, expected) in [
+                ("array_has_any(readers, [10,20])", vec![Some(1), None]),
+                (
+                    "NOT array_has_any(readers, [10,20])",
+                    vec![Some(2), Some(3)],
+                ),
+                ("array_has_any(readers, [10,20]) IS NULL", vec![Some(4)]),
+                ("array_has_any(readers, [])", vec![]),
+            ] {
+                let frame = ctx
+                    .sql(&format!(
+                        "SELECT id FROM probe WHERE {predicate} ORDER BY id NULLS LAST"
+                    ))
+                    .await
+                    .unwrap();
+                let plan = frame.create_physical_plan().await.unwrap();
+                let rendered = format!("{}", displayable(plan.as_ref()).indent(false));
+                if predicate == "array_has_any(readers, [10,20])" {
+                    assert!(
+                        rendered.contains(if budget.is_some() { "EXISTS" } else { "&&" }),
+                        "native SQL missing: {rendered}"
+                    );
+                }
+                let batches = query_all(
+                    &ctx,
+                    &format!("SELECT id FROM probe WHERE {predicate} ORDER BY id NULLS LAST"),
+                )
+                .await;
+                let values = batches
+                    .iter()
+                    .flat_map(|batch| {
+                        batch
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .unwrap()
+                            .iter()
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(values, expected, "predicate={predicate}, budget={budget:?}");
+            }
+        }
+
+        let mut ctx = SessionContext::new();
+        let mut options = HashMap::from([
+            ("table".to_string(), "acl_array_probe".to_string()),
+            ("user_env".to_string(), "PG_USER".to_string()),
+            ("pass_env".to_string(), "PG_PASSWORD".to_string()),
+        ]);
+        options.insert("governed_array_key_budget".to_string(), "1".to_string());
+        register_postgres_tables(
+            &mut ctx,
+            "probe",
+            "postgresql://127.0.0.1:5432/mydb?sslmode=disable",
+            Some(&options),
+            true,
+            None,
+            HierarchyLevel::Table,
+        )
+        .await
+        .unwrap();
+        query_all(
+            &ctx,
+            "INSERT INTO probe (id, readers) VALUES (5, [10, 9223372036854775807, NULL])",
+        )
+        .await;
+        let batches = query_all(&ctx, "SELECT readers FROM probe WHERE id = 5").await;
+        let list = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert_eq!(
+            list.data_type(),
+            &DataType::List(Arc::new(Field::new("item", DataType::Int64, true)))
+        );
+        assert_eq!(
+            list.value(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some(10), Some(i64::MAX), None]
+        );
+        let row = sqlx::query("SELECT readers FROM public.acl_array_probe WHERE id = 5")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "readers",
+            columns[1].1.clone(),
+            true,
+        )]));
+        assert_eq!(
+            super::super::utils::rows_to_batch(&[row], &schema)
+                .unwrap()
+                .column(0)
+                .to_data(),
+            list.to_data()
+        );
+        sqlx::query("DROP TABLE public.acl_array_probe")
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 
     // ─── Scan tests (integration) ───────────────────────────────────────
