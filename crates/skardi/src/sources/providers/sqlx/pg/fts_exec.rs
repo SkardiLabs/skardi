@@ -126,7 +126,7 @@ impl PgFtsExec {
     /// `to_tsvector('lang', col)` when one exists. With the index the double
     /// computation is negligible (ts_rank only runs on matched rows); without one
     /// the real fix is to create the index, not to restructure the query.
-    fn build_query(&self) -> String {
+    pub(super) fn build_query(&self) -> String {
         let cols = self.select_columns();
         let text_col = format!("\"{}\"", self.text_col.replace('"', "\"\""));
         let lang = &self.language;

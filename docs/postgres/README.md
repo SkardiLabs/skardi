@@ -81,7 +81,8 @@ their stock rendering. Predicates retain NULL behavior;
 unsupported array functions stay in DataFusion rather than being sent to Postgres.
 
 A source may set `options.governed_array_key_budget` to a measured crossover: lists above
-that size use an `unnest`/`EXISTS` predicate instead of GIN overlap. Zero selects
+that size use an `unnest`/`EXISTS` predicate instead of GIN overlap, including
+filters on `pg_knn` and `pg_fts`. Zero selects
 that form for every nonempty list. Leaving the option unset retains overlap;
 there is no default count or limit on the caller's readable keys.
 

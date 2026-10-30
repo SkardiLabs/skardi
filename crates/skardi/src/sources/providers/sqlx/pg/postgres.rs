@@ -185,9 +185,16 @@ async fn build_and_register_table(
         )
         .await?;
         if let Some(registry) = pg_knn_registry {
-            register_table_in_knn_registry(sqlx_pool, registry, knn_key, schema, table_name)
-                .await
-                .with_context(|| format!("Failed to register '{}' in pg_knn registry", knn_key))?;
+            register_table_in_knn_registry(
+                sqlx_pool,
+                registry,
+                knn_key,
+                schema,
+                table_name,
+                array_key_budget,
+            )
+            .await
+            .with_context(|| format!("Failed to register '{}' in pg_knn registry", knn_key))?;
         }
         Ok(table_provider)
     };
@@ -445,6 +452,7 @@ async fn register_table_in_knn_registry(
     entry_name: &str,
     schema_name: &str,
     table_name: &str,
+    governed_array_key_budget: Option<usize>,
 ) -> Result<()> {
     let columns = fetch_table_columns(pool, schema_name, table_name)
         .await
@@ -465,6 +473,7 @@ async fn register_table_in_knn_registry(
         pool: Arc::new(pool.clone()),
         qualified_table,
         columns,
+        governed_array_key_budget,
     };
 
     registry
@@ -1244,7 +1253,10 @@ async fn detect_auto_generated_columns(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sources::providers::sqlx::pg::register_pg_fts_udfs;
+    use crate::sources::providers::sqlx::pg::{
+        fts_exec::PgFtsExec, knn_exec::PgKnnExec, register_pg_fts_udfs, register_pg_fts_udtf,
+        register_pg_knn_udtf,
+    };
     use arrow::array::{
         Array, BooleanArray, Float64Array, Int16Array, Int32Array, Int64Array, ListArray,
         StringArray,
@@ -1255,7 +1267,7 @@ mod tests {
     use datafusion::physical_plan::empty::EmptyExec;
     use secrecy::ExposeSecret;
     use sqlx::postgres::PgPoolOptions;
-    use std::sync::Mutex;
+    use std::sync::{Mutex, RwLock};
 
     // ─── build_sqlx_connection_url tests ────────────────────────────────
 
@@ -2041,6 +2053,18 @@ mod tests {
         batches.iter().map(|b| b.num_rows()).sum()
     }
 
+    fn search_sql(plan: &dyn ExecutionPlan) -> Option<String> {
+        if let Some(exec) = plan.as_any().downcast_ref::<PgKnnExec>() {
+            return Some(exec.build_query());
+        }
+        if let Some(exec) = plan.as_any().downcast_ref::<PgFtsExec>() {
+            return Some(exec.build_query());
+        }
+        plan.children()
+            .into_iter()
+            .find_map(|child| search_sql(child.as_ref()))
+    }
+
     // Covers the real schema/insert/scan path: string snapshots alone cannot
     // detect a List child-name mismatch or SQL that PostgreSQL rejects.
     #[tokio::test]
@@ -2056,8 +2080,11 @@ mod tests {
         .expect("CI PostgreSQL service");
         sqlx::raw_sql(
             "DROP TABLE IF EXISTS public.acl_array_probe;
-             CREATE TABLE public.acl_array_probe (id BIGINT, readers BIGINT[], other TEXT[]);
-             INSERT INTO public.acl_array_probe VALUES
+             CREATE TABLE public.acl_array_probe (
+               id BIGINT, readers BIGINT[], other TEXT[],
+               body TEXT DEFAULT 'fixture', embedding vector(2) DEFAULT '[0,0]'
+             );
+             INSERT INTO public.acl_array_probe (id, readers, other) VALUES
                (1, '{10,20}', '{a}'), (2, '{30}', '{b}'), (3, '{}', '{}'),
                (4, NULL, NULL), (NULL, '{20,NULL}', NULL);",
         )
@@ -2088,58 +2115,73 @@ mod tests {
                 options.insert("governed_array_key_budget".to_string(), budget.to_string());
             }
             let mut ctx = SessionContext::new();
+            let registry = Arc::new(RwLock::new(HashMap::new()));
             register_postgres_tables(
                 &mut ctx,
                 "probe",
                 "postgresql://127.0.0.1:5432/mydb?sslmode=disable",
                 Some(&options),
                 false,
-                None,
+                Some(&registry),
                 HierarchyLevel::Table,
             )
             .await
             .unwrap();
+            register_pg_knn_udtf(&ctx, Arc::clone(&registry));
+            register_pg_fts_udtf(&ctx, registry);
 
-            for (predicate, expected) in [
-                ("array_has_any(readers, [10,20])", vec![Some(1), None]),
-                (
-                    "NOT array_has_any(readers, [10,20])",
-                    vec![Some(2), Some(3)],
-                ),
-                ("array_has_any(readers, [10,20]) IS NULL", vec![Some(4)]),
-                ("array_has_any(readers, [])", vec![]),
+            for source in [
+                "probe",
+                "pg_fts('probe', 'body', 'fixture', 20)",
+                "pg_knn('probe', 'embedding', [0.0,0.0], '<->', 20)",
             ] {
-                let frame = ctx
-                    .sql(&format!(
-                        "SELECT id FROM probe WHERE {predicate} ORDER BY id NULLS LAST"
-                    ))
-                    .await
-                    .unwrap();
-                let plan = frame.create_physical_plan().await.unwrap();
-                let rendered = format!("{}", displayable(plan.as_ref()).indent(false));
-                if predicate == "array_has_any(readers, [10,20])" {
-                    assert!(
-                        rendered.contains(if budget.is_some() { "EXISTS" } else { "&&" }),
-                        "native SQL missing: {rendered}"
+                for (predicate, expected) in [
+                    ("array_has_any(readers, [10,20])", vec![Some(1), None]),
+                    (
+                        "NOT array_has_any(readers, [10,20])",
+                        vec![Some(2), Some(3)],
+                    ),
+                    ("array_has_any(readers, [10,20]) IS NULL", vec![Some(4)]),
+                    ("array_has_any(readers, [])", vec![]),
+                ] {
+                    let frame = ctx
+                        .sql(&format!(
+                            "SELECT id FROM {source} WHERE {predicate} ORDER BY id NULLS LAST"
+                        ))
+                        .await
+                        .unwrap();
+                    let plan = frame.create_physical_plan().await.unwrap();
+                    let rendered = search_sql(plan.as_ref())
+                        .unwrap_or_else(|| format!("{}", displayable(plan.as_ref()).indent(false)));
+                    if predicate == "array_has_any(readers, [10,20])" {
+                        assert!(
+                            rendered.contains(if budget.is_some() { "EXISTS" } else { "&&" }),
+                            "native SQL missing: {rendered}"
+                        );
+                    }
+                    let batches = query_all(
+                        &ctx,
+                        &format!(
+                            "SELECT id FROM {source} WHERE {predicate} ORDER BY id NULLS LAST"
+                        ),
+                    )
+                    .await;
+                    let values = batches
+                        .iter()
+                        .flat_map(|batch| {
+                            batch
+                                .column(0)
+                                .as_any()
+                                .downcast_ref::<Int64Array>()
+                                .unwrap()
+                                .iter()
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        values, expected,
+                        "source={source}, predicate={predicate}, budget={budget:?}"
                     );
                 }
-                let batches = query_all(
-                    &ctx,
-                    &format!("SELECT id FROM probe WHERE {predicate} ORDER BY id NULLS LAST"),
-                )
-                .await;
-                let values = batches
-                    .iter()
-                    .flat_map(|batch| {
-                        batch
-                            .column(0)
-                            .as_any()
-                            .downcast_ref::<Int64Array>()
-                            .unwrap()
-                            .iter()
-                    })
-                    .collect::<Vec<_>>();
-                assert_eq!(values, expected, "predicate={predicate}, budget={budget:?}");
             }
         }
 

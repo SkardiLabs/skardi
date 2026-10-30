@@ -17,8 +17,8 @@ use std::sync::Arc;
 ///
 /// Returns `None` for expressions that cannot be reliably converted, so the
 /// caller can skip pushdown for those filters rather than generating invalid SQL.
-pub fn expr_to_pg_sql(expr: &Expr) -> Option<String> {
-    let dialect = GovernedPostgresDialect::default();
+pub fn expr_to_pg_sql(expr: &Expr, governed_array_key_budget: Option<usize>) -> Option<String> {
+    let dialect = GovernedPostgresDialect::new(governed_array_key_budget);
     let unparser = Unparser::new(&dialect);
     unparser.expr_to_sql(expr).ok().map(|ast| ast.to_string())
 }
