@@ -10,8 +10,9 @@
 //! control token exists precisely to stay out of such places (§2.3.4).
 //!
 //! For `claude-code` the CLI runs `claude mcp add-json --scope user skardi
-//! <json>` itself and prints only "registered", so the token never passes
-//! through the agent's transcript. It is in that child's arguments while it
+//! <json>` itself — staged so that a failure never leaves less than there
+//! was, see [`register_claude_code`] — and prints only "registered", so the
+//! token never passes through the agent's transcript. It is in that child's arguments while it
 //! runs, which only the same user's processes can read. `--print` shows the
 //! same configuration, for a person adding it to any other client by hand.
 //!
@@ -171,46 +172,192 @@ fn server_for(
     })
 }
 
-/// `claude mcp add-json --scope user skardi <json>`, after removing any
-/// earlier `skardi` entry: `add-json` refuses a name its scope already holds,
-/// so a re-login's re-run would otherwise fail, and a local-scope entry from
-/// an older setup outranks the user-scope one in its folder. A failed remove
-/// is the usual case on a first registration and is not reported.
+/// Where a new registration is added first, before anything is removed.
+pub const STAGED_NAME: &str = "skardi-pending";
+
+/// What `claude mcp remove` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Removal {
+    Removed,
+    /// There was nothing by that name in that scope: the usual answer on a
+    /// first registration, and not a failure.
+    Absent,
+}
+
+/// Replace the `skardi` entry with `server`, so that **no failure leaves the
+/// user with less than they had**.
 ///
-/// Nothing `claude` prints is passed through: its output could quote the
-/// configuration it was given, and "registered" is the whole answer.
+/// `add-json` refuses a name its scope already holds, and a local-scope
+/// entry from an older setup outranks the user-scope one in its folder, so a
+/// re-registration has to remove the old entries — and `claude` offers no way
+/// to read one back to restore it (`mcp get` is prose, health-checks the
+/// server, and prints the bearer). So the new entry is added FIRST, under
+/// [`STAGED_NAME`], and the swap happens only once Claude Code has accepted
+/// it:
+///
+/// 1. clear a staged entry an interrupted run left behind;
+/// 2. add the new entry as `skardi-pending` — refused (an old Claude, a
+///    malformed entry, a policy, a write error) and nothing has changed;
+/// 3. remove the old `skardi` at local, then user scope — a removal that
+///    fails for any reason but absence stops here, and the staged copy is
+///    taken back out, so the old entry stays in charge;
+/// 4. add the new entry as `skardi` — refused now, and the new server is
+///    still registered, as `skardi-pending`, which the error says;
+/// 5. remove `skardi-pending`.
+///
+/// Every step's result is checked; any failure is an error, so "registered"
+/// is printed only when all five held. Nothing `claude` prints on success is
+/// passed through, since it could quote the configuration it was given, and
+/// what it prints on failure has the token scrubbed out of it.
 fn register_claude_code(server: &Server, claude: &OsStr) -> Result<()> {
     let entry = serde_json::to_string(&server.entry()).expect("a Value always serializes");
+    let token = server.token.as_str();
+
+    remove(claude, "user", STAGED_NAME, token).map_err(|err| {
+        explain(
+            err,
+            format!(
+                "could not clear the `{STAGED_NAME}` entry an earlier run left behind; nothing was changed"
+            ),
+        )
+    })?;
+    add(claude, STAGED_NAME, &entry, token).map_err(|err| {
+        explain(
+            err,
+            format!(
+                "Claude Code did not accept the new MCP server, so nothing was changed: any `{SERVER_NAME}` entry you had is still there"
+            ),
+        )
+    })?;
+
     for scope in ["local", "user"] {
-        let _ = Command::new(claude)
-            .args(["mcp", "remove", "--scope", scope, SERVER_NAME])
-            .output();
+        if let Err(err) = remove(claude, scope, SERVER_NAME, token) {
+            let cleanup = match remove(claude, "user", STAGED_NAME, token) {
+                Ok(_) => String::new(),
+                Err(_) => {
+                    format!(", and the new server is left registered as `{STAGED_NAME}` beside it")
+                }
+            };
+            return Err(explain(
+                err,
+                format!(
+                    "could not remove the existing `{SERVER_NAME}` entry at {scope} scope, so the new one was not put in its place{cleanup}. Remove it with `claude mcp remove --scope {scope} {SERVER_NAME}`, then run this again"
+                ),
+            ));
+        }
     }
-    let output = Command::new(claude)
-        .args(["mcp", "add-json", "--scope", "user", SERVER_NAME])
-        .arg(&entry)
-        .output()
-        .map_err(|err| {
-            anyhow::anyhow!(
-                "could not run `claude` ({err}) — is Claude Code installed and on PATH? Or run `skardi mcp register --print` and add the server by hand"
-            )
-        })?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr)
-            .replace(&server.token, "(redacted)")
-            .trim()
-            .to_string();
-        bail!(
-            "`claude mcp add-json` failed ({}){}",
-            output.status,
-            if stderr.is_empty() {
-                String::new()
-            } else {
-                format!(": {stderr}")
-            }
-        );
-    }
+
+    add(claude, SERVER_NAME, &entry, token).map_err(|err| {
+        explain(
+            err,
+            format!(
+                "the old `{SERVER_NAME}` entry was removed but the new one could not take its name; it is registered as `{STAGED_NAME}` and works under that name. Run `claude mcp remove --scope user {STAGED_NAME}`, then this again"
+            ),
+        )
+    })?;
+    remove(claude, "user", STAGED_NAME, token).map_err(|err| {
+        explain(
+            err,
+            format!(
+                "`{SERVER_NAME}` is registered, but the staged copy `{STAGED_NAME}` could not be removed — remove it with `claude mcp remove --scope user {STAGED_NAME}`"
+            ),
+        )
+    })?;
     Ok(())
+}
+
+/// `claude` could not be started at all. Nothing ran, so none of the
+/// step-by-step explanations applies and it is reported as it is.
+#[derive(Debug)]
+struct NotRunnable(String);
+
+impl std::fmt::Display for NotRunnable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "could not run `claude` ({}) — is Claude Code installed and on PATH? Or run `skardi mcp register --print` and add the server by hand",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for NotRunnable {}
+
+/// Say what a failed step leaves the user with — unless `claude` never ran.
+fn explain(err: anyhow::Error, meaning: String) -> anyhow::Error {
+    if err.is::<NotRunnable>() {
+        err
+    } else {
+        err.context(meaning)
+    }
+}
+
+/// `claude mcp add-json --scope user <name> <entry>`.
+fn add(claude: &OsStr, name: &str, entry: &str, token: &str) -> Result<()> {
+    let args = ["mcp", "add-json", "--scope", "user", name, entry];
+    let output = run_claude(claude, &args)?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(failed(
+        &format!("claude mcp add-json --scope user {name}"),
+        &output,
+        token,
+    ))
+}
+
+/// `claude mcp remove --scope <scope> <name>`, with "there is none" told
+/// apart from a removal that failed.
+///
+/// `claude` exits 1 either way, so absence is read from what it says: `No
+/// MCP server named "…" in … scope` (Claude Code 2.x). Read leniently, and
+/// failing safe: should a later Claude word it differently, absence reads
+/// as a failure, which stops the registration loudly rather than replacing
+/// an entry that may not have gone.
+fn remove(claude: &OsStr, scope: &str, name: &str, token: &str) -> Result<Removal> {
+    let output = run_claude(claude, &["mcp", "remove", "--scope", scope, name])?;
+    if output.status.success() {
+        return Ok(Removal::Removed);
+    }
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+    .to_ascii_lowercase();
+    if said.contains("no mcp server") || said.contains("not found") {
+        return Ok(Removal::Absent);
+    }
+    Err(failed(
+        &format!("claude mcp remove --scope {scope} {name}"),
+        &output,
+        token,
+    ))
+}
+
+fn run_claude(claude: &OsStr, args: &[&str]) -> Result<std::process::Output> {
+    Command::new(claude)
+        .args(args)
+        .output()
+        .map_err(|err| NotRunnable(err.to_string()).into())
+}
+
+/// A failed `claude` call, with what it said on stderr and the token
+/// scrubbed from it: `add-json` can echo the entry it refused.
+fn failed(call: &str, output: &std::process::Output, token: &str) -> anyhow::Error {
+    let stderr = String::from_utf8_lossy(&output.stderr)
+        .replace(token, "(redacted)")
+        .trim()
+        .to_string();
+    anyhow::anyhow!(
+        "`{call}` failed ({}){}",
+        output.status,
+        if stderr.is_empty() {
+            String::new()
+        } else {
+            format!(": {stderr}")
+        }
+    )
 }
 
 #[cfg(test)]
@@ -303,74 +450,294 @@ mod tests {
         assert!(err.contains("claude-code"), "{err}");
     }
 
-    /// A fake `claude` that records its arguments: the registration replaces
-    /// any earlier entry, writes the mcp token at user scope, and prints only
-    /// "registered".
+    /// A fake `claude` with state: each entry is a file `<scope>.<name>`
+    /// under `state/` holding its JSON, so a test asserts what the user is
+    /// left with, not only what was called. It answers as Claude Code 2.x
+    /// does — `remove` of nothing says `No MCP server named …` and exits 1,
+    /// `add-json` of a name its scope holds is refused — and every call is
+    /// logged, one argument per line, `--` between calls.
+    ///
+    /// A file `fail-<verb>-<scope>-<name>` makes that call fail with what a
+    /// refusal prints, echoing its arguments to stderr the way a real error
+    /// can; a removal fails only when there is something to remove.
     #[cfg(unix)]
-    #[test]
-    fn claude_code_is_registered_with_add_json_and_prints_only_registered() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let dir = TempDir::new().unwrap();
-        let path = config(&dir, Some("https://gw.example/mcp"));
-        let log = dir.path().join("argv.log");
-        let fake = dir.path().join("claude");
-        std::fs::write(
-            &fake,
-            format!(
-                "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> '{}'; done\nprintf -- '--\\n' >> '{}'\necho \"Added HTTP MCP server skardi with $5\"\n",
-                log.display(),
-                log.display()
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        let out = register_at(
-            &path,
-            &args(Some("claude-code"), false),
-            None,
-            None,
-            fake.as_os_str(),
-        )
-        .unwrap();
-        assert_eq!(out, "registered\n");
-
-        let argv = std::fs::read_to_string(&log).unwrap();
-        let calls: Vec<&str> = argv.split("--\n").filter(|c| !c.is_empty()).collect();
-        assert_eq!(calls.len(), 3, "{argv}");
-        assert_eq!(calls[0], "mcp\nremove\n--scope\nlocal\nskardi\n");
-        assert_eq!(calls[1], "mcp\nremove\n--scope\nuser\nskardi\n");
-        let add: Vec<&str> = calls[2].lines().collect();
-        assert_eq!(&add[..5], ["mcp", "add-json", "--scope", "user", "skardi"]);
-        let entry: Value = serde_json::from_str(add[5]).unwrap();
-        assert_eq!(entry["url"], "https://gw.example/mcp");
-        assert_eq!(entry["headers"]["Authorization"], format!("Bearer {MCP}"));
-        assert!(!argv.contains(CONTROL), "{argv}");
+    struct FakeClaude {
+        dir: TempDir,
     }
 
     #[cfg(unix)]
+    impl FakeClaude {
+        fn new() -> FakeClaude {
+            use std::os::unix::fs::PermissionsExt as _;
+            let dir = TempDir::new().unwrap();
+            let state = dir.path().join("state");
+            std::fs::create_dir(&state).unwrap();
+            let log = dir.path().join("argv.log");
+            let script = format!(
+                r#"#!/bin/sh
+for a in "$@"; do printf '%s\n' "$a" >> '{log}'; done
+printf -- '--\n' >> '{log}'
+f='{state}'/"$4.$5"
+fail='{state}'/"fail-$2-$4-$5"
+case "$2" in
+  remove)
+    if [ ! -e "$f" ]; then echo "No MCP server named \"$5\" in $4 scope" >&2; exit 1; fi
+    if [ -e "$fail" ]; then echo "refused: $*" >&2; exit 1; fi
+    rm "$f"; echo "Removed MCP server $5 from $4 config";;
+  add-json)
+    if [ -e "$fail" ]; then echo "Invalid configuration: $6" >&2; exit 1; fi
+    if [ -e "$f" ]; then echo "MCP server $5 already exists in $4 config" >&2; exit 1; fi
+    printf '%s' "$6" > "$f"; echo "Added http MCP server $5 with $6";;
+  *) exit 2;;
+esac
+"#,
+                log = log.display(),
+                state = state.display(),
+            );
+            let fake = dir.path().join("claude");
+            std::fs::write(&fake, script).unwrap();
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+            FakeClaude { dir }
+        }
+
+        fn path(&self) -> std::path::PathBuf {
+            self.dir.path().join("claude")
+        }
+
+        fn entry_path(&self, scope: &str, name: &str) -> std::path::PathBuf {
+            self.dir
+                .path()
+                .join("state")
+                .join(format!("{scope}.{name}"))
+        }
+
+        fn holding(self, scope: &str, name: &str, json: &str) -> FakeClaude {
+            std::fs::write(self.entry_path(scope, name), json).unwrap();
+            self
+        }
+
+        fn failing(self, verb: &str, scope: &str, name: &str) -> FakeClaude {
+            let marker = self
+                .dir
+                .path()
+                .join("state")
+                .join(format!("fail-{verb}-{scope}-{name}"));
+            std::fs::write(marker, "").unwrap();
+            self
+        }
+
+        /// The entry `<scope>.<name>` now holds, if any.
+        fn entry(&self, scope: &str, name: &str) -> Option<String> {
+            std::fs::read_to_string(self.entry_path(scope, name)).ok()
+        }
+
+        /// Each call, as `verb scope name`.
+        fn calls(&self) -> Vec<String> {
+            let log = std::fs::read_to_string(self.dir.path().join("argv.log")).unwrap_or_default();
+            log.split("--\n")
+                .filter(|call| !call.is_empty())
+                .map(|call| {
+                    let argv: Vec<&str> = call.lines().collect();
+                    argv[1..5.min(argv.len())]
+                        .iter()
+                        .filter(|a| **a != "--scope")
+                        .copied()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .collect()
+        }
+
+        fn log(&self) -> String {
+            std::fs::read_to_string(self.dir.path().join("argv.log")).unwrap_or_default()
+        }
+
+        fn register(&self, path: &Path) -> Result<String> {
+            register_at(
+                path,
+                &args(Some("claude-code"), false),
+                None,
+                None,
+                self.path().as_os_str(),
+            )
+        }
+    }
+
+    #[cfg(unix)]
+    const OLD: &str = r#"{"type":"http","url":"https://old.example/mcp"}"#;
+
+    /// A re-registration replaces both earlier entries: the new one is
+    /// staged, the old ones removed, the new one put in their place, and the
+    /// staged copy dropped — with the mcp token, at user scope, printing only
+    /// "registered".
+    #[cfg(unix)]
     #[test]
-    fn a_failing_claude_is_reported_without_the_token() {
-        use std::os::unix::fs::PermissionsExt as _;
+    fn claude_code_is_registered_in_place_of_the_old_entries() {
         let dir = TempDir::new().unwrap();
         let path = config(&dir, Some("https://gw.example/mcp"));
-        let fake = dir.path().join("claude");
-        std::fs::write(
-            &fake,
-            "#!/bin/sh\n[ \"$2\" = add-json ] || exit 1\necho \"bad config: $6\" >&2\nexit 3\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let fake = FakeClaude::new()
+            .holding("local", "skardi", OLD)
+            .holding("user", "skardi", OLD);
+
+        assert_eq!(fake.register(&path).unwrap(), "registered\n");
+
+        assert_eq!(
+            fake.calls(),
+            [
+                "remove user skardi-pending",
+                "add-json user skardi-pending",
+                "remove local skardi",
+                "remove user skardi",
+                "add-json user skardi",
+                "remove user skardi-pending",
+            ]
+        );
+        let entry: Value = serde_json::from_str(&fake.entry("user", "skardi").unwrap()).unwrap();
+        assert_eq!(entry["type"], "http");
+        assert_eq!(entry["url"], "https://gw.example/mcp");
+        assert_eq!(entry["headers"]["Authorization"], format!("Bearer {MCP}"));
+        assert_eq!(fake.entry("local", "skardi"), None);
+        assert_eq!(fake.entry("user", "skardi-pending"), None);
+        assert!(!fake.log().contains(CONTROL), "{}", fake.log());
+    }
+
+    /// A first registration: every removal finds nothing, which is fine.
+    #[cfg(unix)]
+    #[test]
+    fn a_first_registration_needs_nothing_to_remove() {
+        let dir = TempDir::new().unwrap();
+        let path = config(&dir, Some("https://gw.example/mcp"));
+        let fake = FakeClaude::new();
+        assert_eq!(fake.register(&path).unwrap(), "registered\n");
+        assert!(fake.entry("user", "skardi").is_some());
+        assert_eq!(fake.entry("user", "skardi-pending"), None);
+    }
+
+    /// Codex on #311: the add used to run after the removals, so a refused
+    /// add left no server at all. Now it is refused while the old entries
+    /// are untouched — and the error carries no token, though `claude`
+    /// echoed the entry it refused.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_add_leaves_the_old_entries_in_place() {
+        let dir = TempDir::new().unwrap();
+        let path = config(&dir, Some("https://gw.example/mcp"));
+        let fake = FakeClaude::new()
+            .holding("local", "skardi", OLD)
+            .holding("user", "skardi", OLD)
+            .failing("add-json", "user", "skardi-pending");
+
+        let err = format!("{:#}", fake.register(&path).unwrap_err());
+        assert!(err.contains("nothing was changed"), "{err}");
+        assert!(err.contains("add-json"), "{err}");
+        assert!(!err.contains(MCP), "{err}");
+        assert!(err.contains("(redacted)"), "{err}");
+        assert_eq!(fake.entry("local", "skardi").as_deref(), Some(OLD));
+        assert_eq!(fake.entry("user", "skardi").as_deref(), Some(OLD));
+        assert!(
+            !fake
+                .calls()
+                .iter()
+                .any(|c| c.ends_with(" skardi") && c.starts_with("remove")),
+            "{:?}",
+            fake.calls()
+        );
+    }
+
+    /// A removal that fails for any reason but absence stops the swap: no
+    /// "registered", the staged copy is taken back out, and the entry the
+    /// removal could not touch is still there.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_removal_is_reported_and_the_staged_copy_withdrawn() {
+        let dir = TempDir::new().unwrap();
+        let path = config(&dir, Some("https://gw.example/mcp"));
+        let fake = FakeClaude::new()
+            .holding("user", "skardi", OLD)
+            .failing("remove", "user", "skardi");
+
+        let err = format!("{:#}", fake.register(&path).unwrap_err());
+        assert!(
+            err.contains("could not remove the existing `skardi` entry at user scope"),
+            "{err}"
+        );
+        assert!(err.contains("refused"), "{err}");
+        assert!(!err.contains(MCP), "{err}");
+        assert_eq!(fake.entry("user", "skardi").as_deref(), Some(OLD));
+        assert_eq!(fake.entry("user", "skardi-pending"), None);
+        assert!(
+            !fake.calls().contains(&"add-json user skardi".to_string()),
+            "{:?}",
+            fake.calls()
+        );
+    }
+
+    /// The old entry is gone but the new one cannot take its name: the
+    /// server is still registered, as `skardi-pending`, and the error says
+    /// so rather than "registered".
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_final_add_leaves_the_new_server_staged_and_says_so() {
+        let dir = TempDir::new().unwrap();
+        let path = config(&dir, Some("https://gw.example/mcp"));
+        let fake = FakeClaude::new()
+            .holding("user", "skardi", OLD)
+            .failing("add-json", "user", "skardi");
+
+        let err = format!("{:#}", fake.register(&path).unwrap_err());
+        assert!(err.contains("registered as `skardi-pending`"), "{err}");
+        assert!(!err.contains(MCP), "{err}");
+        let staged = fake.entry("user", "skardi-pending").unwrap();
+        assert!(staged.contains("https://gw.example/mcp"), "{staged}");
+    }
+
+    /// Everything held but the last cleanup: the registration is real, and
+    /// the leftover is named, not hidden behind "registered".
+    #[cfg(unix)]
+    #[test]
+    fn a_staged_copy_that_cannot_be_removed_is_named() {
+        let dir = TempDir::new().unwrap();
+        let path = config(&dir, Some("https://gw.example/mcp"));
+        let fake = FakeClaude::new().failing("remove", "user", "skardi-pending");
+
+        let err = format!("{:#}", fake.register(&path).unwrap_err());
+        assert!(err.contains("`skardi` is registered"), "{err}");
+        assert!(
+            err.contains("claude mcp remove --scope user skardi-pending"),
+            "{err}"
+        );
+        assert!(fake.entry("user", "skardi").is_some());
+    }
+
+    /// A staged entry an interrupted run left behind is cleared first, so
+    /// it cannot make the staging add refuse.
+    #[cfg(unix)]
+    #[test]
+    fn a_leftover_staged_entry_is_cleared_first() {
+        let dir = TempDir::new().unwrap();
+        let path = config(&dir, Some("https://gw.example/mcp"));
+        let fake = FakeClaude::new().holding("user", "skardi-pending", OLD);
+        assert_eq!(fake.register(&path).unwrap(), "registered\n");
+        assert_eq!(fake.entry("user", "skardi-pending"), None);
+    }
+
+    #[test]
+    fn a_missing_claude_names_print_as_the_way_out() {
+        let dir = TempDir::new().unwrap();
+        let path = config(&dir, Some("https://gw.example/mcp"));
+        let missing = dir.path().join("no-such-claude");
         let err = register_at(
             &path,
             &args(Some("claude-code"), false),
             None,
             None,
-            fake.as_os_str(),
+            missing.as_os_str(),
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("add-json"), "{err}");
-        assert!(!err.contains(MCP), "{err}");
+        assert!(err.contains("is Claude Code installed"), "{err}");
+        assert!(err.contains("--print"), "{err}");
+        // Nothing ran, so no step's account of what it left applies.
+        assert!(!err.contains("earlier run"), "{err}");
     }
 }

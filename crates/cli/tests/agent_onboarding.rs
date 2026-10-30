@@ -549,3 +549,36 @@ async fn mcp_register_is_not_gated_while_the_bridge_still_is() {
     assert_eq!(register.status.code(), Some(0), "{register:?}");
     assert!(stdout(&register).contains("https://gw.example/mcp"));
 }
+
+/// `--token` and `--server` would be ignored by `mcp register`, which writes
+/// what the context holds — so `--token NEW … --print` would have printed the
+/// OLD token as though it were the new one. Refused, before anything is read.
+#[tokio::test]
+async fn mcp_register_refuses_the_global_flags_it_cannot_honour() {
+    let home = TempDir::new().unwrap();
+    seed(home.path(), "https://gw.example", Some(CONTROL));
+    for argv in [
+        vec!["--token", "skardi_pat_NEW", "mcp", "register", "--print"],
+        vec![
+            "--server",
+            "https://other.example",
+            "mcp",
+            "register",
+            "--print",
+        ],
+    ] {
+        let output = run(home.path(), &argv).await;
+        assert_eq!(output.status.code(), Some(1), "{argv:?}: {output:?}");
+        assert!(stdout(&output).is_empty(), "{argv:?}: {output:?}");
+        let err = stderr(&output);
+        assert!(err.contains("not accepted by 'mcp register'"), "{err}");
+        assert!(!err.contains(MCP), "{err}");
+    }
+    // `--context` is what it does honour.
+    let output = run(
+        home.path(),
+        &["--context", "acme/prod", "mcp", "register", "--print"],
+    )
+    .await;
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+}

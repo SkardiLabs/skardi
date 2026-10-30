@@ -312,7 +312,17 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         // the agent's own configuration. Not gated by `Capability::Mcp`,
         // which refuses the stdio bridge on a cloud context — this command
         // exists FOR a cloud context.
+        //
+        // `--server` and `--token` are refused, as `logout` refuses them:
+        // the command writes the URL and token the selected context holds,
+        // so a flag it ignored would register the OLD token while the
+        // person believed they had named a new one.
         Commands::Mcp { cmd: Some(cmd) } => {
+            if cli.token.is_some() || cli.server.is_some() {
+                anyhow::bail!(
+                    "--server and --token are not accepted by 'mcp register': it registers the MCP URL and token that a context's `skardi login` recorded. Pick the context with --context, or run `skardi login` to change what it holds"
+                );
+            }
             return commands::mcp_register::run(cmd, cli.context);
         }
         // The agent commands resolve their own context: they need the
@@ -458,6 +468,33 @@ fn capability_of(command: &Commands) -> Option<Capability> {
 mod tests {
     use super::{Capability, Commands, capability_of};
     use clap::Parser as _;
+
+    /// `mcp register` writes what the context holds, so a global flag it
+    /// would ignore is refused before anything is read or run — the case
+    /// that mattered being `--token NEW … --print` quietly embedding the old
+    /// token.
+    #[tokio::test]
+    async fn mcp_register_refuses_the_global_overrides_it_cannot_honour() {
+        for argv in [
+            &["skardi", "--token", "NEW", "mcp", "register", "--print"][..],
+            &[
+                "skardi",
+                "--server",
+                "https://other.example",
+                "mcp",
+                "register",
+                "claude-code",
+            ],
+            &["skardi", "mcp", "register", "--print", "--token", "NEW"],
+        ] {
+            let cli = super::Cli::try_parse_from(argv).expect("parses");
+            let err = super::dispatch(cli).await.unwrap_err().to_string();
+            assert!(
+                err.contains("not accepted by 'mcp register'"),
+                "{argv:?}: {err}"
+            );
+        }
+    }
 
     /// The table gating and the route-specific error mapping both read. A
     /// remote command with no entry would silently skip cloud gating, so the

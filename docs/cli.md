@@ -738,11 +738,25 @@ skardi mcp register --print       # the same server, for any other client
 Adds the current cloud context's MCP server to an agent: the `mcp-url` the
 login recorded, with the context's `token` as the bearer — the pair's MCP
 token after `login --control`, and the only token after a login without it.
-**Never the control token.** For Claude Code it removes any earlier `skardi`
-entry, registers the new one at user scope, and prints only `registered`, so
-the token does not pass through the agent's transcript. `--print` shows the
+**Never the control token.** For Claude Code it replaces any earlier `skardi`
+entry with the new one at user scope and prints only `registered`, so the
+token does not pass through the agent's transcript. `--print` shows the
 JSON (`type: http`, the URL, `Authorization` and `Skardi-Workspace`
 headers) for a person to add to another client by hand. A re-login re-runs it.
+
+The replacement never leaves you with less than you had. The new entry is
+added first, as `skardi-pending`; only once Claude Code has accepted it are
+the old `skardi` entries (local and user scope) removed and the new one put
+in their place, and the staged copy dropped. Every step is checked, and any
+failure is an error naming what it left — a refused add changes nothing, a
+removal that fails keeps the old entry in charge, a final add that fails
+leaves the new server working as `skardi-pending` — so `registered` means all
+of it held. What `claude` prints is never passed through, and a failure's
+message has the token scrubbed from it.
+
+The command uses what the selected context holds, so it takes `--context`
+and refuses `--server` and `--token`, which it could not honour: to register
+a different token, `skardi login` again.
 
 A context with no `mcp-url` means the control plane named none at login,
 because it has no gateway URL set (`SKARDI_GLOBAL_GATEWAY_URL`); the error
