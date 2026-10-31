@@ -98,7 +98,11 @@ impl fmt::Display for ContextMode {
 /// survive an older CLI's `use-context` rewrite — the file is shared state
 /// between versions, and a rewrite that dropped unknown keys would quietly
 /// downgrade it.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+///
+/// `Debug` is written by hand: the struct carries two credentials, and the
+/// `control` token in particular must not reach a log line or a panic message
+/// through an `{:?}` (agent onboarding §5.0, invariant 10).
+#[derive(Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct Context {
     pub name: String,
@@ -113,6 +117,11 @@ pub struct Context {
     pub workspace: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
+    /// The data-plane credential: every `query`, `run` and upload, and the
+    /// one `mcp register` writes into an agent's MCP configuration. After a
+    /// `login --control` this is the pair's `mcp_token`, which has no
+    /// control-plane reach — kept under the key every older CLI already
+    /// reads, so a context written by this one still works there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
     /// The PAT's id, needed by `logout --revoke` — the token itself cannot
@@ -121,8 +130,46 @@ pub struct Context {
     pub token_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_expires_at: Option<String>,
+    /// The pair's `control` token (agent onboarding §2.1): the only key that
+    /// reaches `/control/v1`, for 24 hours. **No command prints it** —
+    /// `config view --show-tokens` included — and it is sent nowhere but the
+    /// gateway's control door, so an agent driving the CLI never reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_token_expires_at: Option<String>,
+    /// The login this context's tokens came from. Sent as `replaces_pair_id`
+    /// on the next `login`, so the exchange revokes the pair it replaces —
+    /// the CLI holds only PATs, and no PAT may revoke a token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pair_id: Option<String>,
+    /// The workspace's MCP server, as the exchange named it
+    /// (`gateway_url + "/mcp"`): what `mcp register` writes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_url: Option<String>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_yaml::Value>,
+}
+
+impl fmt::Debug for Context {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let redacted = |value: &Option<String>| value.as_ref().map(|_| "(redacted)");
+        f.debug_struct("Context")
+            .field("name", &self.name)
+            .field("server", &self.server)
+            .field("mode", &self.mode)
+            .field("workspace", &self.workspace)
+            .field("user", &self.user)
+            .field("token", &redacted(&self.token))
+            .field("token_id", &self.token_id)
+            .field("token_expires_at", &self.token_expires_at)
+            .field("control_token", &redacted(&self.control_token))
+            .field("control_token_expires_at", &self.control_token_expires_at)
+            .field("pair_id", &self.pair_id)
+            .field("mcp_url", &self.mcp_url)
+            .field("extra", &self.extra.keys().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 fn is_default_mode(mode: &ContextMode) -> bool {
@@ -1644,5 +1691,55 @@ mod tests {
         // would ignore the width and return "cloud" here.
         assert_eq!(format!("[{:<8}]", ContextMode::Cloud), "[cloud   ]");
         assert_eq!(format!("{}", ContextMode::Server), "server");
+    }
+
+    /// `Context`'s `Debug` is hand-written so neither credential reaches a
+    /// log line or a panic message through `{:?}` (agent onboarding §5.0,
+    /// invariant 10) — nor an unmodeled key's value, which may be one. What
+    /// identifies the context and its login is still shown.
+    #[test]
+    fn a_contexts_debug_shows_no_credential() {
+        let mut extra = BTreeMap::new();
+        extra.insert(
+            "refresh-token".to_string(),
+            serde_yaml::Value::String("extra_secret_value".to_string()),
+        );
+        let context = Context {
+            name: "acme/prod".to_string(),
+            mode: ContextMode::Cloud,
+            server: Some("https://gw.example".to_string()),
+            workspace: Some("acme-prod".to_string()),
+            user: Some("alice@example.com".to_string()),
+            token: Some("skardi_pat_mcp_secret".to_string()),
+            token_id: Some("tok-mcp".to_string()),
+            token_expires_at: Some("2027-01-01T00:00:00Z".to_string()),
+            control_token: Some("skardi_pat_control_secret".to_string()),
+            control_token_expires_at: Some("2026-10-31T12:00:00Z".to_string()),
+            pair_id: Some("pair-1".to_string()),
+            mcp_url: Some("https://gw.example/mcp".to_string()),
+            extra,
+        };
+        let rendered = format!("{context:?}");
+        for secret in [
+            "skardi_pat_mcp_secret",
+            "skardi_pat_control_secret",
+            "extra_secret_value",
+        ] {
+            assert!(!rendered.contains(secret), "{rendered}");
+        }
+        for shown in [
+            "acme/prod",
+            "tok-mcp",
+            "2026-10-31T12:00:00Z",
+            "pair-1",
+            "https://gw.example/mcp",
+            "refresh-token",
+            "(redacted)",
+        ] {
+            assert!(rendered.contains(shown), "missing {shown}: {rendered}");
+        }
+        // An absent credential reads as absent, not as redacted.
+        let bare = format!("{:?}", Context::default());
+        assert!(bare.contains("token: None"), "{bare}");
     }
 }

@@ -150,6 +150,14 @@ skardi config delete-context acme/prod
 skardi config view
 ```
 
+`--show-tokens` prints every token **except a `control-token`**, which is
+always `(redacted)` — as is any key that names a control credential however
+it is spelled (`Control-Token`, `control_token`, `controlSecret`: `control`
+with `token`, `secret` or `credential`, case and `-`/`_` ignored): it is the
+one credential that reaches skardi-cloud's control surface, and nothing the
+CLI prints carries it (see
+[Connecting data sources from an agent](#connecting-data-sources-from-an-agent--integrations-handoff-documents)).
+
 The file is written atomically and `0600`, since it holds credentials; a
 looser existing file is reported and rewritten tighter. Keys this CLI does
 not recognize are preserved, so a newer CLI's fields survive an older one's
@@ -282,6 +290,61 @@ wrote context 'acme/my-workspace' (current)
 The request expires in five minutes. If nobody approves it, the CLI says so
 and writes nothing.
 
+### For an agent: `--control`, and signing up on the way
+
+```bash
+# A new person: the approval page creates their account and workspace first
+skardi login --setup personal --name "Alice" --control --no-verify
+
+# Someone who already has an account
+skardi login --control
+```
+
+`--control` asks the approver for a **token pair** instead of one token. The
+approval page shows it as its own tick ("may connect data sources"), offered
+only to an admin of the workspace. Approved, the context holds:
+
+| Key | What |
+|---|---|
+| `token`, `token-id`, `token-expires-at` | the **MCP token**, which has no control-plane reach and lives 90 days: every `query`, the documents upload, and what `mcp register` writes. The same key every older CLI reads, so nothing else changes |
+| `control-token`, `control-token-expires-at` | the **control token**, accepted only by the gateway's `/control/v1`, for **24 hours**: what the `integrations`, `handoff` and `documents` commands send. **No command prints it**, `--json` and `config view --show-tokens` included |
+| `pair-id` | which login the pair came from |
+| `mcp-url` | the workspace's MCP server, as the control plane named it — unless `--server` or `$SKARDI_GATEWAY_URL` sent this context's queries to a different origin, in which case it is that gateway's `/mcp`, and `login` says it set the control plane's aside. The token is only ever registered against the gateway it queries |
+
+When the approval comes back **without** `control` — the box was unticked,
+or your role is not admin — the context is still written, so queries work,
+and `login` exits **6** saying so: re-run `skardi login --control` and tick
+the box, or ask an admin to connect sources.
+
+An approval that carries only **part** of a pair (a control token with no
+`pair_id`, or the reverse — a console and control plane on different
+versions) is not read as "without control": a control token may have been
+minted that nothing would hold. The login fails (exit `1`), writes nothing,
+and names the ids it was given and the `/account/agent-access` page where
+that login is revoked. It never prints the token.
+
+`--setup personal|team` and `--name` (and optionally `--industry`) prefill
+the approval page's signup form for a person who has no account yet, so the
+same browser pass creates the workspace. Someone with an account, or someone
+joining by invitation, leaves them out.
+
+A re-login replaces the previous pair: the CLI sends the context's `pair-id`
+as `replaces_pair_id`, and the control plane revokes that pair when you
+approve — the only way a browser login's credentials are revoked from the
+command line, since the CLI holds only tokens and no token may revoke one.
+`--keep-old-token` skips it.
+
+A pair context overwritten by a login through `--client-id` or `--identity`
+is revoked by its query token's id, and the control plane revokes a pair's
+two tokens together. Either way the replaced `pair-id` is named in the
+output: if the revoke failed, or `--keep-old-token` kept it, `login` warns
+that its control token stays live and names
+`/account/agent-access?pair=<id>` on the console, where it is revoked.
+
+These flags exist only on the console-brokered path, and a control plane
+older than them refuses the request (`invalid_body`); the CLI says the
+server is too old for the flag rather than opening a login without it.
+
 Two consequences of the token arriving already-minted, both of which the CLI
 reports rather than hides:
 
@@ -391,6 +454,12 @@ Plain `logout` is a local edit: the credential leaves this machine but stays
 itself, so `--revoke` signs in again to call the control plane. The context
 itself (server, workspace, mode) is kept either way, so a later `login`
 refills it; removing the context entirely is `skardi config delete-context`.
+
+After a browser login the output also names the console's
+`/account/agent-access` page, where the login is revoked under your own
+session — with `?pair=<pair-id>` for a `--control` login, which revokes both
+tokens of the pair. `logout` clears the control token with the query token
+and keeps the `pair-id`, so the next `login` replaces (revokes) that pair.
 
 `logout` only touches **cloud** contexts — the ones `login` can mint again. A
 server-mode context's token was configured by hand and nothing can restore it,
@@ -669,6 +738,42 @@ safe to retry.
 
 ## MCP — `skardi mcp`
 
+### Registering a skardi-cloud workspace — `skardi mcp register`
+
+```bash
+skardi mcp register claude-code   # runs `claude mcp add-json --scope user skardi …`
+skardi mcp register --print       # the same server, for any other client
+```
+
+Adds the current cloud context's MCP server to an agent: the `mcp-url` the
+login recorded, with the context's `token` as the bearer — the pair's MCP
+token after `login --control`, and the only token after a login without it.
+**Never the control token.** For Claude Code it replaces any earlier `skardi`
+entry with the new one at user scope and prints only `registered`, so the
+token does not pass through the agent's transcript. `--print` shows the
+JSON (`type: http`, the URL, `Authorization` and `Skardi-Workspace`
+headers) for a person to add to another client by hand. A re-login re-runs it.
+
+The replacement never leaves you with less than you had. The new entry is
+added first, as `skardi-pending`; only once Claude Code has accepted it are
+the old `skardi` entries (local and user scope) removed and the new one put
+in their place, and the staged copy dropped. Every step is checked, and any
+failure is an error naming what it left — a refused add changes nothing, a
+removal that fails keeps the old entry in charge, a final add that fails
+leaves the new server working as `skardi-pending` — so `registered` means all
+of it held. What `claude` prints is never passed through, and a failure's
+message has the token scrubbed from it.
+
+The command uses what the selected context holds, so it takes `--context`
+and refuses `--server` and `--token`, which it could not honour: to register
+a different token, `skardi login` again.
+
+A context with no `mcp-url` means the control plane named none at login,
+because it has no gateway URL set (`SKARDI_GLOBAL_GATEWAY_URL`); the error
+says so.
+
+### The stdio bridge — `skardi mcp`
+
 Serves the Model Context Protocol over stdio, bridging an MCP host (Claude
 Desktop, Cursor, …) to a running skardi-server: pipelines become MCP tools,
 plus built-in `query` and `list_data_sources` tools. The host spawns the
@@ -697,7 +802,136 @@ startup, so `2` is rare here). Once the MCP session is up, REST failures —
 unreachable server included — are reported in-band as tool errors, and the
 process exits `0` when the host closes stdin.
 
+The bridge stays refused on a cloud context: the gateway serves `/mcp`
+itself, and `skardi mcp register` is how an agent reaches it.
+
+## Connecting data sources from an agent — `integrations`, `handoff`, `documents`
+
+After `skardi login --control`, a coding agent can connect a skardi-cloud
+workspace's data sources **without ever being handed a secret**: wherever a
+person has to consent at a provider or type a token, the CLI opens a
+*handoff* — a console page only that person can open — and waits for them.
+Everything else is the console wizard's own calls, over the gateway's
+`/control/v1`, with the 24-hour control token.
+
+| Command | What it does |
+|---|---|
+| `skardi integrations list` | the workspace's state, what this org may install, what is connected |
+| `skardi integrations connect <saas> --target new\|<alias>` | opens a handoff for one provider and prints its page link |
+| `skardi handoff wait <id> [--timeout 30m]` | waits until the person is done, then prints the connection alias and version |
+| `skardi integrations permissions <alias> --connection-version <id>` | one verdict per capability, and whether the install may proceed |
+| `skardi integrations candidates <alias> --connection-version <id> [--content-type <t>] [--parent <id>] [--cursor <c>]` | one page of the picker |
+| `skardi integrations install <alias> --connection-version <id> --scope <json> [--request-id <id>] [--timeout 10m]` | adds to what the connection syncs, then waits for the install |
+| `skardi integrations cancel <handoff>` | when the person declines: drops what that handoff staged, never anything else |
+| `skardi integrations status [<source>] [--detail]` | a source's phase, health, runs and items; with none, every source |
+| `skardi integrations sync <source>` | asks for one run now |
+| `skardi documents add <file>` | uploads a local file into a **personal** workspace and starts its run |
+
+Separate runs share nothing, so the connection version is always an
+argument: name the one `handoff wait` printed.
+
+**Every command prints the next one.** Without `--json`, a sentence and a
+`next:` line; with `--json`, exactly one object on stdout:
+
+```text
+{"ok": true,  "result": {…}, "next": "skardi handoff wait 4b9f…"}
+{"ok": false, "error": {"code": "…", "message": "…"}, "next": "<recovery command, or null>"}
+```
+
+A success may also carry `"warning": {"code": "…", "message": "…"}` when
+something went wrong beside it (today, only `install`; see below); the key
+is absent otherwise, and the same warning is a `warning:` line on stderr.
+
+`result` is the control plane's own response (for `install`, the final
+operation) and `error` its own refusal, copied through. The sequence —
+`list` → `connect` → `handoff wait` → `permissions` → `candidates` →
+`install` → `status` → `sync` — lives in those hints, so an agent that
+follows `next` follows it. A hint carries `--json` and `--context` when the
+run that printed it did.
+
+**`--scope`** is a JSON object of content type to rules, in the install
+API's `content-types-v1` shape, **positive rules only**: an install from an
+agent only adds. Copy each `coordinate` verbatim from a `candidates` row;
+`null` means everything the credential reaches.
+
+```bash
+# GitHub, two repositories
+--scope '{"issues":[{"kind":"leaf","coordinate":{"owner":"acme","repo":"api"}},
+                    {"kind":"leaf","coordinate":{"owner":"acme","repo":"web"}}],
+          "pull_requests":[]}'
+# Notion, a page and everything under it
+--scope '{"pages":[{"kind":"subtree","coordinate":{"page_id":"…"}}]}'
+# Everything
+--scope '{"issues":null,"pull_requests":null}'
+```
+
+An `exclude` rule is refused locally: narrowing is the person's, on the
+source's Manage page in the console.
+
+**`handoff wait`** polls every 2 seconds, growing by half up to 10, for up to
+30 minutes (`--timeout`). It tells four endings apart by the error code:
+`still_open` at the deadline, and `expired`, `denied` or `abandoned` when the
+handoff ended without a connection. A completed handoff should be installed
+within the hour, or the staged connection is reclaimed.
+
+**`--timeout` bounds the whole command**, on `handoff wait` and `install`
+alike: a request to a gateway that stalls, and a `429`'s `Retry-After`, are
+cut off at the deadline too, so `--timeout 5s` returns in about five seconds
+— `still_open` for a wait, `install_pending` for an install.
+
+**`install` can always be resumed.** Every install carries a request id, its
+idempotency key, generated before the submit. Whenever the outcome is
+uncertain — the submit timed out, lost its connection or met a 5xx (any
+exit `5`), or the operation was still running at the deadline — the error
+carries that `request_id` and its `next` is the same install with
+`--request-id <id>`, which the control plane answers with the existing
+operation rather than installing twice. A refusal (exit `3`) names no replay:
+nothing was installed.
+
+**An install that only failed to link its installer landed.** When the
+person signed in is not the admin who set the connection up, the control
+plane installs the scope and the sources sync, but the operation still
+settles `failed` with a `link_` code — `link_actor_is_not_the_installer`,
+`link_installer_no_longer_a_member` and the like — because it could not
+link that person to the connection as its installer. `install` reports
+that as the success it is: exit `0`, `next` naming `integrations status`,
+and the code as `warning`. It does so only for a `link_` failure at the
+identity-proof step (the operation's `last_step` is `activated`); any other
+`failed` operation, `install_incomplete` included, is exit `3` with the
+failure as its error code.
+
+**`documents add`** declares the file (its name, type, sha256 and length)
+with the control token, uploads the bytes to the gateway's data plane with
+the MCP token, retries once while the workspace's engine picks up the new
+source, and asks for the first run. The file is read **once**, before
+anything is declared, and those bytes are what is hashed and sent — so
+editing it afterwards cannot make the upload disagree with its declaration.
+A file that changes *while* it is read is refused (`file_changed`) before
+anything is created, and one over 1 GiB, the largest any plan accepts, is
+refused from its size alone (`file_too_large`). A team workspace refuses it
+(`team_upload_not_agent_callable`): there, every member would read the file,
+so it is uploaded in the console.
+
+These commands have their own exit codes, which the `skardi-onboard` skill
+branches on:
+
+| Code | Meaning |
+|---|---|
+| `0` | done — for `install`, also when the only failure was linking the installer (a `warning` says which) |
+| `2` | usage error (a bad flag, a malformed `--scope`) |
+| `3` | refused by the server: any 4xx not below |
+| `4` | a handoff ended without a result: `expired`, `denied`, `abandoned`, or `still_open` at the deadline |
+| `5` | the control plane could not be reached, or answered 5xx |
+| `6` | no usable control token: none was granted, or it expired — run `skardi login --control` |
+
+A `429 rate_limited` is retried after its `Retry-After` (twice) before it is
+reported.
+
 ## Exit codes
+
+The agent commands above, and `login --control`'s `6`, have
+[their own table](#connecting-data-sources-from-an-agent--integrations-handoff-documents).
+Everything else:
 
 | Code | Meaning |
 |---|---|
