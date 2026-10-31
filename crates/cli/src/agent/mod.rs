@@ -22,7 +22,9 @@
 //!   `{"ok": true, "result": …, "next": …}` or
 //!   `{"ok": false, "error": {"code", "message"}, "next": …}`. `result` is the
 //!   route's own response and `error` the server's own envelope, copied
-//!   through. Without `--json`, a sentence and the next command.
+//!   through. A success may also carry `"warning": {"code", "message"}`
+//!   (see [`Warning`]); the key is absent otherwise. Without `--json`, a
+//!   sentence and the next command.
 //! * **`next`.** The onboarding sequence lives HERE, in these hints, and
 //!   nowhere else (§2.7): after `connect` it names `handoff wait <id>`, after
 //!   `handoff wait` it names `permissions` with the alias and version filled
@@ -153,6 +155,20 @@ pub struct Outcome {
     /// Advisory lines for stderr, in either mode. stdout stays one object
     /// under `--json`, so anything a person should see beside it goes here.
     pub notes: Vec<String>,
+    /// Something that went wrong beside a success. See [`Warning`].
+    pub warning: Option<Warning>,
+}
+
+/// What went wrong beside a success, rendered as `{"code", "message"}` — the
+/// shape of `error`, so an agent reads it the same way.
+///
+/// Under `--json` it is the envelope's `warning` key, present only when set,
+/// so every other command's shape is unchanged; in either mode it is also a
+/// `warning:` line on stderr, for the person.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Warning {
+    pub code: String,
+    pub message: String,
 }
 
 impl Outcome {
@@ -163,6 +179,7 @@ impl Outcome {
             show_result: false,
             next: None,
             notes: Vec::new(),
+            warning: None,
         }
     }
 
@@ -178,6 +195,14 @@ impl Outcome {
 
     pub fn with_note(mut self, note: impl Into<String>) -> Outcome {
         self.notes.push(note.into());
+        self
+    }
+
+    pub fn with_warning(mut self, code: &str, message: impl Into<String>) -> Outcome {
+        self.warning = Some(Warning {
+            code: code.to_string(),
+            message: message.into(),
+        });
         self
     }
 }
@@ -234,13 +259,23 @@ pub fn render(
     let (stdout, stderr, exit) = match outcome {
         Ok(outcome) => {
             let next = next(&outcome.next);
-            let notes: String = outcome
+            let mut notes: String = outcome
                 .notes
                 .iter()
                 .map(|note| format!("note: {note}\n"))
                 .collect();
+            if let Some(warning) = &outcome.warning {
+                notes.push_str(&format!(
+                    "warning: {} ({})\n",
+                    warning.message, warning.code
+                ));
+            }
             let stdout = if invocation.json {
-                let envelope = json!({ "ok": true, "result": outcome.result, "next": next });
+                let mut envelope = json!({ "ok": true, "result": outcome.result, "next": next });
+                if let Some(warning) = &outcome.warning {
+                    envelope["warning"] =
+                        json!({ "code": warning.code, "message": warning.message });
+                }
                 format!("{}\n", compact(&envelope))
             } else {
                 let mut out = format!("{}\n", outcome.sentence);
@@ -584,6 +619,45 @@ mod tests {
         );
         assert_eq!(err.exit, EXIT_REFUSED);
         assert!(err.stderr.is_empty(), "stdout is the only channel: {err:?}");
+    }
+
+    /// A warning is the envelope's `warning` key under `--json`, and a
+    /// `warning:` line on stderr in either mode; without one, neither.
+    #[test]
+    fn a_warning_rides_beside_the_success() {
+        let outcome = Ok(Outcome::new(json!({"state": "failed"}), "installed x")
+            .with_next("skardi integrations status")
+            .with_warning("link_actor_is_not_the_installer", "not linked"));
+        let line = "warning: not linked (link_actor_is_not_the_installer)\n";
+
+        let json_mode = render(
+            &outcome,
+            &Invocation {
+                json: true,
+                context: None,
+            },
+            None,
+        );
+        let parsed: Value = serde_json::from_str(json_mode.stdout.trim()).unwrap();
+        assert_eq!(
+            parsed,
+            json!({
+                "ok": true,
+                "result": {"state": "failed"},
+                "next": "skardi integrations status --json",
+                "warning": {"code": "link_actor_is_not_the_installer", "message": "not linked"},
+            })
+        );
+        assert_eq!(json_mode.stderr, line);
+        assert_eq!(json_mode.exit, EXIT_OK);
+
+        let plain = render(&outcome, &Invocation::default(), None);
+        assert_eq!(
+            plain.stdout,
+            "installed x\nnext: skardi integrations status\n"
+        );
+        assert_eq!(plain.stderr, line);
+        assert_eq!(plain.exit, EXIT_OK);
     }
 
     #[test]

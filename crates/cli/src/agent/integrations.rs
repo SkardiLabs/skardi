@@ -375,14 +375,19 @@ pub async fn install(
     let path = format!("/installs/{}", encode_component(&operation_id));
     let mut interval = polling.first;
     let mut operation = submitted;
+    let installed = |operation: Value| {
+        Outcome::new(
+            operation,
+            format!(
+                "installed {alias}: the scope was added, and its sources sync on the next tick"
+            ),
+        )
+        .with_next("skardi integrations status")
+    };
     loop {
         match operation.get("state").and_then(Value::as_str) {
             Some("done") => {
-                let mut outcome = Outcome::new(
-                    operation.clone(),
-                    format!("installed {alias}: the scope was added, and its sources sync on the next tick"),
-                )
-                .with_next("skardi integrations status");
+                let mut outcome = installed(operation.clone());
                 if operation.get("link_owed").and_then(Value::as_bool) == Some(true) {
                     outcome = outcome.with_note(
                         "connected, with nothing to sync yet: new resources sync automatically when they appear",
@@ -391,6 +396,13 @@ pub async fn install(
                 return Ok(outcome);
             }
             Some("failed") => {
+                if let Some(code) = only_the_link_failed(&operation) {
+                    let code = code.to_string();
+                    return Ok(installed(operation).with_warning(
+                        &code,
+                        "the sources were installed, but the person signed in was not linked to the connection as its installer — expected when another admin set up the connection",
+                    ));
+                }
                 let failure = operation
                     .get("failure")
                     .and_then(Value::as_str)
@@ -420,6 +432,42 @@ pub async fn install(
             None => return Err(still_running(Some(operation))),
         };
     }
+}
+
+/// The `last_step` of an operation whose only step left was the identity
+/// proof: skardi-global's `InstallStep::Activated`, the step before
+/// `PushedIdentityProof`.
+const BEFORE_THE_PROOF: &str = "activated";
+
+/// The failure code of a `failed` operation that nonetheless LANDED — its
+/// sources installed and syncing — because only the installer's identity
+/// proof could not be made; `None` for any other failure.
+///
+/// That happens when the person signed in is not the admin who set the
+/// connection up (`link_actor_is_not_the_installer`), or that admin has since
+/// left (`link_installer_no_longer_a_member`), and the rest of
+/// skardi-global's `proofs.rs`. Until the RBAC rework drops the proof
+/// obligation (skardi-cloud #1284, B9), such an install settles `failed`.
+///
+/// Two conditions, both the server's own:
+///
+/// * the failure begins `link_`. skardi-global mints that prefix only from
+///   its proof worker, which runs after the install is durable, and the
+///   console's wizard tells "installed, not linked" apart by it alone.
+/// * `last_step` is [`BEFORE_THE_PROOF`]. The worker settles only operations
+///   whose one remaining step is the proof, and settling does not move
+///   `last_step`, so a proof failure always reads `activated`. This is what
+///   ties the code to the proof STEP rather than to the prefix alone; a
+///   `link_` code on an operation that stopped earlier stays a failure.
+///   (`remaining` cannot do it: the server empties it on every settled
+///   operation, whatever stopped it.)
+///
+/// Either condition missing leaves the failure a failure, which is the safe
+/// direction: it under-claims rather than calling a broken install landed.
+fn only_the_link_failed(operation: &Value) -> Option<&str> {
+    let failure = operation.get("failure").and_then(Value::as_str)?;
+    let last_step = operation.get("last_step").and_then(Value::as_str);
+    (failure.starts_with("link_") && last_step == Some(BEFORE_THE_PROOF)).then_some(failure)
 }
 
 /// An install failure that does not say the install did not happen.
@@ -963,6 +1011,93 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.exit, EXIT_REFUSED);
         assert_eq!(err.code(), "permissions_incomplete");
+    }
+
+    /// A proof the installer could not make leaves an install that landed:
+    /// success, with the code as a warning and `status` next. Any `link_`
+    /// code from the proof step, not only the one the review met.
+    #[rstest]
+    #[case::not_the_installer("link_actor_is_not_the_installer")]
+    #[case::installer_left("link_installer_no_longer_a_member")]
+    #[case::refused("link_refused:AlreadyExists")]
+    #[tokio::test]
+    async fn a_failed_identity_proof_is_a_landed_install_with_a_warning(#[case] code: &str) {
+        let server = MockServer::start().await;
+        answer(
+            &server,
+            "POST",
+            "/installs",
+            202,
+            json!({"operation_id": "op-1", "state": "pending", "last_step": "activated",
+                   "remaining": ["pushed_identity_proof"], "failure": null}),
+        )
+        .await;
+        answer(
+            &server,
+            "GET",
+            "/installs/op-1",
+            200,
+            json!({"operation_id": "op-1", "state": "failed", "last_step": "activated",
+                   "remaining": [], "failure": code}),
+        )
+        .await;
+        let outcome = install(
+            &control(&server),
+            "acme-github",
+            VERSION,
+            r#"{"issues":null}"#,
+            None,
+            fast(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.result["failure"], code);
+        assert_eq!(outcome.next.as_deref(), Some("skardi integrations status"));
+        assert!(
+            outcome.sentence.starts_with("installed acme-github"),
+            "{outcome:?}"
+        );
+        let warning = outcome.warning.expect("a warning");
+        assert_eq!(warning.code, code);
+        assert!(
+            warning.message.contains("not linked") && warning.message.contains("another admin"),
+            "{warning:?}"
+        );
+    }
+
+    /// Anything else that settles `failed` is still exit 3: a failure with
+    /// no `link_` prefix, and a `link_` code on an operation that did not
+    /// stop at the proof step — or does not say where it stopped.
+    #[rstest]
+    #[case::not_a_link_failure("install_incomplete", json!("activated"))]
+    #[case::stopped_before_activation("link_actor_is_not_the_installer", json!("promoted_credential"))]
+    #[case::no_step_recorded("link_actor_is_not_the_installer", Value::Null)]
+    #[case::no_failure_named("install_failed", json!("activated"))]
+    #[tokio::test]
+    async fn any_other_failed_operation_stays_exit_3(#[case] code: &str, #[case] last_step: Value) {
+        let server = MockServer::start().await;
+        answer(
+            &server,
+            "POST",
+            "/installs",
+            202,
+            json!({"operation_id": "op-1", "state": "failed", "last_step": last_step,
+                   "remaining": [], "failure": (code != "install_failed").then_some(code)}),
+        )
+        .await;
+        let err = install(
+            &control(&server),
+            "acme-github",
+            VERSION,
+            r#"{"issues":null}"#,
+            None,
+            fast(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.exit, EXIT_REFUSED);
+        assert_eq!(err.code(), code);
+        assert!(err.message().contains("nothing was added"), "{err:?}");
     }
 
     /// The deadline names the same install with its request id, which the

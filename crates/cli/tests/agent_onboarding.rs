@@ -620,3 +620,61 @@ async fn usage_errors_are_exit_2_in_either_mode() {
     assert_eq!(envelope["error"]["code"], "token_flag_not_accepted");
     assert!(gw.received_requests().await.unwrap().is_empty());
 }
+
+/// An install whose only failure is the installer's identity proof landed:
+/// exit 0, the success envelope with `next`, and the code as `warning`. Any
+/// other failed operation is still exit 3 (the review on skardi-cloud #1338).
+#[tokio::test]
+async fn an_install_whose_only_failure_is_the_installer_link_exits_0_with_a_warning() {
+    let cases: Vec<(&str, i32)> = vec![
+        ("link_actor_is_not_the_installer", 0),
+        ("link_installer_no_longer_a_member", 0),
+        ("install_incomplete", 3),
+    ];
+    for (failure, code) in cases {
+        let gw = MockServer::start().await;
+        ok(
+            &gw,
+            "POST",
+            "/installs",
+            202,
+            json!({"operation_id": "op-1", "state": "failed", "last_step": "activated",
+                   "remaining": [], "failure": failure}),
+        )
+        .await;
+        let home = TempDir::new().unwrap();
+        seed(home.path(), &gw.uri(), Some(CONTROL));
+        let output = run(
+            home.path(),
+            &[
+                "integrations",
+                "install",
+                "acme-github",
+                "--connection-version",
+                VERSION,
+                "--scope",
+                r#"{"issues":null}"#,
+                "--json",
+            ],
+        )
+        .await;
+        assert_eq!(output.status.code(), Some(code), "{failure}: {output:?}");
+        let envelope: Value = serde_json::from_str(stdout(&output).trim())
+            .unwrap_or_else(|e| panic!("{failure}: {e}: {}", stdout(&output)));
+        if code == 0 {
+            assert_eq!(envelope["ok"], true, "{envelope}");
+            assert_eq!(envelope["warning"]["code"], failure, "{envelope}");
+            assert_eq!(envelope["next"], "skardi integrations status --json");
+            assert!(
+                stderr(&output).contains("warning: ") && stderr(&output).contains(failure),
+                "{}",
+                stderr(&output)
+            );
+        } else {
+            assert_eq!(envelope["ok"], false, "{envelope}");
+            assert_eq!(envelope["error"]["code"], failure, "{envelope}");
+            assert!(envelope.get("warning").is_none(), "{envelope}");
+        }
+        assert!(!stdout(&output).contains(CONTROL));
+    }
+}

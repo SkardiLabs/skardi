@@ -838,6 +838,10 @@ argument: name the one `handoff wait` printed.
 {"ok": false, "error": {"code": "…", "message": "…"}, "next": "<recovery command, or null>"}
 ```
 
+A success may also carry `"warning": {"code": "…", "message": "…"}` when
+something went wrong beside it (today, only `install`; see below); the key
+is absent otherwise, and the same warning is a `warning:` line on stderr.
+
 `result` is the control plane's own response (for `install`, the final
 operation) and `error` its own refusal, copied through. The sequence —
 `list` → `connect` → `handoff wait` → `permissions` → `candidates` →
@@ -884,6 +888,18 @@ carries that `request_id` and its `next` is the same install with
 operation rather than installing twice. A refusal (exit `3`) names no replay:
 nothing was installed.
 
+**An install that only failed to link its installer landed.** When the
+person signed in is not the admin who set the connection up, the control
+plane installs the scope and the sources sync, but the operation still
+settles `failed` with a `link_` code — `link_actor_is_not_the_installer`,
+`link_installer_no_longer_a_member` and the like — because it could not
+link that person to the connection as its installer. `install` reports
+that as the success it is: exit `0`, `next` naming `integrations status`,
+and the code as `warning`. It does so only for a `link_` failure at the
+identity-proof step (the operation's `last_step` is `activated`); any other
+`failed` operation, `install_incomplete` included, is exit `3` with the
+failure as its error code.
+
 **`documents add`** declares the file (its name, type, sha256 and length)
 with the control token, uploads the bytes to the gateway's data plane with
 the MCP token, retries once while the workspace's engine picks up the new
@@ -901,7 +917,7 @@ branches on:
 
 | Code | Meaning |
 |---|---|
-| `0` | done |
+| `0` | done — for `install`, also when the only failure was linking the installer (a `warning` says which) |
 | `2` | usage error (a bad flag, a malformed `--scope`) |
 | `3` | refused by the server: any 4xx not below |
 | `4` | a handoff ended without a result: `expired`, `denied`, `abandoned`, or `still_open` at the deadline |
