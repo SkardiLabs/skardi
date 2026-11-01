@@ -35,7 +35,9 @@ shape (`google_drive.files`).
 The optional permission metadata extension uses the `files.list` output
 schema generated from Open Connector `0e4dc775` (2026-11-01). This is a
 source-derived contract update with authored conversion examples, not a new
-live-account capture.
+live-account capture. The stable SQL schema is version 2; bindings pinned to
+version 1 must explicitly upgrade before using these columns. A files listing
+with `incompleteSearch: true` fails instead of returning a partial corpus.
 
 **The wire contract is Open Connector's, not Google's REST API**: the
 gateway's googledrive executors rebuild every row **normalized**

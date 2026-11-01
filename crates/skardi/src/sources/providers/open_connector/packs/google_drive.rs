@@ -1091,7 +1091,11 @@ mod tests {
             assert_eq!(t.row_path, row_path, "{short}");
             // In-band Google errors are consumed by `assertGoogleResponse`
             // upstream into the failure envelope; nothing to forward.
-            assert!(t.error_path.is_none(), "{short}");
+            assert_eq!(
+                t.error_path,
+                (short == "files").then_some("$.incompleteSearch"),
+                "{short}"
+            );
         }
     }
 
@@ -1864,6 +1868,53 @@ bindings:
             message.contains("pagination loop") && message.contains(FILES_PAGE2_TOKEN),
             "the loop names the cursor the gateway would not advance: {message}"
         );
+    }
+
+    #[tokio::test]
+    async fn incomplete_files_listing_never_returns_partial_rows() {
+        for incomplete in [false, true] {
+            let gateway = MockGateway::start(move |req| {
+                if req.method == "GET" && req.path == "/v1/health" {
+                    return MockResponse::ok("{}");
+                }
+                if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                    return google_drive_discovery(&req.path);
+                }
+                if req.method == "POST" && req.path == "/v1/actions/googledrive.files.list" {
+                    return MockResponse::ok(envelope_ok(
+                        json!({"files": [file_row("f-1")], "nextPageToken": null,
+                            "incompleteSearch": incomplete})
+                        .to_string(),
+                    ));
+                }
+                MockResponse::new(404, "{}")
+            })
+            .await;
+            let (_gateway, ctx) =
+                setup_with_gateway(gateway, "SKARDI_TEST_OC_GDRIVE_COMPLETE", "files", "").await;
+            let result = ctx
+                .sql("SELECT id FROM saas.gdrive.files")
+                .await
+                .expect("plan")
+                .collect()
+                .await;
+            if incomplete {
+                let error = result.expect_err("incomplete search must not publish partial rows");
+                assert!(
+                    error.to_string().contains("provider reported error"),
+                    "{error}"
+                );
+            } else {
+                assert_eq!(
+                    result
+                        .expect("complete listing")
+                        .iter()
+                        .map(RecordBatch::num_rows)
+                        .sum::<usize>(),
+                    1
+                );
+            }
+        }
     }
 
     #[tokio::test]
