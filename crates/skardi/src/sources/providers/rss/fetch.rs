@@ -259,7 +259,11 @@ pub enum FetchError {
     /// A terminal HTTP status: either not retryable at all, or retryable
     /// but still failing after the fetcher's attempt budget (three attempts
     /// by default, one under [`FeedFetcher::single_attempt`]).
-    #[error("http status {status}")]
+    ///
+    /// `Display` appends the host's requested wait when there is one
+    /// (`http status 429 (retry after 120s)`), so a throttled feed's log line
+    /// and `feeds.last_error` say how long it asked for.
+    #[error("http status {status}{}", retry_after_suffix(.retry_after))]
     Status {
         status: u16,
         /// The last response's `Retry-After`, delta-seconds or HTTP-date,
@@ -267,6 +271,13 @@ pub enum FetchError {
         /// that does not parse). Uncapped: `MAX_RETRY_WAIT` bounds this
         /// fetcher's own sleeps, while a caller that schedules the retry
         /// itself applies its own clamp.
+        ///
+        /// An HTTP-date already in the past — or one that only looks past
+        /// because the host's clock is behind ours — is `Some(Duration::ZERO)`,
+        /// not `None`. A caller that turns this straight into its next attempt
+        /// time would retry at once and spend an attempt on a host that has
+        /// just throttled it, so it needs a floor of its own. This fetcher's
+        /// own retries have one: they wait `max(retry_after, backoff)`.
         retry_after: Option<Duration>,
     },
 
@@ -785,6 +796,15 @@ impl FeedFetcher {
             // with — see the variant's doc.
             final_url: url.to_string(),
         })
+    }
+}
+
+/// `FetchError::Status`'s `Display` tail: the requested wait in whole
+/// seconds, or nothing when the host named none.
+fn retry_after_suffix(retry_after: &Option<Duration>) -> String {
+    match retry_after {
+        Some(wait) => format!(" (retry after {}s)", wait.as_secs()),
+        None => String::new(),
     }
 }
 
@@ -1723,6 +1743,20 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, FetchError::Egress(_)), "got {err:?}");
         assert_eq!(server.requests().len(), 1);
+    }
+
+    #[test]
+    fn a_status_error_names_the_requested_wait_when_there_is_one() {
+        let throttled = FetchError::Status {
+            status: 429,
+            retry_after: Some(Duration::from_secs(120)),
+        };
+        assert_eq!(throttled.to_string(), "http status 429 (retry after 120s)");
+        let bare = FetchError::Status {
+            status: 503,
+            retry_after: None,
+        };
+        assert_eq!(bare.to_string(), "http status 503");
     }
 
     #[tokio::test]
