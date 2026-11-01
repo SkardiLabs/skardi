@@ -97,6 +97,12 @@
 //! it names. Redirects are not retries: following one always starts a new
 //! hop with a fresh attempt budget.
 //!
+//! [`FeedFetcher::single_attempt`] shrinks that budget to one, for a caller
+//! whose own scheduler retries (Skardi Cloud runs each feed as one work on
+//! its executor). There, a retryable failure returns at once instead of
+//! sleeping, and [`FetchError::Status`] carries the response's `Retry-After`
+//! uncapped, for that caller to clamp and schedule against.
+//!
 //! ## An unconditional `304` is a protocol error, not a cache hit
 //!
 //! `304 Not Modified` is only meaningful as an answer to a conditional
@@ -189,7 +195,7 @@ pub enum FetchOutcome {
     ///
     /// Carries no landing URL, and needs none: a `304` can only answer a hop
     /// that actually sent validators, validators go out on the first hop
-    /// only, and [`FeedFetcher::attempt_hop`] maps an unconditional `304` to
+    /// only, and `FeedFetcher::attempt_hop` maps an unconditional `304` to
     /// [`FetchError::Status`] rather than this variant. So the URL that
     /// produced a `NotModified` is always the one the caller asked for.
     NotModified { http_status: u16 },
@@ -235,11 +241,20 @@ pub enum FetchError {
     Timeout { seconds: u64 },
 
     /// A terminal HTTP status: either not retryable at all, or retryable
-    /// but still failing after [`MAX_ATTEMPTS`] attempts.
+    /// but still failing after the fetcher's attempt budget (three attempts
+    /// by default, one under [`FeedFetcher::single_attempt`]).
     #[error("http status {status}")]
-    Status { status: u16 },
+    Status {
+        status: u16,
+        /// The last response's `Retry-After`, delta-seconds or HTTP-date,
+        /// as a wait from now; `None` when the host sent none (or sent one
+        /// that does not parse). Uncapped: `MAX_RETRY_WAIT` bounds this
+        /// fetcher's own sleeps, while a caller that schedules the retry
+        /// itself applies its own clamp.
+        retry_after: Option<Duration>,
+    },
 
-    /// Following the next redirect would exceed [`MAX_REDIRECT_HOPS`].
+    /// Following the next redirect would exceed `MAX_REDIRECT_HOPS` (5).
     #[error("too many redirects (limit {hops})")]
     TooManyRedirects { hops: u32 },
 
@@ -264,7 +279,7 @@ enum HopOutcome {
 /// Bounded HTTP fetcher for one feed URL.
 ///
 /// One [`FeedFetcher`] owns a single shared `reqwest::Client`, built once at
-/// construction with [`PolicyDns`] as its DNS resolver and
+/// construction with `PolicyDns` as its DNS resolver and
 /// redirect-following disabled — see the module doc for why
 /// [`FeedFetcher::fetch`] drives redirects itself instead.
 #[derive(Debug)]
@@ -273,15 +288,16 @@ pub struct FeedFetcher {
     policy: Arc<dyn EgressPolicy>,
     request_timeout: Duration,
     max_response_bytes: u64,
+    max_attempts: u32,
 }
 
 impl FeedFetcher {
     /// Build the fetcher's one shared client. `policy` is consulted in two
-    /// ways: wrapped in a [`PolicyDns`] as the client's DNS resolver (so every
+    /// ways: wrapped in a `PolicyDns` as the client's DNS resolver (so every
     /// hostname is checked structurally when a connection is *established* —
-    /// reqwest resolves through [`PolicyDns`] before each new connect), and
+    /// reqwest resolves through `PolicyDns` before each new connect), and
     /// held directly for the IP-literal checks
-    /// [`FeedFetcher::check_hop_target`] runs before the initial request and
+    /// `FeedFetcher::check_hop_target` runs before the initial request and
     /// before every redirect hop.
     ///
     /// The resolver check gates connection *establishment*, not every request:
@@ -330,7 +346,44 @@ impl FeedFetcher {
             policy,
             request_timeout,
             max_response_bytes,
+            max_attempts: MAX_ATTEMPTS,
         })
+    }
+
+    /// Make one request per hop instead of `MAX_ATTEMPTS` (3), for a caller
+    /// that schedules retries itself. A retryable status or transport error
+    /// returns at once — no sleep, no second request — with the response's
+    /// `Retry-After` on [`FetchError::Status`]. Redirects are still followed
+    /// and every hop is still egress-checked: a redirect is a new hop, not a
+    /// retry.
+    ///
+    /// ```no_run
+    /// use std::time::Duration;
+    ///
+    /// use skardi::sources::providers::rss::{FeedFetcher, FetchError, FetchOutcome};
+    ///
+    /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    /// let fetcher = FeedFetcher::new(
+    ///     None,
+    ///     Duration::from_secs(10),
+    ///     5 * 1024 * 1024,
+    ///     "my-agent/1.0".to_string(),
+    /// )?
+    /// .single_attempt();
+    /// match fetcher.fetch("https://example.com/feed.xml", None).await {
+    ///     Ok(FetchOutcome::Fetched { body, .. }) => println!("{} bytes", body.len()),
+    ///     Ok(FetchOutcome::NotModified { .. }) => println!("unchanged"),
+    ///     Err(FetchError::Status { status: 429, retry_after }) => {
+    ///         println!("throttled; retry in {retry_after:?}")
+    ///     }
+    ///     Err(e) => println!("failed: {e}"),
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn single_attempt(mut self) -> Self {
+        self.max_attempts = 1;
+        self
     }
 
     /// Fetch `url`, sending `validators` as conditional-GET headers on the
@@ -438,8 +491,8 @@ impl FeedFetcher {
         Ok(())
     }
 
-    /// Drive one hop's attempt loop: send the request, retrying up to
-    /// [`MAX_ATTEMPTS`] times on a retryable status or a retryable
+    /// Drive one hop's attempt loop: send the request, retrying up to the
+    /// fetcher's attempt budget on a retryable status or a retryable
     /// connection failure, and classifying a successful response into the
     /// outer loop's next step.
     async fn attempt_hop(
@@ -449,7 +502,7 @@ impl FeedFetcher {
     ) -> Result<HopOutcome, FetchError> {
         let mut last_err: Option<FetchError> = None;
 
-        for attempt in 0..MAX_ATTEMPTS {
+        for attempt in 0..self.max_attempts {
             let mut req = self.http.get(url.clone());
             // Tracked independently of `validators.is_some()`: a `Validators`
             // with both fields `None` attaches no header either, and a `304`
@@ -470,6 +523,7 @@ impl FeedFetcher {
             match req.send().await {
                 Ok(resp) => {
                     let status = resp.status();
+                    let retry_after = parse_retry_after(&resp);
                     if status.as_u16() == 304 {
                         if sent_validator {
                             return Ok(HopOutcome::Done(FetchOutcome::NotModified {
@@ -480,7 +534,10 @@ impl FeedFetcher {
                         // to confirm — treat it as the terminal, non-retryable
                         // status it actually is rather than fabricating a
                         // cache hit the caller never asked for.
-                        return Err(FetchError::Status { status: 304 });
+                        return Err(FetchError::Status {
+                            status: 304,
+                            retry_after,
+                        });
                     }
                     if status.is_redirection()
                         && let Some(location) = resp.headers().get(LOCATION)
@@ -502,11 +559,12 @@ impl FeedFetcher {
                     if is_retryable_status(status) {
                         let err = FetchError::Status {
                             status: status.as_u16(),
+                            retry_after,
                         };
-                        if attempt + 1 >= MAX_ATTEMPTS {
+                        if attempt + 1 >= self.max_attempts {
                             return Err(err);
                         }
-                        tokio::time::sleep(retry_wait(&resp, attempt)).await;
+                        tokio::time::sleep(retry_wait(retry_after, attempt)).await;
                         last_err = Some(err);
                         continue;
                     }
@@ -537,7 +595,7 @@ impl FeedFetcher {
                             Err(
                                 err @ (FetchError::Timeout { .. } | FetchError::Transport { .. }),
                             ) => {
-                                if attempt + 1 >= MAX_ATTEMPTS {
+                                if attempt + 1 >= self.max_attempts {
                                     return Err(err);
                                 }
                                 tokio::time::sleep(backoff(attempt)).await;
@@ -549,6 +607,7 @@ impl FeedFetcher {
                     }
                     return Err(FetchError::Status {
                         status: status.as_u16(),
+                        retry_after,
                     });
                 }
                 Err(e) => {
@@ -564,7 +623,7 @@ impl FeedFetcher {
                             reason: transport_reason(e),
                         }
                     };
-                    if attempt + 1 >= MAX_ATTEMPTS {
+                    if attempt + 1 >= self.max_attempts {
                         return Err(mapped);
                     }
                     tokio::time::sleep(backoff(attempt)).await;
@@ -574,7 +633,7 @@ impl FeedFetcher {
         }
 
         // Every branch above returns on the final attempt (the
-        // `attempt + 1 >= MAX_ATTEMPTS` guards), so this is unreachable in
+        // `attempt + 1 >= self.max_attempts` guards), so this is unreachable in
         // practice. Kept as a returned error rather than `unreachable!()` so
         // a future change to the loop bounds fails a returned error instead
         // of panicking.
@@ -631,9 +690,9 @@ fn is_retryable_status(status: StatusCode) -> bool {
 
 /// `max(Retry-After, backoff)`, capped at [`MAX_RETRY_WAIT`] — see the
 /// module doc's Retries section.
-fn retry_wait(resp: &Response, attempt: u32) -> Duration {
+fn retry_wait(retry_after: Option<Duration>, attempt: u32) -> Duration {
     let computed = backoff(attempt);
-    let wait = match parse_retry_after(resp) {
+    let wait = match retry_after {
         Some(from_header) => from_header.max(computed),
         None => computed,
     };
