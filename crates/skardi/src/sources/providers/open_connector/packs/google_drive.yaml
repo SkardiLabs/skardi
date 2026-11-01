@@ -49,7 +49,8 @@
 # Google publishes no has-more flag and no total, so no override is
 # declared. In-band Google errors are consumed by the executor
 # (`assertGoogleResponse` throws on any non-2xx), so no table declares
-# `error_path`.
+# `error_path`, except the files listing: incompleteSearch=true is an
+# in-band incomplete result and must fail before any rows are returned.
 #
 # Inputs are strict camelCase (`additionalProperties: false`). Verified
 # live on `files.list`: `fields`, `page`, `perPage`, `limit`,
@@ -77,12 +78,14 @@
 # caveat in `docs/open-connector-google-drive.md`.
 kind: pack
 pack: google_drive
-version: 1
+version: 2
 
 tables:
   files:
     action: googledrive.files.list
     row_path: "$.files"
+    # A successful HTTP response can still omit a requested corpus.
+    error_path: "$.incompleteSearch"
     fingerprint: 8fc57df3637855fcdd9b3490bd2c2bdb52a1790631a778995076e4f467b620ec
     pagination:
       strategy: cursor
