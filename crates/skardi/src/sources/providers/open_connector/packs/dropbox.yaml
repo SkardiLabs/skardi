@@ -1,17 +1,17 @@
-# Dropbox source pack. Wire contract is Open Connector's. LIVE-VERIFIED
-# 2026-08-18 against a self-hosted Open Connector gateway at commit
-# a3efa99 and a real (free-tier) Dropbox account: all five actions
-# discovered, all five pinned fingerprints matched LIVE discovery
-# unchanged, and all three tables scanned real rows end to end. The
-# fingerprints below were derived from the provider source and the live
-# capture confirmed them byte-for-byte, so nothing needed re-pinning.
+# Dropbox source pack. Output schemas were recaptured on 2026-11-01 via
+# GET /v1/actions/<id> from an isolated Open Connector gateway built from
+# source revision 0723029f7b792b4eabac794d7b17f884cabdcdf5 on Node24.22.1.
+# No provider credentials were configured and no Dropbox actions ran.
+# Current pins include the required, nullable hasExplicitSharedMembers
+# metadata field. Payload and pagination observations remain those of the
+# 2026-08-18 live pass at a3efa99; they were not repeated for this update.
 # Two claims remain unobserved rather than confirmed, and are labelled
 # where they live: `shared_links.expires_at` (paid-tier link expiry) and
 # `file_search.match_type = 'content'` (content indexing never landed
 # during the pass).
 #
 # Every list executor NORMALIZES rows through `mapDropboxMetadata`: a
-# fixed camelCase shape whose fifteen keys are ALL declared `required`
+# fixed camelCase shape whose sixteen keys are ALL declared `required`
 # under `additionalProperties: false`. Mapping Dropbox's own snake_case
 # (`path_display`, `client_modified`, `size`) would have produced
 # all-NULL columns — the Slack 5.2 failure mode. The upside of that
