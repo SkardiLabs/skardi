@@ -182,6 +182,22 @@ const RETRYABLE_STATUSES: [u16; 5] = [429, 500, 502, 503, 504];
 /// Conditional-GET validators from a previously cached fetch. Sent as
 /// `If-None-Match`/`If-Modified-Since` on the first hop only — see the
 /// module doc.
+///
+/// # Examples
+///
+/// Rebuilt from the strings a caller stored after its last
+/// [`FetchOutcome::Fetched`]; either field may be absent.
+///
+/// ```
+/// use skardi::sources::providers::rss::Validators;
+///
+/// let stored_etag: Option<&str> = Some("\"v7\"");
+/// let validators = Validators {
+///     etag: stored_etag.map(str::to_string),
+///     last_modified: None,
+/// };
+/// assert_eq!(validators.etag.as_deref(), Some("\"v7\""));
+/// ```
 #[derive(Debug, Clone, Default)]
 pub struct Validators {
     pub etag: Option<String>,
@@ -282,6 +298,38 @@ enum HopOutcome {
 /// construction with `PolicyDns` as its DNS resolver and
 /// redirect-following disabled — see the module doc for why
 /// [`FeedFetcher::fetch`] drives redirects itself instead.
+///
+/// # Examples
+///
+/// A conditional refetch: the validators a `Fetched` reports belong to its
+/// `final_url`, so they are stored, and sent, together.
+///
+/// ```no_run
+/// use std::time::Duration;
+///
+/// use skardi::sources::providers::rss::{FeedFetcher, FetchOutcome, Validators};
+///
+/// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+/// let fetcher = FeedFetcher::new(
+///     None,
+///     Duration::from_secs(10),
+///     5 * 1024 * 1024,
+///     "my-agent/1.0".to_string(),
+/// )?;
+/// let (url, validators) = match fetcher.fetch("https://example.com/feed.xml", None).await? {
+///     FetchOutcome::Fetched {
+///         final_url,
+///         etag,
+///         last_modified,
+///         ..
+///     } => (final_url, Validators { etag, last_modified }),
+///     FetchOutcome::NotModified { .. } => unreachable!("no validators were sent"),
+/// };
+/// // Later: a `304` here comes back as `FetchOutcome::NotModified`.
+/// let _next = fetcher.fetch(&url, Some(&validators)).await?;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug)]
 pub struct FeedFetcher {
     http: reqwest::Client,
@@ -315,6 +363,31 @@ impl FeedFetcher {
     /// the policy always sees the real destination; the switch is the fact of
     /// injection, never the policy's runtime behavior — see the module doc's
     /// "Proxies are disabled exactly when a policy is injected" section.
+    ///
+    /// # Examples
+    ///
+    /// A fetcher that refuses loopback and link-local destinations on every
+    /// hop:
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use std::time::Duration;
+    ///
+    /// use skardi::sources::providers::rss::{DenyCidrs, EgressPolicy, FeedFetcher, IpNet};
+    ///
+    /// let ranges = ["127.0.0.0/8", "169.254.0.0/16"]
+    ///     .into_iter()
+    ///     .map(|range| range.parse::<IpNet>().unwrap());
+    /// let policy: Arc<dyn EgressPolicy> = Arc::new(DenyCidrs::new(ranges));
+    /// let fetcher = FeedFetcher::new(
+    ///     Some(policy),
+    ///     Duration::from_secs(10),
+    ///     5 * 1024 * 1024,
+    ///     "my-agent/1.0".to_string(),
+    /// )
+    /// .unwrap();
+    /// # let _ = fetcher;
+    /// ```
     pub fn new(
         policy: Option<Arc<dyn EgressPolicy>>,
         request_timeout: Duration,
@@ -388,6 +461,37 @@ impl FeedFetcher {
 
     /// Fetch `url`, sending `validators` as conditional-GET headers on the
     /// first hop only. See the module doc for the redirect and retry rules.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::time::Duration;
+    ///
+    /// use skardi::sources::providers::rss::{FeedFetcher, FetchError, FetchOutcome, Validators};
+    ///
+    /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    /// let fetcher = FeedFetcher::new(
+    ///     None,
+    ///     Duration::from_secs(10),
+    ///     5 * 1024 * 1024,
+    ///     "my-agent/1.0".to_string(),
+    /// )?;
+    /// let validators = Validators {
+    ///     etag: Some("\"v7\"".to_string()),
+    ///     last_modified: None,
+    /// };
+    /// match fetcher
+    ///     .fetch("https://example.com/feed.xml", Some(&validators))
+    ///     .await
+    /// {
+    ///     Ok(FetchOutcome::NotModified { .. }) => println!("still current"),
+    ///     Ok(FetchOutcome::Fetched { body, .. }) => println!("{} new bytes", body.len()),
+    ///     Err(FetchError::Egress(denied)) => println!("refused: {denied}"),
+    ///     Err(e) => println!("failed: {e}"),
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn fetch(
         &self,
         url: &str,
