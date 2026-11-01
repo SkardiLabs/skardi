@@ -8,6 +8,11 @@
 # in the URL path, and the `rsplit('.')` lookups elsewhere read TABLE
 # ids, not action ids.
 #
+# The files.list output contract now comes from Open Connector source
+# `0e4dc775` (2026-11-01), including optional permission metadata. This
+# source-derived schema update is not new live-account evidence; historical
+# row fixtures remain unchanged and authored cases cover the new columns.
+#
 # Rows are NORMALIZED upstream — the opposite of `one_drive`, and the
 # reason no column below uses Google's own REST field names. Every
 # executor rebuilds its rows through a `normalize*` function into a
@@ -78,7 +83,7 @@ tables:
   files:
     action: googledrive.files.list
     row_path: "$.files"
-    fingerprint: 1780dbdea3118e36ea078f4bb3f48cf1055395b0ba876dc341bd592cf716f8f8
+    fingerprint: 8fc57df3637855fcdd9b3490bd2c2bdb52a1790631a778995076e4f467b620ec
     pagination:
       strategy: cursor
       cursor_input: pageToken
@@ -172,6 +177,10 @@ tables:
       # included; otherwise an array of parent folder IDs, in practice
       # at most one since Drive dropped multi-parenting.
       - { name: parents, path: parents, type: utf8_list, nullable: true }
+      # Optional observations: neither a missing break flag nor missing IDs
+      # imply false or an empty ACL. These are metadata, not an ACL version.
+      - { name: inherited_permissions_disabled, path: inheritedPermissionsDisabled, type: boolean, nullable: true }
+      - { name: permission_ids, path: permissionIds, type: utf8_list, nullable: true }
       # Two columns from ONE `owners` array under different pluck keys:
       # the engine deliberately has no scalar array indexing, so these
       # are lists rather than `owners[0].…` scalars. My Drive files
