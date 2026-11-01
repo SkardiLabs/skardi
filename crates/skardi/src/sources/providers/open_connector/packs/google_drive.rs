@@ -30,6 +30,11 @@
 //! domain/anyone grants and a user-grant expiration needs a second real
 //! account).
 //!
+//! The optional permission metadata columns and the `files.list` output
+//! schema extension are derived from Open Connector source at `0e4dc775`
+//! (2026-11-01), not a new live-account capture. The historical row fixtures
+//! stay unchanged; the new conversion cases below are authored examples.
+//!
 //! Design decisions and their rationale. Each is held by a named test
 //! below unless marked as an upstream property no Skardi-side test can
 //! hold:
@@ -190,7 +195,7 @@ mod tests {
             .unwrap_or_else(|| panic!("table {short}"))
     }
 
-    /// Discovery serving the captured contracts, so every mock
+    /// Discovery serving the committed contracts, so every mock
     /// registration exercises the fingerprint gate's pass side. The
     /// dotted action ids are matched as full path suffixes — which is
     /// itself part of what these tests exercise: a two-dot action id
@@ -384,6 +389,32 @@ mod tests {
         // emits no `kind` at all — confirmed live on every row.
         for absent in ["owners", "kind", "permission_id", "photo_link"] {
             assert!(batch.column_by_name(absent).is_none(), "{absent}");
+        }
+
+        // Authored optional-metadata cases, not additions to the historical
+        // live capture above. False/empty differ from absent/explicit null.
+        let observed = convert_first_page(
+            table("files"),
+            &json!({"files":[
+                {"id":"reported", "name":"metadata.txt", "mimeType":"text/plain", "inheritedPermissionsDisabled":true, "permissionIds":["grantee-one","grantee-two"]},
+                {"id":"no-break", "name":"metadata.txt", "mimeType":"text/plain", "inheritedPermissionsDisabled":false, "permissionIds":[]},
+                {"id":"unreported", "name":"metadata.txt", "mimeType":"text/plain"},
+                {"id":"null", "name":"metadata.txt", "mimeType":"text/plain", "inheritedPermissionsDisabled":null, "permissionIds":null}
+            ]}),
+        );
+        assert!(boolean(&observed, "inherited_permissions_disabled").value(0));
+        assert!(!boolean(&observed, "inherited_permissions_disabled").value(1));
+        assert_eq!(
+            list_items(utf8_list(&observed, "permission_ids"), 0),
+            vec![Some("grantee-one".into()), Some("grantee-two".into())]
+        );
+        assert_eq!(
+            list_items(utf8_list(&observed, "permission_ids"), 1),
+            Vec::<Option<String>>::new()
+        );
+        for row in [2, 3] {
+            assert!(boolean(&observed, "inherited_permissions_disabled").is_null(row));
+            assert!(utf8_list(&observed, "permission_ids").is_null(row));
         }
     }
 
@@ -820,9 +851,9 @@ mod tests {
     fn empty_page_keeps_schema_stable() {
         // An empty first page must still produce the full declared
         // schema, or a first-page-empty scan would change shape. The
-        // widths are this pack's column counts: 16 / 13 / 11.
+        // widths are this pack's column counts: 18 / 13 / 11.
         for (short, row_key, columns) in [
-            ("files", "files", 16),
+            ("files", "files", 18),
             ("drives", "drives", 13),
             ("file_permissions", "permissions", 11),
         ] {
@@ -881,6 +912,24 @@ mod tests {
                 );
             }
             other => panic!("expected ConversionFailed, got {other}"),
+        }
+        for (field, column, malformed) in [
+            (
+                "inheritedPermissionsDisabled",
+                "inherited_permissions_disabled",
+                json!("false"),
+            ),
+            ("permissionIds", "permission_ids", json!([42])),
+        ] {
+            let mut row = json!({"id":"authored-metadata-mismatch", "name":"metadata.txt", "mimeType":"text/plain"});
+            row[field] = malformed;
+            let err = RowConverter::new(t.fields)
+                .expect("converter")
+                .convert(&[row], 1)
+                .expect_err("malformed optional metadata must fail the page");
+            assert!(
+                matches!(err, OpenConnectorError::ConversionFailed { column: ref actual, .. } if actual == column)
+            );
         }
     }
 

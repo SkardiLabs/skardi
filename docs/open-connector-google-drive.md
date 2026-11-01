@@ -32,6 +32,11 @@ shape (`google_drive.files`).
 > domain/anyone grants, and a user-grant expiration needs a second real
 > account).
 
+The optional permission metadata extension uses the `files.list` output
+schema generated from Open Connector `0e4dc775` (2026-11-01). This is a
+source-derived contract update with authored conversion examples, not a new
+live-account capture.
+
 **The wire contract is Open Connector's, not Google's REST API**: the
 gateway's googledrive executors rebuild every row **normalized**
 (Slack-style) into a fixed key set, declare the row objects
@@ -122,7 +127,7 @@ FROM saas.contract_acl.file_permissions;
 
 Action `googledrive.files.list` — the only action that sees the whole
 corpus. With no resource, the table is **every file the connected
-account can reach**. Sixteen columns:
+account can reach**. Eighteen columns:
 
 | column | wire path | type |
 |---|---|---|
@@ -137,6 +142,8 @@ account can reach**. Sixteen columns:
 | `head_revision_id` | `headRevisionId` | utf8, nullable |
 | `drive_id` | `driveId` | utf8 |
 | `parents` | `parents` | list of utf8 |
+| `inherited_permissions_disabled` | `inheritedPermissionsDisabled` | boolean |
+| `permission_ids` | `permissionIds` | list of utf8 |
 | `owner_display_names` | `owners[].displayName` | list of utf8 |
 | `owner_email_addresses` | `owners[].emailAddress` | list of utf8 |
 | `shared` | `shared` | boolean |
@@ -162,6 +169,13 @@ has no array indexing, not because multi-owner is expected.
 **A NULL boolean means "not reported", never false.** `shared`,
 `starred` and `trashed` are only present on the wire when upstream
 reports a real boolean.
+
+The optional `inherited_permissions_disabled` and `permission_ids` columns
+preserve the metadata returned by Drive. Missing values become SQL NULL;
+an explicit `false` or empty list stays distinct from NULL. Permission IDs
+identify grantees and are not a version for permission or role changes.
+These columns expose metadata; they do not enforce Drive permissions on SQL
+queries.
 
 **Trashed files are included.** Drive's listing does not exclude them by
 default and the pack does not quietly pin a `q` to change that —

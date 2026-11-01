@@ -13,8 +13,9 @@ Dropbox list executor rebuilds each entry through `mapDropboxMetadata`
 into a fixed camelCase shape — `tag`, `name`, `id`, `pathDisplay`,
 `pathLower`, `clientModified`, `serverModified`, `rev`, `sizeBytes`,
 `isDownloadable`, `contentHash`, `url`, `expiresAt`, `sharingInfo`,
-`linkPermissions` — whose fifteen keys are all declared `required` under
-`additionalProperties: false`. Two consequences worth knowing:
+`hasExplicitSharedMembers`, `linkPermissions` — whose sixteen keys are all
+declared `required` under `additionalProperties: false`. Two consequences
+worth knowing:
 
 - Dropbox's own snake_case spellings (`path_display`, `client_modified`,
   `size`) never reach a row, so mapping them would have produced
@@ -24,12 +25,20 @@ into a fixed camelCase shape — `tag`, `name`, `id`, `pathDisplay`,
   where columns ride `additionalProperties` outside any gate.
 
 That gate is narrower than it looks, and the live pass proved it. Because
-*all five* list actions publish the *same* normalized 15-key schema, a
+*all five* list actions publish the *same* normalized metadata schema, a
 fingerprint match says nothing about whether a given key is populated for
 a given action: `shared_links` passed the gate while returning NULL for
 four keys its endpoint has no field for. **Real rows are still the only
 column truth here too** — the gate protects the row *shape*, not the
 per-action field coverage.
+
+The current fingerprints include the nullable `hasExplicitSharedMembers`
+metadata field added with
+[Dropbox membership reads](https://github.com/oomol-lab/open-connector/pull/816).
+The SQL columns remain unchanged. A gateway with the earlier metadata
+schema fails the existing fingerprint check; upgrade the gateway and engine
+together. The historical account-level validation below used the earlier
+fifteen-key contract.
 
 > **✅ Live-verified 2026-08-18** against a self-hosted Open Connector
 > gateway at commit `a3efa99` and a real free-tier Dropbox account. All

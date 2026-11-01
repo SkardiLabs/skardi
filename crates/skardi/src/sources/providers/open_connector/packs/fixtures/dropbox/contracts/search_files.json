@@ -167,6 +167,18 @@
                 ],
                 "description": "A generic JSON object returned by Dropbox."
               },
+              "hasExplicitSharedMembers": {
+                "anyOf": [
+                  {
+                    "type": "boolean",
+                    "description": "Whether the file has explicit members, when requested in the listing."
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Whether the file has explicit members, when requested in the listing."
+              },
               "linkPermissions": {
                 "anyOf": [
                   {
@@ -198,6 +210,7 @@
               "url",
               "expiresAt",
               "sharingInfo",
+              "hasExplicitSharedMembers",
               "linkPermissions"
             ],
             "description": "A normalized Dropbox metadata or shared-link record."

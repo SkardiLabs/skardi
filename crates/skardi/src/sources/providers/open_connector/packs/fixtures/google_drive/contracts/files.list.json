@@ -155,6 +155,18 @@
             "type": "boolean",
             "description": "Whether the file has been trashed."
           },
+          "inheritedPermissionsDisabled": {
+            "type": "boolean",
+            "description": "Whether inherited permissions are disabled, when Drive reports it."
+          },
+          "permissionIds": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "description": "A permission ID."
+            },
+            "description": "The permission IDs of users with access, when Drive reports them."
+          },
           "md5Checksum": {
             "type": "string",
             "description": "The content's MD5 checksum, when Drive reports it. Only available for binary files."
