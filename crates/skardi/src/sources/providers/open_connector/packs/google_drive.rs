@@ -1869,8 +1869,8 @@ bindings:
                     return google_drive_discovery(&req.path);
                 }
                 if req.method == "POST" && req.path == "/v1/actions/googledrive.files.list" {
-                    return MockResponse::ok(envelope_ok(
-                        json!({"files": [file_row("f-1")], "nextPageToken": null,
+                    return MockResponse::ok(&envelope_ok(
+                        &json!({"files": [file_row("f-1")], "nextPageToken": null,
                             "incompleteSearch": incomplete})
                         .to_string(),
                     ));
