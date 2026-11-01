@@ -848,7 +848,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, FetchError::Status { status: 304 }),
+            matches!(err, FetchError::Status { status: 304, .. }),
             "got {err}"
         );
     }
@@ -875,7 +875,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, FetchError::Status { status: 304 }),
+            matches!(err, FetchError::Status { status: 304, .. }),
             "got {err}"
         );
         let req = &server.requests()[0];
@@ -957,7 +957,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, FetchError::Status { status: 304 }),
+            matches!(err, FetchError::Status { status: 304, .. }),
             "got {err}"
         );
         assert_eq!(server.requests().len(), 2);
@@ -1343,10 +1343,16 @@ mod tests {
                 .await
                 .unwrap_err();
             match err {
-                FetchError::Status { status: got } => assert_eq!(
-                    got, status,
-                    "the terminal error carries the status that kept failing"
-                ),
+                FetchError::Status {
+                    status: got,
+                    retry_after,
+                } => {
+                    assert_eq!(
+                        got, status,
+                        "the terminal error carries the status that kept failing"
+                    );
+                    assert_eq!(retry_after, None, "the server sent no Retry-After");
+                }
                 other => panic!("expected a Status error for {status}, got {other:?}"),
             }
             assert_eq!(
@@ -1355,6 +1361,205 @@ mod tests {
                 "{status} must be retried to the attempt budget, not treated as terminal"
             );
         }
+    }
+
+    /// A fetcher whose caller owns retries: one request per hop.
+    fn single_attempt_fetcher(request_timeout: Duration) -> FeedFetcher {
+        FeedFetcher::new(
+            None,
+            request_timeout,
+            1024 * 1024,
+            "skardi-test".to_string(),
+        )
+        .expect("build test fetcher")
+        .single_attempt()
+    }
+
+    /// The executor's case: a throttling host is hit once, and the wait it
+    /// named reaches the caller unclamped — the caller's scheduler turns it
+    /// into the work's `not_before`, and does its own clamping.
+    #[tokio::test]
+    async fn single_attempt_429_returns_at_once_with_its_retry_after() {
+        let server = MockFeedServer::start(|_req| {
+            MockResponse::status(429).with_header("retry-after", "120")
+        })
+        .await;
+        let f = single_attempt_fetcher(Duration::from_secs(2));
+        let start = Instant::now();
+        let err = f
+            .fetch(&format!("{}/f", server.url()), None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FetchError::Status {
+                    status: 429,
+                    retry_after: Some(d),
+                } if d == Duration::from_secs(120)
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(server.requests().len(), 1, "exactly one request");
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "elapsed {:?}: a single attempt must not sleep",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn single_attempt_503_reports_an_http_date_retry_after_as_a_delta() {
+        let server = MockFeedServer::start(|_req| {
+            let date = httpdate::fmt_http_date(SystemTime::now() + Duration::from_secs(120));
+            MockResponse::status(503).with_header("retry-after", &date)
+        })
+        .await;
+        let f = single_attempt_fetcher(Duration::from_secs(2));
+        let err = f
+            .fetch(&format!("{}/f", server.url()), None)
+            .await
+            .unwrap_err();
+        match err {
+            FetchError::Status {
+                status: 503,
+                retry_after: Some(d),
+            } => assert!(
+                // http-dates have whole-second resolution, and a little
+                // wall time passes between minting the date and parsing it.
+                d > Duration::from_secs(110) && d <= Duration::from_secs(120),
+                "retry_after {d:?}, expected about 120s"
+            ),
+            other => panic!("expected Status 503 with a Retry-After, got {other:?}"),
+        }
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn single_attempt_429_without_a_header_has_no_retry_after() {
+        let server = MockFeedServer::start(|_req| MockResponse::status(429)).await;
+        let f = single_attempt_fetcher(Duration::from_secs(2));
+        let err = f
+            .fetch(&format!("{}/f", server.url()), None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FetchError::Status {
+                    status: 429,
+                    retry_after: None,
+                }
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    /// The default fetcher sleeps through a 3s response delay three times;
+    /// a single-attempt one gives up after the first request's timeout.
+    #[tokio::test]
+    async fn single_attempt_timeout_is_one_request_and_no_sleep() {
+        let server = MockFeedServer::start(|_req| {
+            MockResponse::xml("<rss/>").with_delay(Duration::from_secs(3))
+        })
+        .await;
+        let f = single_attempt_fetcher(Duration::from_secs(1));
+        let start = Instant::now();
+        let err = f
+            .fetch(&format!("{}/f", server.url()), None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, FetchError::Timeout { seconds: 1 }),
+            "got {err:?}"
+        );
+        assert_eq!(server.requests().len(), 1);
+        assert!(
+            start.elapsed() < Duration::from_millis(2500),
+            "elapsed {:?}: one 1s timeout, no retry",
+            start.elapsed()
+        );
+    }
+
+    /// The body-phase transport failure `truncated_body_is_retried_and_recovers`
+    /// recovers from by default is terminal here.
+    #[tokio::test]
+    async fn single_attempt_truncated_body_is_a_transport_error_after_one_request() {
+        let server = MockFeedServer::start(|_req| {
+            MockResponse::xml("<rss>complete</rss>").with_truncated_body(4)
+        })
+        .await;
+        let f = single_attempt_fetcher(Duration::from_secs(2));
+        let err = f
+            .fetch(&format!("{}/f", server.url()), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FetchError::Transport { .. }), "got {err:?}");
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn single_attempt_304_is_still_not_modified() {
+        let server = MockFeedServer::start(|req| {
+            if req.header("if-none-match").as_deref() == Some("\"v1\"") {
+                MockResponse::status(304)
+            } else {
+                MockResponse::xml("<rss/>")
+            }
+        })
+        .await;
+        let f = single_attempt_fetcher(Duration::from_secs(2));
+        let v = Validators {
+            etag: Some("\"v1\"".into()),
+            last_modified: None,
+        };
+        let out = f
+            .fetch(&format!("{}/f", server.url()), Some(&v))
+            .await
+            .unwrap();
+        assert!(
+            matches!(out, FetchOutcome::NotModified { http_status: 304 }),
+            "got {out:?}"
+        );
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    /// One attempt per hop, not per fetch: redirects are not retries.
+    #[tokio::test]
+    async fn single_attempt_still_follows_redirects() {
+        let server = MockFeedServer::start(|req| {
+            if req.path == "/moved" {
+                MockResponse::xml("<rss/>")
+            } else {
+                MockResponse::status(302).with_header("location", "/moved")
+            }
+        })
+        .await;
+        let f = single_attempt_fetcher(Duration::from_secs(2));
+        let out = f
+            .fetch(&format!("{}/feed.xml", server.url()), None)
+            .await
+            .unwrap();
+        assert!(matches!(out, FetchOutcome::Fetched { .. }), "got {out:?}");
+        assert_eq!(server.requests().len(), 2);
+    }
+
+    /// Every hop is still egress-checked in single-attempt mode.
+    #[tokio::test]
+    async fn single_attempt_still_checks_redirect_targets() {
+        let server = MockFeedServer::start(|_req| {
+            MockResponse::status(302).with_header("location", "http://10.255.255.1/f")
+        })
+        .await;
+        let policy = Arc::new(DenyList(vec!["10.255.255.1".parse().unwrap()]));
+        let f = fetcher_with_policy(policy).single_attempt();
+        let err = f
+            .fetch(&format!("{}/start", server.url()), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FetchError::Egress(_)), "got {err:?}");
+        assert_eq!(server.requests().len(), 1);
     }
 
     #[tokio::test]
@@ -1366,7 +1571,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, FetchError::Status { status: 404 }),
+            matches!(err, FetchError::Status { status: 404, .. }),
             "got {err}"
         );
         assert_eq!(server.requests().len(), 1);
@@ -1394,7 +1599,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, FetchError::Status { status: 206 }),
+            matches!(err, FetchError::Status { status: 206, .. }),
             "got {err}"
         );
         assert_eq!(server.requests().len(), 1, "a 2xx mismatch is not retried");
@@ -1411,7 +1616,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, FetchError::Status { status: 204 }),
+            matches!(err, FetchError::Status { status: 204, .. }),
             "got {err}"
         );
         assert_eq!(server.requests().len(), 1);
