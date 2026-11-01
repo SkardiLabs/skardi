@@ -188,10 +188,15 @@ mod tests {
                 0,
             ),
         ] {
-            // Prove that each path shape reaches the affected upstream call.
+            // Prove both empty shapes fail without our registered wrapper.
             ctx.register_udf((*udfs::json_get_str_udf()).clone());
             let error = ctx.sql(sql).await.unwrap().collect().await.unwrap_err();
-            assert!(error.to_string().contains("run_ends"), "{sql}: {error}");
+            let expected_error = if expected_rows == 1 {
+                "run_ends"
+            } else {
+                "More than 1 path element"
+            };
+            assert!(error.to_string().contains(expected_error), "{sql}: {error}");
 
             register_json_getter_udfs(&ctx).unwrap();
             let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
