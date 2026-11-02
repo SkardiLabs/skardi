@@ -43,9 +43,8 @@ pub mod exec;
 #[cfg(feature = "rss")]
 pub mod engine;
 // The bounded HTTP fetcher (conditional GET, retries, egress enforcement)
-// built on top of `egress`. Not `pub` for the same reason `egress` isn't:
-// it is an implementation detail of the engine a later task builds on top,
-// not part of this provider's public surface.
+// built on top of `egress`. The module stays private; the types a caller
+// fetching feeds itself needs are re-exported below.
 #[cfg(feature = "rss")]
 mod fetch;
 // Hand-rolled mock feed server the fetcher's tests drive. Test-only (never
@@ -99,6 +98,11 @@ pub use opml::resolve_subscriptions;
 // no ranges of its own.
 #[cfg(feature = "rss")]
 pub use egress::{AllowAll, DenyCidrs, EgressDenied, EgressPolicy, EgressReason};
+// The fetcher itself, for an embedder that fetches feeds outside the engine's
+// scan: Skardi Cloud runs each feed as one work on its executor, with
+// `FeedFetcher::single_attempt` so its own scheduler owns the retries.
+#[cfg(feature = "rss")]
+pub use fetch::{FeedFetcher, FetchError, FetchOutcome, Validators};
 // `RssConfig::deny_cidrs` and `DenyCidrs::new` both speak `ipnet::IpNet`, so
 // `ipnet` is part of this crate's public API whether or not it is named here.
 // Naming it spares a caller a second Cargo dependency whose version it would

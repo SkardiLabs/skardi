@@ -778,7 +778,7 @@ impl RssEngine {
             ),
             Err(error) => {
                 let http_status = match &error {
-                    FetchError::Status { status } => Some(*status),
+                    FetchError::Status { status, .. } => Some(*status),
                     _ => None,
                 };
                 self.degrade(
