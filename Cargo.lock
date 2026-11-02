@@ -9856,7 +9856,7 @@ checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
 
 [[package]]
 name = "skardi"
-version = "0.8.0-rc.1"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -9927,7 +9927,7 @@ dependencies = [
 
 [[package]]
 name = "skardi-cli"
-version = "0.8.0-rc.1"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -9953,7 +9953,7 @@ dependencies = [
 
 [[package]]
 name = "skardi-mcp-core"
-version = "0.8.0-rc.1"
+version = "0.8.0"
 dependencies = [
  "percent-encoding",
  "rmcp",
@@ -9963,7 +9963,7 @@ dependencies = [
 
 [[package]]
 name = "skardi-query-audit"
-version = "0.8.0-rc.1"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -9981,7 +9981,7 @@ dependencies = [
 
 [[package]]
 name = "skardi-server"
-version = "0.8.0-rc.1"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -10034,7 +10034,7 @@ dependencies = [
 
 [[package]]
 name = "skardi-source-pack"
-version = "0.8.0-rc.1"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "async-trait",
