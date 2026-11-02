@@ -283,6 +283,14 @@ See [docs/cli.md](docs/cli.md#signing-in-to-skardi-cloud--login--logout) for the
 other way in (`--client-id`, which selects workspaces from the terminal) and
 for what a cloud context can and cannot do.
 
+A coding agent can also connect your data sources for you: `skardi login
+--control` asks you to approve a 24-hour control token beside the query
+token, after which `skardi integrations …` connects a provider through a page
+only you can open — the agent is never handed a secret — and every command
+prints the next one. `skardi mcp register claude-code` adds the workspace's
+MCP server to Claude Code. See
+[docs/cli.md](docs/cli.md#connecting-data-sources-from-an-agent--integrations-handoff-documents).
+
 **Server** — a Docker image, or a source build (no pre-built binary yet):
 
 ```bash

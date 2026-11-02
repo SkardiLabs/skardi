@@ -99,6 +99,11 @@ pub struct Membership {
     pub provisioning_state: String,
     #[serde(default)]
     pub gateway_url: Option<String>,
+    /// The workspace's MCP server, `gateway_url + "/mcp"` (agent onboarding
+    /// §2.9.2). Sent only by a `skardi login` exchange, and only where the
+    /// control plane has a gateway URL; what `mcp register` writes.
+    #[serde(default)]
+    pub mcp_url: Option<String>,
 }
 
 impl Membership {
@@ -120,6 +125,29 @@ pub struct Minted {
     pub token: String,
     pub token_id: String,
     pub expires_at: Option<String>,
+    /// The pair's other half, when a brokered `login --control` was approved
+    /// with `control` (agent onboarding §2.1.1). Always `None` on the direct
+    /// flow, which mints one token per workspace itself.
+    pub control: Option<ControlGrant>,
+}
+
+/// The `control` token of a pair, and the id that names the pair.
+///
+/// Carries a raw credential, so `Debug` is hand-written below.
+pub struct ControlGrant {
+    pub token: String,
+    pub expires_at: Option<String>,
+    pub pair_id: Option<String>,
+}
+
+impl fmt::Debug for ControlGrant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ControlGrant")
+            .field("token", &"(redacted)")
+            .field("expires_at", &self.expires_at)
+            .field("pair_id", &self.pair_id)
+            .finish()
+    }
 }
 
 /// Hand-written so the raw token cannot reach a log line, a panic message, or
@@ -130,6 +158,7 @@ impl fmt::Debug for Minted {
             .field("token", &"(redacted)")
             .field("token_id", &self.token_id)
             .field("expires_at", &self.expires_at)
+            .field("control", &self.control)
             .finish()
     }
 }
@@ -212,6 +241,7 @@ impl ControlPlane {
             token: parsed.token,
             token_id: parsed.pat.token_id,
             expires_at: parsed.pat.expires_at,
+            control: None,
         })
     }
 
@@ -371,7 +401,7 @@ fn snippet(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_SNIPPET_CHARS, Membership, MembershipsBody, Minted, client_for,
+        ControlGrant, MAX_SNIPPET_CHARS, Membership, MembershipsBody, Minted, client_for,
         identity_provider_client, parse_error,
     };
     use crate::identity::{ClientIdentity, Surface};
@@ -440,8 +470,15 @@ mod tests {
             token: "skardi_pat_the_real_secret".to_string(),
             token_id: "tok-1".to_string(),
             expires_at: Some("2026-11-22T12:00:00Z".to_string()),
+            control: Some(ControlGrant {
+                token: "skardi_pat_the_control_secret".to_string(),
+                expires_at: Some("2026-08-25T12:00:00Z".to_string()),
+                pair_id: Some("pair-1".to_string()),
+            }),
         };
         let rendered = format!("{minted:?}");
+        assert!(!rendered.contains("the_control_secret"), "{rendered}");
+        assert!(rendered.contains("pair-1"), "{rendered}");
         assert!(!rendered.contains("the_real_secret"), "{rendered}");
         assert!(rendered.contains("(redacted)"), "{rendered}");
         // The id and expiry are what a caller legitimately needs to see.
