@@ -7,6 +7,13 @@
 //! `DELETE /v1/me/tokens/{id}`. Presenting the local delete as a revocation
 //! would be the more dangerous message: a token nobody holds is still a token
 //! that works.
+//!
+//! A browser login (the console-brokered flow) holds only PATs, which cannot
+//! revoke anything, so for those the way to revoke is the person's own
+//! session: `logout` names `/account/agent-access` on the console the login
+//! went through, with the pair to revoke when the context recorded one
+//! (agent onboarding §2.1.1). The context's `pair-id` is kept, so the next
+//! `login` names it as `replaces_pair_id` and the exchange revokes it.
 
 use super::login::LogoutArgs;
 use crate::config::{self, ContextMode, ContextsFile};
@@ -20,6 +27,7 @@ use std::time::Duration;
 struct Cleared {
     context: String,
     token_id: Option<String>,
+    pair_id: Option<String>,
 }
 
 pub async fn run(args: LogoutArgs, flag_context: Option<String>) -> Result<()> {
@@ -56,7 +64,8 @@ pub(crate) async fn run_at(path: &Path, args: LogoutArgs, env: &LogoutEnv<'_>) -
     // Read the ids BEFORE clearing them: after the write they are gone, and
     // --revoke needs them. The revoke runs after the local edit so a control
     // plane that cannot be reached still leaves the credential off this disk.
-    let cleared = clear_credentials(path, &args, env.flag_context, env.env_context.as_deref())?;
+    let (cleared, console) =
+        clear_credentials(path, &args, env.flag_context, env.env_context.as_deref())?;
     if cleared.is_empty() {
         println!("no cloud context held a credential — nothing to do");
         return Ok(());
@@ -67,9 +76,7 @@ pub(crate) async fn run_at(path: &Path, args: LogoutArgs, env: &LogoutEnv<'_>) -
     }
 
     if !args.revoke {
-        println!(
-            "the credential is gone from this machine but stays VALID until it expires — run 'skardi logout --revoke' to revoke it at the control plane"
-        );
+        print!("{}", still_valid_notice(&cleared, console.as_deref()));
         return Ok(());
     }
 
@@ -140,15 +147,54 @@ fn unrevoked_warning(revocable: &[&Cleared]) -> String {
     )
 }
 
-/// Clear `token`/`token-id`/`token-expires-at` from the selected contexts,
-/// leaving the context itself (server, workspace, mode) in place so a later
-/// `login` refills it. Deleting the context is `config delete-context`'s job.
+/// What a plain `logout` says: the credential is gone from here and still
+/// valid there, and where to revoke it.
+///
+/// With a console on record (a browser login), the revocation is its
+/// `/account/agent-access` page, under the person's own session — the CLI
+/// holds only PATs, and no PAT may revoke a token. `?pair=` names the login
+/// to revoke, so the page opens on it. Without one, `--revoke` re-authenticates
+/// as before.
+fn still_valid_notice(cleared: &[Cleared], console: Option<&str>) -> String {
+    use std::fmt::Write as _;
+
+    let Some(console) = console
+        .map(|c| c.trim().trim_end_matches('/'))
+        .filter(|c| !c.is_empty())
+    else {
+        return "the credential is gone from this machine but stays VALID until it expires — run 'skardi logout --revoke' to revoke it at the control plane\n".to_string();
+    };
+    let page = format!("{console}/account/agent-access");
+    let mut out = format!(
+        "the credential is gone from this machine but stays VALID until it expires — revoke it in the console at {page}\n"
+    );
+    for entry in cleared {
+        if let Some(pair_id) = &entry.pair_id {
+            let _ = writeln!(
+                out,
+                "  {}: {page}?pair={}",
+                entry.context,
+                crate::client::encode_component(pair_id)
+            );
+        }
+    }
+    out
+}
+
+/// Clear the credentials — `token`/`token-id`/`token-expires-at` and the
+/// pair's `control-token`/`control-token-expires-at` — from the selected
+/// contexts, leaving the context itself (server, workspace, mode, and the
+/// `pair-id` the next login replaces) in place so a later `login` refills it.
+/// Deleting the context is `config delete-context`'s job.
+///
+/// Returns what was cleared, and the console the file records, which is
+/// where a browser login's credentials are revoked.
 fn clear_credentials(
     path: &Path,
     args: &LogoutArgs,
     flag_context: Option<&str>,
     env_context: Option<&str>,
-) -> Result<Vec<Cleared>> {
+) -> Result<(Vec<Cleared>, Option<String>)> {
     let mut file: ContextsFile = config::load_for_mutation(path)?;
     file.promote_legacy_spec();
 
@@ -192,22 +238,26 @@ fn clear_credentials(
         let Some(context) = file.contexts.iter_mut().find(|c| c.name == name) else {
             continue;
         };
-        if context.token.is_none() && context.token_id.is_none() {
+        if context.token.is_none() && context.token_id.is_none() && context.control_token.is_none()
+        {
             continue;
         }
         cleared.push(Cleared {
             context: name,
             token_id: context.token_id.clone(),
+            pair_id: context.pair_id.clone(),
         });
         context.token = None;
         context.token_id = None;
         context.token_expires_at = None;
+        context.control_token = None;
+        context.control_token_expires_at = None;
     }
 
     if !cleared.is_empty() {
         config::save(path, &file)?;
     }
-    Ok(cleared)
+    Ok((cleared, file.console.clone()))
 }
 
 /// Re-authenticate for `--revoke`, reusing `login`'s acquirers so the dev path
@@ -264,7 +314,7 @@ async fn authenticate(args: &LogoutArgs, path: &Path, env: &LogoutEnv<'_>) -> Re
 
 #[cfg(test)]
 mod tests {
-    use super::{Duration, LogoutArgs, LogoutEnv, run_at};
+    use super::{Cleared, Duration, LogoutArgs, LogoutEnv, run_at, still_valid_notice};
     use serde_json::json;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
@@ -749,5 +799,68 @@ mod tests {
         let file = yaml(&path);
         assert_eq!(file["contexts"][0]["token"], "skardi_pat_prod");
         assert!(file["contexts"][1].get("token").is_none());
+    }
+
+    /// A pair's control token leaves with the query token, and the pair id
+    /// stays so the next login revokes the pair it replaces.
+    #[tokio::test]
+    async fn logout_clears_the_control_token_and_keeps_the_pair_id() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(".skardi").join("config.yaml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "console: https://console.example\n\
+             current-context: acme/prod\n\
+             contexts:\n\
+             \x20 - name: acme/prod\n\
+             \x20   mode: cloud\n\
+             \x20   server: http://gw.example\n\
+             \x20   workspace: acme-prod\n\
+             \x20   token: skardi_pat_mcp\n\
+             \x20   token-id: tok-mcp\n\
+             \x20   control-token: skardi_pat_control\n\
+             \x20   control-token-expires-at: 2026-10-31T12:00:00Z\n\
+             \x20   pair-id: pair-1\n\
+             \x20   mcp-url: http://gw.example/mcp\n",
+        )
+        .unwrap();
+
+        run_at(&path, args(false, false), &env(None)).await.unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("skardi_pat_control"), "{raw}");
+        assert!(!raw.contains("skardi_pat_mcp"), "{raw}");
+        let file = yaml(&path);
+        let context = &file["contexts"][0];
+        assert!(context.get("control-token-expires-at").is_none(), "{raw}");
+        assert_eq!(context["pair-id"].as_str(), Some("pair-1"));
+        assert_eq!(context["mcp-url"].as_str(), Some("http://gw.example/mcp"));
+    }
+
+    /// A browser login is revoked on the console's Agent access page, which
+    /// the notice names — with the pair, when the context recorded one.
+    #[test]
+    fn the_notice_names_agent_access_on_the_recorded_console() {
+        let cleared = vec![
+            Cleared {
+                context: "acme/prod".to_string(),
+                token_id: Some("tok-1".to_string()),
+                pair_id: Some("7e1c6f2a-0000-4000-8000-000000000001".to_string()),
+            },
+            Cleared {
+                context: "acme/old".to_string(),
+                token_id: Some("tok-2".to_string()),
+                pair_id: None,
+            },
+        ];
+        let notice = still_valid_notice(&cleared, Some("https://console.example/"));
+        assert_eq!(
+            notice,
+            "the credential is gone from this machine but stays VALID until it expires — revoke it in the console at https://console.example/account/agent-access\n\
+             \x20 acme/prod: https://console.example/account/agent-access?pair=7e1c6f2a-0000-4000-8000-000000000001\n"
+        );
+        // Without a console on record, `--revoke` is the way, as before.
+        assert!(still_valid_notice(&cleared, None).contains("skardi logout --revoke"));
     }
 }

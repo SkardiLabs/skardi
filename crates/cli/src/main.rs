@@ -9,20 +9,25 @@ use clap::error::ErrorKind;
 use clap::{Parser, Subcommand};
 use client::{ApiClient, ApiError};
 use cloud::Capability;
+use commands::agent::{AgentCmd, DocumentsArgs, HandoffArgs, IntegrationsArgs};
 use commands::config::ConfigCmd;
 use commands::jobs::JobCmd;
 use commands::login::{LoginArgs, LogoutArgs};
+use commands::mcp_register::McpCmd;
 use commands::pipeline::PipelineCmd;
 use commands::query::ContextFlags;
 use config::ClientConfig;
+use exit::Exit;
 use identity::{ClientIdentity, Surface};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+mod agent;
 mod client;
 mod cloud;
 mod commands;
 mod config;
+mod exit;
 mod identity;
 mod login;
 mod mcp;
@@ -181,12 +186,28 @@ enum Commands {
         name: Option<String>,
     },
 
-    /// Serve MCP over stdio, proxying tools to the server (for MCP hosts).
+    /// Serve MCP over stdio, proxying tools to the server (for MCP hosts);
+    /// or, with `register`, add a skardi-cloud workspace's MCP server to an
+    /// agent.
     ///
-    /// Spawned by an MCP host (Claude Desktop, Cursor, ...) as a long-lived
-    /// child process; speaks JSON-RPC on stdout, so it prints nothing else
-    /// there. Runs until the host closes stdin.
-    Mcp,
+    /// Without a subcommand: spawned by an MCP host (Claude Desktop, Cursor,
+    /// ...) as a long-lived child process; speaks JSON-RPC on stdout, so it
+    /// prints nothing else there. Runs until the host closes stdin.
+    Mcp {
+        #[command(subcommand)]
+        cmd: Option<McpCmd>,
+    },
+
+    /// Connect a skardi-cloud workspace's data sources: what an agent runs
+    /// after `skardi login --control`. Each command prints the next one.
+    Integrations(IntegrationsArgs),
+
+    /// Wait on a handoff: the page where the person consents or pastes a
+    /// secret for `integrations connect`.
+    Handoff(HandoffArgs),
+
+    /// Upload local files into a personal skardi-cloud workspace.
+    Documents(DocumentsArgs),
 }
 
 #[tokio::main]
@@ -206,6 +227,26 @@ async fn main() -> ExitCode {
                     return ExitCode::SUCCESS;
                 }
                 _ => {
+                    // The agent commands publish their own table (design
+                    // 2026-10-27 §2.4.2), in which a usage error is 2 — and a
+                    // `--json` caller is owed the envelope on stdout, not
+                    // clap's text alone.
+                    let args: Vec<String> = std::env::args().skip(1).collect();
+                    let agent = commands::agent::subcommand_of(args.iter().cloned())
+                        .is_some_and(|sub| commands::agent::AGENT_COMMANDS.contains(&sub.as_str()));
+                    if agent {
+                        if args.iter().any(|a| a == "--json") {
+                            let envelope = serde_json::json!({
+                                "ok": false,
+                                "error": { "code": "usage", "message": e.to_string().trim() },
+                                "next": null,
+                            });
+                            println!("{envelope}");
+                        } else {
+                            let _ = e.print();
+                        }
+                        return ExitCode::from(agent::EXIT_USAGE);
+                    }
                     let _ = e.print();
                     return ExitCode::FAILURE;
                 }
@@ -215,6 +256,15 @@ async fn main() -> ExitCode {
     match dispatch(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
+            // A command that chose its own code (the agent-onboarding table,
+            // `login --control`'s 6) also says whether anything is left to
+            // print: the agent commands have already printed their envelope.
+            if let Some(exit) = err.downcast_ref::<Exit>() {
+                if let Some(message) = &exit.message {
+                    eprintln!("error: {message}");
+                }
+                return ExitCode::from(exit.code);
+            }
             eprintln!("error: {err:#}");
             match err.downcast_ref::<ApiError>() {
                 Some(ApiError::Connect { .. }) => ExitCode::from(2),
@@ -258,6 +308,56 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             }
             return commands::logout::run(args, cli.context).await;
         }
+        // Local: it reads the context's MCP URL and token and hands them to
+        // the agent's own configuration. Not gated by `Capability::Mcp`,
+        // which refuses the stdio bridge on a cloud context — this command
+        // exists FOR a cloud context.
+        //
+        // `--server` and `--token` are refused, as `logout` refuses them:
+        // the command writes the URL and token the selected context holds,
+        // so a flag it ignored would register the OLD token while the
+        // person believed they had named a new one.
+        Commands::Mcp { cmd: Some(cmd) } => {
+            if cli.token.is_some() || cli.server.is_some() {
+                anyhow::bail!(
+                    "--server and --token are not accepted by 'mcp register': it registers the MCP URL and token that a context's `skardi login` recorded. Pick the context with --context, or run `skardi login` to change what it holds"
+                );
+            }
+            return commands::mcp_register::run(cmd, cli.context);
+        }
+        // The agent commands resolve their own context: they need the
+        // control token, which no other command reads, and they report every
+        // failure through their own output contract.
+        Commands::Integrations(args) => {
+            return commands::agent::run(
+                AgentCmd::Integrations(args.cmd),
+                args.json,
+                cli.server,
+                cli.token,
+                cli.context,
+            )
+            .await;
+        }
+        Commands::Handoff(args) => {
+            return commands::agent::run(
+                AgentCmd::Handoff(args.cmd),
+                args.json,
+                cli.server,
+                cli.token,
+                cli.context,
+            )
+            .await;
+        }
+        Commands::Documents(args) => {
+            return commands::agent::run(
+                AgentCmd::Documents(args.cmd),
+                args.json,
+                cli.server,
+                cli.token,
+                cli.context,
+            )
+            .await;
+        }
         _ => {}
     }
 
@@ -277,7 +377,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
     // `skardi mcp` says so in its User-Agent: an agent driving the CLI is the
     // split skardi-cloud's client analytics most wants (`identity`).
     let surface = match cli.command {
-        Commands::Mcp => Surface::Mcp,
+        Commands::Mcp { .. } => Surface::Mcp,
         _ => Surface::Cli,
     };
     let client = ApiClient::with_identity(&config, ClientIdentity::from_env(surface))?;
@@ -325,10 +425,16 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
 
         // Moves `client` by value: the bridge owns it for the process's
         // lifetime (the host decides when that ends by closing stdin).
-        Commands::Mcp => mcp::run(client).await,
+        Commands::Mcp { cmd: None } => mcp::run(client).await,
 
         // Returned above, before resolution.
-        Commands::Config { .. } | Commands::Login(_) | Commands::Logout(_) => Ok(()),
+        Commands::Config { .. }
+        | Commands::Login(_)
+        | Commands::Logout(_)
+        | Commands::Mcp { cmd: Some(_) }
+        | Commands::Integrations(_)
+        | Commands::Handoff(_)
+        | Commands::Documents(_) => Ok(()),
     };
 
     outcome.map_err(|err| cloud::diagnose(err, capability, &config))
@@ -345,9 +451,16 @@ fn capability_of(command: &Commands) -> Option<Capability> {
         Commands::Pipeline { .. } => Some(Capability::Pipeline),
         Commands::Job { .. } => Some(Capability::Job),
         Commands::Health { .. } => Some(Capability::Health),
-        Commands::Mcp => Some(Capability::Mcp),
-        // Local, and returned before resolution: no capability to gate.
-        Commands::Config { .. } | Commands::Login(_) | Commands::Logout(_) => None,
+        Commands::Mcp { cmd: None } => Some(Capability::Mcp),
+        // Local, or resolving their own context, and returned before
+        // resolution: no capability to gate.
+        Commands::Config { .. }
+        | Commands::Login(_)
+        | Commands::Logout(_)
+        | Commands::Mcp { cmd: Some(_) }
+        | Commands::Integrations(_)
+        | Commands::Handoff(_)
+        | Commands::Documents(_) => None,
     }
 }
 
@@ -355,6 +468,33 @@ fn capability_of(command: &Commands) -> Option<Capability> {
 mod tests {
     use super::{Capability, Commands, capability_of};
     use clap::Parser as _;
+
+    /// `mcp register` writes what the context holds, so a global flag it
+    /// would ignore is refused before anything is read or run — the case
+    /// that mattered being `--token NEW … --print` quietly embedding the old
+    /// token.
+    #[tokio::test]
+    async fn mcp_register_refuses_the_global_overrides_it_cannot_honour() {
+        for argv in [
+            &["skardi", "--token", "NEW", "mcp", "register", "--print"][..],
+            &[
+                "skardi",
+                "--server",
+                "https://other.example",
+                "mcp",
+                "register",
+                "claude-code",
+            ],
+            &["skardi", "mcp", "register", "--print", "--token", "NEW"],
+        ] {
+            let cli = super::Cli::try_parse_from(argv).expect("parses");
+            let err = super::dispatch(cli).await.unwrap_err().to_string();
+            assert!(
+                err.contains("not accepted by 'mcp register'"),
+                "{argv:?}: {err}"
+            );
+        }
+    }
 
     /// The table gating and the route-specific error mapping both read. A
     /// remote command with no entry would silently skip cloud gating, so the
@@ -388,6 +528,10 @@ mod tests {
             vec!["skardi", "config", "get-contexts"],
             vec!["skardi", "login"],
             vec!["skardi", "logout"],
+            vec!["skardi", "mcp", "register", "claude-code"],
+            vec!["skardi", "integrations", "list"],
+            vec!["skardi", "handoff", "wait", "h1"],
+            vec!["skardi", "documents", "add", "a.pdf"],
         ] {
             let cli = super::Cli::try_parse_from(&argv).expect("parses");
             assert_eq!(capability_of(&cli.command), None, "argv: {argv:?}");
@@ -470,7 +614,10 @@ mod tests {
                 | Commands::Job { .. }
                 | Commands::Schema
                 | Commands::Health { .. }
-                | Commands::Mcp => true,
+                | Commands::Mcp { .. }
+                | Commands::Integrations(_)
+                | Commands::Handoff(_)
+                | Commands::Documents(_) => true,
             }
         }
         let cli = super::Cli::try_parse_from(["skardi", "schema"]).unwrap();

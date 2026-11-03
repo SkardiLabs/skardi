@@ -97,6 +97,12 @@
 //! it names. Redirects are not retries: following one always starts a new
 //! hop with a fresh attempt budget.
 //!
+//! [`FeedFetcher::single_attempt`] shrinks that budget to one, for a caller
+//! whose own scheduler retries (Skardi Cloud runs each feed as one work on
+//! its executor). There, a retryable failure returns at once instead of
+//! sleeping, and [`FetchError::Status`] carries the response's `Retry-After`
+//! uncapped, for that caller to clamp and schedule against.
+//!
 //! ## An unconditional `304` is a protocol error, not a cache hit
 //!
 //! `304 Not Modified` is only meaningful as an answer to a conditional
@@ -176,6 +182,22 @@ const RETRYABLE_STATUSES: [u16; 5] = [429, 500, 502, 503, 504];
 /// Conditional-GET validators from a previously cached fetch. Sent as
 /// `If-None-Match`/`If-Modified-Since` on the first hop only — see the
 /// module doc.
+///
+/// # Examples
+///
+/// Rebuilt from the strings a caller stored after its last
+/// [`FetchOutcome::Fetched`]; either field may be absent.
+///
+/// ```
+/// use skardi::sources::providers::rss::Validators;
+///
+/// let stored_etag: Option<&str> = Some("\"v7\"");
+/// let validators = Validators {
+///     etag: stored_etag.map(str::to_string),
+///     last_modified: None,
+/// };
+/// assert_eq!(validators.etag.as_deref(), Some("\"v7\""));
+/// ```
 #[derive(Debug, Clone, Default)]
 pub struct Validators {
     pub etag: Option<String>,
@@ -189,7 +211,7 @@ pub enum FetchOutcome {
     ///
     /// Carries no landing URL, and needs none: a `304` can only answer a hop
     /// that actually sent validators, validators go out on the first hop
-    /// only, and [`FeedFetcher::attempt_hop`] maps an unconditional `304` to
+    /// only, and `FeedFetcher::attempt_hop` maps an unconditional `304` to
     /// [`FetchError::Status`] rather than this variant. So the URL that
     /// produced a `NotModified` is always the one the caller asked for.
     NotModified { http_status: u16 },
@@ -235,11 +257,31 @@ pub enum FetchError {
     Timeout { seconds: u64 },
 
     /// A terminal HTTP status: either not retryable at all, or retryable
-    /// but still failing after [`MAX_ATTEMPTS`] attempts.
-    #[error("http status {status}")]
-    Status { status: u16 },
+    /// but still failing after the fetcher's attempt budget (three attempts
+    /// by default, one under [`FeedFetcher::single_attempt`]).
+    ///
+    /// `Display` appends the host's requested wait when there is one
+    /// (`http status 429 (retry after 120s)`), so a throttled feed's log line
+    /// and `feeds.last_error` say how long it asked for.
+    #[error("http status {status}{}", retry_after_suffix(.retry_after))]
+    Status {
+        status: u16,
+        /// The last response's `Retry-After`, delta-seconds or HTTP-date,
+        /// as a wait from now; `None` when the host sent none (or sent one
+        /// that does not parse). Uncapped: `MAX_RETRY_WAIT` bounds this
+        /// fetcher's own sleeps, while a caller that schedules the retry
+        /// itself applies its own clamp.
+        ///
+        /// An HTTP-date already in the past — or one that only looks past
+        /// because the host's clock is behind ours — is `Some(Duration::ZERO)`,
+        /// not `None`. A caller that turns this straight into its next attempt
+        /// time would retry at once and spend an attempt on a host that has
+        /// just throttled it, so it needs a floor of its own. This fetcher's
+        /// own retries have one: they wait `max(retry_after, backoff)`.
+        retry_after: Option<Duration>,
+    },
 
-    /// Following the next redirect would exceed [`MAX_REDIRECT_HOPS`].
+    /// Following the next redirect would exceed `MAX_REDIRECT_HOPS` (5).
     #[error("too many redirects (limit {hops})")]
     TooManyRedirects { hops: u32 },
 
@@ -264,24 +306,57 @@ enum HopOutcome {
 /// Bounded HTTP fetcher for one feed URL.
 ///
 /// One [`FeedFetcher`] owns a single shared `reqwest::Client`, built once at
-/// construction with [`PolicyDns`] as its DNS resolver and
+/// construction with `PolicyDns` as its DNS resolver and
 /// redirect-following disabled — see the module doc for why
 /// [`FeedFetcher::fetch`] drives redirects itself instead.
+///
+/// # Examples
+///
+/// A conditional refetch: the validators a `Fetched` reports belong to its
+/// `final_url`, so they are stored, and sent, together.
+///
+/// ```no_run
+/// use std::time::Duration;
+///
+/// use skardi::sources::providers::rss::{FeedFetcher, FetchOutcome, Validators};
+///
+/// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+/// let fetcher = FeedFetcher::new(
+///     None,
+///     Duration::from_secs(10),
+///     5 * 1024 * 1024,
+///     "my-agent/1.0".to_string(),
+/// )?;
+/// let (url, validators) = match fetcher.fetch("https://example.com/feed.xml", None).await? {
+///     FetchOutcome::Fetched {
+///         final_url,
+///         etag,
+///         last_modified,
+///         ..
+///     } => (final_url, Validators { etag, last_modified }),
+///     FetchOutcome::NotModified { .. } => unreachable!("no validators were sent"),
+/// };
+/// // Later: a `304` here comes back as `FetchOutcome::NotModified`.
+/// let _next = fetcher.fetch(&url, Some(&validators)).await?;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug)]
 pub struct FeedFetcher {
     http: reqwest::Client,
     policy: Arc<dyn EgressPolicy>,
     request_timeout: Duration,
     max_response_bytes: u64,
+    max_attempts: u32,
 }
 
 impl FeedFetcher {
     /// Build the fetcher's one shared client. `policy` is consulted in two
-    /// ways: wrapped in a [`PolicyDns`] as the client's DNS resolver (so every
+    /// ways: wrapped in a `PolicyDns` as the client's DNS resolver (so every
     /// hostname is checked structurally when a connection is *established* —
-    /// reqwest resolves through [`PolicyDns`] before each new connect), and
+    /// reqwest resolves through `PolicyDns` before each new connect), and
     /// held directly for the IP-literal checks
-    /// [`FeedFetcher::check_hop_target`] runs before the initial request and
+    /// `FeedFetcher::check_hop_target` runs before the initial request and
     /// before every redirect hop.
     ///
     /// The resolver check gates connection *establishment*, not every request:
@@ -299,6 +374,31 @@ impl FeedFetcher {
     /// the policy always sees the real destination; the switch is the fact of
     /// injection, never the policy's runtime behavior — see the module doc's
     /// "Proxies are disabled exactly when a policy is injected" section.
+    ///
+    /// # Examples
+    ///
+    /// A fetcher that refuses loopback and link-local destinations on every
+    /// hop:
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use std::time::Duration;
+    ///
+    /// use skardi::sources::providers::rss::{DenyCidrs, EgressPolicy, FeedFetcher, IpNet};
+    ///
+    /// let ranges = ["127.0.0.0/8", "169.254.0.0/16"]
+    ///     .into_iter()
+    ///     .map(|range| range.parse::<IpNet>().unwrap());
+    /// let policy: Arc<dyn EgressPolicy> = Arc::new(DenyCidrs::new(ranges));
+    /// let fetcher = FeedFetcher::new(
+    ///     Some(policy),
+    ///     Duration::from_secs(10),
+    ///     5 * 1024 * 1024,
+    ///     "my-agent/1.0".to_string(),
+    /// )
+    /// .unwrap();
+    /// # let _ = fetcher;
+    /// ```
     pub fn new(
         policy: Option<Arc<dyn EgressPolicy>>,
         request_timeout: Duration,
@@ -330,11 +430,79 @@ impl FeedFetcher {
             policy,
             request_timeout,
             max_response_bytes,
+            max_attempts: MAX_ATTEMPTS,
         })
+    }
+
+    /// Make one request per hop instead of `MAX_ATTEMPTS` (3), for a caller
+    /// that schedules retries itself. A retryable status or transport error
+    /// returns at once — no sleep, no second request — with the response's
+    /// `Retry-After` on [`FetchError::Status`]. Redirects are still followed
+    /// and every hop is still egress-checked: a redirect is a new hop, not a
+    /// retry.
+    ///
+    /// ```no_run
+    /// use std::time::Duration;
+    ///
+    /// use skardi::sources::providers::rss::{FeedFetcher, FetchError, FetchOutcome};
+    ///
+    /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    /// let fetcher = FeedFetcher::new(
+    ///     None,
+    ///     Duration::from_secs(10),
+    ///     5 * 1024 * 1024,
+    ///     "my-agent/1.0".to_string(),
+    /// )?
+    /// .single_attempt();
+    /// match fetcher.fetch("https://example.com/feed.xml", None).await {
+    ///     Ok(FetchOutcome::Fetched { body, .. }) => println!("{} bytes", body.len()),
+    ///     Ok(FetchOutcome::NotModified { .. }) => println!("unchanged"),
+    ///     Err(FetchError::Status { status: 429, retry_after }) => {
+    ///         println!("throttled; retry in {retry_after:?}")
+    ///     }
+    ///     Err(e) => println!("failed: {e}"),
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn single_attempt(mut self) -> Self {
+        self.max_attempts = 1;
+        self
     }
 
     /// Fetch `url`, sending `validators` as conditional-GET headers on the
     /// first hop only. See the module doc for the redirect and retry rules.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::time::Duration;
+    ///
+    /// use skardi::sources::providers::rss::{FeedFetcher, FetchError, FetchOutcome, Validators};
+    ///
+    /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    /// let fetcher = FeedFetcher::new(
+    ///     None,
+    ///     Duration::from_secs(10),
+    ///     5 * 1024 * 1024,
+    ///     "my-agent/1.0".to_string(),
+    /// )?;
+    /// let validators = Validators {
+    ///     etag: Some("\"v7\"".to_string()),
+    ///     last_modified: None,
+    /// };
+    /// match fetcher
+    ///     .fetch("https://example.com/feed.xml", Some(&validators))
+    ///     .await
+    /// {
+    ///     Ok(FetchOutcome::NotModified { .. }) => println!("still current"),
+    ///     Ok(FetchOutcome::Fetched { body, .. }) => println!("{} new bytes", body.len()),
+    ///     Err(FetchError::Egress(denied)) => println!("refused: {denied}"),
+    ///     Err(e) => println!("failed: {e}"),
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn fetch(
         &self,
         url: &str,
@@ -438,8 +606,8 @@ impl FeedFetcher {
         Ok(())
     }
 
-    /// Drive one hop's attempt loop: send the request, retrying up to
-    /// [`MAX_ATTEMPTS`] times on a retryable status or a retryable
+    /// Drive one hop's attempt loop: send the request, retrying up to the
+    /// fetcher's attempt budget on a retryable status or a retryable
     /// connection failure, and classifying a successful response into the
     /// outer loop's next step.
     async fn attempt_hop(
@@ -449,7 +617,7 @@ impl FeedFetcher {
     ) -> Result<HopOutcome, FetchError> {
         let mut last_err: Option<FetchError> = None;
 
-        for attempt in 0..MAX_ATTEMPTS {
+        for attempt in 0..self.max_attempts {
             let mut req = self.http.get(url.clone());
             // Tracked independently of `validators.is_some()`: a `Validators`
             // with both fields `None` attaches no header either, and a `304`
@@ -470,6 +638,7 @@ impl FeedFetcher {
             match req.send().await {
                 Ok(resp) => {
                     let status = resp.status();
+                    let retry_after = parse_retry_after(&resp);
                     if status.as_u16() == 304 {
                         if sent_validator {
                             return Ok(HopOutcome::Done(FetchOutcome::NotModified {
@@ -480,7 +649,10 @@ impl FeedFetcher {
                         // to confirm — treat it as the terminal, non-retryable
                         // status it actually is rather than fabricating a
                         // cache hit the caller never asked for.
-                        return Err(FetchError::Status { status: 304 });
+                        return Err(FetchError::Status {
+                            status: 304,
+                            retry_after,
+                        });
                     }
                     if status.is_redirection()
                         && let Some(location) = resp.headers().get(LOCATION)
@@ -502,11 +674,12 @@ impl FeedFetcher {
                     if is_retryable_status(status) {
                         let err = FetchError::Status {
                             status: status.as_u16(),
+                            retry_after,
                         };
-                        if attempt + 1 >= MAX_ATTEMPTS {
+                        if attempt + 1 >= self.max_attempts {
                             return Err(err);
                         }
-                        tokio::time::sleep(retry_wait(&resp, attempt)).await;
+                        tokio::time::sleep(retry_wait(retry_after, attempt)).await;
                         last_err = Some(err);
                         continue;
                     }
@@ -537,7 +710,7 @@ impl FeedFetcher {
                             Err(
                                 err @ (FetchError::Timeout { .. } | FetchError::Transport { .. }),
                             ) => {
-                                if attempt + 1 >= MAX_ATTEMPTS {
+                                if attempt + 1 >= self.max_attempts {
                                     return Err(err);
                                 }
                                 tokio::time::sleep(backoff(attempt)).await;
@@ -549,6 +722,7 @@ impl FeedFetcher {
                     }
                     return Err(FetchError::Status {
                         status: status.as_u16(),
+                        retry_after,
                     });
                 }
                 Err(e) => {
@@ -564,7 +738,7 @@ impl FeedFetcher {
                             reason: transport_reason(e),
                         }
                     };
-                    if attempt + 1 >= MAX_ATTEMPTS {
+                    if attempt + 1 >= self.max_attempts {
                         return Err(mapped);
                     }
                     tokio::time::sleep(backoff(attempt)).await;
@@ -574,7 +748,7 @@ impl FeedFetcher {
         }
 
         // Every branch above returns on the final attempt (the
-        // `attempt + 1 >= MAX_ATTEMPTS` guards), so this is unreachable in
+        // `attempt + 1 >= self.max_attempts` guards), so this is unreachable in
         // practice. Kept as a returned error rather than `unreachable!()` so
         // a future change to the loop bounds fails a returned error instead
         // of panicking.
@@ -625,15 +799,24 @@ impl FeedFetcher {
     }
 }
 
+/// `FetchError::Status`'s `Display` tail: the requested wait in whole
+/// seconds, or nothing when the host named none.
+fn retry_after_suffix(retry_after: &Option<Duration>) -> String {
+    match retry_after {
+        Some(wait) => format!(" (retry after {}s)", wait.as_secs()),
+        None => String::new(),
+    }
+}
+
 fn is_retryable_status(status: StatusCode) -> bool {
     RETRYABLE_STATUSES.contains(&status.as_u16())
 }
 
 /// `max(Retry-After, backoff)`, capped at [`MAX_RETRY_WAIT`] — see the
 /// module doc's Retries section.
-fn retry_wait(resp: &Response, attempt: u32) -> Duration {
+fn retry_wait(retry_after: Option<Duration>, attempt: u32) -> Duration {
     let computed = backoff(attempt);
-    let wait = match parse_retry_after(resp) {
+    let wait = match retry_after {
         Some(from_header) => from_header.max(computed),
         None => computed,
     };
@@ -848,7 +1031,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, FetchError::Status { status: 304 }),
+            matches!(err, FetchError::Status { status: 304, .. }),
             "got {err}"
         );
     }
@@ -875,7 +1058,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, FetchError::Status { status: 304 }),
+            matches!(err, FetchError::Status { status: 304, .. }),
             "got {err}"
         );
         let req = &server.requests()[0];
@@ -957,7 +1140,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, FetchError::Status { status: 304 }),
+            matches!(err, FetchError::Status { status: 304, .. }),
             "got {err}"
         );
         assert_eq!(server.requests().len(), 2);
@@ -1343,10 +1526,16 @@ mod tests {
                 .await
                 .unwrap_err();
             match err {
-                FetchError::Status { status: got } => assert_eq!(
-                    got, status,
-                    "the terminal error carries the status that kept failing"
-                ),
+                FetchError::Status {
+                    status: got,
+                    retry_after,
+                } => {
+                    assert_eq!(
+                        got, status,
+                        "the terminal error carries the status that kept failing"
+                    );
+                    assert_eq!(retry_after, None, "the server sent no Retry-After");
+                }
                 other => panic!("expected a Status error for {status}, got {other:?}"),
             }
             assert_eq!(
@@ -1355,6 +1544,219 @@ mod tests {
                 "{status} must be retried to the attempt budget, not treated as terminal"
             );
         }
+    }
+
+    /// A fetcher whose caller owns retries: one request per hop.
+    fn single_attempt_fetcher(request_timeout: Duration) -> FeedFetcher {
+        FeedFetcher::new(
+            None,
+            request_timeout,
+            1024 * 1024,
+            "skardi-test".to_string(),
+        )
+        .expect("build test fetcher")
+        .single_attempt()
+    }
+
+    /// The executor's case: a throttling host is hit once, and the wait it
+    /// named reaches the caller unclamped — the caller's scheduler turns it
+    /// into the work's `not_before`, and does its own clamping.
+    #[tokio::test]
+    async fn single_attempt_429_returns_at_once_with_its_retry_after() {
+        let server = MockFeedServer::start(|_req| {
+            MockResponse::status(429).with_header("retry-after", "120")
+        })
+        .await;
+        let f = single_attempt_fetcher(Duration::from_secs(2));
+        let start = Instant::now();
+        let err = f
+            .fetch(&format!("{}/f", server.url()), None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FetchError::Status {
+                    status: 429,
+                    retry_after: Some(d),
+                } if d == Duration::from_secs(120)
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(server.requests().len(), 1, "exactly one request");
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "elapsed {:?}: a single attempt must not sleep",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn single_attempt_503_reports_an_http_date_retry_after_as_a_delta() {
+        let server = MockFeedServer::start(|_req| {
+            let date = httpdate::fmt_http_date(SystemTime::now() + Duration::from_secs(120));
+            MockResponse::status(503).with_header("retry-after", &date)
+        })
+        .await;
+        let f = single_attempt_fetcher(Duration::from_secs(2));
+        let err = f
+            .fetch(&format!("{}/f", server.url()), None)
+            .await
+            .unwrap_err();
+        match err {
+            FetchError::Status {
+                status: 503,
+                retry_after: Some(d),
+            } => assert!(
+                // http-dates have whole-second resolution, and a little
+                // wall time passes between minting the date and parsing it.
+                d > Duration::from_secs(110) && d <= Duration::from_secs(120),
+                "retry_after {d:?}, expected about 120s"
+            ),
+            other => panic!("expected Status 503 with a Retry-After, got {other:?}"),
+        }
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn single_attempt_429_without_a_header_has_no_retry_after() {
+        let server = MockFeedServer::start(|_req| MockResponse::status(429)).await;
+        let f = single_attempt_fetcher(Duration::from_secs(2));
+        let err = f
+            .fetch(&format!("{}/f", server.url()), None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FetchError::Status {
+                    status: 429,
+                    retry_after: None,
+                }
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    /// The default fetcher sleeps through a 3s response delay three times;
+    /// a single-attempt one gives up after the first request's timeout.
+    #[tokio::test]
+    async fn single_attempt_timeout_is_one_request_and_no_sleep() {
+        let server = MockFeedServer::start(|_req| {
+            MockResponse::xml("<rss/>").with_delay(Duration::from_secs(3))
+        })
+        .await;
+        let f = single_attempt_fetcher(Duration::from_secs(1));
+        let start = Instant::now();
+        let err = f
+            .fetch(&format!("{}/f", server.url()), None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, FetchError::Timeout { seconds: 1 }),
+            "got {err:?}"
+        );
+        assert_eq!(server.requests().len(), 1);
+        assert!(
+            start.elapsed() < Duration::from_millis(2500),
+            "elapsed {:?}: one 1s timeout, no retry",
+            start.elapsed()
+        );
+    }
+
+    /// The body-phase transport failure `truncated_body_is_retried_and_recovers`
+    /// recovers from by default is terminal here.
+    #[tokio::test]
+    async fn single_attempt_truncated_body_is_a_transport_error_after_one_request() {
+        let server = MockFeedServer::start(|_req| {
+            MockResponse::xml("<rss>complete</rss>").with_truncated_body(4)
+        })
+        .await;
+        let f = single_attempt_fetcher(Duration::from_secs(2));
+        let err = f
+            .fetch(&format!("{}/f", server.url()), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FetchError::Transport { .. }), "got {err:?}");
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn single_attempt_304_is_still_not_modified() {
+        let server = MockFeedServer::start(|req| {
+            if req.header("if-none-match").as_deref() == Some("\"v1\"") {
+                MockResponse::status(304)
+            } else {
+                MockResponse::xml("<rss/>")
+            }
+        })
+        .await;
+        let f = single_attempt_fetcher(Duration::from_secs(2));
+        let v = Validators {
+            etag: Some("\"v1\"".into()),
+            last_modified: None,
+        };
+        let out = f
+            .fetch(&format!("{}/f", server.url()), Some(&v))
+            .await
+            .unwrap();
+        assert!(
+            matches!(out, FetchOutcome::NotModified { http_status: 304 }),
+            "got {out:?}"
+        );
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    /// One attempt per hop, not per fetch: redirects are not retries.
+    #[tokio::test]
+    async fn single_attempt_still_follows_redirects() {
+        let server = MockFeedServer::start(|req| {
+            if req.path == "/moved" {
+                MockResponse::xml("<rss/>")
+            } else {
+                MockResponse::status(302).with_header("location", "/moved")
+            }
+        })
+        .await;
+        let f = single_attempt_fetcher(Duration::from_secs(2));
+        let out = f
+            .fetch(&format!("{}/feed.xml", server.url()), None)
+            .await
+            .unwrap();
+        assert!(matches!(out, FetchOutcome::Fetched { .. }), "got {out:?}");
+        assert_eq!(server.requests().len(), 2);
+    }
+
+    /// Every hop is still egress-checked in single-attempt mode.
+    #[tokio::test]
+    async fn single_attempt_still_checks_redirect_targets() {
+        let server = MockFeedServer::start(|_req| {
+            MockResponse::status(302).with_header("location", "http://10.255.255.1/f")
+        })
+        .await;
+        let policy = Arc::new(DenyList(vec!["10.255.255.1".parse().unwrap()]));
+        let f = fetcher_with_policy(policy).single_attempt();
+        let err = f
+            .fetch(&format!("{}/start", server.url()), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FetchError::Egress(_)), "got {err:?}");
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    #[test]
+    fn a_status_error_names_the_requested_wait_when_there_is_one() {
+        let throttled = FetchError::Status {
+            status: 429,
+            retry_after: Some(Duration::from_secs(120)),
+        };
+        assert_eq!(throttled.to_string(), "http status 429 (retry after 120s)");
+        let bare = FetchError::Status {
+            status: 503,
+            retry_after: None,
+        };
+        assert_eq!(bare.to_string(), "http status 503");
     }
 
     #[tokio::test]
@@ -1366,7 +1768,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, FetchError::Status { status: 404 }),
+            matches!(err, FetchError::Status { status: 404, .. }),
             "got {err}"
         );
         assert_eq!(server.requests().len(), 1);
@@ -1394,7 +1796,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, FetchError::Status { status: 206 }),
+            matches!(err, FetchError::Status { status: 206, .. }),
             "got {err}"
         );
         assert_eq!(server.requests().len(), 1, "a 2xx mismatch is not retried");
@@ -1411,7 +1813,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, FetchError::Status { status: 204 }),
+            matches!(err, FetchError::Status { status: 204, .. }),
             "got {err}"
         );
         assert_eq!(server.requests().len(), 1);
