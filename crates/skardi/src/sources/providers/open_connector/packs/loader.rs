@@ -216,6 +216,34 @@ fn validate_table(table: &SourcePackTable) -> Result<(), String> {
                 filter.column, filter.operator
             ));
         }
+        // A value domain is a finite list of equalities; under a range
+        // operator it has no meaning the translation could honor, so an
+        // author who wrote one has misread what it gates. Blanks and
+        // repeats are the same kind of slip — a list that says nothing.
+        if !filter.values.is_empty() {
+            if filter.operator != Operator::Eq {
+                return Err(format!(
+                    "{id}: filter on '{}' declares `values`, which only an eq mapping can \
+                     honor — operator {:?} has no finite domain to list",
+                    filter.column, filter.operator
+                ));
+            }
+            let mut seen = std::collections::HashSet::new();
+            for value in filter.values {
+                if value.is_empty() {
+                    return Err(format!(
+                        "{id}: filter on '{}' declares an empty string in `values`",
+                        filter.column
+                    ));
+                }
+                if !seen.insert(*value) {
+                    return Err(format!(
+                        "{id}: filter on '{}' lists '{value}' twice in `values`",
+                        filter.column
+                    ));
+                }
+            }
+        }
         // Epoch renderings floor sub-second precision, which only ever
         // WIDENS a lower bound; under any other operator the floored
         // literal compares at a different instant and the provider drops
@@ -522,6 +550,7 @@ fn convert_filter(doc: FilterDoc) -> FilterMapping {
             FormatDoc::EpochSeconds => ValueFormat::EpochSeconds,
             FormatDoc::EpochSecondsString => ValueFormat::EpochSecondsString,
         },
+        values: leak_str_slice(doc.values),
     }
 }
 
@@ -860,6 +889,10 @@ struct FilterDoc {
     fidelity: FidelityDoc,
     #[serde(default)]
     format: FormatDoc,
+    /// The literals an `eq` mapping may forward; absent means any. See
+    /// [`FilterMapping::values`] for why a closed provider enum needs it.
+    #[serde(default)]
+    values: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -1241,6 +1274,65 @@ tables:
             "      - { column: created, op: gt_eq, input: since, fidelity: inexact, format: epoch_seconds_string }",
         ))
         .expect("lower-bound inexact epoch mapping is legal");
+    }
+
+    #[test]
+    fn a_values_domain_parses_on_eq_and_is_refused_where_it_means_nothing() {
+        let base = |filter: &str| {
+            format!(
+                r#"
+kind: pack
+pack: demo
+version: 1
+tables:
+  items:
+    action: demo.list
+    row_path: "$.items"
+    pagination: {{ strategy: page_number, page_input: page, page_size_input: perPage, page_size: 10 }}
+    columns:
+      - {{ name: state, path: state, type: utf8, nullable: false }}
+      - {{ name: created, path: created, type: timestamp_ms_utc, nullable: true }}
+    filters:
+{filter}
+"#
+            )
+        };
+        // The github shape round-trips, in declaration order.
+        let pack = parse_pack(&base(
+            "      - { column: state, op: eq, input: state, fidelity: inexact, values: [open, closed] }",
+        ))
+        .expect("an eq domain is legal");
+        let filter = &pack.tables[0].filters[0];
+        assert_eq!(filter.values, &["open", "closed"]);
+        // Omitted means unconstrained — the shape every other pack has.
+        let pack = parse_pack(&base(
+            "      - { column: state, op: eq, input: state, fidelity: inexact }",
+        ))
+        .expect("no domain is legal");
+        assert!(pack.tables[0].filters[0].values.is_empty());
+
+        for (filter, expected) in [
+            // A range has no finite domain to list.
+            (
+                "      - { column: created, op: gt_eq, input: since, fidelity: inexact, format: rfc3339, values: [x] }",
+                "only an eq mapping",
+            ),
+            // A list that says nothing is a slip, not a declaration.
+            (
+                "      - { column: state, op: eq, input: state, fidelity: inexact, values: [open, open] }",
+                "twice",
+            ),
+            (
+                "      - { column: state, op: eq, input: state, fidelity: inexact, values: [open, ''] }",
+                "empty string",
+            ),
+        ] {
+            let err = parse_pack(&base(filter)).expect_err(expected);
+            assert!(
+                err.contains(expected) && err.contains("demo.items"),
+                "want {expected:?} naming the table in: {err}"
+            );
+        }
     }
 
     #[test]

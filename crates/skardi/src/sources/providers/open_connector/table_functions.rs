@@ -244,6 +244,11 @@ impl TableFunctionImpl for OpenConnectorQueryFunction {
                     .check_continuation_inputs(meta.input_schema())
                     .map_err(plan_error)?;
             }
+            if action_id == table.action_id {
+                table
+                    .check_filter_values(meta.input_schema())
+                    .map_err(plan_error)?;
+            }
         }
 
         let provider = OpenConnectorTableProvider::new(

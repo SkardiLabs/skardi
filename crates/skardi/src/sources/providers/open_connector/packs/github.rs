@@ -1266,13 +1266,15 @@ bindings:
     }
 
     #[tokio::test]
-    async fn out_of_domain_state_yields_empty_not_the_provider_default() {
-        // The motivating case for classifying `state` as Inexact: a provider
-        // that silently ignores an out-of-domain enum ('merged') and returns
-        // its default listing. Under Exact those rows would leak back as the
-        // "exact" answer; Inexact re-applies the predicate locally, so the
-        // query is correctly empty. setup_table's stub is exactly such a
-        // provider — it serves its rows regardless of the state input.
+    async fn out_of_domain_state_stays_local_and_yields_empty() {
+        // `merged` is outside the `values` domain the mapping declares, so
+        // the predicate is never forwarded: the live action's strict enum
+        // answers it with HTTP 400 invalid_input (skardi-cloud#544), where
+        // SQL promises zero rows. The scan runs under the `state: all` pin
+        // and DataFusion filters locally — the path an unmapped column
+        // takes — so a provider's full listing never leaks into an empty
+        // query either. setup_table's stub serves its rows regardless of
+        // the state input, which is exactly the leak Inexact guards.
         let rows = vec![
             json!({"id": 1, "number": 1, "title": "a", "state": "open"}),
             json!({"id": 2, "number": 2, "title": "b", "state": "open"}),
@@ -1296,14 +1298,156 @@ bindings:
             0,
             "the provider's default listing must not leak into an empty query"
         );
-        // The predicate still narrows the fetch on providers that honor it.
         let bodies = execute_bodies(&gateway);
         assert!(!bodies.is_empty());
         assert!(
             bodies
                 .iter()
-                .all(|body| body.contains(r#""state":"merged""#)),
-            "the push still happens: {bodies:?}"
+                .all(|body| body.contains(r#""state":"all""#) && !body.contains("merged")),
+            "an out-of-domain literal is not pushed; the pin stays: {bodies:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_literal_the_action_refuses_answers_zero_rows_not_a_failure() {
+        // skardi-cloud#544 end to end, against a gateway that mirrors the
+        // live action's input validation: any `state` outside its enum is
+        // HTTP 400 invalid_input. Before the domain was declared, `'OPEN'`
+        // was forwarded and the query failed with that 400 dressed as an
+        // execution failure; now it is answered as SQL requires.
+        let served = std::sync::Arc::new(many_issues());
+        let gateway = {
+            let served = std::sync::Arc::clone(&served);
+            MockGateway::start(move |req| {
+                if req.method == "POST" && req.path == "/v1/actions/github.list_repository_issues" {
+                    let body: Value = serde_json::from_str(&req.body).unwrap_or_default();
+                    let state = body
+                        .pointer("/input/state")
+                        .and_then(Value::as_str)
+                        .unwrap_or("open");
+                    if !["open", "closed", "all"].contains(&state) {
+                        return MockResponse::new(
+                            400,
+                            testutil::envelope_err(
+                                "invalid_input",
+                                "Action input does not match the action schema.",
+                            ),
+                        );
+                    }
+                }
+                issues_handler(req, &served)
+            })
+            .await
+        };
+        let (gateway, ctx) = setup_with_gateway(gateway, "SKARDI_TEST_OC_GITHUB_ENUM_400").await;
+
+        for literal in ["OPEN", "PAID"] {
+            let batches = collect(
+                &ctx,
+                &format!("SELECT count(*) AS n FROM saas.gh.issues WHERE state = '{literal}'"),
+            )
+            .await;
+            assert_eq!(
+                u64s_i64(&batches[0], "n"),
+                0,
+                "{literal}: a value no row holds is zero rows, not a gateway refusal"
+            );
+        }
+        let bodies = execute_bodies(&gateway);
+        assert!(!bodies.is_empty());
+        assert!(
+            bodies.iter().all(|body| body.contains(r#""state":"all""#)
+                && !body.contains("OPEN")
+                && !body.contains("PAID")),
+            "the refused literals never reach the action: {bodies:?}"
+        );
+
+        // The in-domain spelling still pushes and still counts.
+        let batches = collect(
+            &ctx,
+            "SELECT count(*) AS n FROM saas.gh.issues WHERE state = 'open'",
+        )
+        .await;
+        assert_eq!(u64s_i64(&batches[0], "n"), 75);
+        let last = execute_bodies(&gateway)
+            .pop()
+            .expect("the open query hit the gateway");
+        assert!(last.contains(r#""state":"open""#), "{last}");
+    }
+
+    /// Register the issues binding against a gateway whose discovered
+    /// `list_repository_issues` input schema types `state` as `accepted`.
+    async fn register_with_state_enum(
+        accepted: &'static [&'static str],
+        token_env: &'static str,
+    ) -> anyhow::Result<()> {
+        let gateway = MockGateway::start(move |req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path == "/v1/actions/github.list_repository_issues" {
+                let input_schema = json!({
+                    "type": "object",
+                    "properties": {
+                        "owner": {"type": "string"},
+                        "repo": {"type": "string"},
+                        "state": {"type": "string", "enum": accepted},
+                        "since": {"type": "string"}
+                    }
+                });
+                return MockResponse::ok(&discovery_ok(
+                    &input_schema.to_string(),
+                    include_str!("fixtures/github/contracts/list_repository_issues.json"),
+                    true,
+                    None,
+                ));
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                return github_discovery(&req.path);
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+        let _token = testutil::EnvVarGuard::set(token_env, "test-token");
+        let mut ctx = SessionContext::new();
+        register_open_connector_tables(
+            &mut ctx,
+            "saas",
+            &gateway.url,
+            Some(&issues_config(token_env)),
+            false,
+            HierarchyLevel::Catalog,
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn the_declared_state_domain_is_checked_against_the_discovered_enum() {
+        // Pass side: the live action's enum (open-connector
+        // `src/providers/github/actions.ts`) admits every value the pack
+        // declares — `all` is the pin, not a column value, so it is in the
+        // enum and not in `values`.
+        register_with_state_enum(
+            &["open", "closed", "all"],
+            "SKARDI_TEST_OC_GITHUB_STATE_ENUM_OK",
+        )
+        .await
+        .expect("the pack's domain is a subset of the live enum");
+
+        // Refusal side: an upstream that drops `closed` makes the pack's
+        // claim false, and that is a registration failure naming the
+        // table, the action and the value — not a 400 on the first query.
+        let err =
+            register_with_state_enum(&["open", "all"], "SKARDI_TEST_OC_GITHUB_STATE_ENUM_DRIFT")
+                .await
+                .expect_err("a value outside the enum fails the compatibility check");
+        let message = err.to_string();
+        assert!(
+            message.contains("github.issues")
+                && message.contains("github.list_repository_issues")
+                && message.contains("[closed]"),
+            "table, action and value are named: {message}"
         );
     }
 

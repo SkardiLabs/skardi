@@ -435,8 +435,20 @@ read/write classification — as is a `required` list that is present but is
 not an array of strings, since a gate that cannot read its input has
 verified nothing.
 
-Four authoring invariants are enforced by the loader:
+Five authoring invariants are enforced by the loader:
 
+- `values` on a filter mapping — the literals an `eq` push may forward — is
+  legal only on `eq`, and may not be blank or repeat an entry. Declare it
+  for any input the action types as a closed enum (GitHub's
+  `state: open | closed | all`): the gateway validates inputs strictly, so
+  without it `state = 'OPEN'` is forwarded and refused as `invalid_input`,
+  surfacing as an execution failure where SQL promises zero rows. With the
+  domain declared, a literal outside it stays local — the scan runs under
+  the pack's fixed inputs and DataFusion filters the fetch, exactly as an
+  unmapped column behaves. Registration checks the declaration against the
+  action's discovered input schema: a declared value the enum does not
+  accept fails the table's compatibility check, and an enum-typed input
+  with no `values` logs a warning naming the accepted values;
 - a `continuation` on a non-cursor strategy is a parse error;
 - a table that pins its continuation's fingerprint must pin its own
   action's too (half a gate reads as gated while verifying only pages 2..N);

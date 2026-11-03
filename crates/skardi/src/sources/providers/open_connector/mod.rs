@@ -305,6 +305,15 @@ pub async fn register_open_connector_tables(
             // DIFFERENT continue action is an assumption about two
             // independently discovered schemas, not a fact.)
             table.check_continuation_inputs(continuation_input_schema)?;
+            // Same reasoning for a filter's value domain: an input the
+            // gateway types as an enum is invisible to the output
+            // fingerprint, and a pack value the enum dropped would 400 on
+            // the first page of every query that pushes it.
+            table.check_filter_values(
+                registry
+                    .get(table.action_id)
+                    .and_then(ActionMetadata::input_schema),
+            )?;
 
             let provider = OpenConnectorTableProvider::new(
                 Arc::clone(&client),

@@ -103,4 +103,23 @@ pub struct FilterMapping {
     pub fidelity: Fidelity,
     /// How the literal renders into the provider input (see [`ValueFormat`]).
     pub value_format: ValueFormat,
+    /// The literals this mapping may forward, or empty for any literal the
+    /// column's type admits.
+    ///
+    /// Declared for inputs the provider types as a closed enum (GitHub's
+    /// `state: open | closed | all`). Open Connector validates action inputs
+    /// against that enum strictly, so a literal outside it — `'OPEN'`, a
+    /// typo, a value from another provider's vocabulary — is a hard 400 on
+    /// the first page, surfaced as an execution failure where SQL promises
+    /// zero rows. With the domain declared, the engine's translation keeps
+    /// such a predicate LOCAL instead of forwarding it: the scan runs with
+    /// the pack's fixed inputs and DataFusion filters the fetch, which is
+    /// exactly how an unmapped column already behaves. Registration also
+    /// checks the declaration against the action's discovered input schema,
+    /// so a pack that claims a value the enum dropped fails loudly rather
+    /// than at query time.
+    ///
+    /// Only meaningful under [`Operator::Eq`] — a range operator has no
+    /// finite domain to list — and the pack loader rejects it elsewhere.
+    pub values: &'static [&'static str],
 }

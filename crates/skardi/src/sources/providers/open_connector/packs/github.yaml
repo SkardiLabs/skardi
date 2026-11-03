@@ -70,7 +70,11 @@ tables:
       # Both pushes are Inexact: `state` is faithful only inside the
       # provider's enum domain, and `since` means "updated at or after"
       # under any granularity fuzz — DataFusion re-applies both.
-      - { column: state, op: eq, input: state, fidelity: inexact }
+      # `values` is the column's domain, not the input's: `all` is an
+      # input spelling no row carries, and the action's strict enum
+      # 400s anything else (`OPEN`, `PAID`), so a literal outside this
+      # list stays local and answers zero rows over the `state: all` pin.
+      - { column: state, op: eq, input: state, fidelity: inexact, values: [open, closed] }
       - { column: updated_at, op: gt_eq, input: since, fidelity: inexact, format: rfc3339 }
 
   issue_comments:
@@ -123,7 +127,9 @@ tables:
       - { name: merged_at, path: merged_at, type: timestamp_ms_utc, nullable: true }
       - { name: html_url, path: html_url, type: utf8, nullable: true }
     filters:
-      - { column: state, op: eq, input: state, fidelity: inexact }
+      # Same domain rule as issues: a literal outside the action's enum
+      # stays local rather than being refused as invalid input.
+      - { column: state, op: eq, input: state, fidelity: inexact, values: [open, closed] }
 
   reviews:
     action: github.list_pull_request_reviews

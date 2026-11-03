@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 
 use serde_json::Value;
+use tracing::warn;
 
 use crate::error::OpenConnectorError;
 use crate::filters::FilterMapping;
@@ -502,6 +503,90 @@ impl SourcePackTable {
                     continuation.action_id,
                     undeclared.join(", ")
                 )));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl SourcePackTable {
+    /// Verify every `values` domain this table's filters declare against
+    /// the table's OWN action's discovered input schema.
+    ///
+    /// The fingerprint hashes the output schema, so an input the gateway
+    /// types as a closed enum can drift with nothing else changing. Two
+    /// disagreements are possible, and they are answered differently:
+    ///
+    /// - the pack lists a value the enum does not accept → refused, as
+    ///   [`OpenConnectorError::ActionContractMismatch`]. The pack asserts
+    ///   something the gateway will 400, and a claim about inputs that the
+    ///   gateway contradicts is the same case as a drifted fingerprint;
+    /// - the enum exists and the pack declares no domain → a warning naming
+    ///   the column and the accepted values. The table still works for every
+    ///   in-domain literal, and refusing a whole table over the one predicate
+    ///   shape that would 400 is a worse trade than a loud log line. This is
+    ///   exactly the gap that produced the 502 on `state = 'OPEN'`
+    ///   (skardi-cloud#544), so it is named rather than silent.
+    ///
+    /// `Ok(())` when the action publishes no input schema, no readable
+    /// `properties`, or no `enum` on a pushed input: a free-string input has
+    /// no domain to check against. Only string enum members count; a
+    /// mapping's `values` are strings by construction.
+    ///
+    /// # Errors
+    /// [`OpenConnectorError::ActionContractMismatch`] naming the action,
+    /// the input, the column and the values outside the enum.
+    pub fn check_filter_values(
+        &self,
+        input_schema: Option<&Value>,
+    ) -> Result<(), OpenConnectorError> {
+        let Some(properties) = input_schema
+            .and_then(|schema| schema.get("properties"))
+            .and_then(Value::as_object)
+        else {
+            return Ok(());
+        };
+        for filter in self.filters {
+            let Some(accepted) = properties
+                .get(filter.input_field)
+                .and_then(|property| property.get("enum"))
+                .and_then(Value::as_array)
+            else {
+                continue;
+            };
+            let accepted: Vec<&str> = accepted.iter().filter_map(Value::as_str).collect();
+            if filter.values.is_empty() {
+                warn!(
+                    table = self.id,
+                    action = self.action_id,
+                    column = filter.column,
+                    input = filter.input_field,
+                    accepted = ?accepted,
+                    "Open Connector action types a pushed filter input as an enum the pack does not declare; a literal outside it is refused by the gateway instead of answering zero rows — declare `values` on the mapping"
+                );
+                continue;
+            }
+            let mut outside: Vec<&str> = filter
+                .values
+                .iter()
+                .copied()
+                .filter(|value| !accepted.contains(value))
+                .collect();
+            if !outside.is_empty() {
+                outside.sort_unstable();
+                return Err(OpenConnectorError::ActionContractMismatch {
+                    table: self.id.to_string(),
+                    reason: format!(
+                        "action '{}' accepts [{}] for input '{}', but the filter on column '{}' \
+                         declares value(s) [{}] outside it; a predicate pushing one of those \
+                         would be refused as invalid input",
+                        self.action_id,
+                        accepted.join(", "),
+                        filter.input_field,
+                        filter.column,
+                        outside.join(", ")
+                    ),
+                });
             }
         }
         Ok(())

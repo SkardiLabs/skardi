@@ -62,6 +62,7 @@ pub fn builtin_pack_registry() -> Result<SourcePackRegistry, OpenConnectorError>
 #[cfg(test)]
 mod tests {
     use super::super::*;
+    use skardi_source_pack::filters::*;
     use skardi_source_pack::pagination::*;
     use skardi_source_pack::source_pack::*;
 
@@ -707,6 +708,83 @@ mod tests {
         cursor_only_table()
             .check_full_continuation_inputs(None)
             .expect("cursor_only is checked by check_continuation_inputs");
+    }
+
+    /// The github `state` shape: an Inexact eq push whose domain is the
+    /// column's two values, against an action enum that also admits `all`.
+    fn domain_table(values: &'static [&'static str]) -> SourcePackTable {
+        SourcePackTable {
+            filters: Box::leak(Box::new([FilterMapping {
+                column: "state",
+                operator: Operator::Eq,
+                input_field: "state",
+                fidelity: Fidelity::Inexact,
+                value_format: ValueFormat::Verbatim,
+                values,
+            }])),
+            ..leaked_table("t.entries")
+        }
+    }
+
+    fn state_enum(accepted: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "owner": {"type": "string"},
+                "state": {"type": "string", "enum": accepted}
+            }
+        })
+    }
+
+    #[test]
+    fn a_filter_domain_inside_the_discovered_enum_registers() {
+        let table = domain_table(&["open", "closed"]);
+        table
+            .check_filter_values(Some(&state_enum(&["open", "closed", "all"])))
+            .expect("a subset of the enum is exactly the claim the pack makes");
+        // Nothing to check against: no schema, no properties, a free-string
+        // input, or an enum the pack does not constrain (warned, not
+        // refused — every in-domain literal still works).
+        for schema in [
+            None,
+            Some(serde_json::json!({"type": "object"})),
+            Some(serde_json::json!({
+                "type": "object",
+                "properties": {"state": {"type": "string"}}
+            })),
+        ] {
+            table
+                .check_filter_values(schema.as_ref())
+                .expect("no enum means no domain to disagree with");
+        }
+        domain_table(&[])
+            .check_filter_values(Some(&state_enum(&["open", "closed", "all"])))
+            .expect("an undeclared domain is a warning, not a refusal");
+    }
+
+    #[test]
+    fn a_filter_domain_outside_the_discovered_enum_fails_registration() {
+        // The pack claims `closed`; the gateway dropped it. Pushing that
+        // literal would be a 400 on page one of every query that uses it,
+        // so the table is refused with the action, input, column and the
+        // offending value named — the fingerprint gate's shape.
+        let err = domain_table(&["open", "closed"])
+            .check_filter_values(Some(&state_enum(&["open", "all"])))
+            .expect_err("a value the enum does not accept is a contract mismatch");
+        let rendered = err.to_string();
+        for needle in [
+            "t.entries",
+            "t.action",
+            "input 'state'",
+            "column 'state'",
+            "[closed]",
+        ] {
+            assert!(rendered.contains(needle), "want {needle:?} in: {rendered}");
+        }
+        assert!(
+            !rendered.contains("[open]"),
+            "an accepted value is not reported as outside: {rendered}"
+        );
     }
 
     #[test]

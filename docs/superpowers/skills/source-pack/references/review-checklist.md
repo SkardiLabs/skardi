@@ -67,6 +67,12 @@ The worst failure class: wrong results with a green status.
       observed on the documented spelling.
 - [ ] `Exact` fidelity only where faithful across the whole value
       domain; every string-enum push is `Inexact`.
+- [ ] Every `eq` push on an input the action types as a closed enum
+      declares `values` (the COLUMN's domain — a pin-only spelling such
+      as GitHub's `all` is in the enum, not in `values`), so an
+      out-of-domain literal stays local and answers zero rows instead of
+      a gateway `invalid_input`; the registration enum gate has a
+      pass-side and a refusal-side test against the live enum.
 - [ ] Fingerprints pinned from the live capture; sync test locks pin ↔
       contract fixture; drift-refusal e2e exists; mocks serve the
       captured contracts so the gate's pass side actually runs; the

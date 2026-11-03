@@ -219,6 +219,7 @@ mod tests {
                 input_field: "min_id",
                 fidelity: Fidelity::Exact,
                 value_format: ValueFormat::Rfc3339,
+                values: &[],
             }],
             error_path: None,
             expected_fingerprint: None,

@@ -113,7 +113,24 @@ fn translate_one(filter: &Expr, mappings: &[FilterMapping]) -> Option<(String, V
     })?;
 
     let value = scalar_to_json(&literal, mapping.value_format)?;
+    if !in_declared_domain(&value, mapping.values) {
+        return None;
+    }
     Some((mapping.input_field.to_string(), value, mapping.fidelity))
+}
+
+/// Whether a rendered literal may be forwarded under the mapping's declared
+/// value domain. An empty domain admits everything; a declared one admits
+/// exactly its strings, so `state = 'OPEN'` against `[open, closed]` stays
+/// local — the provider would 400 it where SQL promises zero rows — and a
+/// non-string literal against a string domain stays local for the same
+/// reason. Case is NOT folded: the provider's enum is the contract, and a
+/// pack that wants `OPEN` accepted lists it.
+fn in_declared_domain(value: &Value, values: &[&str]) -> bool {
+    if values.is_empty() {
+        return true;
+    }
+    value.as_str().is_some_and(|text| values.contains(&text))
 }
 
 /// Resolve the literal side of a predicate, folding literal-only `CAST` /
@@ -222,6 +239,7 @@ mod tests {
             input_field: "min_value",
             fidelity: Fidelity::Exact,
             value_format: ValueFormat::Verbatim,
+            values: &[],
         },
         FilterMapping {
             column: "value",
@@ -229,6 +247,7 @@ mod tests {
             input_field: "min_value_inclusive",
             fidelity: Fidelity::Exact,
             value_format: ValueFormat::Verbatim,
+            values: &[],
         },
         FilterMapping {
             column: "name",
@@ -236,6 +255,7 @@ mod tests {
             input_field: "name",
             fidelity: Fidelity::Exact,
             value_format: ValueFormat::Verbatim,
+            values: &[],
         },
         FilterMapping {
             column: "updated_at",
@@ -243,6 +263,7 @@ mod tests {
             input_field: "since",
             fidelity: Fidelity::Inexact,
             value_format: ValueFormat::Rfc3339,
+            values: &[],
         },
         FilterMapping {
             column: "created",
@@ -250,6 +271,7 @@ mod tests {
             input_field: "ts_from",
             fidelity: Fidelity::Inexact,
             value_format: ValueFormat::EpochSeconds,
+            values: &[],
         },
         FilterMapping {
             column: "create_time",
@@ -257,6 +279,7 @@ mod tests {
             input_field: "startTime",
             fidelity: Fidelity::Inexact,
             value_format: ValueFormat::EpochSecondsString,
+            values: &[],
         },
         FilterMapping {
             column: "completed",
@@ -264,6 +287,7 @@ mod tests {
             input_field: "completed",
             fidelity: Fidelity::Inexact,
             value_format: ValueFormat::Verbatim,
+            values: &[],
         },
     ];
 
@@ -326,6 +350,7 @@ mod tests {
                 input_field: "after_value",
                 fidelity: Fidelity::Exact,
                 value_format: ValueFormat::Rfc3339,
+                values: &[],
             },
             FilterMapping {
                 column: "value",
@@ -333,6 +358,7 @@ mod tests {
                 input_field: "from_value",
                 fidelity: Fidelity::Exact,
                 value_format: ValueFormat::Rfc3339,
+                values: &[],
             },
         ];
         let gt = Expr::BinaryExpr(BinaryExpr::new(
@@ -444,6 +470,94 @@ mod tests {
                 vec![TableProviderFilterPushDown::Exact]
             );
         }
+    }
+
+    /// GitHub's `state`: the action's enum is `open | closed | all`, the
+    /// column's domain is `open | closed`.
+    const DOMAIN: &[FilterMapping] = &[FilterMapping {
+        column: "state",
+        operator: Operator::Eq,
+        input_field: "state",
+        fidelity: Fidelity::Inexact,
+        value_format: ValueFormat::Verbatim,
+        values: &["open", "closed"],
+    }];
+
+    fn state_eq(literal: Expr) -> Expr {
+        Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(col("state")),
+            SqlOperator::Eq,
+            Box::new(literal),
+        ))
+    }
+
+    #[test]
+    fn a_literal_inside_the_declared_domain_pushes() {
+        let translated = translate_filters(&[state_eq(lit("closed"))], DOMAIN);
+        assert_eq!(
+            translated.inputs,
+            vec![("state".to_string(), Value::from("closed"))]
+        );
+        assert_eq!(
+            translated.pushdown,
+            vec![TableProviderFilterPushDown::Inexact]
+        );
+    }
+
+    #[test]
+    fn a_literal_outside_the_declared_domain_stays_local() {
+        // skardi-cloud#544: the gateway validates `state` against its enum
+        // strictly, so forwarding `'OPEN'` or `'PAID'` is an HTTP 400 where
+        // SQL promises zero rows. Outside the domain the predicate is
+        // Unsupported — fetched under the pack's fixed inputs and filtered
+        // by DataFusion, exactly as an unmapped column is. Case is not
+        // folded: the enum is the contract, and `OPEN` is not in it.
+        for literal in ["OPEN", "PAID", "Open", ""] {
+            let translated = translate_filters(&[state_eq(lit(literal))], DOMAIN);
+            assert!(
+                translated.inputs.is_empty(),
+                "{literal:?} must not reach the action: {:?}",
+                translated.inputs
+            );
+            assert_eq!(
+                translated.pushdown,
+                vec![TableProviderFilterPushDown::Unsupported],
+                "{literal:?}"
+            );
+        }
+        // A non-string literal against a string domain is outside it too —
+        // `state = 1` compiles against a Utf8 column after coercion and
+        // would otherwise forward the number.
+        let translated = translate_filters(&[state_eq(lit(1_i64))], DOMAIN);
+        assert!(translated.inputs.is_empty());
+        assert_eq!(
+            translated.pushdown,
+            vec![TableProviderFilterPushDown::Unsupported]
+        );
+        // View-typed string scalars are domain-checked by content, not by
+        // their Arrow spelling.
+        let view = Expr::Literal(ScalarValue::Utf8View(Some("open".to_string())), None);
+        let translated = translate_filters(&[state_eq(view)], DOMAIN);
+        assert_eq!(
+            translated.inputs,
+            vec![("state".to_string(), Value::from("open"))]
+        );
+    }
+
+    #[test]
+    fn an_undeclared_domain_forwards_any_literal() {
+        // `name` declares no `values`: the mapping is unconstrained, and a
+        // free-string input must keep accepting whatever the query says.
+        let name_eq = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(col("name")),
+            SqlOperator::Eq,
+            Box::new(lit("ANYTHING at all")),
+        ));
+        let translated = translate_filters(&[name_eq], MAPPINGS);
+        assert_eq!(
+            translated.inputs,
+            vec![("name".to_string(), Value::from("ANYTHING at all"))]
+        );
     }
 
     #[test]
@@ -757,6 +871,7 @@ mod tests {
             input_field: "ts_from",
             fidelity: Fidelity::Inexact,
             value_format: ValueFormat::Verbatim,
+            values: &[],
         }];
         let filter = Expr::BinaryExpr(BinaryExpr::new(
             Box::new(col("created")),
