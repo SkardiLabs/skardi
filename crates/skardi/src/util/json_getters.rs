@@ -27,7 +27,8 @@ use std::any::Any;
 use std::sync::Arc;
 
 use arrow::array::new_empty_array;
-use arrow::datatypes::{DataType, FieldRef};
+use arrow::compute::CastOptions;
+use arrow::datatypes::{DataType, Field, FieldRef};
 use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::{
     ColumnarValue, ExpressionPlacement, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF,
@@ -57,8 +58,9 @@ use datafusion_functions_json::udfs;
 /// # Ok(())
 /// # }
 /// ```
-/// Empty dynamic-path batches keep their declared type; nonempty calls use
-/// the upstream implementation unchanged.
+/// Empty dynamic-path batches keep their declared type. Integer extraction
+/// accepts the whole signed 64-bit range, including values that the upstream
+/// JSON parser represents as arbitrary-precision integers.
 pub fn register_json_getter_udfs(ctx: &SessionContext) -> DFResult<()> {
     // The exact set `register_all` registers, listed individually so the
     // rewriter/planner pair it installs afterwards can never sneak in.
@@ -84,7 +86,8 @@ pub fn register_json_getter_udfs(ctx: &SessionContext) -> DFResult<()> {
 /// The upstream scalar-JSON/array-path helper constructs a run-end array with
 /// a single run of length `path.len()`. A zero-row batch would make that run
 /// end zero, which Arrow rejects (datafusion-functions-json 0.53.1,
-/// `common.rs::invoke_scalar_array`). Keep all nonempty calls upstream.
+/// `common.rs::invoke_scalar_array`). Nonempty calls retain upstream path
+/// extraction; integer conversion checks the original JSON token's range.
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct EmptyPathBatch(Arc<ScalarUDF>);
 
@@ -117,7 +120,7 @@ impl ScalarUDFImpl for EmptyPathBatch {
         self.0.placement(args)
     }
 
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+    fn invoke_with_args(&self, mut args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         if matches!(args.args.first(), Some(ColumnarValue::Scalar(_)))
             && args
                 .args
@@ -127,13 +130,29 @@ impl ScalarUDFImpl for EmptyPathBatch {
         {
             return Ok(ColumnarValue::Array(new_empty_array(args.return_type())));
         }
+        if self.name() == "json_get_int" {
+            // jiter represents 19-digit integers as BigInt even when they fit
+            // i64; upstream json_get_int silently returns NULL for all of them.
+            // Extract the original JSON token and parse it with a checked
+            // integer cast: decimals, strings and overflow still become NULL.
+            let json = udfs::json_get_json_udf();
+            let types = args
+                .args
+                .iter()
+                .map(ColumnarValue::data_type)
+                .collect::<Vec<_>>();
+            args.return_field = Arc::new(Field::new(json.name(), json.return_type(&types)?, true));
+            return json
+                .invoke_with_args(args)?
+                .cast_to(&DataType::Int64, Some(&CastOptions::default()));
+        }
         self.0.invoke_with_args(args)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use arrow::array::StringArray;
+    use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{Field, Schema};
     use arrow::record_batch::RecordBatch;
     use datafusion::datasource::MemTable;
@@ -158,6 +177,92 @@ mod tests {
             .downcast_ref::<arrow::array::StringArray>()
             .expect("string column");
         assert_eq!(col.value(0), "x");
+    }
+
+    #[tokio::test]
+    async fn nested_json_integers_keep_the_full_i64_range() {
+        let ctx = SessionContext::new();
+        register_json_getter_udfs(&ctx).unwrap();
+        let values = [
+            ("6443232871316209794", Some(6443232871316209794)),
+            ("9223372036854775807", Some(i64::MAX)),
+            ("-9223372036854775808", Some(i64::MIN)),
+            ("-1", Some(-1)),
+            ("0", Some(0)),
+            ("9223372036854775808", None),
+            ("-9223372036854775809", None),
+            ("1.0", None),
+            ("1e2", None),
+            ("\"1\"", None),
+            ("null", None),
+            ("true", None),
+            ("[]", None),
+            ("{}", None),
+        ];
+        let schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StringArray::from(
+                values
+                    .iter()
+                    .enumerate()
+                    .map(|(index, _)| format!("file-{index}.md"))
+                    .collect::<Vec<_>>(),
+            ))],
+        )
+        .unwrap();
+        ctx.register_table(
+            "metadata",
+            Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap()),
+        )
+        .unwrap();
+        let json = format!(
+            "{{{}}}",
+            values
+                .iter()
+                .enumerate()
+                .map(|(index, (value, _))| format!("\"file-{index}.md\":{{\"acl_root\":{value}}}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let batches = ctx
+            .sql(&format!("SELECT json_get_int(json_get_json('{json}', key), 'acl_root') AS root FROM metadata"))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let actual = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .iter()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            values.iter().map(|(_, value)| *value).collect::<Vec<_>>()
+        );
+        let scalar = ctx
+            .sql("SELECT json_get_int(json_get_json('{\"file.md\":{\"acl_root\":6443232871316209794}}', 'file.md'), 'acl_root')")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            scalar[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            6443232871316209794
+        );
     }
 
     #[tokio::test]
