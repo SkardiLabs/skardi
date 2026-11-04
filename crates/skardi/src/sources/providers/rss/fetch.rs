@@ -103,6 +103,21 @@
 //! sleeping, and [`FetchError::Status`] carries the response's `Retry-After`
 //! uncapped, for that caller to clamp and schedule against.
 //!
+//! ## https only, on request
+//!
+//! By default every hop may be `http` or `https`, which is what an OSS
+//! deployment reading arbitrary feeds wants. [`FeedFetcher::https_only`]
+//! narrows that to `https`, on the initial URL and on every redirect hop,
+//! for a caller whose network can only reach `443` anyway (Skardi Cloud's
+//! executor allows public `443` and nothing else). Without it, a feed that
+//! redirects to `http://` is followed, the connect to port `80` is dropped by
+//! the network, and the fetch reports [`FetchError::Timeout`] a whole
+//! request timeout later, which names the wrong cause. With it, the
+//! downgrading hop is refused before any connection is attempted, as
+//! [`FetchError::InsecureRedirect`]. An `http` initial URL is
+//! [`FetchError::InvalidUrl`] instead: the caller wrote it, nothing
+//! redirected to it.
+//!
 //! ## An unconditional `304` is a protocol error, not a cache hit
 //!
 //! `304 Not Modified` is only meaningful as an answer to a conditional
@@ -285,6 +300,17 @@ pub enum FetchError {
     #[error("too many redirects (limit {hops})")]
     TooManyRedirects { hops: u32 },
 
+    /// Under [`FeedFetcher::https_only`], a redirect pointed at a URL that is
+    /// not `https`. Refused before the hop is requested: on a network that
+    /// only reaches `443` the request could never succeed, and would fail as
+    /// a timeout that hides why.
+    ///
+    /// `target` is the redirect target with userinfo, query and fragment
+    /// stripped, since it can carry a private token and this string reaches
+    /// `feeds.last_error`.
+    #[error("redirect left https: refused to follow '{target}' (https only)")]
+    InsecureRedirect { target: String },
+
     /// The feed URL — or a redirect target — is not a usable `http(s)` URL.
     #[error("invalid feed url: {reason}")]
     InvalidUrl { reason: String },
@@ -301,6 +327,15 @@ pub enum FetchError {
 enum HopOutcome {
     Done(FetchOutcome),
     Redirect(String),
+}
+
+/// Which URL [`FeedFetcher::check_hop_target`] is judging: the one the caller
+/// passed, or one a server redirected to. Only the https-only refusal tells
+/// them apart.
+#[derive(Clone, Copy)]
+enum HopKind {
+    Initial,
+    Redirect,
 }
 
 /// Bounded HTTP fetcher for one feed URL.
@@ -348,6 +383,7 @@ pub struct FeedFetcher {
     request_timeout: Duration,
     max_response_bytes: u64,
     max_attempts: u32,
+    https_only: bool,
 }
 
 impl FeedFetcher {
@@ -431,6 +467,7 @@ impl FeedFetcher {
             request_timeout,
             max_response_bytes,
             max_attempts: MAX_ATTEMPTS,
+            https_only: false,
         })
     }
 
@@ -467,6 +504,39 @@ impl FeedFetcher {
     /// ```
     pub fn single_attempt(mut self) -> Self {
         self.max_attempts = 1;
+        self
+    }
+
+    /// Accept only `https`, on the initial URL and on every redirect hop, for
+    /// a caller whose network reaches nothing but `443`. An `http` initial
+    /// URL is [`FetchError::InvalidUrl`]; a redirect to an `http` URL is
+    /// [`FetchError::InsecureRedirect`], returned before that hop is
+    /// requested. Off by default — see the module doc's "https only, on
+    /// request" section.
+    ///
+    /// ```no_run
+    /// use std::time::Duration;
+    ///
+    /// use skardi::sources::providers::rss::{FeedFetcher, FetchError};
+    ///
+    /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    /// let fetcher = FeedFetcher::new(
+    ///     None,
+    ///     Duration::from_secs(10),
+    ///     5 * 1024 * 1024,
+    ///     "my-agent/1.0".to_string(),
+    /// )?
+    /// .https_only();
+    /// match fetcher.fetch("https://example.com/feed.xml", None).await {
+    ///     Err(FetchError::InsecureRedirect { target }) => println!("downgraded to {target}"),
+    ///     Err(e) => println!("failed: {e}"),
+    ///     Ok(_) => println!("fetched"),
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn https_only(mut self) -> Self {
+        self.https_only = true;
         self
     }
 
@@ -508,7 +578,20 @@ impl FeedFetcher {
         url: &str,
         validators: Option<&Validators>,
     ) -> Result<FetchOutcome, FetchError> {
-        let mut current = self.parse_and_check(url)?;
+        let start = self.parse_and_check(url)?;
+        self.follow_from(start, validators).await
+    }
+
+    /// The hop loop, from a URL `parse_and_check` already accepted. Split out
+    /// of [`FeedFetcher::fetch`] so a test can start an https-only fetcher on
+    /// the plain-http mock server and exercise the redirect check, which is
+    /// the part with behavior of its own; the initial check is one line.
+    async fn follow_from(
+        &self,
+        start: Url,
+        validators: Option<&Validators>,
+    ) -> Result<FetchOutcome, FetchError> {
+        let mut current = start;
         let mut redirects_followed: u32 = 0;
 
         loop {
@@ -543,7 +626,7 @@ impl FeedFetcher {
         let parsed = Url::parse(url).map_err(|e| FetchError::InvalidUrl {
             reason: e.to_string(),
         })?;
-        self.check_hop_target(&parsed)?;
+        self.check_hop_target(&parsed, HopKind::Initial)?;
         Ok(parsed)
     }
 
@@ -563,17 +646,35 @@ impl FeedFetcher {
                 redact_url(current)
             ),
         })?;
-        self.check_hop_target(&target)?;
+        self.check_hop_target(&target, HopKind::Redirect)?;
         Ok(target)
     }
 
-    /// Scheme allowlist plus, for an IP-literal host, [`EgressPolicy::check_ip`].
-    /// A hostname host needs no check here: [`PolicyDns`] (the client's DNS
-    /// resolver) validates it structurally when reqwest actually connects.
-    fn check_hop_target(&self, url: &Url) -> Result<(), FetchError> {
+    /// Scheme allowlist (narrowed to `https` under
+    /// [`FeedFetcher::https_only`]) plus, for an IP-literal host,
+    /// [`EgressPolicy::check_ip`]. A hostname host needs no check here:
+    /// [`PolicyDns`] (the client's DNS resolver) validates it structurally
+    /// when reqwest actually connects.
+    ///
+    /// The scheme checks run first, so an https-only fetcher reports a
+    /// downgrade as one even when the policy would also refuse its address.
+    fn check_hop_target(&self, url: &Url, kind: HopKind) -> Result<(), FetchError> {
         if url.scheme() != "http" && url.scheme() != "https" {
             return Err(FetchError::InvalidUrl {
                 reason: format!("scheme '{}' is not http or https", url.scheme()),
+            });
+        }
+        if self.https_only && url.scheme() != "https" {
+            return Err(match kind {
+                HopKind::Initial => FetchError::InvalidUrl {
+                    reason: format!("scheme '{}' is not https (https only)", url.scheme()),
+                },
+                // Redacted for the same reason as `resolve_redirect_target`'s
+                // current URL. Safe to call: the allowlist above means this is
+                // an `http` URL, which always has a host.
+                HopKind::Redirect => FetchError::InsecureRedirect {
+                    target: redact_url(url),
+                },
             });
         }
         let ip = match url.host() {
@@ -1743,6 +1844,161 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, FetchError::Egress(_)), "got {err:?}");
         assert_eq!(server.requests().len(), 1);
+    }
+
+    /// The mock server speaks plain http, so an https-only fetcher would
+    /// refuse it as the initial URL. These tests start the hop loop on it
+    /// directly, past `parse_and_check`, to exercise the redirect check.
+    fn mock_start_url(server: &MockFeedServer, path: &str) -> Url {
+        Url::parse(&format!("{}{path}", server.url())).expect("mock server url parses")
+    }
+
+    /// The dev-cluster case: a redirect to `http://` on a network that drops
+    /// port 80. The target is unroutable, so following it would sit out the
+    /// whole request timeout and report `Timeout`; https-only refuses it
+    /// before connecting, names the downgrade, and redacts the target.
+    #[tokio::test]
+    async fn https_only_refuses_a_redirect_to_http_before_requesting_it() {
+        let server = MockFeedServer::start(|_req| {
+            MockResponse::status(302).with_header("location", "http://10.255.255.1/f?token=secret")
+        })
+        .await;
+        let f = single_attempt_fetcher(Duration::from_secs(2)).https_only();
+        let started = Instant::now();
+        let err = f
+            .follow_from(mock_start_url(&server, "/start"), None)
+            .await
+            .unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "refused without connecting, took {:?}",
+            started.elapsed()
+        );
+        match &err {
+            FetchError::InsecureRedirect { target } => {
+                assert_eq!(target, "http://10.255.255.1/f")
+            }
+            other => panic!("expected InsecureRedirect, got {other:?}"),
+        }
+        let msg = err.to_string();
+        assert!(msg.contains("redirect left https"), "{msg}");
+        assert!(!msg.contains("token=secret"), "{msg}");
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    /// The scheme is judged before the egress policy: a target that is both
+    /// a downgrade and a refused address reports the downgrade.
+    #[tokio::test]
+    async fn https_only_reports_the_downgrade_before_the_egress_policy() {
+        let server = MockFeedServer::start(|_req| {
+            MockResponse::status(302).with_header("location", "http://10.255.255.1/f")
+        })
+        .await;
+        let policy = Arc::new(DenyList(vec!["10.255.255.1".parse().unwrap()]));
+        let f = fetcher_with_policy(policy).single_attempt().https_only();
+        let err = f
+            .follow_from(mock_start_url(&server, "/start"), None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, FetchError::InsecureRedirect { .. }),
+            "got {err:?}"
+        );
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    /// A relative `Location` inherits the current hop's scheme, so on an
+    /// http hop it is a non-https target like any other.
+    #[tokio::test]
+    async fn https_only_refuses_a_relative_redirect_that_stays_on_http() {
+        let server = MockFeedServer::start(|req| {
+            if req.path == "/moved" {
+                MockResponse::xml("<rss/>")
+            } else {
+                MockResponse::status(302).with_header("location", "/moved")
+            }
+        })
+        .await;
+        let f = test_fetcher().https_only();
+        let err = f
+            .follow_from(mock_start_url(&server, "/feed.xml"), None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, FetchError::InsecureRedirect { .. }),
+            "got {err:?}"
+        );
+        assert_eq!(server.requests().len(), 1, "/moved is never requested");
+    }
+
+    /// An `http` initial URL is the caller's own, so it is `InvalidUrl`, not
+    /// a redirect error, and no request is made.
+    #[tokio::test]
+    async fn https_only_refuses_an_http_feed_url_without_requesting_it() {
+        let server = MockFeedServer::start(|_req| MockResponse::xml("<rss/>")).await;
+        let f = test_fetcher().https_only();
+        let err = f
+            .fetch(&format!("{}/feed.xml", server.url()), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FetchError::InvalidUrl { .. }), "got {err:?}");
+        assert!(err.to_string().contains("is not https"), "{err}");
+        assert_eq!(server.requests().len(), 0);
+    }
+
+    /// Which redirect targets each mode accepts, judged without a network:
+    /// https-only keeps https targets, relative or absolute, and refuses an
+    /// http one; the default accepts both, as it always has.
+    #[test]
+    fn https_only_judges_each_redirect_target_by_its_scheme() {
+        let base = Url::parse("https://feeds.example/feed.xml").unwrap();
+        let strict = test_fetcher().https_only();
+        assert_eq!(
+            strict
+                .resolve_redirect_target(&base, "/moved")
+                .unwrap()
+                .as_str(),
+            "https://feeds.example/moved"
+        );
+        assert_eq!(
+            strict
+                .resolve_redirect_target(&base, "https://other.example/f")
+                .unwrap()
+                .as_str(),
+            "https://other.example/f"
+        );
+        let err = strict
+            .resolve_redirect_target(&base, "http://other.example/f")
+            .unwrap_err();
+        assert!(
+            matches!(err, FetchError::InsecureRedirect { .. }),
+            "got {err:?}"
+        );
+        // Not-http-at-all is still the allowlist's verdict, in either mode.
+        let err = strict
+            .resolve_redirect_target(&base, "ftp://other.example/f")
+            .unwrap_err();
+        assert!(matches!(err, FetchError::InvalidUrl { .. }), "got {err:?}");
+
+        let default = test_fetcher();
+        assert_eq!(
+            default
+                .resolve_redirect_target(&base, "http://other.example/f")
+                .unwrap()
+                .as_str(),
+            "http://other.example/f"
+        );
+    }
+
+    #[test]
+    fn an_insecure_redirect_names_its_target() {
+        let err = FetchError::InsecureRedirect {
+            target: "http://example.com/".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "redirect left https: refused to follow 'http://example.com/' (https only)"
+        );
     }
 
     #[test]

@@ -100,6 +100,7 @@ async fn live_s3_scan_reads_objects_and_writes_image_store() {
         image_mode: skardi::sources::providers::documents::ImageMode::Embedded,
         image_store: Some(format!("s3://{bucket}/{base}/extracted")),
         render_page_images: true,
+        retain_empty_text: false,
         ocr: skardi::sources::providers::documents::OcrMode::Off,
         ocr_server_url: None,
     };
@@ -173,6 +174,7 @@ async fn live_s3_self_ingestion_guard_holds_across_scans() {
         image_mode: skardi::sources::providers::documents::ImageMode::Embedded,
         image_store: Some(format!("s3://{bucket}/{base}/docs/crops")),
         render_page_images: true,
+        retain_empty_text: false,
         ocr: skardi::sources::providers::documents::OcrMode::Off,
         ocr_server_url: None,
     };

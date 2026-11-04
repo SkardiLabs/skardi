@@ -23,4 +23,4 @@ pub use destination::{
     JobDestination, JobDestinationKind, LanceDestination, SqlDmlDestination, WriteOutcome,
 };
 pub use executor::{JobExecutor, JobSubmitError};
-pub use store::{JobRun, JobRunStatus, JobStore, SqliteJobStore};
+pub use store::{JobProviderFailure, JobRun, JobRunStatus, JobStore, SqliteJobStore};

@@ -131,6 +131,7 @@ pub struct SourcePackTable {
     /// successful envelope (Slack's HTTP-200 `ok: false` + `error`
     /// pattern). When declared and present in a page, the scan fails with
     /// the provider's own code instead of a misleading row-path error.
+    /// Boolean flags signal failure only when true.
     pub error_path: Option<&'static str>,
     /// Expected action-contract fingerprint. When set, registration compares
     /// it with the discovered action's fingerprint and fails on mismatch.

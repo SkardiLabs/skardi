@@ -5,13 +5,17 @@ as evidence of what Dropbox puts on the wire.
 
 ## `contracts/*.json` — CAPTURED (output schemas only)
 
-Five real captures from `GET /v1/actions/<id>` on a self-hosted Open
-Connector gateway at commit `a3efa99`, taken during the 2026-08-18 live
-pass. Each came back **byte-identical** to the source-derived schema it
-replaced, which is why the `fingerprint:` pins in `dropbox.yaml` matched
-live discovery unchanged. `list_folder_continue.json` being identical to
-`list_folder.json` (and likewise for the search pair) is a fact about the
-wire, not an artifact of derivation.
+The five output schemas were recaptured on 2026-11-01 from
+`GET /v1/actions/<id>` on an isolated Open Connector gateway built from
+source revision `0723029f7b792b4eabac794d7b17f884cabdcdf5`, using
+Node 24.22.1. No provider credentials were configured and no Dropbox
+actions were executed. The current fingerprints include the required,
+nullable `hasExplicitSharedMembers` metadata field.
+
+These HTTP metadata captures replace the schemas recorded during the
+2026-08-18 pass at `a3efa99`; they are not new payload or live-account
+evidence. The folder and search continuation schemas remain identical to
+their respective opener schemas; all five were requested independently.
 
 These are the files `pinned_fingerprints_match_the_committed_contracts`
 hashes, so drift in either the schema or the pin fails the suite.
@@ -46,11 +50,12 @@ engine work, exactly as documented for gmail and outlook.
 
 ## `*.json` (this directory) — AUTHORED, not captured
 
-Every row fixture is **hand-authored in the executor's normalized shape**
-(`mapDropboxMetadata`'s fifteen camelCase keys). None is a redacted live
-capture, and none should be read as one — the account used for the live
-pass holds personal files, so its pages were never committed. The
-placeholder tells: `id:aaaaaaaaaaaaaaaaaaaaaa`, `Redacted Folder`,
+Every row fixture is **hand-authored using the earlier normalized
+metadata shape**. These payloads were not recaptured for the 2026-11-01
+schema update and do not provide live evidence for the new
+`hasExplicitSharedMembers` field. None is a redacted live capture: the
+account used for the 2026-08-18 pass holds personal files, so its pages
+were never committed. The placeholders make their authored origin clear: `id:aaaaaaaaaaaaaaaaaaaaaa`, `Redacted Folder`,
 `AAGxYzRedactedCursorValue`.
 
 What each one is for, and how far it can be trusted:

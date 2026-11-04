@@ -67,13 +67,22 @@ pub(super) fn is_text_path(rel_path: &str) -> bool {
 /// Errors are per-file: the caller logs and skips, and the wholesale-failure
 /// guard turns "every file failed" into a hard error. That is the same
 /// contract the liteparse path has.
-pub(super) fn parse_text(bytes: &[u8], rel_path: &str) -> Result<Vec<ParsedPage>> {
+pub(super) fn parse_text(
+    bytes: &[u8],
+    rel_path: &str,
+    retain_empty_text: bool,
+) -> Result<Vec<ParsedPage>> {
     let text = decode(bytes, rel_path)?;
     let file_type = file_type_for(Path::new(rel_path));
     let doc_id = doc_id_for(rel_path);
     let markdown_rules = file_type == "md";
 
-    let sections = split_into_sections(&text, markdown_rules);
+    let mut sections = split_into_sections(&text, markdown_rules);
+    if sections.is_empty() && retain_empty_text {
+        // Preserve the file's identity with the ordinary row metadata, without
+        // inventing content or emitting an unbounded whitespace section.
+        sections.push(String::new());
+    }
     if sections.is_empty() {
         // Not an error: an empty (or whitespace-only) file is a file with
         // nothing in it, not a file that failed. It contributes no rows and
@@ -604,7 +613,7 @@ mod tests {
 
     #[test]
     fn a_bom_is_stripped_so_the_first_heading_still_parses() {
-        let rows = parse_text("\u{feff}# Title\n\nbody\n".as_bytes(), "a.md").unwrap();
+        let rows = parse_text("\u{feff}# Title\n\nbody\n".as_bytes(), "a.md", false).unwrap();
         assert_eq!(rows.len(), 1);
         assert!(
             rows[0].markdown.starts_with("# Title"),
@@ -615,16 +624,16 @@ mod tests {
 
     #[test]
     fn crlf_and_lone_cr_become_newlines() {
-        let rows = parse_text(b"# A\r\n\r\npara\r\n", "a.md").unwrap();
+        let rows = parse_text(b"# A\r\n\r\npara\r\n", "a.md", false).unwrap();
         assert!(!rows[0].markdown.contains('\r'));
-        let rows = parse_text(b"# A\r\rpara\r", "a.md").unwrap();
+        let rows = parse_text(b"# A\r\rpara\r", "a.md", false).unwrap();
         assert!(!rows[0].markdown.contains('\r'));
     }
 
     #[test]
     fn latin_1_is_refused_rather_than_lossily_decoded() {
         // `café` in Latin-1: a bare 0xE9 that starts a sequence never finished.
-        let err = parse_text(b"caf\xe9 notes", "notes.txt").unwrap_err();
+        let err = parse_text(b"caf\xe9 notes", "notes.txt", false).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("is not UTF-8"), "{msg}");
         assert!(
@@ -636,7 +645,7 @@ mod tests {
     #[test]
     fn a_nul_byte_is_refused_although_it_is_valid_utf8() {
         assert!(std::str::from_utf8(b"a\0b").is_ok(), "the premise");
-        let err = parse_text(b"a\0b", "notes.txt").unwrap_err();
+        let err = parse_text(b"a\0b", "notes.txt", false).unwrap_err();
         assert!(format!("{err:#}").contains("NUL byte"), "{err:#}");
     }
 
@@ -646,10 +655,10 @@ mod tests {
     #[test]
     fn markdown_and_md_report_one_file_type() {
         for path in ["a.md", "a.markdown", "A.MARKDOWN"] {
-            let rows = parse_text(b"# T\n\nbody\n", path).unwrap();
+            let rows = parse_text(b"# T\n\nbody\n", path, false).unwrap();
             assert_eq!(rows[0].file_type, "md", "{path}");
         }
-        let rows = parse_text(b"plain\n", "a.txt").unwrap();
+        let rows = parse_text(b"plain\n", "a.txt", false).unwrap();
         assert_eq!(rows[0].file_type, "txt");
     }
 
@@ -669,7 +678,7 @@ mod tests {
     fn rows_carry_the_section_ordinal_and_the_empty_liteparse_columns() {
         let body = "q".repeat(MIN_SECTION_BYTES + 10);
         let text = format!("# One\n\n{body}\n\n## Two\n\n{body}\n");
-        let rows = parse_text(text.as_bytes(), "deep/a.md").unwrap();
+        let rows = parse_text(text.as_bytes(), "deep/a.md", false).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].page, 1);
         assert_eq!(rows[1].page, 2);
@@ -686,20 +695,24 @@ mod tests {
     #[test]
     fn the_section_body_is_the_file_verbatim() {
         let text = "# Title\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n```rust\nfn main() {}\n```\n";
-        let rows = parse_text(text.as_bytes(), "a.md").unwrap();
+        let rows = parse_text(text.as_bytes(), "a.md", false).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].markdown, text);
     }
 
     #[test]
     fn an_empty_file_is_no_rows_rather_than_an_error() {
-        assert!(parse_text(b"", "a.txt").unwrap().is_empty());
-        assert!(parse_text(b"   \n\n \t\n", "a.txt").unwrap().is_empty());
+        assert!(parse_text(b"", "a.txt", false).unwrap().is_empty());
+        assert!(
+            parse_text(b"   \n\n \t\n", "a.txt", false)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
     fn a_one_line_file_is_one_section() {
-        let rows = parse_text(b"just one line, no trailing newline", "a.txt").unwrap();
+        let rows = parse_text(b"just one line, no trailing newline", "a.txt", false).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].markdown, "just one line, no trailing newline");
     }

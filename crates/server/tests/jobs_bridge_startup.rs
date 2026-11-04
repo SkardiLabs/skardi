@@ -82,6 +82,7 @@ async fn a_restart_repairs_a_correlation_lost_before_the_previous_shutdown() {
             rows_written: Some(1),
             snapshot_id: None,
             error: None,
+            provider_failure: None,
             submission_id: Some(audit_id.clone()),
         })
         .await
@@ -147,6 +148,7 @@ async fn a_clean_restart_repairs_nothing_and_leaves_stamped_rows_alone() {
             rows_written: Some(1),
             snapshot_id: None,
             error: None,
+            provider_failure: None,
             submission_id: Some(audit_id.clone()),
         })
         .await

@@ -358,10 +358,11 @@ impl ActionScan {
         // unchanged (Slack-style HTTP 200, `ok: false` + `error`). Packs
         // targeting such a gateway declare `error_path` so the provider's own
         // code surfaces instead of the misleading row-path error the missing
-        // row array would raise.
+        // row array would raise. A boolean flag signals failure only when true.
         if let Some(error_path) = &self.error_path
             && let Ok(code) = error_path.extract(&envelope, page)
             && !code.is_null()
+            && code.as_bool() != Some(false)
         {
             let code = match code.as_str() {
                 Some(text) => crate::text::truncate_chars(text, 128),

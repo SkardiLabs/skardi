@@ -70,6 +70,25 @@ curl -X POST http://localhost:8080/pg_user_query/execute \
   -d '{"user_id": 1}' | jq .
 ```
 
+## Integer arrays and membership filters
+
+One-dimensional `bigint[]` columns read and write as Arrow `List<Int64>` with a
+nullable child named `item`. Empty arrays and an entire array set to SQL `NULL`
+round-trip. NULL elements inside an array are unsupported by the upstream table
+reader, so INSERT rejects them before building SQL rather than substituting zero.
+Multidimensional arrays and other PostgreSQL arrays keep their existing behavior.
+
+For a constant integer list, `array_has_any(readers, [10, 20])` pushes down as
+PostgreSQL array overlap (`&&`). Bigint-column `IN` and `NOT IN` predicates keep
+their stock rendering. Predicates retain NULL behavior;
+unsupported array functions stay in DataFusion rather than being sent to Postgres.
+
+A source may set `options.governed_array_key_budget` to a measured crossover: lists above
+that size use an `unnest`/`EXISTS` predicate instead of GIN overlap, including
+filters on `pg_knn` and `pg_fts`. Zero selects
+that form for every nonempty list. Leaving the option unset retains overlap;
+there is no default count or limit on the caller's readable keys.
+
 ## Prerequisites
 
 1. **PostgreSQL Server** running locally or remotely
