@@ -23,7 +23,17 @@
 //! (Design: `docs/superpowers/specs/2026-08-08-graph-engine-bypass-design.md`,
 //! milestone 4 — the carried-in obligation this module discharges.)
 
+use std::any::Any;
+use std::sync::Arc;
+
+use arrow::array::new_empty_array;
+use arrow::compute::CastOptions;
+use arrow::datatypes::{DataType, Field, FieldRef};
 use datafusion::error::Result as DFResult;
+use datafusion::logical_expr::{
+    ColumnarValue, ExpressionPlacement, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF,
+    ScalarUDFImpl, Signature,
+};
 use datafusion::prelude::SessionContext;
 use datafusion_functions_json::udfs;
 
@@ -48,6 +58,9 @@ use datafusion_functions_json::udfs;
 /// # Ok(())
 /// # }
 /// ```
+/// Empty dynamic-path batches keep their declared type. Integer extraction
+/// accepts the whole signed 64-bit range, including values that the upstream
+/// JSON parser represents as arbitrary-precision integers.
 pub fn register_json_getter_udfs(ctx: &SessionContext) -> DFResult<()> {
     // The exact set `register_all` registers, listed individually so the
     // rewriter/planner pair it installs afterwards can never sneak in.
@@ -63,15 +76,88 @@ pub fn register_json_getter_udfs(ctx: &SessionContext) -> DFResult<()> {
         udfs::json_contains_udf(),
         udfs::json_length_udf(),
         udfs::json_object_keys_udf(),
-        udfs::json_from_scalar_udf(),
     ] {
-        ctx.register_udf((*udf).clone());
+        ctx.register_udf(ScalarUDF::new_from_impl(EmptyPathBatch(udf)));
     }
+    ctx.register_udf((*udfs::json_from_scalar_udf()).clone());
     Ok(())
+}
+
+/// The upstream scalar-JSON/array-path helper constructs a run-end array with
+/// a single run of length `path.len()`. A zero-row batch would make that run
+/// end zero, which Arrow rejects (datafusion-functions-json 0.53.1,
+/// `common.rs::invoke_scalar_array`). Nonempty calls retain upstream path
+/// extraction; integer conversion checks the original JSON token's range.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct EmptyPathBatch(Arc<ScalarUDF>);
+
+impl ScalarUDFImpl for EmptyPathBatch {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+
+    fn aliases(&self) -> &[String] {
+        self.0.aliases()
+    }
+
+    fn signature(&self) -> &Signature {
+        self.0.signature()
+    }
+
+    fn return_type(&self, arg_types: &[DataType]) -> DFResult<DataType> {
+        self.0.return_type(arg_types)
+    }
+
+    fn return_field_from_args(&self, args: ReturnFieldArgs) -> DFResult<FieldRef> {
+        self.0.return_field_from_args(args)
+    }
+
+    fn placement(&self, args: &[ExpressionPlacement]) -> ExpressionPlacement {
+        self.0.placement(args)
+    }
+
+    fn invoke_with_args(&self, mut args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        if matches!(args.args.first(), Some(ColumnarValue::Scalar(_)))
+            && args
+                .args
+                .iter()
+                .skip(1)
+                .any(|arg| matches!(arg, ColumnarValue::Array(path) if path.is_empty()))
+        {
+            return Ok(ColumnarValue::Array(new_empty_array(args.return_type())));
+        }
+        if self.name() == "json_get_int" {
+            // jiter represents 19-digit integers as BigInt even when they fit
+            // i64; upstream json_get_int silently returns NULL for all of them.
+            // Extract the original JSON token and parse it with a checked
+            // integer cast: decimals, strings and overflow still become NULL.
+            let json = udfs::json_get_json_udf();
+            let types = args
+                .args
+                .iter()
+                .map(ColumnarValue::data_type)
+                .collect::<Vec<_>>();
+            args.return_field = Arc::new(Field::new(json.name(), json.return_type(&types)?, true));
+            return json
+                .invoke_with_args(args)?
+                .cast_to(&DataType::Int64, Some(&CastOptions::default()));
+        }
+        self.0.invoke_with_args(args)
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use datafusion::datasource::MemTable;
+    use datafusion::prelude::SessionConfig;
+
     use super::*;
 
     #[tokio::test]
@@ -91,6 +177,150 @@ mod tests {
             .downcast_ref::<arrow::array::StringArray>()
             .expect("string column");
         assert_eq!(col.value(0), "x");
+    }
+
+    #[tokio::test]
+    async fn nested_json_integers_keep_the_full_i64_range() {
+        let ctx = SessionContext::new();
+        register_json_getter_udfs(&ctx).unwrap();
+        let values = [
+            ("6443232871316209794", Some(6443232871316209794)),
+            ("9223372036854775807", Some(i64::MAX)),
+            ("-9223372036854775808", Some(i64::MIN)),
+            ("-1", Some(-1)),
+            ("0", Some(0)),
+            ("9223372036854775808", None),
+            ("-9223372036854775809", None),
+            ("1.0", None),
+            ("1e2", None),
+            ("\"1\"", None),
+            ("null", None),
+            ("true", None),
+            ("[]", None),
+            ("{}", None),
+        ];
+        let schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StringArray::from(
+                values
+                    .iter()
+                    .enumerate()
+                    .map(|(index, _)| format!("file-{index}.md"))
+                    .collect::<Vec<_>>(),
+            ))],
+        )
+        .unwrap();
+        ctx.register_table(
+            "metadata",
+            Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap()),
+        )
+        .unwrap();
+        let json = format!(
+            "{{{}}}",
+            values
+                .iter()
+                .enumerate()
+                .map(|(index, (value, _))| format!("\"file-{index}.md\":{{\"acl_root\":{value}}}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let batches = ctx
+            .sql(&format!("SELECT json_get_int(json_get_json('{json}', key), 'acl_root') AS root FROM metadata"))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let actual = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .iter()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            values.iter().map(|(_, value)| *value).collect::<Vec<_>>()
+        );
+        let scalar = ctx
+            .sql("SELECT json_get_int(json_get_json('{\"file.md\":{\"acl_root\":6443232871316209794}}', 'file.md'), 'acl_root')")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            scalar[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            6443232871316209794
+        );
+    }
+
+    #[tokio::test]
+    async fn scalar_json_dynamic_paths_accept_an_empty_batch_after_a_row() {
+        let config = SessionConfig::new().set_bool("datafusion.execution.coalesce_batches", false);
+        let ctx = SessionContext::new_with_config(config);
+        let schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Utf8, false)]));
+        let row = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StringArray::from(vec!["a"]))],
+        )
+        .unwrap();
+        let empty = RecordBatch::new_empty(Arc::clone(&schema));
+        let input = MemTable::try_new(Arc::clone(&schema), vec![vec![row, empty.clone()]]).unwrap();
+        ctx.register_table("paths", Arc::new(input)).unwrap();
+        let empty_input = MemTable::try_new(schema, vec![vec![empty]]).unwrap();
+        ctx.register_table("empty_paths", Arc::new(empty_input))
+            .unwrap();
+        for (sql, expected_rows) in [
+            (
+                "SELECT json_get_str('{\"a\":\"value\"}', key) AS value FROM paths",
+                1,
+            ),
+            // Upstream rejects nonempty variadic array paths. This wrapper only
+            // handles empty batches, including an array after a scalar path.
+            (
+                "SELECT json_get_str('{\"a\":{\"b\":\"value\"}}', 'a', key) AS value FROM empty_paths",
+                0,
+            ),
+        ] {
+            // Prove both empty shapes fail without our registered wrapper.
+            ctx.register_udf((*udfs::json_get_str_udf()).clone());
+            let error = ctx.sql(sql).await.unwrap().collect().await.unwrap_err();
+            let expected_error = if expected_rows == 1 {
+                "run_ends"
+            } else {
+                "More than 1 path element"
+            };
+            assert!(error.to_string().contains(expected_error), "{sql}: {error}");
+
+            register_json_getter_udfs(&ctx).unwrap();
+            let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+            assert_eq!(
+                batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                expected_rows
+            );
+            if expected_rows == 1 {
+                let row = batches.iter().find(|batch| batch.num_rows() == 1).unwrap();
+                assert_eq!(
+                    row.column(0)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap()
+                        .value(0),
+                    "value"
+                );
+            }
+        }
     }
 
     /// The federation-pushdown contract (module doc): with ONLY the getter

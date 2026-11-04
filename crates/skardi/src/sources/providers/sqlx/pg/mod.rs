@@ -1,3 +1,4 @@
+mod dialect;
 pub mod fts_exec;
 pub mod fts_table_function;
 pub mod fts_udfs;

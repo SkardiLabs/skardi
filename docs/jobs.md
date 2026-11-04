@@ -414,6 +414,13 @@ Row fields, matching the CLI `status` response:
 | `rows_written` | Set on `succeeded`; also set on post-commit cancels |
 | `snapshot_id` | For Lance: the version the commit landed on, as a string |
 | `error` | Non-null on failures / cancels; free-form message |
+| `provider_failure` | Optional provider classification and pacing, separate from `error`; null when unavailable |
+
+An Open Connector quota refusal carries
+`provider_failure: {"code": "quota_exhausted", "retry_after_ms": 2678400000}`
+when the provider supplies that recovery delay. The delay is in milliseconds;
+it is null when no usable delay is available. This object contains no provider
+response payload. Non-failed status transitions clear it.
 
 The row carries one field the response does not: `submission_id`, the opaque
 correlation token the submitter supplied — for the server, the `query_audit`

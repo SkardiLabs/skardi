@@ -70,6 +70,7 @@ All keys are optional except `path`.
 | `image_store` | — | Destination for extracted image crops — a local path or an `s3://bucket/prefix`. Both backends perform a real write (S3 objects get a `Content-Type` inferred from the extension). Local refs are usable as `llm_extract`'s `image_ref` as-is; `s3://` refs are readable too but **only with `LLM_EXTRACT_IMAGE_FETCH=1`** — see [Image refs and `llm_extract`](#image-refs-and-llm_extract). When both `path` and `image_store` are `s3://`, they must be in the **same bucket** (see [S3 / object store](#s3--object-store)). |
 | `ocr` | `auto` | `auto` OCRs only complex pages (needs `ocr_server_url`); `on` always (requires `ocr_server_url`, else hard error); `off` never. See OCR. |
 | `render_page_images` | `false` | Render each page to a PNG into `image_store` and set `page_image_ref` (needed for multimodal `llm_extract`). |
+| `retain_empty_text` | `false` | Emit one row for an empty or whitespace-only Markdown/plain-text file, with empty `markdown` and the usual path-derived `doc_id`, page 1 and file metadata. |
 | `ocr_server_url` | — | HTTP OCR engine URL. The only way to do OCR in this build (no bundled Tesseract). Mandatory for `ocr: on`. |
 
 Filtering by "batch" is just a path predicate — `WHERE path LIKE 'batch-a/%'`.
@@ -158,9 +159,13 @@ wholesale-failure guard turns into a hard error):
 | a NUL byte | It *is* valid UTF-8, and a Postgres `text` column cannot hold it. A section carrying one fails a consumer's INSERT with a message naming neither this file nor this format. |
 | — | A leading BOM is stripped rather than refused; CRLF and lone CR are normalised to `\n`. |
 
-An empty (or whitespace-only) file is not an error. It contributes no rows and
-still counts as parsed, so it cannot by itself trip the wholesale-failure
-guard.
+An empty (or whitespace-only) file is not an error. By default it contributes
+no rows and still counts as parsed, so it cannot by itself trip the
+wholesale-failure guard. Set `options: { retain_empty_text: "true" }` when a
+rendered document must keep its catalog row even without body text. This emits
+one ordinary row with `markdown = ''`, page 1 and the same path-derived document
+id; whitespace-only text is normalized to an empty body. Other formats and
+non-empty text keep their usual behavior.
 
 ## OCR and external tools
 

@@ -303,7 +303,7 @@ mod tests {
         let registry = super::builtin_pack_registry().expect("embedded assets parse");
         let pack = registry.require("google_drive").unwrap();
         assert_eq!(pack.name, "google_drive");
-        assert_eq!(pack.version, 1);
+        assert_eq!(pack.version, 2);
         // BTreeMap order, not the yaml's authoring order: drives sorts
         // ahead of the files table it exists to join against.
         let ids: Vec<&str> = pack.tables.iter().map(|table| table.id).collect();

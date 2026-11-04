@@ -416,6 +416,7 @@ async fn restart_reconciles_orphaned_running_row_to_failed() {
             rows_written: None,
             snapshot_id: None,
             error: None,
+            provider_failure: None,
             submission_id: None,
         };
         store.create_run(&run).await.unwrap();

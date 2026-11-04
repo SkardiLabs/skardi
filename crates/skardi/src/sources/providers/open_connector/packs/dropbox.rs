@@ -2,19 +2,23 @@
 //! Connector `dropbox.*` read actions (OAuth2, cursor pagination with
 //! split-action continuation).
 //!
-//! # Provenance: live-verified 2026-08-18
+//! # Provenance
 //!
-//! Authored against the Open Connector provider source
-//! (`src/providers/dropbox/`) and then verified end to end against a
-//! self-hosted Open Connector gateway at commit `a3efa99` and a real
-//! (free-tier) Dropbox account. What the live pass established:
+//! The five current output schemas in `fixtures/dropbox/contracts/*.json`
+//! were recaptured on 2026-11-01 via `GET /v1/actions/<id>` on an isolated
+//! Open Connector gateway built from source revision
+//! `0723029f7b792b4eabac794d7b17f884cabdcdf5`, using Node 24.22.1. No
+//! provider credentials were configured and no Dropbox actions were
+//! executed. The pins include the required, nullable
+//! `hasExplicitSharedMembers` field. Folder and search continuation
+//! schemas still match their respective openers; each was fetched
+//! independently. These are HTTP schema captures, not payload captures.
 //!
-//! - the five `fixtures/dropbox/contracts/*.json` captures came back
-//!   byte-identical to the source-derived schemas they replaced, so every
-//!   `fingerprint:` in `dropbox.yaml` matched LIVE discovery unchanged and
-//!   registration passed the contract gate on the first try. The
-//!   `*_continue.json` files being identical to their openers is a fact
-//!   about the wire, not an artifact of how they were derived;
+//! Payload and pagination evidence below comes from the historical
+//! 2026-08-18 pass against gateway revision `a3efa99` and a real free-tier
+//! Dropbox account; those observations were not repeated in the schema
+//! recapture. The historical pass established:
+//!
 //! - all three tables scanned real rows, and every column the pack
 //!   DECLARES carried a real non-NULL value somewhere — 12/12 on `files`
 //!   (378 rows) and 13/13 on `file_search`. `shared_links` is 11/11 of
@@ -63,7 +67,8 @@
 //! fixed camelCase shape — `tag` / `name` / `id` / `pathDisplay` /
 //! `pathLower` / `clientModified` / `serverModified` / `rev` /
 //! `sizeBytes` / `isDownloadable` / `contentHash` / `url` / `expiresAt` /
-//! `sharingInfo` / `linkPermissions` — with all fifteen keys declared
+//! `sharingInfo` / `hasExplicitSharedMembers` / `linkPermissions` — with
+//! all sixteen keys declared
 //! `required` under `additionalProperties: false`. Mapping Dropbox's own
 //! snake_case (`path_display`, `client_modified`, `size`) would have
 //! produced all-NULL columns no Dropbox doc would explain, the exact
@@ -138,7 +143,7 @@
 //!   whose `files` row carries all four came back with all four NULL on
 //!   its own `shared_links` row — same file, same normalizer, different
 //!   endpoint. The fingerprint gate cannot catch this class, because both
-//!   actions publish the same normalized 15-key schema; only real rows
+//!   actions publish the same normalized metadata schema; only real rows
 //!   can. A negative-space test pins the absence.
 //!
 //! - **No filter is pushed by any table.** Dropbox's remaining list
@@ -796,8 +801,8 @@ mod tests {
     fn dropbox_discovery(path: &str) -> MockResponse {
         // Each action reads its OWN contract file. The two continue files
         // being byte-identical to their openers is a fact about the wire —
-        // the live pass captured all four independently and they came back
-        // the same — NOT an artifact of derivation. Keeping the files
+        // the 2026-11-01 metadata-only HTTP recapture requested all five
+        // independently. Keeping the files
         // separate is what lets a future upstream split them without
         // touching this helper.
         let action = path.rsplit('/').next().unwrap_or_default();

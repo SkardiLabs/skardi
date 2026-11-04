@@ -67,6 +67,10 @@ pub struct ParseOptions {
     pub image_store: Option<String>,
     pub ocr: OcrMode,
     pub render_page_images: bool,
+    /// Keep one row with empty markdown for an empty or whitespace-only text
+    /// file. For example, `options: { retain_empty_text: "true" }` preserves a
+    /// rendered document's catalog identity even when it has no body.
+    pub retain_empty_text: bool,
     /// Optional HTTP OCR server URL. liteparse is built here without the
     /// bundled Tesseract engine (see Cargo.toml), so OCR is only actually
     /// performed when this is set; otherwise `on`/`auto` degrade to no-OCR.
@@ -84,6 +88,7 @@ impl Default for ParseOptions {
             image_store: None,
             ocr: OcrMode::Auto,
             render_page_images: false,
+            retain_empty_text: false,
             ocr_server_url: None,
         }
     }
@@ -167,6 +172,9 @@ impl ParseOptions {
         }
         if let Some(v) = map.get("render_page_images") {
             opts.render_page_images = parse_bool(v, opts.render_page_images);
+        }
+        if let Some(v) = map.get("retain_empty_text") {
+            opts.retain_empty_text = parse_bool(v, opts.retain_empty_text);
         }
         if let Some(v) = map.get("ocr_server_url") {
             let v = v.trim();
@@ -678,7 +686,7 @@ fn scan_blocking(
         // `PlainText`, renames the input `input.txt`, finds no conversion
         // route for that extension, and fails the file.
         let parsed = if super::text::is_text_path(&rel_path) {
-            super::text::parse_text(&bytes, &rel_path)
+            super::text::parse_text(&bytes, &rel_path, opts.retain_empty_text)
         } else {
             runtime.block_on(parse_file(
                 &bytes,
@@ -817,6 +825,8 @@ fn tool_available(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
 
     #[test]
@@ -828,6 +838,7 @@ mod tests {
             image_store: None,
             ocr: OcrMode::Off,
             render_page_images: false,
+            retain_empty_text: false,
             ocr_server_url: None,
         };
         let rows = parse_source("tests/fixtures/documents", &opts).unwrap();
@@ -846,9 +857,11 @@ mod tests {
     #[test]
     fn markdown_and_text_are_ingested_directly_beside_pdfs() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("readme.md"), b"# Title\n\nbody text\n").unwrap();
-        std::fs::write(dir.path().join("notes.markdown"), b"# Other\n\nmore\n").unwrap();
-        std::fs::write(dir.path().join("log.txt"), b"plain line one\n\nline two\n").unwrap();
+        fs::write(dir.path().join("readme.md"), b"# Title\n\nbody text\n").unwrap();
+        fs::write(dir.path().join("notes.markdown"), b"# Other\n\nmore\n").unwrap();
+        fs::write(dir.path().join("log.txt"), b"plain line one\n\nline two\n").unwrap();
+        fs::write(dir.path().join("empty.md"), b"").unwrap();
+        fs::write(dir.path().join("whitespace.md"), b"   \n\n\t\n").unwrap();
         let opts = ParseOptions {
             include_globs: vec!["*.md".into(), "*.markdown".into(), "*.txt".into()],
             ocr: OcrMode::Off,
@@ -867,6 +880,37 @@ mod tests {
         // The body is the file verbatim — nothing was reconstructed.
         let readme = rows.iter().find(|r| r.path == "readme.md").unwrap();
         assert_eq!(readme.markdown, "# Title\n\nbody text\n");
+
+        let options = HashMap::from([
+            ("include_globs".into(), "*.md,*.markdown,*.txt".into()),
+            ("ocr".into(), "off".into()),
+            ("retain_empty_text".into(), "true".into()),
+        ]);
+        let retained = parse_source(
+            dir.path().to_str().unwrap(),
+            &ParseOptions::from_map(Some(&options)),
+        )
+        .unwrap();
+        assert_eq!(retained.len(), 5, "empty text must retain its catalog row");
+        for path in ["empty.md", "whitespace.md"] {
+            let row = retained.iter().find(|row| row.path == path).unwrap();
+            assert_eq!(row.doc_id, doc_id_for(path));
+            assert_eq!(row.page, 1);
+            assert!(row.markdown.is_empty());
+            assert_eq!(row.file_type, "md");
+            assert_eq!(row.tables_json, "[]");
+            assert!(row.page_image_ref.is_none());
+            assert!(row.image_refs.is_empty());
+        }
+        assert_eq!(
+            retained
+                .iter()
+                .find(|row| row.path == "readme.md")
+                .unwrap()
+                .markdown,
+            readme.markdown,
+            "retaining empty text must not change populated files"
+        );
     }
 
     /// The failure this whole path exists to avoid: liteparse cannot read
@@ -948,6 +992,7 @@ mod tests {
             image_store: None,
             ocr: OcrMode::Off,
             render_page_images: false,
+            retain_empty_text: false,
             ocr_server_url: None,
         };
         let err = parse_source("tests/fixtures/documents/does-not-exist", &opts).unwrap_err();
@@ -1382,6 +1427,7 @@ mod tests {
             image_store: None,
             ocr: OcrMode::Off,
             render_page_images: false,
+            retain_empty_text: false,
             ocr_server_url: None,
         };
         let store = BlobStore::Remote(mem as Arc<dyn ObjectStore>);

@@ -341,7 +341,7 @@ agents; deploy it next to your data, behind your usual auth.
 
 | Type | CRUD | Catalog | Notes | Docs |
 |------|------|---------|-------|------|
-| PostgreSQL | Full | Yes | pgvector KNN, FTS (`pg_fts`, plus `tsvector` predicates pushed down from raw SQL), configurable read/write pools and initialization budgets | [docs](docs/postgres/) |
+| PostgreSQL | Full | Yes | pgvector KNN, FTS (`pg_fts`, plus `tsvector` predicates pushed down from raw SQL), one-dimensional `bigint[]` read/write (non-NULL elements) and membership filters, configurable read/write pools and initialization budgets | [docs](docs/postgres/) |
 | MySQL | Full | Yes | Table or catalog registration | [docs](docs/mysql/) |
 | SQLite | Full | Yes | sqlite-vec KNN, FTS | [docs](docs/sqlite/) |
 | MongoDB | Full | No | Collections with point lookups | [docs](docs/mongo/) |
@@ -355,7 +355,7 @@ agents; deploy it next to your data, behind your usual auth.
 | S3 / GCS / Azure | Read | No | CSV, Parquet, Lance in object stores | [docs](docs/S3_USAGE.md) |
 | CSV / Parquet | Read | No | Local or remote files | [docs](docs/server.md) |
 | SaaS via Open Connector | Read | Yes | GitHub, Slack, Notion, Feishu, Lark, Gmail, Discord, Outlook, OneDrive, Google Drive, Dropbox, WhatsApp packs as stable SQL tables; Slack channel history and Feishu/Lark document text as content tables, with time-window pushdown for incremental scans; pushdown + TTL cache | [docs](docs/open-connector.md) |
-| Documents | Read | No | PDF/Office/ODF/image → per-page Markdown, tables, images; Markdown and plain text read directly, one row per heading or paragraph run | [docs](docs/documents.md) |
+| Documents | Read | No | PDF/Office/ODF/image → per-page Markdown, tables, images; Markdown and plain text read directly, one row per heading or paragraph run; optional empty-text rows | [docs](docs/documents.md) |
 | RSS / Atom | Read | Yes | Feeds as `feeds` + `items`; per-feed TTL cache, fault isolation, un-sandboxed fetch egress | [docs](docs/rss.md) |
 | Graph (Apache AGE) | Read | Yes | Read-only openCypher over Postgres; YAML views as catalog tables, `cypher_query` UDTF | [docs](docs/graph.md) |
 
