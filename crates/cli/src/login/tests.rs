@@ -2271,6 +2271,51 @@ async fn a_control_login_asks_for_control_and_stores_the_pair() {
     );
 }
 
+/// A `--control` login approving several workspaces: the server mints the
+/// pair for the whole scope (skardi-cloud `control_needs_admin_cap` checks
+/// every workspace in it), so EVERY context carries both halves, and
+/// `skardi agent` works in whichever one is current. Every probe still uses
+/// the mcp token, never the control one.
+#[tokio::test]
+async fn a_control_login_for_several_workspaces_gives_every_context_the_pair() {
+    let gw = gateway(200).await;
+    let mut body = approved_scoped(
+        &gw.uri(),
+        "tok-mcp",
+        &[("ws-a", "admin"), ("ws-b", "admin")],
+    );
+    body["control_token"] = json!("skardi_pat_control_secret");
+    body["control_token_id"] = json!("tok-control");
+    body["control_expires_at"] = json!("2026-08-25T12:00:00Z");
+    body["pair_id"] = json!("pair-1");
+    let console = console(200, body).await;
+    let home = TempDir::new().unwrap();
+
+    let report = login(control_options(&console.uri()), &config_in(&home))
+        .await
+        .unwrap();
+
+    assert!(!report.control_missing);
+    let file = read_yaml(&config_in(&home));
+    for (i, ws) in ["ws-a", "ws-b"].iter().enumerate() {
+        let context = &file["contexts"][i];
+        assert_eq!(context["workspace"].as_str(), Some(*ws));
+        assert_eq!(context["token"].as_str(), Some("skardi_pat_tok-mcp"));
+        assert_eq!(
+            context["control-token"].as_str(),
+            Some("skardi_pat_control_secret"),
+            "{ws}"
+        );
+        assert_eq!(context["pair-id"].as_str(), Some("pair-1"), "{ws}");
+    }
+    for probe in gw.received_requests().await.unwrap() {
+        assert_eq!(
+            probe.headers.get("authorization").unwrap(),
+            "Bearer skardi_pat_tok-mcp"
+        );
+    }
+}
+
 /// Approved without `control` — the box unticked, or a member's cap: the
 /// context is still written so queries work, and the report says control is
 /// missing, which the command turns into exit 6.
