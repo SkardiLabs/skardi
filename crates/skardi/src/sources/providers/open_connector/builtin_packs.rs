@@ -62,6 +62,7 @@ pub fn builtin_pack_registry() -> Result<SourcePackRegistry, OpenConnectorError>
 #[cfg(test)]
 mod tests {
     use super::super::*;
+    use skardi_source_pack::filters::*;
     use skardi_source_pack::pagination::*;
     use skardi_source_pack::source_pack::*;
 
@@ -707,6 +708,151 @@ mod tests {
         cursor_only_table()
             .check_full_continuation_inputs(None)
             .expect("cursor_only is checked by check_continuation_inputs");
+    }
+
+    /// The github `state` shape: an Inexact eq push whose domain is the
+    /// column's two values, against an action enum that also admits `all`.
+    fn domain_table(values: &'static [&'static str]) -> SourcePackTable {
+        SourcePackTable {
+            filters: Box::leak(Box::new([FilterMapping {
+                column: "state",
+                operator: Operator::Eq,
+                input_field: "state",
+                fidelity: Fidelity::Inexact,
+                value_format: ValueFormat::Verbatim,
+                values,
+            }])),
+            ..leaked_table("t.entries")
+        }
+    }
+
+    fn state_enum(accepted: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "owner": {"type": "string"},
+                "state": {"type": "string", "enum": accepted}
+            }
+        })
+    }
+
+    #[test]
+    fn a_filter_domain_inside_the_discovered_enum_registers() {
+        let table = domain_table(&["open", "closed"]);
+        let findings = table
+            .check_filter_values("t.action", Some(&state_enum(&["open", "closed", "all"])))
+            .expect("a subset of the enum is exactly the claim the pack makes");
+        assert!(findings.is_empty(), "{findings:?}");
+        // Nothing to check against: no schema, no properties, or a
+        // free-string input.
+        for schema in [
+            None,
+            Some(serde_json::json!({"type": "object"})),
+            Some(serde_json::json!({
+                "type": "object",
+                "properties": {"state": {"type": "string"}}
+            })),
+        ] {
+            let findings = table
+                .check_filter_values("t.action", schema.as_ref())
+                .expect("no enum means no domain to disagree with");
+            assert!(findings.is_empty(), "{findings:?}");
+        }
+        // An enum the pack does not constrain is reported for the caller to
+        // log, not refused — every in-domain literal still works.
+        let findings = domain_table(&[])
+            .check_filter_values("t.action", Some(&state_enum(&["open", "closed", "all"])))
+            .expect("an undeclared domain is a finding, not a refusal");
+        assert_eq!(
+            findings,
+            vec![UndeclaredDomain {
+                action_id: "t.action".to_string(),
+                column: "state",
+                input_field: "state",
+                accepted: vec!["open".to_string(), "closed".to_string(), "all".to_string()],
+            }]
+        );
+        // An action the pushed inputs never reach has nothing to check,
+        // whatever its schema says.
+        let findings = domain_table(&["open", "closed"])
+            .check_filter_values("t.unrelated", Some(&state_enum(&["merged"])))
+            .expect("an unrelated action's enum is not this table's contract");
+        assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    #[test]
+    fn a_full_continuation_to_another_action_has_its_enum_checked_too() {
+        // Pages 2..N repeat the opener's inputs on the continuation action,
+        // so its enum is as much the pushed literal's contract as the
+        // opener's — the page-two 400 that `check_continuation_inputs`
+        // closes for the other input keys. A cursor-only continuation never
+        // sees the inputs, so its enum is not consulted.
+        let full = SourcePackTable {
+            continuation: Some(CursorContinuation {
+                action_id: "t.action_continue",
+                expected_fingerprint: "aa",
+                cursor_only: false,
+            }),
+            ..domain_table(&["open", "closed"])
+        };
+        assert_eq!(
+            full.filter_input_actions().collect::<Vec<_>>(),
+            vec!["t.action", "t.action_continue"]
+        );
+        let err = full
+            .check_filter_values("t.action_continue", Some(&state_enum(&["open", "all"])))
+            .expect_err("the continuation action's enum dropped `closed`");
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("t.action_continue") && rendered.contains("[closed]"),
+            "the continuation action is the one named: {rendered}"
+        );
+        let findings = full
+            .check_filter_values("t.action_continue", Some(&state_enum(&["open", "closed"])))
+            .expect("a continuation enum that admits the domain passes");
+        assert!(findings.is_empty(), "{findings:?}");
+
+        let cursor_only = SourcePackTable {
+            continuation: Some(CursorContinuation {
+                action_id: "t.action_continue",
+                expected_fingerprint: "aa",
+                cursor_only: true,
+            }),
+            ..domain_table(&["open", "closed"])
+        };
+        assert_eq!(
+            cursor_only.filter_input_actions().collect::<Vec<_>>(),
+            vec!["t.action"]
+        );
+        let findings = cursor_only
+            .check_filter_values("t.action_continue", Some(&state_enum(&["open", "all"])))
+            .expect("a cursor-only continuation receives no filter input to validate");
+        assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    #[test]
+    fn a_filter_domain_outside_the_discovered_enum_fails_registration() {
+        // The pack claims `closed`; the gateway dropped it. Pushing that
+        // literal would be a 400 on page one of every query that uses it,
+        // so the table is refused with the action, input, column and the
+        // offending value named — the fingerprint gate's shape.
+        let err = domain_table(&["open", "closed"])
+            .check_filter_values("t.action", Some(&state_enum(&["open", "all"])))
+            .expect_err("a value the enum does not accept is a contract mismatch");
+        let rendered = err.to_string();
+        for needle in [
+            "t.entries",
+            "t.action",
+            "input 'state'",
+            "column 'state'",
+            "[closed]",
+        ] {
+            assert!(rendered.contains(needle), "want {needle:?} in: {rendered}");
+        }
+        assert!(
+            !rendered.contains("[open]"),
+            "an accepted value is not reported as outside: {rendered}"
+        );
     }
 
     #[test]

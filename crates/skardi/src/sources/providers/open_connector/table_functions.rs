@@ -244,6 +244,25 @@ impl TableFunctionImpl for OpenConnectorQueryFunction {
                     .check_continuation_inputs(meta.input_schema())
                     .map_err(plan_error)?;
             }
+            // The domain gate decides for itself which actions receive the
+            // pushed inputs (the table's own, and a full-input continuation
+            // to another), so this entry point offers every discovered
+            // action and cannot skip one. A query plans this on every call,
+            // so an enum the pack leaves undeclared is a debug line here and
+            // a warning on the once-per-process registration path.
+            for finding in table
+                .check_filter_values(action_id, meta.input_schema())
+                .map_err(plan_error)?
+            {
+                tracing::debug!(
+                    table = table.id,
+                    action = %finding.action_id,
+                    column = finding.column,
+                    input = finding.input_field,
+                    accepted = ?finding.accepted,
+                    "Open Connector action types a pushed filter input as an enum the pack does not declare"
+                );
+            }
         }
 
         let provider = OpenConnectorTableProvider::new(

@@ -305,6 +305,33 @@ pub async fn register_open_connector_tables(
             // DIFFERENT continue action is an assumption about two
             // independently discovered schemas, not a fact.)
             table.check_continuation_inputs(continuation_input_schema)?;
+            // Same reasoning for a filter's value domain: an input the
+            // gateway types as an enum is invisible to the output
+            // fingerprint, and a pack value the enum dropped would 400 on
+            // the first page of every query that pushes it — or on page
+            // two, when a full-input continuation repeats the inputs on
+            // another action; the gate itself knows which actions those
+            // are. Registration runs once per process, so an enum the pack
+            // leaves undeclared is worth a warning here; the table-function
+            // path re-runs this per planned query and logs it at debug.
+            for action_id in table.filter_input_actions() {
+                let undeclared = table.check_filter_values(
+                    action_id,
+                    registry
+                        .get(action_id)
+                        .and_then(ActionMetadata::input_schema),
+                )?;
+                for finding in undeclared {
+                    tracing::warn!(
+                        table = table.id,
+                        action = %finding.action_id,
+                        column = finding.column,
+                        input = finding.input_field,
+                        accepted = ?finding.accepted,
+                        "Open Connector action types a pushed filter input as an enum the pack does not declare; a literal outside it is refused by the gateway instead of answering zero rows — declare `values` on the mapping"
+                    );
+                }
+            }
 
             let provider = OpenConnectorTableProvider::new(
                 Arc::clone(&client),

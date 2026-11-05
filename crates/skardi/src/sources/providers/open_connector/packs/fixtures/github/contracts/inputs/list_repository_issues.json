@@ -1,0 +1,60 @@
+{
+  "type": "object",
+  "properties": {
+    "owner": {
+      "type": "string",
+      "minLength": 1
+    },
+    "repo": {
+      "type": "string",
+      "minLength": 1
+    },
+    "state": {
+      "type": "string",
+      "enum": [
+        "open",
+        "closed",
+        "all"
+      ]
+    },
+    "labels": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "sort": {
+      "type": "string",
+      "enum": [
+        "created",
+        "updated",
+        "comments"
+      ]
+    },
+    "direction": {
+      "type": "string",
+      "enum": [
+        "asc",
+        "desc"
+      ]
+    },
+    "since": {
+      "type": "string"
+    },
+    "perPage": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 100,
+      "description": "Number of results requested per page. Defaults to 30.",
+      "default": 30
+    },
+    "page": {
+      "type": "integer"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "owner",
+    "repo"
+  ]
+}

@@ -70,7 +70,13 @@ tables:
       # Both pushes are Inexact: `state` is faithful only inside the
       # provider's enum domain, and `since` means "updated at or after"
       # under any granularity fuzz — DataFusion re-applies both.
-      - { column: state, op: eq, input: state, fidelity: inexact }
+      # `values` is the column's COMPLETE domain, not the input's: `all`
+      # is an input spelling no row carries, and the action's strict enum
+      # 400s anything else (`OPEN`, `PAID`). A literal outside this list
+      # can match no row, so the scan answers zero rows without a
+      # request — which is why the list must be whole, not merely the
+      # values worth pushing.
+      - { column: state, op: eq, input: state, fidelity: inexact, values: [open, closed] }
       - { column: updated_at, op: gt_eq, input: since, fidelity: inexact, format: rfc3339 }
 
   issue_comments:
@@ -123,7 +129,9 @@ tables:
       - { name: merged_at, path: merged_at, type: timestamp_ms_utc, nullable: true }
       - { name: html_url, path: html_url, type: utf8, nullable: true }
     filters:
-      - { column: state, op: eq, input: state, fidelity: inexact }
+      # Same domain rule as issues: a literal outside the column's domain
+      # answers zero rows without a request, not a gateway refusal.
+      - { column: state, op: eq, input: state, fidelity: inexact, values: [open, closed] }
 
   reviews:
     action: github.list_pull_request_reviews

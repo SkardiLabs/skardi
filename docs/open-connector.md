@@ -435,8 +435,25 @@ read/write classification — as is a `required` list that is present but is
 not an array of strings, since a gate that cannot read its input has
 verified nothing.
 
-Four authoring invariants are enforced by the loader:
+Five authoring invariants are enforced by the loader:
 
+- `values` on a filter mapping — the column's COMPLETE value domain — is
+  legal only on an `eq` mapping over a `utf8` column, and may not be blank
+  or repeat an entry. Declare it for any input the action types as a
+  closed enum (GitHub's `state: open | closed | all`): the gateway
+  validates inputs strictly, so without it `state = 'OPEN'` is forwarded
+  and refused as `invalid_input`, surfacing as an execution failure where
+  SQL promises zero rows. With the domain declared, a literal outside it
+  can match no row, so the scan answers zero rows without a request — no
+  page budget spent, and no `max_rows` / `max_pages` to trip on a large
+  collection. That is why the list must be the whole domain and not merely
+  the values worth pushing; a pin-only spelling such as GitHub's `all` is
+  in the enum, not in `values`. Registration checks the declaration
+  against the discovered input schema of every action the pushed input
+  reaches (the table's own, and a full-input continuation's): a declared
+  value the enum does not accept fails the table's compatibility check,
+  and an enum-typed input with no `values` logs a warning naming the
+  accepted values;
 - a `continuation` on a non-cursor strategy is a parse error;
 - a table that pins its continuation's fingerprint must pin its own
   action's too (half a gate reads as gated while verifying only pages 2..N);

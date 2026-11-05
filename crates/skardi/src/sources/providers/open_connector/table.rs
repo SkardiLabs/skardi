@@ -11,6 +11,7 @@ use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::empty::EmptyExec;
 use serde_json::Value;
 
 use super::cache::ScanCache;
@@ -151,6 +152,23 @@ impl TableProvider for OpenConnectorTableProvider {
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let translated = translate_filters(filters, self.table.filters);
+        // A pushed literal outside its declared domain matches no row, so
+        // the answer is known before any request: an empty plan over the
+        // projected schema — no gateway call, no page budget, no `max_rows`
+        // to trip on a large collection (`TranslatedFilters::unsatisfiable`).
+        if translated.unsatisfiable {
+            tracing::debug!(
+                gateway = %self.gateway,
+                binding = self.binding.as_deref().unwrap_or("<udtf>"),
+                table = self.table.id,
+                "Open Connector scan short-circuited: a pushed literal is outside its column's declared domain"
+            );
+            let schema = match projection {
+                Some(indices) => Arc::new(self.converter.schema().project(indices)?),
+                None => Arc::clone(self.converter.schema()),
+            };
+            return Ok(Arc::new(EmptyExec::new(schema)));
+        }
         let exec = OpenConnectorExec::new(
             Arc::clone(&self.client),
             self.cache.clone(),
@@ -184,6 +202,8 @@ mod tests {
     };
     use crate::sources::providers::open_connector::json_to_arrow::{FieldMapping, FieldType};
     use crate::sources::providers::open_connector::pagination::{AbsentCursor, PaginationStrategy};
+    use datafusion::physical_plan::collect;
+    use datafusion::prelude::{SessionContext, col, lit};
     // A `FilterMapping`'s operator is the pack's declaration, not
     // DataFusion's — this test builds a mapping, not an expression.
     use skardi_source_pack::filters::Operator;
@@ -219,11 +239,105 @@ mod tests {
                 input_field: "min_id",
                 fidelity: Fidelity::Exact,
                 value_format: ValueFormat::Rfc3339,
+                values: &[],
             }],
             error_path: None,
             expected_fingerprint: None,
             continuation: None,
         }))
+    }
+
+    /// GitHub's `state` shape: a Utf8 column whose Inexact eq mapping
+    /// declares the column's domain.
+    fn domain_table() -> &'static SourcePackTable {
+        Box::leak(Box::new(SourcePackTable {
+            id: "test.t",
+            action_id: "test.action",
+            row_path: "$.items",
+            row_shape: RowShape::Array,
+            fields: &[
+                FieldMapping {
+                    name: "id",
+                    path: "id",
+                    field_type: FieldType::UInt64,
+                    nullable: false,
+                },
+                FieldMapping {
+                    name: "state",
+                    path: "state",
+                    field_type: FieldType::Utf8,
+                    nullable: false,
+                },
+            ],
+            pagination: PaginationStrategy::SinglePage {
+                next_cursor_path: None,
+            },
+            required_resources: &[],
+            optional_resources: &[],
+            exclusive_resources: &[],
+            fixed_inputs: &[],
+            filters: &[FilterMapping {
+                column: "state",
+                operator: Operator::Eq,
+                input_field: "state",
+                fidelity: Fidelity::Inexact,
+                value_format: ValueFormat::Verbatim,
+                values: &["open", "closed"],
+            }],
+            error_path: None,
+            expected_fingerprint: None,
+            continuation: None,
+        }))
+    }
+
+    #[tokio::test]
+    async fn a_literal_outside_the_declared_domain_scans_empty_without_a_request() {
+        // The client points at a closed port, so any plan that reaches the
+        // gateway cannot produce rows: zero rows here is the short-circuit,
+        // not a lucky empty listing. The in-domain spelling plans the real
+        // scan, which is the only path that would ever send a request.
+        let provider = OpenConnectorTableProvider::new(
+            offline_client(),
+            None,
+            "saas".to_string(),
+            None,
+            None,
+            domain_table(),
+            1,
+            serde_json::json!({}),
+            10,
+            1000,
+            Duration::from_secs(30),
+        )
+        .expect("binds");
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        let plan = provider
+            .scan(
+                &state,
+                Some(&vec![0]),
+                &[col("state").eq(lit("OPEN"))],
+                None,
+            )
+            .await
+            .expect("an unsatisfiable predicate still plans");
+        assert!(plan.as_any().is::<EmptyExec>(), "{plan:?}");
+        assert_eq!(
+            plan.schema().fields().len(),
+            1,
+            "the empty plan carries the projected schema"
+        );
+        let batches = collect(plan, ctx.task_ctx())
+            .await
+            .expect("an empty plan executes without a request");
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
+
+        let plan = provider
+            .scan(&state, None, &[col("state").eq(lit("open"))], None)
+            .await
+            .expect("an in-domain literal plans the scan");
+        assert!(plan.as_any().is::<OpenConnectorExec>(), "{plan:?}");
     }
 
     #[test]

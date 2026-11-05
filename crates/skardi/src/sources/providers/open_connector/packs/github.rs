@@ -49,6 +49,14 @@
 //!   endpoint contract are likewise reconciled against the live gateway
 //!   and its provider source; the bundled fixtures (see tests) remain the
 //!   build-time conversion contract.
+//! - **The input half is captured too** for `list_repository_issues` and
+//!   `list_pull_requests` (`fixtures/github/contracts/inputs/`, from the
+//!   gateway fork tag `skardi-pin-3c65a955` on 2026-11-05): the mock
+//!   discovery serves them, so every e2e registration runs the `state`
+//!   enum gate's pass side against the real contract rather than a
+//!   hand-written one, and a sync test locks the enum to the pack's
+//!   `values` domain plus the `all` pin — an upstream that nests the enum
+//!   under `anyOf` fails that test instead of the gate silently passing.
 
 use std::sync::OnceLock;
 
@@ -74,6 +82,7 @@ mod tests {
     use crate::sources::providers::open_connector::source_pack::SourcePackTable;
     use arrow::array::{Array, ListArray, StringArray, TimestampMillisecondArray, UInt64Array};
     use arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
 
     /// Discovery responses serve the CAPTURED live contracts, so every e2e
     /// registration exercises the fingerprint gate's pass side.
@@ -117,7 +126,25 @@ mod tests {
             .find(|(action, _)| path.ends_with(action))
             .map(|(_, schema)| *schema)
             .unwrap_or(r#"{"type": "object"}"#);
-        MockResponse::ok(&discovery_ok("{}", output_schema, true, None))
+        // The input half of the same capture, for the two actions whose
+        // `state` enum the pack's `values` domain is checked against at
+        // registration; the other actions publish none here, as before.
+        let inputs: &[(&str, &str)] = &[
+            (
+                "github.list_repository_issues",
+                include_str!("fixtures/github/contracts/inputs/list_repository_issues.json"),
+            ),
+            (
+                "github.list_pull_requests",
+                include_str!("fixtures/github/contracts/inputs/list_pull_requests.json"),
+            ),
+        ];
+        let input_schema = inputs
+            .iter()
+            .find(|(action, _)| path.ends_with(action))
+            .map(|(_, schema)| *schema)
+            .unwrap_or("{}");
+        MockResponse::ok(&discovery_ok(input_schema, output_schema, true, None))
     }
 
     #[tokio::test]
@@ -689,9 +716,9 @@ bindings:
 
     /// Register the gateway (catalog + UDTFs) against `rows`.
     async fn setup(rows: Vec<Value>, token_env: &str) -> (MockGateway, SessionContext) {
-        let served = std::sync::Arc::new(rows);
+        let served = Arc::new(rows);
         let gateway = {
-            let served = std::sync::Arc::clone(&served);
+            let served = Arc::clone(&served);
             MockGateway::start(move |req| issues_handler(req, &served)).await
         };
         setup_with_gateway(gateway, token_env).await
@@ -825,9 +852,9 @@ bindings:
                 })
             })
             .collect();
-        let served = std::sync::Arc::new(rows);
+        let served = Arc::new(rows);
         let gateway = {
-            let served = std::sync::Arc::clone(&served);
+            let served = Arc::clone(&served);
             MockGateway::start(move |req| {
                 if req.method == "GET" && req.path == "/v1/health" {
                     return MockResponse::ok("{}");
@@ -957,9 +984,9 @@ bindings:
         rows: Vec<Value>,
         token_env: &'static str,
     ) -> (MockGateway, SessionContext) {
-        let served = std::sync::Arc::new(rows);
+        let served = Arc::new(rows);
         let gateway = {
-            let served = std::sync::Arc::clone(&served);
+            let served = Arc::clone(&served);
             MockGateway::start(move |req| {
                 if req.method == "GET" && req.path == "/v1/health" {
                     return MockResponse::ok("{}");
@@ -1266,13 +1293,14 @@ bindings:
     }
 
     #[tokio::test]
-    async fn out_of_domain_state_yields_empty_not_the_provider_default() {
-        // The motivating case for classifying `state` as Inexact: a provider
-        // that silently ignores an out-of-domain enum ('merged') and returns
-        // its default listing. Under Exact those rows would leak back as the
-        // "exact" answer; Inexact re-applies the predicate locally, so the
-        // query is correctly empty. setup_table's stub is exactly such a
-        // provider — it serves its rows regardless of the state input.
+    async fn out_of_domain_state_answers_empty_without_a_request() {
+        // `merged` is outside the `values` domain the mapping declares —
+        // the column's whole value set — so no row can match: the predicate
+        // is never forwarded (the live action's strict enum would answer it
+        // with HTTP 400 invalid_input, skardi-cloud#544) and the scan is
+        // not run at all. setup_table's stub serves its rows regardless of
+        // the state input, so a leaked listing would show as rows here, and
+        // a fetch-then-filter would show as an execute body.
         let rows = vec![
             json!({"id": 1, "number": 1, "title": "a", "state": "open"}),
             json!({"id": 2, "number": 2, "title": "b", "state": "open"}),
@@ -1296,15 +1324,261 @@ bindings:
             0,
             "the provider's default listing must not leak into an empty query"
         );
-        // The predicate still narrows the fetch on providers that honor it.
-        let bodies = execute_bodies(&gateway);
-        assert!(!bodies.is_empty());
         assert!(
-            bodies
-                .iter()
-                .all(|body| body.contains(r#""state":"merged""#)),
-            "the push still happens: {bodies:?}"
+            execute_bodies(&gateway).is_empty(),
+            "an unsatisfiable predicate never reaches the gateway"
         );
+
+        // The in-domain spelling runs the scan, with the literal pushed over
+        // the `state: all` pin.
+        let batches = collect(
+            &ctx,
+            "SELECT id FROM saas.gh.pull_requests WHERE state = 'open'",
+        )
+        .await;
+        assert_eq!(rows_of(&batches), 2);
+        let bodies = execute_bodies(&gateway);
+        assert_eq!(bodies.len(), 1, "{bodies:?}");
+        assert!(bodies[0].contains(r#""state":"open""#), "{}", bodies[0]);
+    }
+
+    #[tokio::test]
+    async fn a_literal_the_action_refuses_answers_zero_rows_not_a_failure() {
+        // skardi-cloud#544 end to end, against a gateway that mirrors the
+        // live action's input validation: any `state` outside its enum is
+        // HTTP 400 invalid_input. Before the domain was declared, `'OPEN'`
+        // was forwarded and the query failed with that 400 dressed as an
+        // execution failure; now it is answered as SQL requires — and
+        // without a request, so a repository larger than the scan bounds
+        // answers the same zero rows instead of a `max_rows` error.
+        let served = Arc::new(many_issues());
+        let gateway = {
+            let served = Arc::clone(&served);
+            MockGateway::start(move |req| {
+                if req.method == "POST" && req.path == "/v1/actions/github.list_repository_issues" {
+                    let body: Value = serde_json::from_str(&req.body).unwrap_or_default();
+                    let state = body
+                        .pointer("/input/state")
+                        .and_then(Value::as_str)
+                        .unwrap_or("open");
+                    if !["open", "closed", "all"].contains(&state) {
+                        return MockResponse::new(
+                            400,
+                            testutil::envelope_err(
+                                "invalid_input",
+                                "Action input does not match the action schema.",
+                            ),
+                        );
+                    }
+                }
+                issues_handler(req, &served)
+            })
+            .await
+        };
+        let (gateway, ctx) = setup_with_gateway(gateway, "SKARDI_TEST_OC_GITHUB_ENUM_400").await;
+
+        for literal in ["OPEN", "PAID"] {
+            let batches = collect(
+                &ctx,
+                &format!("SELECT count(*) AS n FROM saas.gh.issues WHERE state = '{literal}'"),
+            )
+            .await;
+            assert_eq!(
+                u64s_i64(&batches[0], "n"),
+                0,
+                "{literal}: a value no row holds is zero rows, not a gateway refusal"
+            );
+        }
+        assert!(
+            execute_bodies(&gateway).is_empty(),
+            "an unsatisfiable predicate is answered without a request"
+        );
+
+        // The in-domain spelling still pushes and still counts.
+        let batches = collect(
+            &ctx,
+            "SELECT count(*) AS n FROM saas.gh.issues WHERE state = 'open'",
+        )
+        .await;
+        assert_eq!(u64s_i64(&batches[0], "n"), 75);
+        let last = execute_bodies(&gateway)
+            .pop()
+            .expect("the open query hit the gateway");
+        assert!(last.contains(r#""state":"open""#), "{last}");
+    }
+
+    /// Register the issues binding against a gateway whose discovered
+    /// `list_repository_issues` input schema types `state` as `accepted`.
+    async fn register_with_state_enum(
+        accepted: &'static [&'static str],
+        token_env: &'static str,
+    ) -> anyhow::Result<()> {
+        let gateway = MockGateway::start(move |req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path == "/v1/actions/github.list_repository_issues" {
+                let input_schema = json!({
+                    "type": "object",
+                    "properties": {
+                        "owner": {"type": "string"},
+                        "repo": {"type": "string"},
+                        "state": {"type": "string", "enum": accepted},
+                        "since": {"type": "string"}
+                    }
+                });
+                return MockResponse::ok(&discovery_ok(
+                    &input_schema.to_string(),
+                    include_str!("fixtures/github/contracts/list_repository_issues.json"),
+                    true,
+                    None,
+                ));
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                return github_discovery(&req.path);
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+        let _token = testutil::EnvVarGuard::set(token_env, "test-token");
+        let mut ctx = SessionContext::new();
+        register_open_connector_tables(
+            &mut ctx,
+            "saas",
+            &gateway.url,
+            Some(&issues_config(token_env)),
+            false,
+            HierarchyLevel::Catalog,
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn the_declared_state_domain_is_checked_against_the_discovered_enum() {
+        // Pass side: the live action's enum (open-connector
+        // `src/providers/github/actions.ts`) admits every value the pack
+        // declares — `all` is the pin, not a column value, so it is in the
+        // enum and not in `values`. Every e2e registration also runs this
+        // side against the CAPTURED input contract `github_discovery`
+        // serves; the hand-written enum here keeps the refusal side's
+        // shape next to it.
+        register_with_state_enum(
+            &["open", "closed", "all"],
+            "SKARDI_TEST_OC_GITHUB_STATE_ENUM_OK",
+        )
+        .await
+        .expect("the pack's domain is a subset of the live enum");
+
+        // Refusal side: an upstream that drops `closed` makes the pack's
+        // claim false, and that is a registration failure naming the
+        // table, the action and the value — not a 400 on the first query.
+        let err =
+            register_with_state_enum(&["open", "all"], "SKARDI_TEST_OC_GITHUB_STATE_ENUM_DRIFT")
+                .await
+                .expect_err("a value outside the enum fails the compatibility check");
+        let message = err.to_string();
+        assert!(
+            message.contains("github.issues")
+                && message.contains("github.list_repository_issues")
+                && message.contains("[closed]"),
+            "table, action and value are named: {message}"
+        );
+    }
+
+    #[test]
+    fn captured_input_contracts_admit_every_input_the_pack_sends() {
+        // The output fixtures feed the fingerprint gate; these are the input
+        // halves of the same capture, served by `github_discovery` so every
+        // e2e registration runs the enum gate's pass side against the real
+        // contract. Both sides are committed artifacts, so this locks on
+        // re-capture, not live: the schema is strict and declares every key
+        // the pack can send; it requires nothing the pack does not send on
+        // every request; and `state` is a closed enum of exactly the pack's
+        // domain plus the `all` pin — an upstream that nests the enum under
+        // `anyOf` fails here, where the gate would otherwise pass silently.
+        for (short, contract) in [
+            (
+                "issues",
+                include_str!("fixtures/github/contracts/inputs/list_repository_issues.json"),
+            ),
+            (
+                "pull_requests",
+                include_str!("fixtures/github/contracts/inputs/list_pull_requests.json"),
+            ),
+        ] {
+            let schema: Value =
+                serde_json::from_str(contract).expect("input contract fixture parses");
+            let properties = schema["properties"]
+                .as_object()
+                .expect("the input schema declares properties");
+            let t = table(short);
+
+            assert_eq!(
+                schema["additionalProperties"],
+                json!(false),
+                "{short}: the action's input schema is strict"
+            );
+
+            let PaginationStrategy::PageNumber {
+                page_param,
+                per_page_param,
+                ..
+            } = t.pagination
+            else {
+                panic!("{short}: both tables page by number");
+            };
+            let mut sendable: Vec<&str> = t
+                .required_resources
+                .iter()
+                .chain(t.optional_resources)
+                .copied()
+                .collect();
+            sendable.extend(t.fixed_inputs.iter().map(|(key, _)| *key));
+            sendable.extend([page_param, per_page_param]);
+            sendable.extend(t.filters.iter().map(|f| f.input_field));
+            for key in &sendable {
+                assert!(
+                    properties.contains_key(*key),
+                    "{short}: `{key}` is not declared by the action's input schema"
+                );
+            }
+
+            let guaranteed: Vec<&str> = t
+                .required_resources
+                .iter()
+                .copied()
+                .chain(t.fixed_inputs.iter().map(|(key, _)| *key))
+                .collect();
+            for entry in schema["required"].as_array().into_iter().flatten() {
+                let entry = entry.as_str().expect("required entries are strings");
+                assert!(
+                    guaranteed.contains(&entry),
+                    "{short}: the action requires `{entry}`, which the pack does not send on \
+                     every request"
+                );
+            }
+
+            let state = t
+                .filters
+                .iter()
+                .find(|f| f.column == "state")
+                .expect("both tables push `state`");
+            let mut accepted: Vec<&str> = properties["state"]["enum"]
+                .as_array()
+                .expect("`state` is a closed enum at the top level of its property")
+                .iter()
+                .map(|v| v.as_str().expect("enum members are strings"))
+                .collect();
+            let mut expected: Vec<&str> = state.values.to_vec();
+            expected.push("all");
+            accepted.sort_unstable();
+            expected.sort_unstable();
+            assert_eq!(
+                accepted, expected,
+                "{short}: the enum is the column's domain plus the `all` pin"
+            );
+        }
     }
 
     #[test]

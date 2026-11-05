@@ -28,7 +28,7 @@
 //! produces a startup diagnostic, and the parse-all test below keeps
 //! shipped assets valid in the first place.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::OnceLock;
 
 use serde::Deserialize;
@@ -39,7 +39,9 @@ use crate::sources::providers::open_connector::error::OpenConnectorError;
 // a query planner, and it used to convert to DataFusion's on the way in
 // for no reason other than where the type happened to live.
 use crate::sources::providers::open_connector::json_to_arrow::RowConverter;
-use crate::sources::providers::open_connector::json_to_arrow::{ColumnDoc, FieldMapping};
+use crate::sources::providers::open_connector::json_to_arrow::{
+    ColumnDoc, FieldMapping, FieldType,
+};
 use crate::sources::providers::open_connector::pagination::{
     AbsentCursor, CursorContinuation, PaginationStrategy,
 };
@@ -196,13 +198,13 @@ fn validate_table(table: &SourcePackTable) -> Result<(), String> {
         .map_err(|e| format!("{id}: {e}"))?;
     RowConverter::new(table.fields).map_err(|e| format!("{id}: {e}"))?;
 
-    let mut columns = std::collections::HashSet::new();
+    let mut columns = HashSet::new();
     for field in table.fields {
         if !columns.insert(field.name) {
             return Err(format!("{id}: duplicate column '{}'", field.name));
         }
     }
-    let mut mappings = std::collections::HashSet::new();
+    let mut mappings = HashSet::new();
     for filter in table.filters {
         if !columns.contains(filter.column) {
             return Err(format!(
@@ -215,6 +217,50 @@ fn validate_table(table: &SourcePackTable) -> Result<(), String> {
                 "{id}: duplicate filter mapping for column '{}' and operator {:?}",
                 filter.column, filter.operator
             ));
+        }
+        // A value domain is a finite list of equalities; under a range
+        // operator it has no meaning the translation could honor, so an
+        // author who wrote one has misread what it gates. Blanks and
+        // repeats are the same kind of slip — a list that says nothing.
+        if !filter.values.is_empty() {
+            if filter.operator != Operator::Eq {
+                return Err(format!(
+                    "{id}: filter on '{}' declares `values`, which only an eq mapping can \
+                     honor — operator {:?} has no finite domain to list",
+                    filter.column, filter.operator
+                ));
+            }
+            let mut seen = HashSet::new();
+            for value in filter.values {
+                if value.is_empty() {
+                    return Err(format!(
+                        "{id}: filter on '{}' declares an empty string in `values`",
+                        filter.column
+                    ));
+                }
+                if !seen.insert(*value) {
+                    return Err(format!(
+                        "{id}: filter on '{}' lists '{value}' twice in `values`",
+                        filter.column
+                    ));
+                }
+            }
+            // A domain is a list of strings and the translation admits only
+            // a string literal into one, so on any other column every
+            // literal would fall outside it and every predicate would
+            // answer empty — a pushdown switched off (or, for a boolean
+            // column, a spelling-dependent one) with nothing saying so.
+            // The column exists: undeclared ones were refused above.
+            if let Some(field) = table.fields.iter().find(|f| f.name == filter.column)
+                && field.field_type != FieldType::Utf8
+            {
+                return Err(format!(
+                    "{id}: filter on '{}' declares `values` on a column of type {}; a value \
+                     domain is a list of strings and only a utf8 column can carry one",
+                    filter.column,
+                    field.field_type.label()
+                ));
+            }
         }
         // Epoch renderings floor sub-second precision, which only ever
         // WIDENS a lower bound; under any other operator the floored
@@ -368,7 +414,7 @@ fn validate_table(table: &SourcePackTable) -> Result<(), String> {
     // rejected below even though the scan-time claimed-inputs guard makes
     // them safe (the loser stays local): which predicate pushes would
     // depend on query order, and that ambiguity is an authoring mistake.
-    let mut filter_inputs = std::collections::HashSet::new();
+    let mut filter_inputs = HashSet::new();
     for filter in table.filters {
         if !filter_inputs.insert(filter.input_field) {
             return Err(format!(
@@ -522,6 +568,7 @@ fn convert_filter(doc: FilterDoc) -> FilterMapping {
             FormatDoc::EpochSeconds => ValueFormat::EpochSeconds,
             FormatDoc::EpochSecondsString => ValueFormat::EpochSecondsString,
         },
+        values: leak_str_slice(doc.values),
     }
 }
 
@@ -860,6 +907,10 @@ struct FilterDoc {
     fidelity: FidelityDoc,
     #[serde(default)]
     format: FormatDoc,
+    /// The literals an `eq` mapping may forward; absent means any. See
+    /// [`FilterMapping::values`] for why a closed provider enum needs it.
+    #[serde(default)]
+    values: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -1241,6 +1292,77 @@ tables:
             "      - { column: created, op: gt_eq, input: since, fidelity: inexact, format: epoch_seconds_string }",
         ))
         .expect("lower-bound inexact epoch mapping is legal");
+    }
+
+    #[test]
+    fn a_values_domain_parses_on_eq_and_is_refused_where_it_means_nothing() {
+        let base = |filter: &str| {
+            format!(
+                r#"
+kind: pack
+pack: demo
+version: 1
+tables:
+  items:
+    action: demo.list
+    row_path: "$.items"
+    pagination: {{ strategy: page_number, page_input: page, page_size_input: perPage, page_size: 10 }}
+    columns:
+      - {{ name: state, path: state, type: utf8, nullable: false }}
+      - {{ name: created, path: created, type: timestamp_ms_utc, nullable: true }}
+      - {{ name: done, path: done, type: boolean, nullable: true }}
+      - {{ name: count, path: count, type: int64, nullable: true }}
+    filters:
+{filter}
+"#
+            )
+        };
+        // The github shape round-trips, in declaration order.
+        let pack = parse_pack(&base(
+            "      - { column: state, op: eq, input: state, fidelity: inexact, values: [open, closed] }",
+        ))
+        .expect("an eq domain is legal");
+        let filter = &pack.tables[0].filters[0];
+        assert_eq!(filter.values, &["open", "closed"]);
+        // Omitted means unconstrained — the shape every other pack has.
+        let pack = parse_pack(&base(
+            "      - { column: state, op: eq, input: state, fidelity: inexact }",
+        ))
+        .expect("no domain is legal");
+        assert!(pack.tables[0].filters[0].values.is_empty());
+
+        for (filter, expected) in [
+            // A range has no finite domain to list.
+            (
+                "      - { column: created, op: gt_eq, input: since, fidelity: inexact, format: rfc3339, values: [x] }",
+                "only an eq mapping",
+            ),
+            // A list that says nothing is a slip, not a declaration.
+            (
+                "      - { column: state, op: eq, input: state, fidelity: inexact, values: [open, open] }",
+                "twice",
+            ),
+            (
+                "      - { column: state, op: eq, input: state, fidelity: inexact, values: [open, ''] }",
+                "empty string",
+            ),
+            // A domain is a list of strings; on any other column every
+            // literal would be outside it.
+            (
+                "      - { column: done, op: eq, input: done, fidelity: inexact, values: [yes] }",
+                "column of type boolean",
+            ),
+            (
+                "      - { column: count, op: eq, input: count, fidelity: inexact, values: ['1'] }",
+                "column of type integer",
+            ),
+        ] {
+            let err = parse_pack(&base(filter)).expect_err(expected);
+            assert!(
+                err.contains(expected) && err.contains("demo.items"),
+                "want {expected:?} naming the table in: {err}"
+            );
+        }
     }
 
     #[test]

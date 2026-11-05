@@ -103,4 +103,30 @@ pub struct FilterMapping {
     pub fidelity: Fidelity,
     /// How the literal renders into the provider input (see [`ValueFormat`]).
     pub value_format: ValueFormat,
+    /// The column's COMPLETE value domain, or empty for any literal the
+    /// column's type admits.
+    ///
+    /// Declared for inputs the provider types as a closed enum (GitHub's
+    /// `state: open | closed | all`). Open Connector validates action inputs
+    /// against that enum strictly, so a literal outside it — `'OPEN'`, a
+    /// typo, a value from another provider's vocabulary — is a hard 400 on
+    /// the first page, surfaced as an execution failure where SQL promises
+    /// zero rows. With the domain declared, an `eq` predicate whose literal
+    /// lies outside it is UNSATISFIABLE — no row carries a value the
+    /// column's domain excludes — so the scan short-circuits to an empty
+    /// result without calling the gateway at all. Fetching the whole
+    /// collection to filter it locally would pay the full page budget for an
+    /// answer known in advance, and trip `max_rows` / `max_pages` on a large
+    /// one. That is also why the list must be the whole domain and not
+    /// merely "the values worth pushing": a missing entry turns a real
+    /// predicate into an empty answer. A pin-only input spelling (GitHub's
+    /// `all`) is in the action's enum and not in the domain. Registration
+    /// checks the declaration against the discovered input schema of every
+    /// action the pushed input reaches, so a pack that claims a value the
+    /// enum dropped fails loudly rather than at query time.
+    ///
+    /// Only meaningful under [`Operator::Eq`] on a Utf8 column — a range
+    /// operator has no finite domain to list, and a domain is a list of
+    /// strings — and the pack loader rejects both elsewhere.
+    pub values: &'static [&'static str],
 }
