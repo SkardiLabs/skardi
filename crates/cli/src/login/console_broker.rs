@@ -103,6 +103,10 @@ pub struct Brokered {
     /// order. Empty is tolerated: `workspace` is authoritative, and this is
     /// what lets a context carry an org slug and a role.
     pub memberships: Vec<Membership>,
+    /// Approved workspaces the exchange returned no membership for. The token
+    /// reaches them, but no context can be named for one, so the login refuses
+    /// rather than write a subset of what the approver ticked.
+    pub unmatched: Vec<String>,
     /// The pair's `control` token, present only when the approver ticked
     /// `control` (agent onboarding §2.1.1).
     pub control: Option<ControlGrant>,
@@ -123,6 +127,7 @@ impl fmt::Debug for Brokered {
             .field("expires_at", &self.expires_at)
             .field("workspace", &self.workspace)
             .field("memberships", &self.memberships)
+            .field("unmatched", &self.unmatched)
             .field("control", &self.control)
             .field("roles", &self.roles)
             .finish()
@@ -352,29 +357,37 @@ struct ExchangeBody {
 #[derive(Deserialize)]
 struct ApprovedWorkspace {
     workspace: String,
-    role: String,
+    /// Display only, so optional: the exchange has already minted by the time
+    /// this parses, and a missing role must not fail the parse and strand a
+    /// credential. Absent, the membership's own role is reported instead.
+    #[serde(default)]
+    role: Option<String>,
 }
 
 /// The approved set, in the approver's order. When the control plane lists
 /// `workspaces`, that list is the grant: memberships are kept only for the
 /// workspaces it names and in its order, so a context is never written for a
-/// membership the token does not reach. Without it — an older control plane —
+/// membership the token does not reach. A named workspace with no membership
+/// is kept in `unmatched` rather than dropped, because the token reaches it
+/// and the caller must say so. Without the list — an older control plane —
 /// the memberships are taken as sent, which is the single approved one.
 fn approved(parsed: ExchangeBody, control: Option<ControlGrant>) -> Brokered {
+    let mut unmatched = Vec::new();
     let memberships = if parsed.workspaces.is_empty() {
         parsed.memberships
     } else {
-        parsed
-            .workspaces
-            .iter()
-            .filter_map(|w| {
-                parsed
-                    .memberships
-                    .iter()
-                    .find(|m| m.tenant_slug == w.workspace)
-                    .cloned()
-            })
-            .collect()
+        let mut kept = Vec::with_capacity(parsed.workspaces.len());
+        for w in &parsed.workspaces {
+            match parsed
+                .memberships
+                .iter()
+                .find(|m| m.tenant_slug == w.workspace)
+            {
+                Some(m) => kept.push(m.clone()),
+                None => unmatched.push(w.workspace.clone()),
+            }
+        }
+        kept
     };
     Brokered {
         token: parsed.token,
@@ -382,11 +395,12 @@ fn approved(parsed: ExchangeBody, control: Option<ControlGrant>) -> Brokered {
         expires_at: parsed.expires_at,
         workspace: parsed.workspace,
         memberships,
+        unmatched,
         control,
         roles: parsed
             .workspaces
             .into_iter()
-            .map(|w| (w.workspace, w.role))
+            .filter_map(|w| Some((w.workspace, w.role?)))
             .collect(),
     }
 }
@@ -638,6 +652,7 @@ mod tests {
             expires_at: Some("2026-11-22T12:00:00Z".to_string()),
             workspace: "acme-prod".to_string(),
             memberships: Vec::new(),
+            unmatched: Vec::new(),
             control: Some(ControlGrant {
                 token: "skardi_pat_the_control_secret".to_string(),
                 expires_at: None,

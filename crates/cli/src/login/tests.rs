@@ -15,7 +15,7 @@ use rstest::rstest;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
-use wiremock::matchers::{body_string_contains, method, path, path_regex};
+use wiremock::matchers::{body_string_contains, header, method, path, path_regex};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 fn at(rfc3339: &str) -> DateTime<Utc> {
@@ -1780,6 +1780,173 @@ async fn a_shared_token_still_held_by_another_context_is_not_reported_for_revoca
 }
 
 #[tokio::test]
+async fn a_second_workspace_that_fails_verify_writes_no_context_at_all() {
+    // All or nothing: ws-a verified, but a set of contexts missing one the
+    // approver ticked is not what they asked for, so neither is written — and
+    // the one credential behind both is named for revocation.
+    let gw = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/query"))
+        .and(header("skardi-workspace", "ws-b"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+            "success": false,
+            "error": "unauthorized",
+            "error_type": "unauthorized",
+        })))
+        .with_priority(1)
+        .mount(&gw)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/query"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "success": true,
+            "columns": ["n"],
+            "rows": [[1]],
+        })))
+        .mount(&gw)
+        .await;
+    let console = console(
+        200,
+        approved_scoped(&gw.uri(), "tok-1", &[("ws-a", "admin"), ("ws-b", "admin")]),
+    )
+    .await;
+    let home = TempDir::new().unwrap();
+
+    let err = format!(
+        "{:#}",
+        login(broker_options(&console.uri()), &config_in(&home))
+            .await
+            .unwrap_err()
+    );
+    assert!(err.contains("Revoke token tok-1"), "{err}");
+    assert!(err.contains("'ws-b'"), "{err}");
+    assert!(!config_in(&home).exists(), "ws-a was not written either");
+}
+
+#[tokio::test]
+async fn an_approved_workspace_with_no_membership_is_refused_and_names_it() {
+    // The token reaches ws-b, but no membership came back to name its
+    // context after. Writing ws-a alone would be a silent partial login.
+    let gw = gateway(200).await;
+    let mut body = approved_scoped(&gw.uri(), "tok-1", &[("ws-a", "admin"), ("ws-b", "admin")]);
+    body["memberships"].as_array_mut().unwrap().truncate(1);
+    let console = console(200, body).await;
+    let home = TempDir::new().unwrap();
+
+    let err = login(broker_options(&console.uri()), &config_in(&home))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("'ws-b'"), "{err}");
+    assert!(err.contains("revoke token tok-1"), "{err}");
+    assert!(!config_in(&home).exists(), "nothing was written");
+}
+
+#[tokio::test]
+async fn an_approved_workspace_without_a_role_falls_back_to_the_membership_role() {
+    // `role` is display-only, and by the time it parses the exchange has
+    // minted: a missing one must not fail the parse and strand the token.
+    let gw = gateway(200).await;
+    let mut body = approved_scoped(
+        &gw.uri(),
+        "tok-1",
+        &[("ws-a", "member"), ("ws-b", "member")],
+    );
+    body["workspaces"][1]
+        .as_object_mut()
+        .unwrap()
+        .remove("role");
+    let console = console(200, body).await;
+    let home = TempDir::new().unwrap();
+
+    let report = login(broker_options(&console.uri()), &config_in(&home))
+        .await
+        .unwrap();
+    assert_eq!(
+        report.written[0].role, "member",
+        "the capped role, when sent"
+    );
+    assert_eq!(report.written[1].role, "admin", "the membership's own role");
+}
+
+/// Two contexts sharing one pair, as a multi-workspace `--control` login
+/// leaves them, with `current` as the current context.
+fn two_contexts_sharing_pair_old(current: &str) -> String {
+    [
+        &format!("current-context: {current}"),
+        "contexts:",
+        "  - name: acme/ws-a",
+        "    mode: cloud",
+        "    server: http://gw.example",
+        "    workspace: ws-a",
+        "    token: skardi_pat_old",
+        "    token-id: tok-old",
+        "    pair-id: pair-old",
+        "  - name: acme/ws-b",
+        "    mode: cloud",
+        "    server: http://gw.example",
+        "    workspace: ws-b",
+        "    token: skardi_pat_old",
+        "    token-id: tok-old",
+        "    pair-id: pair-old",
+    ]
+    .join("\n")
+        + "\n"
+}
+
+#[tokio::test]
+async fn a_sibling_left_holding_the_revoked_pair_is_named() {
+    // A re-login approving ws-a alone sends pair-old, and the exchange
+    // revokes both halves of it — under ws-b too, which still holds it. The
+    // old token is counted as revoked, not quietly kept for ws-b's sake, and
+    // ws-b is named so its next 401 is not a mystery.
+    let gw = gateway(200).await;
+    let console = console(
+        200,
+        approved_scoped(&gw.uri(), "tok-2", &[("ws-a", "admin")]),
+    )
+    .await;
+    let home = TempDir::new().unwrap();
+    let path = config_in(&home);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, two_contexts_sharing_pair_old("acme/ws-a")).unwrap();
+
+    let report = login(broker_options(&console.uri()), &path).await.unwrap();
+
+    let opened = opened_body(&console.received_requests().await.unwrap());
+    assert_eq!(opened["replaces_pair_id"], json!("pair-old"));
+    assert_eq!(report.replaced_revoked, vec!["tok-old".to_string()]);
+    assert!(report.revoke_failures.is_empty(), "{report:?}");
+    assert_eq!(
+        report.replaced_pair_elsewhere,
+        vec!["acme/ws-b".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn a_named_context_rewritten_after_the_first_is_not_reported_elsewhere() {
+    // The current context is ws-b, and the approver ticked ws-a THEN ws-b.
+    // `current-context` becomes ws-a, but ws-b was rewritten all the same, so
+    // telling the user to log ws-b in again would mint a token for nothing.
+    let gw = gateway(200).await;
+    let console = console(
+        200,
+        approved_scoped(&gw.uri(), "tok-2", &[("ws-a", "admin"), ("ws-b", "admin")]),
+    )
+    .await;
+    let home = TempDir::new().unwrap();
+    let path = config_in(&home);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, two_contexts_sharing_pair_old("acme/ws-b")).unwrap();
+
+    let report = login(broker_options(&console.uri()), &path).await.unwrap();
+
+    assert_eq!(report.current_context.as_deref(), Some("acme/ws-a"));
+    assert!(report.replaced_pair_elsewhere.is_empty(), "{report:?}");
+    assert_eq!(report.replaced_revoked, vec!["tok-old".to_string()]);
+}
+
+#[tokio::test]
 async fn an_unknown_exchange_status_is_reported_rather_than_polled_forever() {
     // A control plane newer than this CLI. Treating an unrecognised terminal
     // state as "pending" would spin until the deadline and then blame the
@@ -2308,7 +2475,14 @@ async fn a_control_login_for_several_workspaces_gives_every_context_the_pair() {
         );
         assert_eq!(context["pair-id"].as_str(), Some("pair-1"), "{ws}");
     }
-    for probe in gw.received_requests().await.unwrap() {
+    // Counted, so the loop below cannot pass vacuously on zero probes.
+    let probes = gw.received_requests().await.unwrap();
+    let probed: Vec<_> = probes
+        .iter()
+        .map(|r| r.headers.get("skardi-workspace").unwrap().to_str().unwrap())
+        .collect();
+    assert_eq!(probed, ["ws-a", "ws-b"]);
+    for probe in &probes {
         assert_eq!(
             probe.headers.get("authorization").unwrap(),
             "Bearer skardi_pat_tok-mcp"
@@ -2401,7 +2575,7 @@ async fn a_relogin_sends_replaces_pair_id_and_reports_the_old_pair_revoked() {
     assert_eq!(opened["replaces_pair_id"], json!("pair-old"));
     assert_eq!(report.replaced_revoked, vec!["tok-old".to_string()]);
     assert!(report.revoke_failures.is_empty(), "{report:?}");
-    assert_eq!(report.replaced_pair_elsewhere, None);
+    assert!(report.replaced_pair_elsewhere.is_empty());
 
     let raw = std::fs::read_to_string(&path).unwrap();
     assert!(!raw.contains("skardi_pat_old_control"), "{raw}");
@@ -2476,8 +2650,8 @@ async fn a_pair_replaced_in_another_context_is_reported() {
     .unwrap();
     let report = login(control_options(&console.uri()), &path).await.unwrap();
     assert_eq!(
-        report.replaced_pair_elsewhere.as_deref(),
-        Some("acme/other")
+        report.replaced_pair_elsewhere,
+        vec!["acme/other".to_string()]
     );
 }
 
