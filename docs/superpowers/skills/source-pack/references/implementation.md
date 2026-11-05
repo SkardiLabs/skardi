@@ -135,14 +135,16 @@ Work module by module; the reference packs are the style guide.
    `packs/mod.rs`. The loader validates structure FOR you at parse time —
    unknown keys, duplicate columns, filters on undeclared columns,
    duplicate mappings or shared filter inputs, a `values` domain on a
-   non-`eq` mapping or with blank/repeated entries, resource/fixed-input/
+   non-`eq` mapping, on a non-`utf8` column or with blank/repeated
+   entries, resource/fixed-input/
    pagination key collisions, zero page sizes, non-finite floats, and
    path validity all fail as `SourcePackAssetInvalid` diagnostics — so
    your authoring attention goes to the SEMANTIC choices the loader
    cannot check: which action, which columns, which fidelity, which
    value domain (an `eq` push on an input the action types as a closed
-   enum declares `values`, so an out-of-domain literal stays local
-   instead of being refused by the gateway), which termination signal.
+   enum declares `values` — the column's COMPLETE domain, since a literal
+   outside it answers zero rows without a request instead of being
+   refused by the gateway), which termination signal.
    **Response shape.** `row_shape` defaults to `array`: `row_path` locates
    the row array, which is how every shipped table works. A point-read
    action whose ENTIRE response is the row — `feishu.get_document_content`,

@@ -12,7 +12,6 @@
 use std::collections::HashMap;
 
 use serde_json::Value;
-use tracing::warn;
 
 use crate::error::OpenConnectorError;
 use crate::filters::FilterMapping;
@@ -510,26 +509,64 @@ impl SourcePackTable {
     }
 }
 
+/// A pushed filter input the gateway types as a closed enum that the pack
+/// leaves unconstrained — reported by [`SourcePackTable::check_filter_values`]
+/// for the caller to log at the severity its entry point warrants, rather
+/// than logged here: registration runs once per process and warns, while
+/// the table-function path re-runs the check on every planned query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UndeclaredDomain {
+    /// The discovered action whose input schema carries the enum.
+    pub action_id: String,
+    /// The pack column whose mapping declares no `values`.
+    pub column: &'static str,
+    /// The action input the mapping writes.
+    pub input_field: &'static str,
+    /// The enum's string members, in schema order.
+    pub accepted: Vec<String>,
+}
+
 impl SourcePackTable {
+    /// The actions a scan sends its pushed filter inputs to, each once: the
+    /// table's own, plus a full-input continuation that names a DIFFERENT
+    /// action — pages 2..N repeat the opener's inputs on it, so an enum it
+    /// declares differently would 400 on page two, the gap
+    /// [`Self::check_continuation_inputs`] exists to close for the other
+    /// input keys. A `cursor_only` continuation receives the cursor alone
+    /// and is not listed.
+    pub fn filter_input_actions(&self) -> impl Iterator<Item = &'static str> + '_ {
+        std::iter::once(self.action_id).chain(
+            self.continuation
+                .filter(|c| !c.cursor_only && c.action_id != self.action_id)
+                .map(|c| c.action_id),
+        )
+    }
+
     /// Verify every `values` domain this table's filters declare against
-    /// the table's OWN action's discovered input schema.
+    /// the discovered input schema of `action_id`.
     ///
     /// The fingerprint hashes the output schema, so an input the gateway
-    /// types as a closed enum can drift with nothing else changing. Two
-    /// disagreements are possible, and they are answered differently:
+    /// types as a closed enum can drift with nothing else changing. Which
+    /// actions matter is decided HERE, not by the caller: for an action the
+    /// pushed inputs never reach ([`Self::filter_input_actions`]) the
+    /// result is `Ok(empty)`, so both entry points — binding registration
+    /// and the table function — can offer every discovered action and
+    /// neither can skip one. Two disagreements are possible, and they are
+    /// answered differently:
     ///
     /// - the pack lists a value the enum does not accept → refused, as
     ///   [`OpenConnectorError::ActionContractMismatch`]. The pack asserts
     ///   something the gateway will 400, and a claim about inputs that the
     ///   gateway contradicts is the same case as a drifted fingerprint;
-    /// - the enum exists and the pack declares no domain → a warning naming
-    ///   the column and the accepted values. The table still works for every
-    ///   in-domain literal, and refusing a whole table over the one predicate
-    ///   shape that would 400 is a worse trade than a loud log line. This is
+    /// - the enum exists and the pack declares no domain → reported as an
+    ///   [`UndeclaredDomain`] naming the column and the accepted values,
+    ///   for the caller to log. The table still works for every in-domain
+    ///   literal, and refusing a whole table over the one predicate shape
+    ///   that would 400 is a worse trade than a loud log line. This is
     ///   exactly the gap that produced the 502 on `state = 'OPEN'`
     ///   (skardi-cloud#544), so it is named rather than silent.
     ///
-    /// `Ok(())` when the action publishes no input schema, no readable
+    /// `Ok(empty)` when the action publishes no input schema, no readable
     /// `properties`, or no `enum` on a pushed input: a free-string input has
     /// no domain to check against. Only string enum members count; a
     /// mapping's `values` are strings by construction.
@@ -539,13 +576,18 @@ impl SourcePackTable {
     /// the input, the column and the values outside the enum.
     pub fn check_filter_values(
         &self,
+        action_id: &str,
         input_schema: Option<&Value>,
-    ) -> Result<(), OpenConnectorError> {
+    ) -> Result<Vec<UndeclaredDomain>, OpenConnectorError> {
+        let mut undeclared = Vec::new();
+        if !self.filter_input_actions().any(|id| id == action_id) {
+            return Ok(undeclared);
+        }
         let Some(properties) = input_schema
             .and_then(|schema| schema.get("properties"))
             .and_then(Value::as_object)
         else {
-            return Ok(());
+            return Ok(undeclared);
         };
         for filter in self.filters {
             let Some(accepted) = properties
@@ -557,14 +599,12 @@ impl SourcePackTable {
             };
             let accepted: Vec<&str> = accepted.iter().filter_map(Value::as_str).collect();
             if filter.values.is_empty() {
-                warn!(
-                    table = self.id,
-                    action = self.action_id,
-                    column = filter.column,
-                    input = filter.input_field,
-                    accepted = ?accepted,
-                    "Open Connector action types a pushed filter input as an enum the pack does not declare; a literal outside it is refused by the gateway instead of answering zero rows — declare `values` on the mapping"
-                );
+                undeclared.push(UndeclaredDomain {
+                    action_id: action_id.to_string(),
+                    column: filter.column,
+                    input_field: filter.input_field,
+                    accepted: accepted.iter().map(|value| value.to_string()).collect(),
+                });
                 continue;
             }
             let mut outside: Vec<&str> = filter
@@ -578,10 +618,9 @@ impl SourcePackTable {
                 return Err(OpenConnectorError::ActionContractMismatch {
                     table: self.id.to_string(),
                     reason: format!(
-                        "action '{}' accepts [{}] for input '{}', but the filter on column '{}' \
-                         declares value(s) [{}] outside it; a predicate pushing one of those \
-                         would be refused as invalid input",
-                        self.action_id,
+                        "action '{action_id}' accepts [{}] for input '{}', but the filter on \
+                         column '{}' declares value(s) [{}] outside it; a predicate pushing one \
+                         of those would be refused as invalid input",
                         accepted.join(", "),
                         filter.input_field,
                         filter.column,
@@ -590,7 +629,7 @@ impl SourcePackTable {
                 });
             }
         }
-        Ok(())
+        Ok(undeclared)
     }
 }
 

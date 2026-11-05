@@ -28,6 +28,14 @@ pub struct TranslatedFilters {
     pub inputs: Vec<(String, Value)>,
     /// Per-filter pushdown classification, aligned with the input slice.
     pub pushdown: Vec<TableProviderFilterPushDown>,
+    /// A pushed `eq` predicate's literal lies outside its mapping's declared
+    /// value domain, so no row can satisfy the conjunction. The scan answers
+    /// empty without a gateway request: forwarding the literal would be
+    /// refused as invalid input (skardi-cloud#544), and fetching the whole
+    /// collection to filter it locally pays the full page budget — and trips
+    /// `max_rows` / `max_pages` on a large one — for a result known before
+    /// the first request.
+    pub unsatisfiable: bool,
 }
 
 /// Translate scan filters against the source pack's allowlist.
@@ -39,14 +47,28 @@ pub fn translate_filters(filters: &[Expr], mappings: &[FilterMapping]) -> Transl
             // An action input holds one value. Marking two predicates that
             // target it as pushed would let the later insert overwrite the
             // former while DataFusion skips reapplying an Exact one.
-            Some((input_field, value, fidelity)) if claimed_inputs.insert(input_field.clone()) => {
+            Translation::Pushed {
+                input_field,
+                value,
+                fidelity,
+            } if claimed_inputs.insert(input_field.clone()) => {
                 translated.inputs.push((input_field, value));
                 translated.pushdown.push(match fidelity {
                     Fidelity::Exact => TableProviderFilterPushDown::Exact,
                     Fidelity::Inexact => TableProviderFilterPushDown::Inexact,
                 });
             }
-            Some(_) | None => translated
+            // Inexact rather than Exact on purpose: DataFusion then hands the
+            // predicate to the scan (which is how the short-circuit sees it)
+            // AND re-applies it above, so a short-circuit that ever went
+            // missing would cost a fetch, never a wrong row.
+            Translation::Unsatisfiable => {
+                translated.unsatisfiable = true;
+                translated
+                    .pushdown
+                    .push(TableProviderFilterPushDown::Inexact);
+            }
+            Translation::Pushed { .. } | Translation::Local => translated
                 .pushdown
                 .push(TableProviderFilterPushDown::Unsupported),
         }
@@ -54,8 +76,23 @@ pub fn translate_filters(filters: &[Expr], mappings: &[FilterMapping]) -> Transl
     translated
 }
 
-/// Translate one filter, returning `(input_field, value, fidelity)` on a match.
-fn translate_one(filter: &Expr, mappings: &[FilterMapping]) -> Option<(String, Value, Fidelity)> {
+/// What one filter translates to.
+enum Translation {
+    /// Forward `value` as the action input `input_field`.
+    Pushed {
+        input_field: String,
+        value: Value,
+        fidelity: Fidelity,
+    },
+    /// Nothing to forward; DataFusion evaluates the predicate over the fetch.
+    Local,
+    /// The predicate maps, but its literal is outside the mapping's declared
+    /// domain: no row can match (see [`TranslatedFilters::unsatisfiable`]).
+    Unsatisfiable,
+}
+
+/// Translate one filter against the allowlist.
+fn translate_one(filter: &Expr, mappings: &[FilterMapping]) -> Translation {
     // DataFusion's simplifier rewrites boolean equality to the bare
     // column (`completed = true` → `completed`) or its negation
     // (`completed = false` → `NOT completed`) before pushdown, so an Eq
@@ -67,30 +104,33 @@ fn translate_one(filter: &Expr, mappings: &[FilterMapping]) -> Option<(String, V
     // boolean-typed column can appear as a bare predicate in a
     // type-checked DataFusion plan — an Eq mapping on a non-boolean
     // column is reachable solely through the BinaryExpr arm below, where
-    // the literal comes from the query.
+    // the literal comes from the query. The fabricated literal still goes
+    // through `push_literal`, so a declared domain gates every spelling
+    // of the predicate: a string domain admits no boolean, and the loader
+    // refuses that shape at load time, so for a YAML pack the gate here
+    // is unreachable — it exists so a hand-built mapping cannot push
+    // through one spelling what it refuses through the other.
     match filter {
         Expr::Column(column) => {
-            let mapping = mappings.iter().find(|mapping| {
-                mapping.column == column.name && mapping.operator == Operator::Eq
-            })?;
-            let value = scalar_to_json(&ScalarValue::Boolean(Some(true)), mapping.value_format)?;
-            return Some((mapping.input_field.to_string(), value, mapping.fidelity));
+            return match eq_mapping(mappings, &column.name) {
+                Some(mapping) => push_literal(mapping, ScalarValue::Boolean(Some(true))),
+                None => Translation::Local,
+            };
         }
         Expr::Not(inner) => {
             let Expr::Column(column) = inner.as_ref() else {
-                return None;
+                return Translation::Local;
             };
-            let mapping = mappings.iter().find(|mapping| {
-                mapping.column == column.name && mapping.operator == Operator::Eq
-            })?;
-            let value = scalar_to_json(&ScalarValue::Boolean(Some(false)), mapping.value_format)?;
-            return Some((mapping.input_field.to_string(), value, mapping.fidelity));
+            return match eq_mapping(mappings, &column.name) {
+                Some(mapping) => push_literal(mapping, ScalarValue::Boolean(Some(false))),
+                None => Translation::Local,
+            };
         }
         _ => {}
     }
 
     let Expr::BinaryExpr(binary) = filter else {
-        return None;
+        return Translation::Local;
     };
 
     // Normalize to `column <op> literal`, flipping the operator when the
@@ -98,9 +138,15 @@ fn translate_one(filter: &Expr, mappings: &[FilterMapping]) -> Option<(String, V
     // *column* is never matched — `CAST(updated_at AS DATE) >= …` changes
     // the predicate's semantics and must stay in DataFusion.
     let (column, operator, literal) = match (binary.left.as_ref(), binary.right.as_ref()) {
-        (Expr::Column(column), right) => (column, binary.op, resolve_literal(right)?),
-        (left, Expr::Column(column)) => (column, binary.op.swap()?, resolve_literal(left)?),
-        _ => return None,
+        (Expr::Column(column), right) => match resolve_literal(right) {
+            Some(literal) => (column, binary.op, literal),
+            None => return Translation::Local,
+        },
+        (left, Expr::Column(column)) => match (binary.op.swap(), resolve_literal(left)) {
+            (Some(operator), Some(literal)) => (column, operator, literal),
+            _ => return Translation::Local,
+        },
+        _ => return Translation::Local,
     };
 
     let mapping = mappings.iter().find(|mapping| {
@@ -110,22 +156,45 @@ fn translate_one(filter: &Expr, mappings: &[FilterMapping]) -> Option<(String, V
         // `None` and simply does not push down, which is always
         // safe — DataFusion re-evaluates what we do not translate.
         mapping.column == column.name && declared_operator(operator) == Some(mapping.operator)
-    })?;
-
-    let value = scalar_to_json(&literal, mapping.value_format)?;
-    if !in_declared_domain(&value, mapping.values) {
-        return None;
+    });
+    match mapping {
+        Some(mapping) => push_literal(mapping, literal),
+        None => Translation::Local,
     }
-    Some((mapping.input_field.to_string(), value, mapping.fidelity))
 }
 
-/// Whether a rendered literal may be forwarded under the mapping's declared
-/// value domain. An empty domain admits everything; a declared one admits
-/// exactly its strings, so `state = 'OPEN'` against `[open, closed]` stays
-/// local — the provider would 400 it where SQL promises zero rows — and a
-/// non-string literal against a string domain stays local for the same
-/// reason. Case is NOT folded: the provider's enum is the contract, and a
-/// pack that wants `OPEN` accepted lists it.
+/// The Eq mapping on `column`, if the pack declares one.
+fn eq_mapping<'a>(mappings: &'a [FilterMapping], column: &str) -> Option<&'a FilterMapping> {
+    mappings
+        .iter()
+        .find(|mapping| mapping.column == column && mapping.operator == Operator::Eq)
+}
+
+/// Render `literal` for `mapping` and gate it on the declared domain. A
+/// literal the format cannot render stays local; one the domain excludes
+/// can match no row.
+fn push_literal(mapping: &FilterMapping, literal: ScalarValue) -> Translation {
+    let Some(value) = scalar_to_json(&literal, mapping.value_format) else {
+        return Translation::Local;
+    };
+    if !in_declared_domain(&value, mapping.values) {
+        return Translation::Unsatisfiable;
+    }
+    Translation::Pushed {
+        input_field: mapping.input_field.to_string(),
+        value,
+        fidelity: mapping.fidelity,
+    }
+}
+
+/// Whether a rendered literal lies inside the mapping's declared value
+/// domain. An empty domain admits everything; a declared one admits exactly
+/// its strings, so `state = 'OPEN'` against `[open, closed]` is
+/// unsatisfiable — the provider would 400 it where SQL promises zero rows,
+/// and the column's domain says no row holds it — and a non-string literal
+/// against a string domain is outside it for the same reason. Case is NOT
+/// folded: the provider's enum is the contract, and a pack that wants
+/// `OPEN` accepted lists it.
 fn in_declared_domain(value: &Value, values: &[&str]) -> bool {
     if values.is_empty() {
         return true;
@@ -502,16 +571,19 @@ mod tests {
             translated.pushdown,
             vec![TableProviderFilterPushDown::Inexact]
         );
+        assert!(!translated.unsatisfiable);
     }
 
     #[test]
-    fn a_literal_outside_the_declared_domain_stays_local() {
+    fn a_literal_outside_the_declared_domain_is_unsatisfiable() {
         // skardi-cloud#544: the gateway validates `state` against its enum
         // strictly, so forwarding `'OPEN'` or `'PAID'` is an HTTP 400 where
-        // SQL promises zero rows. Outside the domain the predicate is
-        // Unsupported — fetched under the pack's fixed inputs and filtered
-        // by DataFusion, exactly as an unmapped column is. Case is not
-        // folded: the enum is the contract, and `OPEN` is not in it.
+        // SQL promises zero rows. The domain is the column's whole value
+        // set, so a literal outside it matches no row: nothing is
+        // forwarded, the scan is flagged unsatisfiable, and the predicate is
+        // classified Inexact so DataFusion still hands it to the scan and
+        // re-applies it above. Case is not folded: the enum is the
+        // contract, and `OPEN` is not in it.
         for literal in ["OPEN", "PAID", "Open", ""] {
             let translated = translate_filters(&[state_eq(lit(literal))], DOMAIN);
             assert!(
@@ -519,9 +591,10 @@ mod tests {
                 "{literal:?} must not reach the action: {:?}",
                 translated.inputs
             );
+            assert!(translated.unsatisfiable, "{literal:?}");
             assert_eq!(
                 translated.pushdown,
-                vec![TableProviderFilterPushDown::Unsupported],
+                vec![TableProviderFilterPushDown::Inexact],
                 "{literal:?}"
             );
         }
@@ -530,10 +603,7 @@ mod tests {
         // would otherwise forward the number.
         let translated = translate_filters(&[state_eq(lit(1_i64))], DOMAIN);
         assert!(translated.inputs.is_empty());
-        assert_eq!(
-            translated.pushdown,
-            vec![TableProviderFilterPushDown::Unsupported]
-        );
+        assert!(translated.unsatisfiable);
         // View-typed string scalars are domain-checked by content, not by
         // their Arrow spelling.
         let view = Expr::Literal(ScalarValue::Utf8View(Some("open".to_string())), None);
@@ -542,6 +612,69 @@ mod tests {
             translated.inputs,
             vec![("state".to_string(), Value::from("open"))]
         );
+        assert!(!translated.unsatisfiable);
+    }
+
+    #[test]
+    fn an_unsatisfiable_predicate_does_not_unpush_its_neighbours() {
+        // The flag is a property of the conjunction; the other predicates
+        // keep their own classification and inputs, so the plan DataFusion
+        // builds above the (empty) scan is the same one it would build over
+        // a real fetch.
+        let translated = translate_filters(&[state_eq(lit("OPEN")), state_eq(lit("open"))], DOMAIN);
+        assert!(translated.unsatisfiable);
+        assert_eq!(
+            translated.inputs,
+            vec![("state".to_string(), Value::from("open"))]
+        );
+        assert_eq!(
+            translated.pushdown,
+            vec![
+                TableProviderFilterPushDown::Inexact,
+                TableProviderFilterPushDown::Inexact
+            ]
+        );
+    }
+
+    #[test]
+    fn a_declared_domain_gates_the_simplified_boolean_spellings_too() {
+        // A string domain on a boolean column is a shape the loader refuses,
+        // so a YAML pack never reaches this; a hand-built mapping could, and
+        // then every spelling of the predicate must agree — the bare column
+        // and `NOT column` the simplifier produces no less than the
+        // `BinaryExpr` the query wrote. A boolean is never a member of a
+        // string domain, so all three are unsatisfiable and none forwards.
+        const MISDECLARED: &[FilterMapping] = &[FilterMapping {
+            column: "completed",
+            operator: Operator::Eq,
+            input_field: "completed",
+            fidelity: Fidelity::Inexact,
+            value_format: ValueFormat::Verbatim,
+            values: &["yes", "no"],
+        }];
+        let binary = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(col("completed")),
+            SqlOperator::Eq,
+            Box::new(lit(true)),
+        ));
+        for (spelling, filter) in [
+            ("bare column", col("completed")),
+            ("NOT column", Expr::Not(Box::new(col("completed")))),
+            ("column = true", binary),
+        ] {
+            let translated = translate_filters(&[filter], MISDECLARED);
+            assert!(
+                translated.inputs.is_empty(),
+                "{spelling}: a boolean is outside a string domain: {:?}",
+                translated.inputs
+            );
+            assert!(translated.unsatisfiable, "{spelling}");
+            assert_eq!(
+                translated.pushdown,
+                vec![TableProviderFilterPushDown::Inexact],
+                "{spelling}"
+            );
+        }
     }
 
     #[test]

@@ -49,6 +49,14 @@
 //!   endpoint contract are likewise reconciled against the live gateway
 //!   and its provider source; the bundled fixtures (see tests) remain the
 //!   build-time conversion contract.
+//! - **The input half is captured too** for `list_repository_issues` and
+//!   `list_pull_requests` (`fixtures/github/contracts/inputs/`, from the
+//!   gateway fork tag `skardi-pin-3c65a955` on 2026-11-05): the mock
+//!   discovery serves them, so every e2e registration runs the `state`
+//!   enum gate's pass side against the real contract rather than a
+//!   hand-written one, and a sync test locks the enum to the pack's
+//!   `values` domain plus the `all` pin — an upstream that nests the enum
+//!   under `anyOf` fails that test instead of the gate silently passing.
 
 use std::sync::OnceLock;
 
@@ -118,7 +126,25 @@ mod tests {
             .find(|(action, _)| path.ends_with(action))
             .map(|(_, schema)| *schema)
             .unwrap_or(r#"{"type": "object"}"#);
-        MockResponse::ok(&discovery_ok("{}", output_schema, true, None))
+        // The input half of the same capture, for the two actions whose
+        // `state` enum the pack's `values` domain is checked against at
+        // registration; the other actions publish none here, as before.
+        let inputs: &[(&str, &str)] = &[
+            (
+                "github.list_repository_issues",
+                include_str!("fixtures/github/contracts/inputs/list_repository_issues.json"),
+            ),
+            (
+                "github.list_pull_requests",
+                include_str!("fixtures/github/contracts/inputs/list_pull_requests.json"),
+            ),
+        ];
+        let input_schema = inputs
+            .iter()
+            .find(|(action, _)| path.ends_with(action))
+            .map(|(_, schema)| *schema)
+            .unwrap_or("{}");
+        MockResponse::ok(&discovery_ok(input_schema, output_schema, true, None))
     }
 
     #[tokio::test]
@@ -1267,15 +1293,14 @@ bindings:
     }
 
     #[tokio::test]
-    async fn out_of_domain_state_stays_local_and_yields_empty() {
-        // `merged` is outside the `values` domain the mapping declares, so
-        // the predicate is never forwarded: the live action's strict enum
-        // answers it with HTTP 400 invalid_input (skardi-cloud#544), where
-        // SQL promises zero rows. The scan runs under the `state: all` pin
-        // and DataFusion filters locally — the path an unmapped column
-        // takes — so a provider's full listing never leaks into an empty
-        // query either. setup_table's stub serves its rows regardless of
-        // the state input, which is exactly the leak Inexact guards.
+    async fn out_of_domain_state_answers_empty_without_a_request() {
+        // `merged` is outside the `values` domain the mapping declares —
+        // the column's whole value set — so no row can match: the predicate
+        // is never forwarded (the live action's strict enum would answer it
+        // with HTTP 400 invalid_input, skardi-cloud#544) and the scan is
+        // not run at all. setup_table's stub serves its rows regardless of
+        // the state input, so a leaked listing would show as rows here, and
+        // a fetch-then-filter would show as an execute body.
         let rows = vec![
             json!({"id": 1, "number": 1, "title": "a", "state": "open"}),
             json!({"id": 2, "number": 2, "title": "b", "state": "open"}),
@@ -1299,14 +1324,22 @@ bindings:
             0,
             "the provider's default listing must not leak into an empty query"
         );
-        let bodies = execute_bodies(&gateway);
-        assert!(!bodies.is_empty());
         assert!(
-            bodies
-                .iter()
-                .all(|body| body.contains(r#""state":"all""#) && !body.contains("merged")),
-            "an out-of-domain literal is not pushed; the pin stays: {bodies:?}"
+            execute_bodies(&gateway).is_empty(),
+            "an unsatisfiable predicate never reaches the gateway"
         );
+
+        // The in-domain spelling runs the scan, with the literal pushed over
+        // the `state: all` pin.
+        let batches = collect(
+            &ctx,
+            "SELECT id FROM saas.gh.pull_requests WHERE state = 'open'",
+        )
+        .await;
+        assert_eq!(rows_of(&batches), 2);
+        let bodies = execute_bodies(&gateway);
+        assert_eq!(bodies.len(), 1, "{bodies:?}");
+        assert!(bodies[0].contains(r#""state":"open""#), "{}", bodies[0]);
     }
 
     #[tokio::test]
@@ -1315,7 +1348,9 @@ bindings:
         // live action's input validation: any `state` outside its enum is
         // HTTP 400 invalid_input. Before the domain was declared, `'OPEN'`
         // was forwarded and the query failed with that 400 dressed as an
-        // execution failure; now it is answered as SQL requires.
+        // execution failure; now it is answered as SQL requires — and
+        // without a request, so a repository larger than the scan bounds
+        // answers the same zero rows instead of a `max_rows` error.
         let served = Arc::new(many_issues());
         let gateway = {
             let served = Arc::clone(&served);
@@ -1354,13 +1389,9 @@ bindings:
                 "{literal}: a value no row holds is zero rows, not a gateway refusal"
             );
         }
-        let bodies = execute_bodies(&gateway);
-        assert!(!bodies.is_empty());
         assert!(
-            bodies.iter().all(|body| body.contains(r#""state":"all""#)
-                && !body.contains("OPEN")
-                && !body.contains("PAID")),
-            "the refused literals never reach the action: {bodies:?}"
+            execute_bodies(&gateway).is_empty(),
+            "an unsatisfiable predicate is answered without a request"
         );
 
         // The in-domain spelling still pushes and still counts.
@@ -1428,7 +1459,10 @@ bindings:
         // Pass side: the live action's enum (open-connector
         // `src/providers/github/actions.ts`) admits every value the pack
         // declares — `all` is the pin, not a column value, so it is in the
-        // enum and not in `values`.
+        // enum and not in `values`. Every e2e registration also runs this
+        // side against the CAPTURED input contract `github_discovery`
+        // serves; the hand-written enum here keeps the refusal side's
+        // shape next to it.
         register_with_state_enum(
             &["open", "closed", "all"],
             "SKARDI_TEST_OC_GITHUB_STATE_ENUM_OK",
@@ -1450,6 +1484,101 @@ bindings:
                 && message.contains("[closed]"),
             "table, action and value are named: {message}"
         );
+    }
+
+    #[test]
+    fn captured_input_contracts_admit_every_input_the_pack_sends() {
+        // The output fixtures feed the fingerprint gate; these are the input
+        // halves of the same capture, served by `github_discovery` so every
+        // e2e registration runs the enum gate's pass side against the real
+        // contract. Both sides are committed artifacts, so this locks on
+        // re-capture, not live: the schema is strict and declares every key
+        // the pack can send; it requires nothing the pack does not send on
+        // every request; and `state` is a closed enum of exactly the pack's
+        // domain plus the `all` pin — an upstream that nests the enum under
+        // `anyOf` fails here, where the gate would otherwise pass silently.
+        for (short, contract) in [
+            (
+                "issues",
+                include_str!("fixtures/github/contracts/inputs/list_repository_issues.json"),
+            ),
+            (
+                "pull_requests",
+                include_str!("fixtures/github/contracts/inputs/list_pull_requests.json"),
+            ),
+        ] {
+            let schema: Value =
+                serde_json::from_str(contract).expect("input contract fixture parses");
+            let properties = schema["properties"]
+                .as_object()
+                .expect("the input schema declares properties");
+            let t = table(short);
+
+            assert_eq!(
+                schema["additionalProperties"],
+                json!(false),
+                "{short}: the action's input schema is strict"
+            );
+
+            let PaginationStrategy::PageNumber {
+                page_param,
+                per_page_param,
+                ..
+            } = t.pagination
+            else {
+                panic!("{short}: both tables page by number");
+            };
+            let mut sendable: Vec<&str> = t
+                .required_resources
+                .iter()
+                .chain(t.optional_resources)
+                .copied()
+                .collect();
+            sendable.extend(t.fixed_inputs.iter().map(|(key, _)| *key));
+            sendable.extend([page_param, per_page_param]);
+            sendable.extend(t.filters.iter().map(|f| f.input_field));
+            for key in &sendable {
+                assert!(
+                    properties.contains_key(*key),
+                    "{short}: `{key}` is not declared by the action's input schema"
+                );
+            }
+
+            let guaranteed: Vec<&str> = t
+                .required_resources
+                .iter()
+                .copied()
+                .chain(t.fixed_inputs.iter().map(|(key, _)| *key))
+                .collect();
+            for entry in schema["required"].as_array().into_iter().flatten() {
+                let entry = entry.as_str().expect("required entries are strings");
+                assert!(
+                    guaranteed.contains(&entry),
+                    "{short}: the action requires `{entry}`, which the pack does not send on \
+                     every request"
+                );
+            }
+
+            let state = t
+                .filters
+                .iter()
+                .find(|f| f.column == "state")
+                .expect("both tables push `state`");
+            let mut accepted: Vec<&str> = properties["state"]["enum"]
+                .as_array()
+                .expect("`state` is a closed enum at the top level of its property")
+                .iter()
+                .map(|v| v.as_str().expect("enum members are strings"))
+                .collect();
+            let mut expected: Vec<&str> = state.values.to_vec();
+            expected.push("all");
+            accepted.sort_unstable();
+            expected.sort_unstable();
+            assert_eq!(
+                accepted, expected,
+                "{short}: the enum is the column's domain plus the `all` pin"
+            );
+        }
     }
 
     #[test]

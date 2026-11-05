@@ -39,7 +39,9 @@ use crate::sources::providers::open_connector::error::OpenConnectorError;
 // a query planner, and it used to convert to DataFusion's on the way in
 // for no reason other than where the type happened to live.
 use crate::sources::providers::open_connector::json_to_arrow::RowConverter;
-use crate::sources::providers::open_connector::json_to_arrow::{ColumnDoc, FieldMapping};
+use crate::sources::providers::open_connector::json_to_arrow::{
+    ColumnDoc, FieldMapping, FieldType,
+};
 use crate::sources::providers::open_connector::pagination::{
     AbsentCursor, CursorContinuation, PaginationStrategy,
 };
@@ -242,6 +244,22 @@ fn validate_table(table: &SourcePackTable) -> Result<(), String> {
                         filter.column
                     ));
                 }
+            }
+            // A domain is a list of strings and the translation admits only
+            // a string literal into one, so on any other column every
+            // literal would fall outside it and every predicate would
+            // answer empty — a pushdown switched off (or, for a boolean
+            // column, a spelling-dependent one) with nothing saying so.
+            // The column exists: undeclared ones were refused above.
+            if let Some(field) = table.fields.iter().find(|f| f.name == filter.column)
+                && field.field_type != FieldType::Utf8
+            {
+                return Err(format!(
+                    "{id}: filter on '{}' declares `values` on a column of type {}; a value \
+                     domain is a list of strings and only a utf8 column can carry one",
+                    filter.column,
+                    field.field_type.label()
+                ));
             }
         }
         // Epoch renderings floor sub-second precision, which only ever
@@ -1292,6 +1310,8 @@ tables:
     columns:
       - {{ name: state, path: state, type: utf8, nullable: false }}
       - {{ name: created, path: created, type: timestamp_ms_utc, nullable: true }}
+      - {{ name: done, path: done, type: boolean, nullable: true }}
+      - {{ name: count, path: count, type: int64, nullable: true }}
     filters:
 {filter}
 "#
@@ -1325,6 +1345,16 @@ tables:
             (
                 "      - { column: state, op: eq, input: state, fidelity: inexact, values: [open, ''] }",
                 "empty string",
+            ),
+            // A domain is a list of strings; on any other column every
+            // literal would be outside it.
+            (
+                "      - { column: done, op: eq, input: done, fidelity: inexact, values: [yes] }",
+                "column of type boolean",
+            ),
+            (
+                "      - { column: count, op: eq, input: count, fidelity: inexact, values: ['1'] }",
+                "column of type integer",
             ),
         ] {
             let err = parse_pack(&base(filter)).expect_err(expected);
