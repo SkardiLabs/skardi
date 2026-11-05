@@ -74,6 +74,7 @@ mod tests {
     use crate::sources::providers::open_connector::source_pack::SourcePackTable;
     use arrow::array::{Array, ListArray, StringArray, TimestampMillisecondArray, UInt64Array};
     use arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
 
     /// Discovery responses serve the CAPTURED live contracts, so every e2e
     /// registration exercises the fingerprint gate's pass side.
@@ -689,9 +690,9 @@ bindings:
 
     /// Register the gateway (catalog + UDTFs) against `rows`.
     async fn setup(rows: Vec<Value>, token_env: &str) -> (MockGateway, SessionContext) {
-        let served = std::sync::Arc::new(rows);
+        let served = Arc::new(rows);
         let gateway = {
-            let served = std::sync::Arc::clone(&served);
+            let served = Arc::clone(&served);
             MockGateway::start(move |req| issues_handler(req, &served)).await
         };
         setup_with_gateway(gateway, token_env).await
@@ -825,9 +826,9 @@ bindings:
                 })
             })
             .collect();
-        let served = std::sync::Arc::new(rows);
+        let served = Arc::new(rows);
         let gateway = {
-            let served = std::sync::Arc::clone(&served);
+            let served = Arc::clone(&served);
             MockGateway::start(move |req| {
                 if req.method == "GET" && req.path == "/v1/health" {
                     return MockResponse::ok("{}");
@@ -957,9 +958,9 @@ bindings:
         rows: Vec<Value>,
         token_env: &'static str,
     ) -> (MockGateway, SessionContext) {
-        let served = std::sync::Arc::new(rows);
+        let served = Arc::new(rows);
         let gateway = {
-            let served = std::sync::Arc::clone(&served);
+            let served = Arc::clone(&served);
             MockGateway::start(move |req| {
                 if req.method == "GET" && req.path == "/v1/health" {
                     return MockResponse::ok("{}");
@@ -1315,9 +1316,9 @@ bindings:
         // HTTP 400 invalid_input. Before the domain was declared, `'OPEN'`
         // was forwarded and the query failed with that 400 dressed as an
         // execution failure; now it is answered as SQL requires.
-        let served = std::sync::Arc::new(many_issues());
+        let served = Arc::new(many_issues());
         let gateway = {
-            let served = std::sync::Arc::clone(&served);
+            let served = Arc::clone(&served);
             MockGateway::start(move |req| {
                 if req.method == "POST" && req.path == "/v1/actions/github.list_repository_issues" {
                     let body: Value = serde_json::from_str(&req.body).unwrap_or_default();

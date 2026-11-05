@@ -28,7 +28,7 @@
 //! produces a startup diagnostic, and the parse-all test below keeps
 //! shipped assets valid in the first place.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::OnceLock;
 
 use serde::Deserialize;
@@ -196,13 +196,13 @@ fn validate_table(table: &SourcePackTable) -> Result<(), String> {
         .map_err(|e| format!("{id}: {e}"))?;
     RowConverter::new(table.fields).map_err(|e| format!("{id}: {e}"))?;
 
-    let mut columns = std::collections::HashSet::new();
+    let mut columns = HashSet::new();
     for field in table.fields {
         if !columns.insert(field.name) {
             return Err(format!("{id}: duplicate column '{}'", field.name));
         }
     }
-    let mut mappings = std::collections::HashSet::new();
+    let mut mappings = HashSet::new();
     for filter in table.filters {
         if !columns.contains(filter.column) {
             return Err(format!(
@@ -228,7 +228,7 @@ fn validate_table(table: &SourcePackTable) -> Result<(), String> {
                     filter.column, filter.operator
                 ));
             }
-            let mut seen = std::collections::HashSet::new();
+            let mut seen = HashSet::new();
             for value in filter.values {
                 if value.is_empty() {
                     return Err(format!(
@@ -396,7 +396,7 @@ fn validate_table(table: &SourcePackTable) -> Result<(), String> {
     // rejected below even though the scan-time claimed-inputs guard makes
     // them safe (the loser stays local): which predicate pushes would
     // depend on query order, and that ambiguity is an authoring mistake.
-    let mut filter_inputs = std::collections::HashSet::new();
+    let mut filter_inputs = HashSet::new();
     for filter in table.filters {
         if !filter_inputs.insert(filter.input_field) {
             return Err(format!(
