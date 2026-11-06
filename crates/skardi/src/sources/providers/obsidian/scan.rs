@@ -16,7 +16,7 @@ use super::frontmatter;
 use super::markdown::{self, RawLink};
 use super::resolve::{Index, LinkKind, Resolution};
 use crate::sources::providers::blob::{
-    BlobEntry, BlobStore, ListOptions, ReadOptions, SizeCapExceeded,
+    BlobEntry, BlobStore, ListOptions, Loc, ReadOptions, SizeCapExceeded,
 };
 
 /// Where a link or tag was found (`links.source`, `tags.source`). `Body`
@@ -178,14 +178,30 @@ impl VaultScan {
     /// `spawn_blocking` (see [`run_scan`]); panics outside a Tokio runtime
     /// because it needs `Handle::current()` to drive the S3 arms.
     pub fn run(root: &str, opts: &ScanOptions) -> Result<Vec<ParsedNote>> {
+        let (store, prefix) = BlobStore::resolve(root)
+            .with_context(|| format!("obsidian: resolving vault root {root}"))?;
+        Self::run_on(&store, &prefix, root, opts)
+    }
+
+    /// The scan proper, over an already-resolved store. Split out of [`run`]
+    /// because `BlobStore::resolve` only ever builds a real S3 client for an
+    /// `s3://` root: without this seam the object-store arm — the one where a
+    /// note's key is an `object_store` path rather than a filesystem path —
+    /// is unreachable from a test. Same blocking contract as `run`.
+    ///
+    /// [`run`]: VaultScan::run
+    fn run_on(
+        store: &BlobStore,
+        prefix: &Loc,
+        root: &str,
+        opts: &ScanOptions,
+    ) -> Result<Vec<ParsedNote>> {
         let started = Instant::now();
         let handle = Handle::current();
 
-        let (store, prefix) = BlobStore::resolve(root)
-            .with_context(|| format!("obsidian: resolving vault root {root}"))?;
         let entries = handle
             .block_on(store.list(
-                &prefix,
+                prefix,
                 ListOptions {
                     recursive: true,
                     follow_symlinks: false,
@@ -223,7 +239,7 @@ impl VaultScan {
             attempted += 1;
             let bytes = match handle.block_on(store.get(
                 &entry.loc,
-                ReadOptions::no_symlinks_beneath(&prefix).with_max_bytes(opts.max_file_bytes),
+                ReadOptions::no_symlinks_beneath(prefix).with_max_bytes(opts.max_file_bytes),
             )) {
                 Ok(bytes) => bytes,
                 Err(e) if e.downcast_ref::<SizeCapExceeded>().is_some() => {
@@ -902,5 +918,99 @@ mod tests {
             .map(|t| (t.tag.as_str(), t.source.as_str()))
             .collect();
         assert_eq!(tags, vec![("a", "body"), ("t", "frontmatter")]);
+    }
+
+    /// The object-store arm, with the note names a vault actually has: CJK,
+    /// a `#` and a `%` in a file name. Each object is seeded at its raw key —
+    /// the key a listing returns — and the scan must read every one of them.
+    ///
+    /// This is the obsidian half of #288. While `Loc::S3`'s key was a `String`
+    /// re-encoded with `OsPath::from` on the way to `get`, each of these keys
+    /// was fetched percent-encoded: every read 404'd, so a vault of such notes
+    /// failed wholesale and a mixed vault silently dropped them from `notes`
+    /// while `links` still resolved to them. Every other test here is local,
+    /// where a path is a path and nothing is ever encoded.
+    #[tokio::test]
+    async fn s3_vault_reads_notes_at_their_raw_keys() {
+        use object_store::path::Path as OsPath;
+        use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
+        use std::sync::Arc;
+
+        let seeded: &[(&str, &str)] = &[
+            ("vault/团体.md", "# 团体\n\n见 [[笔记/项目]] #中文标签\n"),
+            ("vault/笔记/项目.md", "项目笔记\n"),
+            ("vault/issue#12.md", "See [[团体]]\n"),
+            ("vault/50% off.md", "折扣\n"),
+        ];
+        let mem = Arc::new(object_store::memory::InMemory::new());
+        for (key, body) in seeded {
+            let path =
+                OsPath::parse(key).unwrap_or_else(|e| panic!("Path::parse rejects {key:?}: {e}"));
+            // The store holds the key verbatim; nothing below may re-encode it.
+            assert_eq!(path.as_ref(), *key, "Path::parse altered {key:?}");
+            mem.put(&path, PutPayload::from(body.as_bytes().to_vec()))
+                .await
+                .unwrap();
+        }
+
+        let store = BlobStore::Remote(mem as Arc<dyn ObjectStore>);
+        let prefix = Loc::parse("s3://bk/vault").unwrap();
+        let opts = defaults();
+        // Same contract as `run_scan`: the synchronous scan drives its futures
+        // with `Handle::block_on`, so it belongs on the blocking pool.
+        let notes = tokio::task::spawn_blocking(move || {
+            VaultScan::run_on(&store, &prefix, "s3://bk/vault", &opts)
+        })
+        .await
+        .unwrap()
+        .expect("every note must be readable at the key the listing returned");
+
+        let paths: Vec<&str> = notes.iter().map(|n| n.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["50% off.md", "issue#12.md", "团体.md", "笔记/项目.md"]
+        );
+
+        // A nested fn, not a closure: a closure would tie the returned
+        // reference's lifetime to the `path` argument.
+        fn note<'a>(notes: &'a [ParsedNote], path: &str) -> &'a ParsedNote {
+            notes
+                .iter()
+                .find(|n| n.path == path)
+                .unwrap_or_else(|| panic!("no note at {path:?}"))
+        }
+
+        // Bodies prove each read landed on its own object, not merely on some
+        // object: a re-encoded key would have missed, and a mixed-up one would
+        // show here as the wrong text.
+        assert_eq!(note(&notes, "笔记/项目.md").body, "项目笔记\n");
+        assert_eq!(note(&notes, "50% off.md").body, "折扣\n");
+        assert_eq!(note(&notes, "笔记/项目.md").folder, "笔记");
+        assert_eq!(note(&notes, "issue#12.md").name, "issue#12");
+        assert_eq!(note(&notes, "团体.md").size_bytes, seeded[0].1.len() as i64);
+
+        // The link graph is built from the same keys: a path-ish wikilink to a
+        // CJK note resolves exactly, a bare one by name.
+        assert_eq!(
+            summarize(&note(&notes, "团体.md").links),
+            vec![(
+                Some("笔记/项目.md"),
+                "笔记/项目",
+                "wikilink",
+                "exact",
+                "body",
+                Some(3)
+            )]
+        );
+        assert_eq!(
+            summarize(&note(&notes, "issue#12.md").links),
+            vec![(Some("团体.md"), "团体", "wikilink", "name", "body", Some(1))]
+        );
+        let tags: Vec<(&str, &str)> = note(&notes, "团体.md")
+            .tags
+            .iter()
+            .map(|t| (t.tag.as_str(), t.source.as_str()))
+            .collect();
+        assert_eq!(tags, vec![("中文标签", "body")]);
     }
 }
