@@ -11,9 +11,12 @@
 //! already gave. So what arrives is a **credential, not an identity**, and
 //! three properties follow:
 //!
-//! 1. **One workspace.** The consent screen selects exactly one (§11.1), so
-//!    `--workspace` and `--all-workspaces` have no meaning on this path. The
-//!    caller refuses them rather than ignoring them.
+//! 1. **The browser chooses the workspaces.** The consent screen ticks one or
+//!    more, each at a role cap, and the exchange mints ONE token reaching all
+//!    of them (skardi-cloud #1217). The caller writes a context per approved
+//!    workspace, every one carrying that token, so `--workspace` and
+//!    `--all-workspaces` have no meaning on this path. The caller refuses them
+//!    rather than ignoring them.
 //! 2. **No client id.** That is the whole point: `skardi login
 //!    --control-plane <url>` works with nothing else.
 //! 3. **Nothing here can revoke.** A PAT authenticates to the *gateway*;
@@ -92,15 +95,26 @@ pub struct Brokered {
     /// credential it cannot revoke.
     pub token_id: String,
     pub expires_at: Option<String>,
-    /// The single workspace the consent screen chose.
+    /// The first workspace the consent screen chose — the only one a control
+    /// plane that predates scoped approval reports.
     pub workspace: String,
-    /// §11.2 — the membership rides along, so the context is written without a
-    /// second round trip. Empty is tolerated: `workspace` is authoritative,
-    /// and this is what lets the context carry an org slug and a role.
+    /// §11.2 — the memberships ride along, so the contexts are written without
+    /// a second round trip: one per approved workspace, in the approver's
+    /// order. Empty is tolerated: `workspace` is authoritative, and this is
+    /// what lets a context carry an org slug and a role.
     pub memberships: Vec<Membership>,
+    /// Approved workspaces the exchange returned no membership for. The token
+    /// reaches them, but no context can be named for one, so the login refuses
+    /// rather than write a subset of what the approver ticked.
+    pub unmatched: Vec<String>,
     /// The pair's `control` token, present only when the approver ticked
     /// `control` (agent onboarding §2.1.1).
     pub control: Option<ControlGrant>,
+    /// The role the gateway answers at in each approved workspace —
+    /// `min(membership role, the cap the approver chose)` — keyed by
+    /// workspace. Empty from a control plane that predates scoped approval,
+    /// whose single grant is at the membership's own role.
+    pub roles: std::collections::BTreeMap<String, String>,
 }
 
 /// Hand-written, for the same reason `Minted`'s is: the raw token must not be
@@ -113,7 +127,9 @@ impl fmt::Debug for Brokered {
             .field("expires_at", &self.expires_at)
             .field("workspace", &self.workspace)
             .field("memberships", &self.memberships)
+            .field("unmatched", &self.unmatched)
             .field("control", &self.control)
+            .field("roles", &self.roles)
             .finish()
     }
 }
@@ -251,14 +267,7 @@ pub async fn poll_once(
             let parsed: ExchangeBody = serde_json::from_value(value)
                 .context("the console's CLI-login exchange was not the expected shape")?;
             let control = control_grant(&parsed, console_base)?;
-            Ok(Some(Brokered {
-                token: parsed.token,
-                token_id: parsed.token_id,
-                expires_at: parsed.expires_at,
-                workspace: parsed.workspace,
-                memberships: parsed.memberships,
-                control,
-            }))
+            Ok(Some(approved(parsed, control)))
         }
         // A status this CLI does not know is a control plane newer than it is.
         // Reported rather than treated as pending, because polling forever on
@@ -338,6 +347,62 @@ struct ExchangeBody {
     control_expires_at: Option<String>,
     #[serde(default)]
     pair_id: Option<String>,
+    /// Absent from a control plane that predates scoped approval.
+    #[serde(default)]
+    workspaces: Vec<ApprovedWorkspace>,
+}
+
+/// One entry of the exchange's `workspaces`: what was approved, and the role
+/// the gateway will answer at there.
+#[derive(Deserialize)]
+struct ApprovedWorkspace {
+    workspace: String,
+    /// Display only, so optional: the exchange has already minted by the time
+    /// this parses, and a missing role must not fail the parse and strand a
+    /// credential. Absent, the membership's own role is reported instead.
+    #[serde(default)]
+    role: Option<String>,
+}
+
+/// The approved set, in the approver's order. When the control plane lists
+/// `workspaces`, that list is the grant: memberships are kept only for the
+/// workspaces it names and in its order, so a context is never written for a
+/// membership the token does not reach. A named workspace with no membership
+/// is kept in `unmatched` rather than dropped, because the token reaches it
+/// and the caller must say so. Without the list — an older control plane —
+/// the memberships are taken as sent, which is the single approved one.
+fn approved(parsed: ExchangeBody, control: Option<ControlGrant>) -> Brokered {
+    let mut unmatched = Vec::new();
+    let memberships = if parsed.workspaces.is_empty() {
+        parsed.memberships
+    } else {
+        let mut kept = Vec::with_capacity(parsed.workspaces.len());
+        for w in &parsed.workspaces {
+            match parsed
+                .memberships
+                .iter()
+                .find(|m| m.tenant_slug == w.workspace)
+            {
+                Some(m) => kept.push(m.clone()),
+                None => unmatched.push(w.workspace.clone()),
+            }
+        }
+        kept
+    };
+    Brokered {
+        token: parsed.token,
+        token_id: parsed.token_id,
+        expires_at: parsed.expires_at,
+        workspace: parsed.workspace,
+        memberships,
+        unmatched,
+        control,
+        roles: parsed
+            .workspaces
+            .into_iter()
+            .filter_map(|w| Some((w.workspace, w.role?)))
+            .collect(),
+    }
 }
 
 /// Cap on a console response body — the same "something is very wrong" bound
@@ -587,11 +652,13 @@ mod tests {
             expires_at: Some("2026-11-22T12:00:00Z".to_string()),
             workspace: "acme-prod".to_string(),
             memberships: Vec::new(),
+            unmatched: Vec::new(),
             control: Some(ControlGrant {
                 token: "skardi_pat_the_control_secret".to_string(),
                 expires_at: None,
                 pair_id: Some("pair-1".to_string()),
             }),
+            roles: Default::default(),
         };
         let rendered = format!("{brokered:?}");
         assert!(!rendered.contains("the_real_secret"), "{rendered}");

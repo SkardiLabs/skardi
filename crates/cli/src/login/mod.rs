@@ -27,7 +27,7 @@ use crate::client::ApiClient;
 use crate::config::{self, Context, ContextMode, ContextsFile, SelectedContext};
 use anyhow::{Context as _, Result, anyhow, bail};
 use chrono::{DateTime, Duration, Utc};
-use control_plane::{ControlPlane, CpError, Membership, Minted};
+use control_plane::{ControlGrant, ControlPlane, CpError, Membership, Minted};
 use std::path::Path;
 use tokio::time::{Instant, sleep};
 
@@ -149,10 +149,12 @@ pub struct LoginReport {
     /// `--server` or `$SKARDI_GATEWAY_URL` sent this context's queries to a
     /// different origin. Reported, so the substitution is never silent.
     pub mcp_url_set_aside: Option<String>,
-    /// The context whose pair this login named as `replaces_pair_id` when
-    /// that is NOT the context it wrote: the exchange revoked a pair some
-    /// other context still holds, so that context needs a login of its own.
-    pub replaced_pair_elsewhere: Option<String>,
+    /// Contexts this login did NOT write that hold the pair it named as
+    /// `replaces_pair_id`: the exchange revoked a pair they still hold, so
+    /// each needs a login of its own. The named context when the approval
+    /// did not include it, and any sibling a multi-workspace login gave the
+    /// same pair.
+    pub replaced_pair_elsewhere: Vec<String>,
     /// `(token id, pair id)` for each replaced credential that was one half
     /// of a `login --control` pair. Its control token is the other half, and
     /// no context holds it after the overwrite, so the pair id is the only
@@ -167,6 +169,15 @@ pub struct LoginReport {
 struct Replaced {
     token_id: String,
     pair_id: Option<String>,
+}
+
+/// What [`write_contexts`] changed beyond the contexts themselves.
+struct Written {
+    /// The credentials it replaced, for §6.5's replacement revocation.
+    replaced: Vec<Replaced>,
+    /// Contexts it did NOT write that hold the pair sent as
+    /// `replaces_pair_id` — revoked under them by the exchange.
+    still_holding_sent_pair: Vec<String>,
 }
 
 /// A PAT this run created, retained so the saga can revoke it.
@@ -277,8 +288,8 @@ pub async fn login(options: LoginOptions, config_path: &Path) -> Result<LoginRep
         pending.push((membership, token, server));
     }
 
-    match write_contexts(config_path, &options, &pending) {
-        Ok(replaced) => {
+    match write_contexts(config_path, &options, &pending, None) {
+        Ok(Written { replaced, .. }) => {
             record_mcp_url(&mut report, &pending);
             report.replaced_pairs = pairs_of(&replaced);
             // A pair context was written by a browser login, which recorded
@@ -346,17 +357,17 @@ pub fn selects_console_broker(identity: Option<&str>, client_id: Option<&str>) -
 /// and nobody knows exists is the outcome §6.5 was written to prevent, and the
 /// id is the only thing that prevents it here.
 async fn console_brokered_login(options: LoginOptions, config_path: &Path) -> Result<LoginReport> {
-    // Refused, not ignored. The consent screen selects exactly one workspace
-    // (§11.1), so there is no honest reading of either flag on this path — and
-    // silently logging into one workspace when `--all-workspaces` was asked
-    // for is the kind of success that gets discovered much later.
+    // Refused, not ignored. The consent screen chooses the workspaces, so there
+    // is no honest reading of either flag on this path — and silently logging
+    // into a set the browser chose when `--workspace` named another is the
+    // kind of success that gets discovered much later.
     match &options.selection {
         Selection::Auto => {}
         Selection::Named(slug) => bail!(
-            "--workspace '{slug}' cannot be honoured through a browser login: the console's consent screen chooses the workspace, and it grants exactly one. Approve '{slug}' in the browser, or select it from the terminal with --client-id <ID> (or --identity dev:<id> against a loopback control plane)"
+            "--workspace '{slug}' cannot be honoured through a browser login: the console's consent screen chooses the workspaces. Tick '{slug}' in the browser, or select it from the terminal with --client-id <ID> (or --identity dev:<id> against a loopback control plane)"
         ),
         Selection::All => bail!(
-            "--all-workspaces cannot be honoured through a browser login: one approval grants one workspace. Run this once per workspace, or select from the terminal with --client-id <ID> (or --identity dev:<id> against a loopback control plane)"
+            "--all-workspaces cannot be honoured through a browser login: the console's consent screen chooses the workspaces. Tick every one you want there and this login writes a context for each, or select from the terminal with --client-id <ID> (or --identity dev:<id> against a loopback control plane)"
         ),
     }
 
@@ -419,39 +430,89 @@ async fn console_brokered_login(options: LoginOptions, config_path: &Path) -> Re
 
     let brokered = poll_for_approval(&http, &options, &opened, &pkce.verifier).await?;
 
-    // §11.2: the membership rides along, so the context is written without a
-    // second round trip. Its absence is exceptional — it means the approved
-    // membership vanished between approval and redemption — and it is fatal
-    // here because the context NAME is `<org>/<workspace>` and the org slug
-    // has nowhere else to come from. The token id is printed because at this
-    // point a credential exists that this CLI cannot revoke.
-    let membership = brokered.memberships.first().cloned().ok_or_else(|| {
-        anyhow!(
+    // §11.2: the memberships ride along, so the contexts are written without a
+    // second round trip — one per approved workspace, every one carrying the
+    // single token the approval minted. Their absence is exceptional — it means
+    // the approved memberships vanished between approval and redemption — and
+    // it is fatal here because a context NAME is `<org>/<workspace>` and the
+    // org slug has nowhere else to come from. The token id is printed because
+    // at this point a credential exists that this CLI cannot revoke.
+    if brokered.memberships.is_empty() {
+        bail!(
             "the console approved workspace '{}' but returned no membership for it, so there is no organization to name the context after. The credential it minted is live and this CLI cannot revoke it — revoke token {} in the console",
             brokered.workspace,
             brokered.token_id
-        )
-    })?;
-
+        );
+    }
+    // The token reaches every workspace the approver ticked, so a context set
+    // that misses one would be a silent partial login. Refused the same way
+    // the empty case is, naming what the token reaches and how to revoke it.
+    if !brokered.unmatched.is_empty() {
+        bail!(
+            "the console approved workspace(s) {} but returned no membership for them, so no context can be named for them and this login wrote none. The credential it minted is live and reaches them, and this CLI cannot revoke it — revoke token {} in the console",
+            brokered
+                .unmatched
+                .iter()
+                .map(|w| format!("'{w}'"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            brokered.token_id
+        );
+    }
+    let memberships = brokered.memberships;
+    let roles = brokered.roles;
     let token = Minted {
         token: brokered.token,
         token_id: brokered.token_id,
         expires_at: brokered.expires_at,
         control: brokered.control,
     };
-    let server = resolve_server(&options, &membership).map_err(|err| abandoned(&token, err))?;
-    if !options.no_verify
-        && let Err(err) = verify(&server, &membership, &token, options.verify_timeout).await
-    {
-        return Err(abandoned(&token, err));
+    // `--context` names ONE context. Only known to be wrong now, after the
+    // browser chose the set, so the credential is reported rather than lost:
+    // writing every workspace under one name would leave only the last.
+    if options.context_name.is_some() && memberships.len() > 1 {
+        return Err(abandoned(
+            &token,
+            anyhow!(
+                "--context names ONE context, but {} workspaces were approved — run `skardi login` again without it, or tick a single workspace",
+                memberships.len()
+            ),
+        ));
     }
 
-    let pending = vec![(membership, token, server)];
-    let replaced = write_contexts(config_path, &options, &pending).map_err(|err| {
-        // `pending` still owns the token, so read the id off it rather than
-        // moving anything: the write failed, and the credential is stranded.
-        abandoned(&pending[0].1, err)
+    // Each context is verified through its own `Skardi-Workspace`, because the
+    // token reaching one approved workspace says nothing about the next.
+    let mut pending = Vec::with_capacity(memberships.len());
+    for membership in memberships {
+        let server = resolve_server(&options, &membership).map_err(|err| abandoned(&token, err))?;
+        if !options.no_verify
+            && let Err(err) = verify(&server, &membership, &token, options.verify_timeout).await
+        {
+            return Err(abandoned(&token, err));
+        }
+        // The pair travels whole: the server minted its control half for the
+        // same scope as the PAT (approval refuses `control` below admin in ANY
+        // workspace in scope), so every context gets both, and `skardi agent`
+        // works in whichever one is current.
+        let shared = Minted {
+            token: token.token.clone(),
+            token_id: token.token_id.clone(),
+            expires_at: token.expires_at.clone(),
+            control: token.control.as_ref().map(|c| ControlGrant {
+                token: c.token.clone(),
+                expires_at: c.expires_at.clone(),
+                pair_id: c.pair_id.clone(),
+            }),
+        };
+        pending.push((membership, shared, server));
+    }
+
+    let sent_pair = replaces.as_ref().map(|(_, pair_id)| pair_id.as_str());
+    let written = write_contexts(config_path, &options, &pending, sent_pair).map_err(|err| {
+        // The write failed, and the credential is stranded.
+        abandoned(&token, err)
     })?;
+    let replaced = written.replaced;
 
     let mut report = LoginReport::default();
     report.written = pending
@@ -460,7 +521,11 @@ async fn console_brokered_login(options: LoginOptions, config_path: &Path) -> Re
             name: context_name(&options, membership),
             server: server.clone(),
             workspace: membership.tenant_slug.clone(),
-            role: membership.role.clone(),
+            // What the gateway will answer at, which a role cap can lower.
+            role: roles
+                .get(&membership.tenant_slug)
+                .cloned()
+                .unwrap_or_else(|| membership.role.clone()),
             expires_at: token.expires_at.clone(),
         })
         .collect();
@@ -471,12 +536,12 @@ async fn console_brokered_login(options: LoginOptions, config_path: &Path) -> Re
     let (_, token, _) = &pending[0];
     report.control_expires_at = token.control.as_ref().and_then(|c| c.expires_at.clone());
     report.control_missing = options.control && token.control.is_none();
-    let sent_pair = replaces.as_ref().map(|(_, pair_id)| pair_id.as_str());
-    if let Some((named, _)) = &replaces
-        && report.current_context.as_deref() != Some(named.as_str())
-    {
-        report.replaced_pair_elsewhere = Some(named.clone());
-    }
+    // Every context this write left alone that still holds the pair the
+    // exchange was asked to revoke — the one `--context` or the current
+    // context named, when it was not rewritten, and any sibling a multi-
+    // workspace login gave the same pair. Compared against what was WRITTEN,
+    // not the current context, which is only the first of them.
+    report.replaced_pair_elsewhere = written.still_holding_sent_pair;
 
     // The replacement rule. A credential whose pair this login named was
     // revoked by the exchange itself (§2.1.1), under the approver's session —
@@ -978,7 +1043,8 @@ fn write_contexts(
     path: &Path,
     options: &LoginOptions,
     pending: &[(Membership, Minted, String)],
-) -> Result<Vec<Replaced>> {
+    sent_pair: Option<&str>,
+) -> Result<Written> {
     let mut file: ContextsFile = config::load_for_mutation(path)?;
     file.promote_legacy_spec();
     let mut replaced = Vec::new();
@@ -1024,6 +1090,36 @@ fn write_contexts(
     if let Some((membership, _, _)) = pending.first() {
         file.current_context = Some(context_name(options, membership));
     }
+    // One token can now back several contexts (a browser login approving
+    // several workspaces), so a replaced id is reported for revocation only
+    // once, and not at all while a context this write left alone still holds
+    // it — revoking it would cut that context off too.
+    // Keyed on the token id: every context the shared token backed held the
+    // same pair, so one entry per id keeps its pair id too.
+    replaced.sort_by(|a, b| a.token_id.cmp(&b.token_id));
+    replaced.dedup_by(|a, b| a.token_id == b.token_id);
+    //
+    // Except a token whose pair this login sent as `replaces_pair_id`: the
+    // exchange revoked that pair server-side whoever still holds it, so it is
+    // reported as revoked, and the contexts left holding it are named.
+    let was_sent = |pair_id: Option<&str>| pair_id.is_some() && pair_id == sent_pair;
+    replaced.retain(|old| {
+        was_sent(old.pair_id.as_deref())
+            || !file
+                .contexts
+                .iter()
+                .any(|c| c.token_id.as_deref() == Some(old.token_id.as_str()))
+    });
+    let written_names: Vec<String> = pending
+        .iter()
+        .map(|(membership, _, _)| context_name(options, membership))
+        .collect();
+    let still_holding_sent_pair = file
+        .contexts
+        .iter()
+        .filter(|c| !written_names.contains(&c.name) && was_sent(c.pair_id.as_deref()))
+        .map(|c| c.name.clone())
+        .collect();
     // Recorded so a later `login` with no --control-plane reaches the same
     // place this one did — under the key that matches WHICH place it is.
     //
@@ -1040,7 +1136,10 @@ fn write_contexts(
         file.control_plane = Some(options.control_plane.clone());
     }
     config::save(path, &file)?;
-    Ok(replaced)
+    Ok(Written {
+        replaced,
+        still_holding_sent_pair,
+    })
 }
 
 /// §6.5's rollback: revoke everything this run minted, then report the ORIGINAL

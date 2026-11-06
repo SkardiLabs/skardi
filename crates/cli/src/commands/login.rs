@@ -509,7 +509,7 @@ fn render_report(report: &LoginReport) -> String {
             "  (the control plane named {named}, but this context queries the gateway --server or $SKARDI_GATEWAY_URL chose, so its MCP server is taken from there)"
         );
     }
-    if let Some(name) = &report.replaced_pair_elsewhere {
+    for name in &report.replaced_pair_elsewhere {
         let _ = writeln!(
             out,
             "this login replaced the credentials context {name} held, which the exchange revoked if they were yours — run `skardi login --context {name}` to sign it in again"
@@ -952,7 +952,7 @@ mod tests {
             control_expires_at: Some("2026-10-31T12:00:00Z".to_string()),
             mcp_url: Some("https://gw.example/mcp".to_string()),
             mcp_url_set_aside: Some("https://elsewhere.example/mcp".to_string()),
-            replaced_pair_elsewhere: Some("acme/other".to_string()),
+            replaced_pair_elsewhere: vec!["acme/other".to_string()],
             replaced_revoked: vec!["tok-old".to_string()],
             replaced_pairs: vec![("tok-old".to_string(), "pair-old".to_string())],
             ..LoginReport::default()
