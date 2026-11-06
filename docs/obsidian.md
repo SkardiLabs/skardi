@@ -123,7 +123,9 @@ Skardi mirrors Obsidian's rules, not a general file resolver:
 |---|---|---|
 | `[[Name]]`, `[[Name#H]]`, `[[Name\|t]]` | exactly one note named `Name` anywhere → that note | `name` |
 | same, several notes share `Name` | none picked | `ambiguous` |
-| `[[Folder/Name]]` | root-relative exact path (`.md` optional) | `exact` / `missing` |
+| `[[Folder/Name]]` | root-relative exact path (`.md` optional) | `exact` |
+| same, nothing at that path | exactly one note whose path *ends* with `Folder/Name` → that note | `name` |
+| same, several notes end with it | none picked | `ambiguous` |
 | `[[./X]]`, `[[../X]]` | relative to the linking note's folder | `exact` / `missing` |
 | `[[Note.md]]`, `[[Note v2.1]]` | tries a root-level exact path first, then falls back to the name rule | `exact` or `name` |
 | `[text](Note.md)`, `[text](../Note.md)` | relative to the linking note (Markdown semantics), then name fallback | `exact` / `name` / `missing` |
@@ -146,7 +148,10 @@ Every query scans the whole vault: list, read, parse. There is no cache, so
 edits are visible on the next query and nothing needs reloading. A query that
 touches two tables scans twice. For a few thousand notes this is tens of
 milliseconds; for an `s3://` root every query is one `LIST` plus one `GET`
-per note — budget the egress accordingly.
+per note — budget the egress accordingly. Those `GET`s run 16 at a time, so a
+5k-note vault costs about ten seconds of round trips rather than the two and a
+half minutes they would take one after another. A cancelled query stops the
+scan at the next note instead of reading the vault out for nobody.
 
 Notes larger than `max_file_bytes` are skipped with a `warn` log naming the
 path. The cap is enforced twice: on the listed size, and again on the open

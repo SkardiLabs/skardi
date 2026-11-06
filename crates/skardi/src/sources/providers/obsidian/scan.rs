@@ -5,10 +5,13 @@
 //! store inside the same task so an S3 client never crosses runtimes.
 
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use futures::{StreamExt, stream};
 use tokio::runtime::Handle;
 
 use super::config::ScanOptions;
@@ -169,6 +172,54 @@ fn link_row(from_path: &str, raw: &RawLink, source: Source, index: &Index) -> Li
     }
 }
 
+/// Note reads in flight at once. Bounded, not unbounded: a vault is listed
+/// whole, so `buffer_unordered`-style fan-out over 10k notes would open 10k
+/// connections and buffer 10k bodies. 16 is the usual sweet spot for S3 round
+/// trips and costs nothing locally, where each read resolves immediately.
+const READ_CONCURRENCY: usize = 16;
+
+/// Cooperative cancellation for one scan.
+///
+/// `spawn_blocking` tasks cannot be aborted: dropping the `JoinHandle` detaches
+/// the task, it does not stop it. So a cancelled query (a `LIMIT` satisfied
+/// upstream, a dropped client) would otherwise leave the scan reading the whole
+/// vault — on S3, thousands of billed GETs nobody is waiting for. The scan
+/// checks this between notes; [`CancelGuard`] flips it when the stream that
+/// owns it is dropped.
+#[derive(Debug, Clone, Default)]
+pub struct Cancel(Arc<AtomicBool>);
+
+impl Cancel {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Ask the scan to stop. Idempotent, and never blocks.
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    /// A guard that calls [`Cancel::cancel`] when dropped. Hand it to whatever
+    /// owns the query's lifetime; a drop after the scan finished is a no-op.
+    pub fn guard(&self) -> CancelGuard {
+        CancelGuard(self.clone())
+    }
+}
+
+/// Cancels its [`Cancel`] on drop. See [`Cancel::guard`].
+#[derive(Debug)]
+pub struct CancelGuard(Cancel);
+
+impl Drop for CancelGuard {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 /// The scanner. A unit struct so the entry point reads as
 /// `VaultScan::run(root, opts)` at the call sites the spec names.
 pub struct VaultScan;
@@ -177,10 +228,10 @@ impl VaultScan {
     /// Full synchronous scan of `root`. **Blocking**: call only from inside
     /// `spawn_blocking` (see [`run_scan`]); panics outside a Tokio runtime
     /// because it needs `Handle::current()` to drive the S3 arms.
-    pub fn run(root: &str, opts: &ScanOptions) -> Result<Vec<ParsedNote>> {
+    pub fn run(root: &str, opts: &ScanOptions, cancel: &Cancel) -> Result<Vec<ParsedNote>> {
         let (store, prefix) = BlobStore::resolve(root)
             .with_context(|| format!("obsidian: resolving vault root {root}"))?;
-        Self::run_on(&store, &prefix, root, opts)
+        Self::run_on(&store, &prefix, root, opts, cancel)
     }
 
     /// The scan proper, over an already-resolved store. Split out of [`run`]
@@ -195,6 +246,7 @@ impl VaultScan {
         prefix: &Loc,
         root: &str,
         opts: &ScanOptions,
+        cancel: &Cancel,
     ) -> Result<Vec<ParsedNote>> {
         let started = Instant::now();
         let handle = Handle::current();
@@ -217,11 +269,8 @@ impl VaultScan {
         let all_paths: Vec<&str> = kept.iter().map(|e| e.rel_key.as_str()).collect();
         let index = Index::build(&all_paths);
 
-        let mut notes = Vec::new();
         let mut skipped = 0usize;
-        let mut attempted = 0usize;
-        let mut failed = 0usize;
-        let mut first_failure: Option<(String, String)> = None;
+        let mut targets: Vec<&BlobEntry> = Vec::new();
         for entry in &kept {
             if !is_markdown(&entry.rel_key) {
                 continue;
@@ -236,45 +285,82 @@ impl VaultScan {
                 skipped += 1;
                 continue;
             }
-            attempted += 1;
-            let bytes = match handle.block_on(store.get(
-                &entry.loc,
-                ReadOptions::no_symlinks_beneath(prefix).with_max_bytes(opts.max_file_bytes),
-            )) {
-                Ok(bytes) => bytes,
-                Err(e) if e.downcast_ref::<SizeCapExceeded>().is_some() => {
-                    // The note grew past the cap between listing and read.
-                    // Same policy as the listing-time skip, so it is a skip and
-                    // not an attempt: an oversized-only vault stays empty
-                    // rather than tripping the wholesale-failure guard.
-                    tracing::warn!(
-                        path = %entry.rel_key,
-                        max_file_bytes = opts.max_file_bytes,
-                        "obsidian: skipping note that grew past max_file_bytes after listing"
-                    );
-                    attempted -= 1;
-                    skipped += 1;
-                    continue;
-                }
-                Err(e) => {
-                    let cause = format!("{e:#}");
-                    tracing::warn!(path = %entry.rel_key, error = %cause, "obsidian: skipping unreadable note");
-                    failed += 1;
-                    if first_failure.is_none() {
-                        first_failure = Some((entry.rel_key.clone(), cause));
-                    }
-                    continue;
-                }
-            };
-            let text = String::from_utf8_lossy(&bytes);
-            notes.push(parse_note(
-                &entry.rel_key,
-                entry.size,
-                entry.modified,
-                &text,
-                &index,
-            ));
+            targets.push(entry);
         }
+
+        let mut notes = Vec::with_capacity(targets.len());
+        let mut attempted = targets.len();
+        let mut failed = 0usize;
+        let mut first_failure: Option<(String, String)> = None;
+        // One read is one round trip, and a scan is nothing but reads: serially
+        // a 5k-note S3 vault spends ~150s per table at 30ms a GET, and nothing
+        // is cached, so every query pays it again. `buffered` keeps the listing
+        // order (the sort below and the fixture oracles depend on it) while
+        // `READ_CONCURRENCY` of them are in flight; locally the futures resolve
+        // on the spot, so this costs an ordered queue and nothing else.
+        let scanned: Result<()> = handle.block_on(async {
+            let mut reads = stream::iter(targets.iter().copied())
+                .map(|entry| async move {
+                    let bytes = store
+                        .get(
+                            &entry.loc,
+                            ReadOptions::no_symlinks_beneath(prefix)
+                                .with_max_bytes(opts.max_file_bytes),
+                        )
+                        .await;
+                    (entry, bytes)
+                })
+                .buffered(READ_CONCURRENCY);
+
+            while let Some((entry, result)) = reads.next().await {
+                // Between notes, not inside one: a read already in flight is
+                // dropped with the stream when this loop breaks.
+                if cancel.is_cancelled() {
+                    anyhow::bail!(
+                        "obsidian: scan of {root} cancelled after {} of {} notes",
+                        notes.len(),
+                        targets.len()
+                    );
+                }
+                let bytes = match result {
+                    Ok(bytes) => bytes,
+                    Err(e) if e.downcast_ref::<SizeCapExceeded>().is_some() => {
+                        // The note grew past the cap between listing and read.
+                        // Same policy as the listing-time skip, so it is a skip
+                        // and not an attempt: an oversized-only vault stays
+                        // empty rather than tripping the wholesale-failure
+                        // guard.
+                        tracing::warn!(
+                            path = %entry.rel_key,
+                            max_file_bytes = opts.max_file_bytes,
+                            "obsidian: skipping note that grew past max_file_bytes after listing"
+                        );
+                        attempted -= 1;
+                        skipped += 1;
+                        continue;
+                    }
+                    Err(e) => {
+                        let cause = format!("{e:#}");
+                        tracing::warn!(path = %entry.rel_key, error = %cause, "obsidian: skipping unreadable note");
+                        failed += 1;
+                        if first_failure.is_none() {
+                            first_failure = Some((entry.rel_key.clone(), cause));
+                        }
+                        continue;
+                    }
+                };
+                let text = String::from_utf8_lossy(&bytes);
+                notes.push(parse_note(
+                    &entry.rel_key,
+                    entry.size,
+                    entry.modified,
+                    &text,
+                    &index,
+                ));
+            }
+            Ok(())
+        });
+        scanned?;
 
         // Wholesale-failure guard (spec §Failure Modes): policy skips are not
         // attempts, so an oversized-only vault is empty, not an error.
@@ -301,8 +387,12 @@ impl VaultScan {
 
 /// Run [`VaultScan::run`] on the blocking pool. This is the only entry point
 /// async code (the `ExecutionPlan`, tests) should use.
-pub async fn run_scan(root: String, opts: ScanOptions) -> Result<Vec<ParsedNote>> {
-    tokio::task::spawn_blocking(move || VaultScan::run(&root, &opts))
+///
+/// `cancel` stops the scan between notes; hold a [`Cancel::guard`] for the
+/// lifetime of whatever awaits this, because awaiting it is the one thing that
+/// does *not* stop the work when it is dropped.
+pub async fn run_scan(root: String, opts: ScanOptions, cancel: Cancel) -> Result<Vec<ParsedNote>> {
+    tokio::task::spawn_blocking(move || VaultScan::run(&root, &opts, &cancel))
         .await
         .context("obsidian: scan task panicked or was cancelled")?
 }
@@ -336,7 +426,7 @@ mod tests {
     }
 
     async fn scan(root: &Path, opts: ScanOptions) -> anyhow::Result<Vec<ParsedNote>> {
-        run_scan(root.to_string_lossy().into_owned(), opts).await
+        run_scan(root.to_string_lossy().into_owned(), opts, Cancel::new()).await
     }
 
     type LinkSummary<'a> = (
@@ -959,7 +1049,7 @@ mod tests {
         // Same contract as `run_scan`: the synchronous scan drives its futures
         // with `Handle::block_on`, so it belongs on the blocking pool.
         let notes = tokio::task::spawn_blocking(move || {
-            VaultScan::run_on(&store, &prefix, "s3://bk/vault", &opts)
+            VaultScan::run_on(&store, &prefix, "s3://bk/vault", &opts, &Cancel::new())
         })
         .await
         .unwrap()
@@ -1012,5 +1102,35 @@ mod tests {
             .map(|t| (t.tag.as_str(), t.source.as_str()))
             .collect();
         assert_eq!(tags, vec![("中文标签", "body")]);
+    }
+
+    /// A cancelled scan stops and says so, instead of reading the rest of the
+    /// vault. `spawn_blocking` tasks cannot be aborted — dropping the
+    /// `JoinHandle` detaches the task, it does not stop it — so this check is
+    /// the only thing standing between a cancelled query and a full vault of
+    /// billed GETs.
+    #[tokio::test]
+    async fn a_cancelled_scan_stops_and_says_so() {
+        let cancel = Cancel::new();
+        cancel.cancel();
+        let err = run_scan(
+            fixture_root().to_string_lossy().into_owned(),
+            defaults(),
+            cancel,
+        )
+        .await
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("cancelled"), "{msg}");
+    }
+
+    /// What the `ExecutionPlan`'s stream owns: the guard cancels on drop, so a
+    /// dropped stream stops the scan without anyone calling `cancel`.
+    #[test]
+    fn dropping_the_guard_cancels() {
+        let cancel = Cancel::new();
+        assert!(!cancel.is_cancelled());
+        drop(cancel.guard());
+        assert!(cancel.is_cancelled());
     }
 }

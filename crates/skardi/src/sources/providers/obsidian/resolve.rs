@@ -1,9 +1,12 @@
 //! Link resolution: turn a `RawLink` plus the linking note's path into
 //! `(to_path, kind, resolution)` using an index over every listed file.
 //! Pure; the two rule tables in the spec (§Link Resolution) are implemented
-//! one arm each below, with one recorded deviation: a bare dotted wikilink
-//! name (`[[Note v2.1]]`) that is not a root-level file falls through to the
-//! name lookup instead of `missing`, as Obsidian does.
+//! one arm each below, with two recorded deviations, both of them Obsidian's
+//! own behaviour: a bare dotted wikilink name (`[[Note v2.1]]`) that is not a
+//! root-level file falls through to the name lookup instead of `missing`, and
+//! a path-ish wikilink that matches nothing from the vault root falls back to
+//! a unique path suffix (`[[Projects/Notes]]` -> `Work/Projects/Notes.md`).
+//! Markdown links keep the stricter path rules; only wikilinks do this.
 
 use std::collections::HashMap;
 
@@ -67,6 +70,9 @@ pub struct Resolved {
 pub struct Index {
     by_path: HashMap<String, String>,
     by_name: HashMap<String, Vec<String>>,
+    /// Multi-segment tails of every path, for the suffix rule in
+    /// [`Index::resolve_wikilink`].
+    by_suffix: HashMap<String, Vec<String>>,
 }
 
 impl Index {
@@ -90,8 +96,18 @@ impl Index {
                 .entry(name.to_lowercase())
                 .or_default()
                 .push(path.to_string());
+            for suffix in path_suffixes(path) {
+                index
+                    .by_suffix
+                    .entry(suffix)
+                    .or_default()
+                    .push(path.to_string());
+            }
         }
         for candidates in index.by_name.values_mut() {
+            candidates.sort();
+        }
+        for candidates in index.by_suffix.values_mut() {
             candidates.sort();
         }
         index
@@ -135,7 +151,19 @@ impl Index {
             return self.exact_or_missing(normalize(folder_of(from_path), target));
         }
         if target.contains('/') {
-            return self.exact_or_missing(normalize("", target));
+            let Some(candidate) = normalize("", target) else {
+                return (None, Resolution::Missing);
+            };
+            if let Some(path) = self.lookup_exact(&candidate) {
+                return (Some(path), Resolution::Exact);
+            }
+            // Obsidian also resolves a path-ish wikilink by its tail when
+            // nothing sits at that path from the root: in a vault holding
+            // `Work/Projects/Notes.md`, `[[Projects/Notes]]` is that note, not
+            // a broken link. Same outcome vocabulary as a bare name — one hit
+            // is `name`, several are `ambiguous` — because it is the same kind
+            // of lookup: by what the link says, not by where it points.
+            return self.lookup_suffix(&candidate);
         }
         // Bare name. A dot may be an extension (`Home.md`, `a.png`) or part
         // of a title (`Note v2.1`): try the root-level exact match, then fall
@@ -188,6 +216,18 @@ impl Index {
         None
     }
 
+    /// A path-ish target matched against the multi-segment tails of every
+    /// listed path (`Projects/Notes` -> `Work/Projects/Notes.md`). Only
+    /// reached once the root-relative path missed.
+    fn lookup_suffix(&self, candidate: &str) -> (Option<String>, Resolution) {
+        let key = strip_md(candidate).unwrap_or(candidate).to_lowercase();
+        match self.by_suffix.get(&key).map(Vec::as_slice) {
+            Some([only]) => (Some(only.clone()), Resolution::Name),
+            Some([_, _, ..]) => (None, Resolution::Ambiguous),
+            Some([]) | None => (None, Resolution::Missing),
+        }
+    }
+
     /// Bare name: stem for notes (`Note` or `Note.md`), full name otherwise.
     fn lookup_name(&self, target: &str) -> (Option<String>, Resolution) {
         let key = strip_md(target).unwrap_or(target).to_lowercase();
@@ -197,6 +237,26 @@ impl Index {
             Some([]) | None => (None, Resolution::Missing),
         }
     }
+}
+
+/// Every multi-segment tail of `path`, lowercased, with and without the `.md`
+/// extension — the keys a path-ish wikilink can match by suffix.
+///
+/// The one-segment tail is deliberately absent: a bare name is `by_name`'s job,
+/// under different rules (stem only, and it is what Obsidian's "Shortest path"
+/// setting writes). Size is linear in the number of path segments in the vault,
+/// which is why this is built once per scan rather than scanned per link.
+fn path_suffixes(path: &str) -> Vec<String> {
+    let segments: Vec<&str> = path.split('/').collect();
+    let mut out = Vec::new();
+    for start in (0..segments.len().saturating_sub(1)).rev() {
+        let lower = segments[start..].join("/").to_lowercase();
+        if let Some(stem) = strip_md(&lower) {
+            out.push(stem.to_string());
+        }
+        out.push(lower);
+    }
+    out
 }
 
 /// Parent folder of a relative path (`""` at the root).
@@ -357,6 +417,46 @@ mod tests {
             r("Home.md", &wiki("Note: subtitle")),
             (None, Resolution::Missing)
         );
+    }
+
+    /// Obsidian resolves a path-ish wikilink by its tail when nothing sits at
+    /// that path from the vault root, so `[[Projects/Notes]]` finds the note
+    /// filed under `Work/`. Root-relative still wins where it exists, and two
+    /// candidate tails are `ambiguous`, exactly as two candidate names are.
+    #[test]
+    fn a_path_ish_wikilink_falls_back_to_a_unique_suffix() {
+        let nested = Index::build(&["Work/Projects/Notes.md", "Home.md"]);
+        let at = |i: &Index, target: &str| {
+            let res = i.resolve("Home.md", &wiki(target));
+            (res.to_path, res.resolution)
+        };
+        assert_eq!(
+            at(&nested, "Projects/Notes"),
+            ok("Work/Projects/Notes.md", Resolution::Name)
+        );
+        // Case-insensitive, and the written extension changes nothing.
+        assert_eq!(
+            at(&nested, "projects/NOTES.md"),
+            ok("Work/Projects/Notes.md", Resolution::Name)
+        );
+        // The full path is still exact, not a suffix hit.
+        assert_eq!(
+            at(&nested, "Work/Projects/Notes"),
+            ok("Work/Projects/Notes.md", Resolution::Exact)
+        );
+        // A tail nothing ends with stays missing.
+        assert_eq!(at(&nested, "Nope/Notes"), (None, Resolution::Missing));
+
+        // A note at that path from the root wins over a tail elsewhere.
+        let both = Index::build(&["Projects/Notes.md", "Work/Projects/Notes.md"]);
+        assert_eq!(
+            at(&both, "Projects/Notes"),
+            ok("Projects/Notes.md", Resolution::Exact)
+        );
+
+        // Two tails, no winner.
+        let twice = Index::build(&["A/Projects/Notes.md", "B/Projects/Notes.md"]);
+        assert_eq!(at(&twice, "Projects/Notes"), (None, Resolution::Ambiguous));
     }
 
     #[test]

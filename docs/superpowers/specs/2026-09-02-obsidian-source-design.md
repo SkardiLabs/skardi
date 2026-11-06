@@ -294,9 +294,10 @@ The base a path is resolved against depends on the syntax. **Wikilinks** (`[[…
 |---|---|---|
 | `exact` (self) | target is empty (`[[#Heading]]`) | `to_path = from_path` |
 | `exact` (relative) | target starts with `./` or `../` | resolve against the note's folder and normalize; `.md` appended if the result has no extension; must exist, else `missing` |
-| `exact` (vault path) | target contains `/` or has a file extension | match the relative path from the vault root, `.md` optional for notes; must exist, else `missing` |
+| `exact` (vault path) | target contains `/` or has a file extension | match the relative path from the vault root, `.md` optional for notes |
+| `name` (path suffix) | target contains `/` and matched nothing from the root | exactly one file whose path *ends* with the target (at a segment boundary, `.md` optional) → that file; Obsidian resolves `[[Projects/Notes]]` to `Work/Projects/Notes.md` |
 | `name` | exactly one file has that name | that file |
-| `ambiguous` | more than one file has that name | `to_path = NULL` |
+| `ambiguous` | more than one file has that name, or more than one path ends with the target | `to_path = NULL` |
 | `missing` | nothing matched | `to_path = NULL` |
 
 **Markdown links** (`[…](…)`, `![…](…)`) are note-relative, as in CommonMark and as Obsidian's "Relative path to file" format writes them (`[other](other.md)` for a sibling in the same folder, `../x.md` to climb); Obsidian's "Absolute path in vault" format writes root-relative paths in the same syntax, so the root is tried second:
@@ -319,12 +320,12 @@ A bare `[[Alias]]` whose text matches a note's `aliases` entry but no file name 
 ## Scan Execution
 
 1. `BlobStore::list(root, ListOptions { recursive: true, follow_symlinks: false })`. Paths are normalized to forward-slash relative form and filtered by `exclude_globs`. `.md` files are notes; every other path is an attachment candidate for the resolution index. Each entry's `size` and `modified` feed `notes.size_bytes` and `notes.modified_at` directly.
-2. Each note whose listed `size` exceeds `max_file_bytes` is skipped with a `tracing::warn!` naming the path and size — before any read. The rest are read with `BlobStore::get(loc, ReadOptions { follow_symlinks: false })` and decoded lossily as UTF-8. A read that fails — including a path that became a symlink since listing — is skipped with a warning; if at least one read was attempted and every one failed, the scan stops here with an error naming the root, the attempted count, and the first failure (path and cause) — see Failure Modes.
+2. Each note whose listed `size` exceeds `max_file_bytes` is skipped with a `tracing::warn!` naming the path and size — before any read. The rest are read with `BlobStore::get(loc, ReadOptions { follow_symlinks: false })`, up to `READ_CONCURRENCY` (16) in flight and in listing order, and decoded lossily as UTF-8. Between notes the scan checks its cancellation flag and stops with an error if the query that asked for it has gone away. A read that fails — including a path that became a symlink since listing — is skipped with a warning; if at least one read was attempted and every one failed, the scan stops here with an error naming the root, the attempted count, and the first failure (path and cause) — see Failure Modes.
 3. Frontmatter is split and parsed, and its string values are scanned for wikilinks; the body is walked for tags and raw links.
 4. The resolution index is built from all listed paths; every raw link is resolved.
-5. The requesting table projects its columns, applies `LIMIT`, and returns one `RecordBatch`.
+5. The requesting table projects its columns, applies `LIMIT`, and returns the rows as one or more `RecordBatch`es of at most `MAX_BATCH_ROWS` (8192) rows, in row order.
 
-Steps 1–4 run inside one `spawn_blocking` task (see Decisions); step 5 runs on the async side once the task returns. Reads are sequential in the first release. Concurrency is an internal detail that can change without touching the surface.
+Steps 1–4 run inside one `spawn_blocking` task (see Decisions); step 5 runs on the async side once the task returns. The read concurrency and the batch size are internal details that can change without touching the surface.
 
 ## Failure Modes
 
@@ -434,6 +435,21 @@ covered by a test:
   note's folder is never tried (matches the docs' "root-relative" row).
 - **`aliases` with nothing usable** (`""`, `[]`, `[7]`) is NULL, not an empty
   list — one shape for "no aliases".
+- **Path-ish wikilinks fall back to a unique path suffix** (`[[Projects/Notes]]`
+  finds `Work/Projects/Notes.md`), as Obsidian does; the spec's pure
+  root-relative rule reported those as `missing`. Root-relative still wins, two
+  candidate tails are `ambiguous`, and Markdown links keep the stricter rules.
+- **Reads run `READ_CONCURRENCY` (16) at a time**, not one after another: a
+  scan is nothing but round trips, an S3 vault of 5k notes costs ~150s per
+  table serially, and nothing is cached. `buffered` keeps the listing order the
+  final sort and the fixture oracles depend on.
+- **A cancelled query stops the scan.** `spawn_blocking` tasks cannot be
+  aborted, so `ObsidianScanExec`'s stream holds a `Cancel` guard that flips a
+  flag on drop; the scan checks it between notes. Without it a dropped stream
+  left the whole vault being read, and billed, for nobody.
+- **Rows are emitted in `MAX_BATCH_ROWS` (8192) chunks.** `notes.body` is a
+  `Utf8` column, so one batch holding more than 2 GiB of note text overflows
+  its i32 offsets and panics inside Arrow instead of returning an error.
 - **Frontmatter tags** follow the body grammar's digit rule (`2026` dropped,
   `y2026` kept) and lose exactly one leading `#`.
 - **Declared output ordering.** `ObsidianScanExec` declares `notes` by

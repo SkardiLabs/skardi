@@ -28,10 +28,10 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
 };
 use datafusion::prelude::Expr;
-use futures::stream;
+use futures::{StreamExt, stream};
 
 use super::config::ScanOptions;
-use super::scan::{LinkRow, ParsedNote, TagRow, run_scan};
+use super::scan::{Cancel, LinkRow, ParsedNote, TagRow, run_scan};
 use super::{LINKS_TABLE, NOTES_TABLE, OBSIDIAN_SURFACE_VERSION, TAGS_TABLE};
 
 /// Schema-metadata key carrying [`OBSIDIAN_SURFACE_VERSION`].
@@ -261,22 +261,30 @@ impl ExecutionPlan for ObsidianScanExec {
         let projection = self.projection.clone();
         let limit = self.limit;
         let batch_schema = schema.clone();
+        let cancel = Cancel::new();
+        let guard = cancel.guard();
         // The scan runs on the blocking pool (see scan.rs); nothing here blocks
-        // the worker that polls this stream.
-        let batch = async move {
-            let notes = run_scan(root, opts)
+        // the worker that polls this stream. The guard lives inside this
+        // future, which is what makes a cancelled query stop the scan: dropping
+        // the stream drops the future, the guard with it, and the scan gives up
+        // at its next note. Dropping the `JoinHandle` alone would not — a
+        // `spawn_blocking` task detaches rather than stops.
+        let batches = async move {
+            let _guard = guard;
+            let notes = run_scan(root, opts, cancel)
                 .await
                 .map_err(|e| DataFusionError::External(e.into()))?;
-            build_batch(kind, &notes, &batch_schema, &projection, limit)
+            build_batches(kind, &notes, &batch_schema, &projection, limit)
         };
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            schema,
-            stream::once(batch),
-        )))
+        let stream = stream::once(batches).flat_map(|result| match result {
+            Ok(batches) => stream::iter(batches.into_iter().map(Ok).collect::<Vec<_>>()),
+            Err(e) => stream::iter(vec![Err(e)]),
+        });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 }
 
-/// The order [`build_batch`] emits rows in, as far as the projection keeps the
+/// The order [`build_batches`] emits rows in, as far as the projection keeps the
 /// leading columns: `notes` by `path`; `links` by `from_path` (within a note
 /// frontmatter links precede body links by line, which is not a column order,
 /// so only that prefix is declared); `tags` by `(path, tag, source)`. Declaring
@@ -327,19 +335,32 @@ fn columns(
         .collect()
 }
 
-/// Project + limit the parsed notes into one batch of `kind`. An empty
-/// projection (`count(*)`) still carries the row count.
-pub(crate) fn build_batch(
+/// Rows per emitted batch.
+///
+/// Not a tuning knob: `notes.body` is a `Utf8` column, whose offsets are `i32`,
+/// so a single batch holding more than 2 GiB of note text overflows inside
+/// Arrow — a panic in the middle of a scan rather than an error a caller can
+/// see. A vault that big is rare but entirely legal (`max_file_bytes` caps one
+/// note, not the vault), and chunking costs nothing: the row order across
+/// batches is the order within one, so [`declared_ordering`] still holds.
+const MAX_BATCH_ROWS: usize = 8 * 1024;
+
+/// Project + limit the parsed notes into batches of `kind`, in row order. An
+/// empty projection (`count(*)`) still carries the row count, and an empty
+/// vault still yields one empty batch.
+pub(crate) fn build_batches(
     kind: TableKind,
     notes: &[ParsedNote],
     projected_schema: &SchemaRef,
     projection: &[usize],
     limit: Option<usize>,
-) -> datafusion::common::Result<RecordBatch> {
-    let (row_count, arrays) = match kind {
+) -> datafusion::common::Result<Vec<RecordBatch>> {
+    match kind {
         TableKind::Notes => {
             let rows = truncate(notes, limit);
-            (rows.len(), columns(projection, |i| notes_column(i, rows))?)
+            chunked(rows, projected_schema, |chunk| {
+                columns(projection, |i| notes_column(i, chunk))
+            })
         }
         TableKind::Links => {
             let all: Vec<(&str, &LinkRow)> = notes
@@ -347,7 +368,9 @@ pub(crate) fn build_batch(
                 .flat_map(|n| n.links.iter().map(move |l| (n.path.as_str(), l)))
                 .collect();
             let rows = truncate(&all, limit);
-            (rows.len(), columns(projection, |i| links_column(i, rows))?)
+            chunked(rows, projected_schema, |chunk| {
+                columns(projection, |i| links_column(i, chunk))
+            })
         }
         TableKind::Tags => {
             let all: Vec<(&str, &TagRow)> = notes
@@ -355,9 +378,34 @@ pub(crate) fn build_batch(
                 .flat_map(|n| n.tags.iter().map(move |t| (n.path.as_str(), t)))
                 .collect();
             let rows = truncate(&all, limit);
-            (rows.len(), columns(projection, |i| tags_column(i, rows))?)
+            chunked(rows, projected_schema, |chunk| {
+                columns(projection, |i| tags_column(i, chunk))
+            })
         }
-    };
+    }
+}
+
+/// `rows` in `MAX_BATCH_ROWS`-sized batches, built by `arrays_for`. No rows
+/// still means one batch: the consumer needs the schema, and `count(*)` over an
+/// empty vault must see a zero-row batch rather than nothing at all.
+fn chunked<T>(
+    rows: &[T],
+    projected_schema: &SchemaRef,
+    mut arrays_for: impl FnMut(&[T]) -> datafusion::common::Result<Vec<ArrayRef>>,
+) -> datafusion::common::Result<Vec<RecordBatch>> {
+    if rows.is_empty() {
+        return Ok(vec![batch(projected_schema, arrays_for(rows)?, 0)?]);
+    }
+    rows.chunks(MAX_BATCH_ROWS)
+        .map(|chunk| batch(projected_schema, arrays_for(chunk)?, chunk.len()))
+        .collect()
+}
+
+fn batch(
+    projected_schema: &SchemaRef,
+    arrays: Vec<ArrayRef>,
+    row_count: usize,
+) -> datafusion::common::Result<RecordBatch> {
     let options = RecordBatchOptions::new().with_row_count(Some(row_count));
     RecordBatch::try_new_with_options(projected_schema.clone(), arrays, &options)
         .map_err(|e| DataFusionError::Execution(format!("obsidian: building RecordBatch: {e}")))
@@ -453,6 +501,21 @@ mod tests {
 
     fn epoch() -> DateTime<Utc> {
         DateTime::<Utc>::from(UNIX_EPOCH)
+    }
+
+    /// The single batch these fixtures fit in. Asserting the count here keeps
+    /// every other test reading as "one batch, these rows" while
+    /// [`build_batches`] is free to chunk.
+    fn build_batch(
+        kind: TableKind,
+        notes: &[ParsedNote],
+        projected_schema: &SchemaRef,
+        projection: &[usize],
+        limit: Option<usize>,
+    ) -> datafusion::common::Result<RecordBatch> {
+        let mut batches = build_batches(kind, notes, projected_schema, projection, limit)?;
+        assert_eq!(batches.len(), 1, "fixture should fit one batch");
+        Ok(batches.remove(0))
     }
 
     fn two_notes() -> Vec<ParsedNote> {
@@ -642,5 +705,47 @@ mod tests {
         let text = arrow::util::pretty::pretty_format_batches(&plan)?.to_string();
         assert!(text.contains("ObsidianScanExec"), "{text}");
         Ok(())
+    }
+
+    /// Past `MAX_BATCH_ROWS` the scan emits several batches, in row order and
+    /// without losing or duplicating a row. The split exists because
+    /// `notes.body` is a `Utf8` column: one batch holding more than 2 GiB of
+    /// note text overflows its i32 offsets and panics inside Arrow.
+    #[test]
+    fn a_large_vault_comes_out_in_several_batches() {
+        // Turbofish: an empty slice cannot infer the path type.
+        let index = Index::build::<&str>(&[]);
+        let rows = MAX_BATCH_ROWS + 7;
+        let notes: Vec<ParsedNote> = (0..rows)
+            .map(|i| parse_note(&format!("{i:06}.md"), 1, epoch(), "x\n", &index))
+            .collect();
+        let schema = TableKind::Notes.schema();
+        let all: Vec<usize> = (0..schema.fields().len()).collect();
+
+        let batches = build_batches(TableKind::Notes, &notes, &schema, &all, None).unwrap();
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].num_rows(), MAX_BATCH_ROWS);
+        assert_eq!(batches[1].num_rows(), 7);
+        assert_eq!(
+            batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+            rows,
+            "every row survives the split"
+        );
+        // The order across batches is the order within one, which is what
+        // `declared_ordering` promises the planner.
+        let first_path = |b: &RecordBatch| b.column(0).as_string::<i32>().value(0).to_string();
+        assert_eq!(first_path(&batches[0]), "000000.md");
+        assert_eq!(first_path(&batches[1]), format!("{MAX_BATCH_ROWS:06}.md"));
+    }
+
+    /// An empty vault is still a batch: the consumer needs the schema, and
+    /// `count(*)` must see a zero-row batch rather than no batch at all.
+    #[test]
+    fn an_empty_vault_still_yields_one_empty_batch() {
+        let schema = TableKind::Notes.schema();
+        let all: Vec<usize> = (0..schema.fields().len()).collect();
+        let batches = build_batches(TableKind::Notes, &[], &schema, &all, None).unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 0);
     }
 }
