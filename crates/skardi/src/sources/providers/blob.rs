@@ -425,17 +425,24 @@ fn list_local(root: &Path, opts: ListOptions) -> Result<Vec<BlobEntry>> {
                 }
                 continue;
             }
+            // A file that cannot be stat-ed is still listed, with unknown size
+            // and mtime, so the read decides its fate: dropping it here would
+            // make it vanish from the listing instead of counting as the fetch
+            // failure it is, quietly shrinking `documents`' failure count and
+            // hiding a note from obsidian's wholesale-failure guard. `size = 0`
+            // also means no size policy can skip it before that read.
             let meta = match std::fs::metadata(&path) {
-                Ok(m) => m,
+                Ok(m) => Some(m),
                 Err(e) => {
-                    tracing::warn!(path = %path.display(), error = %e, "blob: cannot stat");
-                    continue;
+                    tracing::warn!(path = %path.display(), error = %e, "blob: cannot stat; listing it unsized so the read reports the failure");
+                    None
                 }
             };
             let modified = meta
-                .modified()
+                .as_ref()
+                .and_then(|m| m.modified().ok())
                 .map(DateTime::<Utc>::from)
-                .unwrap_or_else(|_| DateTime::<Utc>::from(std::time::UNIX_EPOCH));
+                .unwrap_or_else(|| DateTime::<Utc>::from(std::time::UNIX_EPOCH));
             // Joined from the path's components rather than `to_string_lossy`
             // with the OS separator replaced: on unix a `\` is a legal
             // character in a file name, and replacing it would forge a
@@ -449,7 +456,7 @@ fn list_local(root: &Path, opts: ListOptions) -> Result<Vec<BlobEntry>> {
                 rel_key.push_str(&component.as_os_str().to_string_lossy());
             }
             out.push(BlobEntry {
-                size: meta.len(),
+                size: meta.as_ref().map(|m| m.len()).unwrap_or(0),
                 modified,
                 loc: Loc::Local(path),
                 rel_key,
@@ -1027,6 +1034,44 @@ mod tests {
             .unwrap();
         let rels: Vec<&str> = listed.iter().map(|e| e.rel_key.as_str()).collect();
         assert_eq!(rels, vec![r"sub/a\b.md"]);
+    }
+
+    /// A listed file that cannot be stat-ed stays in the listing, unsized, so
+    /// the read reports it. Dropping it here would make it vanish: `documents`
+    /// would stop counting it as a fetch failure, and obsidian's
+    /// wholesale-failure guard would never see it. A dangling symlink under
+    /// `follow_symlinks: true` is the cheap way to produce one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_list_keeps_a_file_it_cannot_stat() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("real.md"), b"R").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("gone.md"), dir.path().join("dangling.md"))
+            .unwrap();
+        let prefix = Loc::Local(dir.path().to_path_buf());
+
+        let listed = BlobStore::Local
+            .list(
+                &prefix,
+                ListOptions {
+                    recursive: true,
+                    follow_symlinks: true,
+                },
+            )
+            .await
+            .unwrap();
+        let rels: Vec<&str> = listed.iter().map(|e| e.rel_key.as_str()).collect();
+        assert_eq!(rels, vec!["dangling.md", "real.md"]);
+        let dangling = &listed[0];
+        assert_eq!(dangling.size, 0, "unknown size, not a skipped entry");
+
+        // And the read is where it fails, naming the path.
+        let err = BlobStore::Local
+            .get(&dangling.loc, ReadOptions::follow())
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("dangling.md"), "{msg}");
     }
 
     #[cfg(unix)]
