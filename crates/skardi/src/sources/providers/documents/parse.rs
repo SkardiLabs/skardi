@@ -13,7 +13,7 @@ use liteparse::config::ImageMode as LpImageMode;
 use liteparse::types::PdfInput;
 use liteparse::{LiteParse, LiteParseConfig, OutputFormat};
 
-use super::blob::{BlobStore, Loc};
+use crate::sources::providers::blob::{BlobEntry, BlobStore, ListOptions, Loc, ReadOptions};
 
 /// How raster images on a page are surfaced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,17 +276,25 @@ async fn list_docs(
     prefix: &Loc,
     opts: &ParseOptions,
     image_store: Option<&Loc>,
-) -> Result<Vec<(Loc, String)>> {
-    let entries = store.list(prefix, opts.recursive).await?;
+) -> Result<Vec<BlobEntry>> {
+    let entries = store
+        .list(
+            prefix,
+            ListOptions {
+                recursive: opts.recursive,
+                follow_symlinks: true,
+            },
+        )
+        .await?;
     Ok(entries
         .into_iter()
-        .filter(|(loc, rel)| {
-            let name = rel.rsplit('/').next().unwrap_or(rel);
+        .filter(|entry| {
+            let name = entry.rel_key.rsplit('/').next().unwrap_or(&entry.rel_key);
             if !matches_globs(name, &opts.include_globs) {
                 return false;
             }
             if let Some(base) = image_store {
-                if loc_is_under(loc, base) {
+                if loc_is_under(&entry.loc, base) {
                     return false;
                 }
             }
@@ -671,8 +679,13 @@ fn scan_blocking(
     let mut rows = Vec::new();
     let mut ok_files = 0usize;
     let mut writes = WriteTally::default();
-    for (loc, rel_path) in entries {
-        let bytes = match runtime.block_on(read_store.get(&loc)) {
+    for BlobEntry {
+        loc,
+        rel_key: rel_path,
+        ..
+    } in entries
+    {
+        let bytes = match runtime.block_on(read_store.get(&loc, ReadOptions::follow())) {
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!("documents: fetch failed for {}: {:#}", rel_path, e);
@@ -1276,7 +1289,7 @@ mod tests {
             .await
             .unwrap()
             .into_iter()
-            .map(|(_, r)| r)
+            .map(|e| e.rel_key)
             .collect();
         assert_eq!(rels, vec!["sub/nested.pdf", "top.pdf"]); // .txt filtered out
 
@@ -1288,7 +1301,7 @@ mod tests {
             .await
             .unwrap()
             .into_iter()
-            .map(|(_, r)| r)
+            .map(|e| e.rel_key)
             .collect();
         assert_eq!(rels, vec!["top.pdf"]);
     }
@@ -1316,7 +1329,7 @@ mod tests {
             .await
             .unwrap()
             .into_iter()
-            .map(|(_, r)| r)
+            .map(|e| e.rel_key)
             .collect();
         assert_eq!(with_excl, vec!["a.pdf"]);
 
@@ -1324,7 +1337,7 @@ mod tests {
             .await
             .unwrap()
             .into_iter()
-            .map(|(_, r)| r)
+            .map(|e| e.rel_key)
             .collect();
         assert_eq!(without_excl, vec!["a.pdf", "crops/a.pdf_img0.png"]);
     }
@@ -1369,13 +1382,13 @@ mod tests {
 
         let entries = list_docs(&store, &prefix, &opts, None).await.unwrap();
         let mut got: Vec<(String, Vec<u8>)> = Vec::new();
-        for (loc, rel) in &entries {
+        for entry in &entries {
             // The provider's fetch: the listed location, never a rebuilt name.
             let bytes = store
-                .get(loc)
+                .get(&entry.loc, ReadOptions::follow())
                 .await
-                .unwrap_or_else(|e| panic!("fetch {rel:?}: {e:#}"));
-            got.push((rel.clone(), bytes));
+                .unwrap_or_else(|e| panic!("fetch {:?}: {e:#}", entry.rel_key));
+            got.push((entry.rel_key.clone(), bytes));
         }
         got.sort();
 

@@ -314,6 +314,15 @@ jobs:
         # and were caught only by the doctest step below; a `#[cfg(test)]`
         # allowlist entry survived it and was caught only by `--all-targets`.
         run: cargo check --all
+      - name: Check single-feature builds
+        # `documents` and `obsidian` share providers/blob.rs and each must
+        # build on its own (obsidian spec acceptance). Neither `cargo check
+        # --all` nor `--all-features` compiles either shape, so a symbol only
+        # one of them uses would rot unnoticed. Checking the server pulls the
+        # library in with exactly that one feature.
+        run: |
+          cargo check -p skardi-server --features documents
+          cargo check -p skardi-server --features obsidian
       - name: The source pack stays importable by a syncer
         # `skardi-source-pack` exists so the engine, cloud's ETL runner
         # and cloud's rbac syncer share one Open Connector client. Two of
