@@ -11,10 +11,11 @@ use super::{
     LoginOptions, Selection, login, oauth, parse_expires, render_workspace_menu, select_memberships,
 };
 use chrono::{DateTime, Duration, Utc};
+use rstest::rstest;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
-use wiremock::matchers::{body_string_contains, method, path, path_regex};
+use wiremock::matchers::{body_string_contains, header, method, path, path_regex};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 fn at(rfc3339: &str) -> DateTime<Utc> {
@@ -121,8 +122,11 @@ fn options(control_plane: &str, server_override: Option<&str>) -> LoginOptions {
         open_browser: oauth::open_in_browser,
         verify_timeout: std::time::Duration::from_millis(200),
         callback_timeout: std::time::Duration::from_millis(50),
+        poll_interval: std::time::Duration::from_millis(1),
         token_name: "cli@test-host".to_string(),
         now: at("2026-08-24T12:00:00Z"),
+        control: false,
+        setup: None,
     }
 }
 
@@ -698,7 +702,17 @@ async fn a_non_dev_identity_bearer_is_refused_by_shape() {
 }
 
 #[tokio::test]
-async fn the_browser_path_needs_a_client_id_and_says_so() {
+async fn a_missing_client_id_now_brokers_through_the_console_instead_of_failing() {
+    // This case used to be a dead end: no identity and no usable client id
+    // meant "no OAuth client id: pass --client-id, set
+    // $SKARDI_OAUTH_CLIENT_ID, or use --identity dev:<id>". Every deployment
+    // that wanted CLI access therefore had to provision a Google Desktop
+    // client first, which is the whole problem design 2026-09-08 removes.
+    //
+    // It is now the DEFAULT path, so the assertion inverts: the flow proceeds
+    // and fails at the console, not at the flag check. `127.0.0.1:1` answers
+    // nothing, so the error names the console it could not reach — proof the
+    // broker was selected rather than the OAuth path.
     let home = TempDir::new().unwrap();
     let mut options = options("http://127.0.0.1:1", Some("http://gw.example"));
     options.identity = None;
@@ -707,8 +721,12 @@ async fn the_browser_path_needs_a_client_id_and_says_so() {
         .await
         .unwrap_err()
         .to_string();
-    assert!(err.contains("--client-id"), "{err}");
-    assert!(err.contains("SKARDI_OAUTH_CLIENT_ID"), "{err}");
+    assert!(err.contains("cannot reach the console"), "{err}");
+    assert!(err.contains("cli-login/requests"), "{err}");
+    assert!(
+        !err.contains("SKARDI_OAUTH_CLIENT_ID"),
+        "a client id is no longer required: {err}"
+    );
 }
 
 #[tokio::test]
@@ -930,6 +948,25 @@ async fn the_browser_path_presents_the_id_token_to_the_control_plane() {
     let written = std::fs::read_to_string(&path).unwrap();
     assert!(!written.contains("the-id-token"), "{written}");
     assert!(written.contains("skardi_pat_tok-1"), "{written}");
+
+    // The CLI identifies itself to the control plane, and not to the identity
+    // provider: the token endpoint is Google's in production, a third party.
+    let user_agent = |r: &Request| {
+        r.headers
+            .get("user-agent")
+            .map(|v| v.to_str().unwrap().to_string())
+    };
+    assert!(
+        user_agent(discovery).is_some_and(|ua| ua.starts_with("skardi-cli")),
+        "{:?}",
+        user_agent(discovery)
+    );
+    let token = requests
+        .iter()
+        .find(|r| r.url.path() == "/token")
+        .expect("the code was redeemed");
+    assert_eq!(user_agent(token), None);
+    assert!(!token.headers.contains_key("dnt"));
 }
 
 #[test]
@@ -1192,4 +1229,1763 @@ async fn a_rejected_probe_does_not_advise_the_env_var_it_refuses() {
         ["tok-1"]
     );
     assert!(!path.exists());
+}
+
+// ── The console-brokered flow (design 2026-09-08) ────────────────────────
+//
+// Driven against a wiremock CONSOLE rather than a control plane, because that
+// is what the CLI talks to on this path: skardi-global has no public ingress
+// in any deployment we run, which is the reason the flow exists. The two
+// session-less routes are forwarded by the console's BFF under
+// `/api/global/v1/cli-login/*`.
+
+/// A console whose exchange answers `body` with `status`.
+///
+/// The open call always succeeds — every case below is about what happens
+/// after a request exists.
+async fn console(status: u16, exchange_body: Value) -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/global/v1/cli-login/requests"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "request_id": "7f3a9c0000000000000000000000abcd",
+            "confirm": "7f3a9c",
+            // Three seconds past `options()`'s frozen clock, not the real
+            // five minutes: the deadline is derived from THIS value, so the
+            // production TTL here would make the give-up test sleep for five
+            // actual minutes.
+            "expires_at": "2026-08-24T12:00:03Z",
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/global/v1/cli-login/exchange"))
+        .respond_with(ResponseTemplate::new(status).set_body_json(exchange_body))
+        .mount(&server)
+        .await;
+    server
+}
+
+/// An approved exchange for one workspace, with the membership §11.2 sends
+/// along.
+fn approved(workspace: &str, gateway_url: &str, token_id: &str) -> Value {
+    json!({
+        "status": "approved",
+        "token": format!("skardi_pat_{token_id}"),
+        "token_id": token_id,
+        "expires_at": "2026-11-22T12:00:00Z",
+        "workspace": workspace,
+        "memberships": [membership("acme", workspace, "active", Some(gateway_url))],
+    })
+}
+
+/// A config file already holding a cloud context for `acme/my-ws`, so the
+/// replacement rule has something to replace.
+fn existing_cloud_context() -> String {
+    [
+        "contexts:",
+        "  - name: acme/my-ws",
+        "    mode: cloud",
+        "    server: http://gw.example",
+        "    workspace: my-ws",
+        "    token: skardi_pat_old",
+        "    token-id: tok-old",
+    ]
+    .join("\n")
+        + "\n"
+}
+
+/// The brokered path's own options: no identity and no client id, which is
+/// what selects it (§9).
+fn broker_options(console_base: &str) -> LoginOptions {
+    let mut options = options(console_base, None);
+    options.identity = None;
+    options.client_id = None;
+    options
+}
+
+#[tokio::test]
+async fn a_browser_login_writes_the_context_from_the_token_the_console_brokered() {
+    let gw = gateway(200).await;
+    let console = console(200, approved("my-ws", &gw.uri(), "tok-1")).await;
+    let home = TempDir::new().unwrap();
+
+    let report = login(broker_options(&console.uri()), &config_in(&home))
+        .await
+        .unwrap();
+
+    assert_eq!(report.written.len(), 1, "one approval, one workspace");
+    let written = &report.written[0];
+    assert_eq!(written.name, "acme/my-ws");
+    assert_eq!(written.workspace, "my-ws");
+    assert_eq!(report.current_context.as_deref(), Some("acme/my-ws"));
+
+    // No mint and no membership listing: the console already did both, which
+    // is what makes this path work with no client id and no IdP.
+    let seen = console.received_requests().await.unwrap();
+    assert!(
+        mint_bodies(&seen).is_empty(),
+        "the CLI must not mint on this path"
+    );
+    assert!(
+        !seen.iter().any(|r| r.url.path() == "/v1/me/workspaces"),
+        "memberships ride along with the exchange (§11.2)"
+    );
+
+    // The context holds the brokered token AND its id — the id is what a later
+    // login names when it replaces this credential.
+    let file = read_yaml(&config_in(&home));
+    let context = &file["contexts"][0];
+    assert_eq!(context["token"].as_str(), Some("skardi_pat_tok-1"));
+    assert_eq!(context["token-id"].as_str(), Some("tok-1"));
+}
+
+#[tokio::test]
+async fn the_open_call_carries_the_pkce_challenge_the_expiry_and_the_machine_name() {
+    let gw = gateway(200).await;
+    let console = console(200, approved("my-ws", &gw.uri(), "tok-1")).await;
+    let home = TempDir::new().unwrap();
+    login(broker_options(&console.uri()), &config_in(&home))
+        .await
+        .unwrap();
+
+    let seen = console.received_requests().await.unwrap();
+    let opened: Value = seen
+        .iter()
+        .find(|r| r.url.path() == "/api/global/v1/cli-login/requests")
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .expect("the flow opens a request");
+
+    // 43 characters is RFC 7636's floor and what `Pkce` produces; the server
+    // refuses anything outside 43..=128.
+    let challenge = opened["challenge"].as_str().unwrap();
+    assert_eq!(challenge.len(), 43, "an S256 challenge: {challenge}");
+    // `--expires` has to ride the OPEN call: the mint happens minutes later in
+    // a browser that never sees the flag.
+    assert_eq!(
+        opened["token_expires_at"].as_str(),
+        Some("2026-11-22T12:00:00+00:00"),
+        "90 days from the injected clock"
+    );
+    // What the consent screen shows, and what the PAT is named upstream — one
+    // name per machine whichever flow wrote it.
+    assert_eq!(opened["client_desc"].as_str(), Some("cli@test-host"));
+
+    // And the exchange proves ownership with the verifier, never the challenge.
+    let exchanged: Value = seen
+        .iter()
+        .find(|r| r.url.path() == "/api/global/v1/cli-login/exchange")
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .expect("the flow polls the exchange");
+    let verifier = exchanged["verifier"].as_str().unwrap();
+    assert_ne!(verifier, challenge, "the verifier is not the challenge");
+    assert_eq!(
+        exchanged["request_id"].as_str(),
+        Some("7f3a9c0000000000000000000000abcd")
+    );
+}
+
+#[rstest]
+#[case::workspace(Selection::Named("other".to_string()), "--workspace 'other'")]
+#[case::all_workspaces(Selection::All, "--all-workspaces")]
+#[tokio::test]
+async fn a_browser_login_refuses_the_flags_it_cannot_honour(
+    #[case] selection: Selection,
+    #[case] expected: &str,
+) {
+    // The consent screen chooses the workspaces, so neither flag has an honest
+    // reading here — and quietly logging into the set the browser chose when
+    // `--workspace` named another is a success discovered much later.
+    let home = TempDir::new().unwrap();
+    let mut options = broker_options("http://127.0.0.1:1");
+    options.selection = selection;
+    let err = login(options, &config_in(&home))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains(expected), "{err}");
+    // Points at the flows that CAN do it, rather than only refusing. Both are
+    // named, because `--identity` opts out of the broker too.
+    assert!(err.contains("--client-id"), "{err}");
+    assert!(err.contains("--identity"), "{err}");
+}
+
+#[tokio::test]
+async fn a_console_without_the_cli_login_route_says_so_and_names_the_alternative() {
+    // What an older console looks like from here: its BFF allowlist has no
+    // CLI-login entry, so its own proxy answers 403. Nothing the user retypes
+    // fixes it, so the message has to name the flag that still works.
+    let console = console(
+        403,
+        json!({ "error": { "code": "route_not_allowed",
+        "message": "this endpoint is not part of the console surface" } }),
+    )
+    .await;
+    let home = TempDir::new().unwrap();
+    let err = login(broker_options(&console.uri()), &config_in(&home))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("does not support browser-brokered"), "{err}");
+    assert!(err.contains("--client-id"), "{err}");
+}
+
+#[tokio::test]
+async fn an_expired_or_redeemed_request_tells_the_user_to_run_login_again() {
+    // One server answer covers expired, unknown and already-redeemed —
+    // deliberately, so the endpoint cannot enumerate live ids — so the CLI has
+    // to translate it into the action that fixes all three.
+    let console = console(
+        404,
+        json!({ "error": { "code": "no_such_request",
+        "message": "no such CLI login request" } }),
+    )
+    .await;
+    let home = TempDir::new().unwrap();
+    let err = login(broker_options(&console.uri()), &config_in(&home))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("no longer open"), "{err}");
+    assert!(err.contains("skardi login"), "{err}");
+}
+
+#[tokio::test]
+async fn nobody_approving_expires_with_the_deadline_named() {
+    let console = console(200, json!({ "status": "pending" })).await;
+    let home = TempDir::new().unwrap();
+    let err = login(broker_options(&console.uri()), &config_in(&home))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("nobody approved this login"), "{err}");
+    // Nothing was written, and there is no credential to warn about — the
+    // exchange never handed one over.
+    assert!(
+        !config_in(&home).exists(),
+        "no context on an unapproved login"
+    );
+    assert!(!err.contains("Revoke token"), "nothing was minted: {err}");
+}
+
+/// The give-up deadline comes from the SERVER's request expiry, not from the
+/// local OAuth callback timeout.
+///
+/// The two differ by design — a brokered request lives five minutes, the
+/// loopback listener waits 120 seconds — so using the local one abandoned the
+/// poll while the request was still open and told the human they had not
+/// approved in time when they had minutes left. `options()` sets a 50ms
+/// callback timeout and the console reports an expiry 3s past the frozen
+/// clock, so the reported budget names which one was used.
+#[tokio::test]
+async fn the_poll_deadline_comes_from_the_request_expiry_not_the_callback_timeout() {
+    let console = console(200, json!({ "status": "pending" })).await;
+    let home = TempDir::new().unwrap();
+    let options = broker_options(&console.uri());
+    assert_eq!(
+        options.callback_timeout,
+        std::time::Duration::from_millis(50),
+        "the fixture must make the two budgets distinguishable"
+    );
+
+    let err = login(options, &config_in(&home))
+        .await
+        .unwrap_err()
+        .to_string();
+    // 3s is the console's expiry; the callback timeout would render as 0s.
+    assert!(err.contains("within 3s"), "{err}");
+    assert!(!err.contains("within 0s"), "{err}");
+}
+
+/// A brokered login records the console under `console:`, leaving
+/// `control-plane:` alone.
+///
+/// They are different services: `ControlPlane` appends bare `/v1/me/...`,
+/// while a console serves that API under `/api/global/v1/...` and only to a
+/// browser holding a session. Recording a console URL as `control-plane`
+/// poisoned every later direct call — a `logout --revoke` cleared the local
+/// credential and then sent `DELETE /v1/me/tokens/{id}` at the console, which
+/// replied with its own 404 page.
+#[tokio::test]
+async fn a_brokered_login_records_the_console_url_under_its_own_key() {
+    let gw = gateway(200).await;
+    let console = console(200, approved("my-ws", &gw.uri(), "tok-1")).await;
+    let home = TempDir::new().unwrap();
+    login(broker_options(&console.uri()), &config_in(&home))
+        .await
+        .unwrap();
+
+    let file = read_yaml(&config_in(&home));
+    assert_eq!(file["console"].as_str(), Some(console.uri().as_str()));
+    assert!(
+        file["control-plane"].is_null(),
+        "a console URL must not become the control-plane API base: {file:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_brokered_credential_that_cannot_query_is_reported_by_id_not_revoked() {
+    // The saga's counterpart revokes here. This path cannot: a PAT
+    // authenticates to the gateway, and skardi-global's `/v1/*` does not
+    // accept one — so the id is the only thing standing between the user and
+    // a live credential nobody knows exists.
+    let gw = gateway(403).await;
+    let console = console(200, approved("my-ws", &gw.uri(), "tok-live")).await;
+    let home = TempDir::new().unwrap();
+
+    let err = login(broker_options(&console.uri()), &config_in(&home))
+        .await
+        .unwrap_err();
+    let rendered = format!("{err:#}");
+    assert!(rendered.contains("could not query"), "{rendered}");
+    assert!(rendered.contains("Revoke token tok-live"), "{rendered}");
+    assert!(rendered.contains("cannot revoke"), "{rendered}");
+    // And no context was written, so the failure is not half-committed.
+    assert!(!config_in(&home).exists(), "{rendered}");
+}
+
+#[tokio::test]
+async fn a_brokered_relogin_reports_the_replaced_token_it_cannot_revoke() {
+    let gw = gateway(200).await;
+    let console = console(200, approved("my-ws", &gw.uri(), "tok-2")).await;
+    let home = TempDir::new().unwrap();
+    let path = config_in(&home);
+
+    // A context already holding a credential from an earlier login.
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, existing_cloud_context()).unwrap();
+
+    let report = login(broker_options(&console.uri()), &config_in(&home))
+        .await
+        .unwrap();
+
+    // Nothing was revoked, and nothing pretends to have been: the old id is
+    // reported through the same channel a FAILED revoke uses, because the
+    // outcome for the user is identical — go revoke it in the console.
+    assert!(report.replaced_revoked.is_empty());
+    assert_eq!(report.revoke_failures.len(), 1);
+    let (token_id, reason) = &report.revoke_failures[0];
+    assert_eq!(token_id, "tok-old");
+    assert!(reason.contains("cannot revoke"), "{reason}");
+    assert!(
+        revoked_ids(&console.received_requests().await.unwrap()).is_empty(),
+        "the CLI must not attempt a revoke it cannot authenticate"
+    );
+
+    // The new credential did land.
+    let file = read_yaml(&path);
+    assert_eq!(file["contexts"][0]["token-id"].as_str(), Some("tok-2"));
+}
+
+#[tokio::test]
+async fn keep_old_token_reports_the_replacement_as_kept_rather_than_stranded() {
+    let gw = gateway(200).await;
+    let console = console(200, approved("my-ws", &gw.uri(), "tok-2")).await;
+    let home = TempDir::new().unwrap();
+    let path = config_in(&home);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, existing_cloud_context()).unwrap();
+
+    let mut options = broker_options(&console.uri());
+    options.keep_old_token = true;
+    let report = login(options, &config_in(&home)).await.unwrap();
+
+    // Asked for deliberately, so it is not a warning — an agent mid-task is
+    // still holding the old credential.
+    assert_eq!(report.replaced_kept, vec!["tok-old".to_string()]);
+    assert!(report.revoke_failures.is_empty());
+}
+
+#[tokio::test]
+async fn an_approval_with_no_membership_is_fatal_and_names_the_live_token() {
+    // Exceptional: the approved membership vanished between approval and
+    // redemption. Fatal because the context name is `<org>/<workspace>` and
+    // the org slug has nowhere else to come from — and by this point a
+    // credential exists that this CLI cannot revoke.
+    let console = console(
+        200,
+        json!({
+            "status": "approved",
+            "token": "skardi_pat_orphan",
+            "token_id": "tok-orphan",
+            "workspace": "my-ws",
+            "memberships": [],
+        }),
+    )
+    .await;
+    let home = TempDir::new().unwrap();
+    let err = login(broker_options(&console.uri()), &config_in(&home))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("no membership"), "{err}");
+    assert!(err.contains("revoke token tok-orphan"), "{err}");
+}
+
+/// An approved exchange for several workspaces (skardi-cloud #1217): ONE token,
+/// `memberships` for each, and `workspaces` with the role the gateway answers
+/// at after the approver's cap.
+fn approved_scoped(gateway_url: &str, token_id: &str, grants: &[(&str, &str)]) -> Value {
+    json!({
+        "status": "approved",
+        "token": format!("skardi_pat_{token_id}"),
+        "token_id": token_id,
+        "expires_at": "2026-11-22T12:00:00Z",
+        "workspace": grants[0].0,
+        "workspaces": grants
+            .iter()
+            .map(|(ws, role)| json!({"workspace": ws, "org_slug": "acme", "role": role}))
+            .collect::<Vec<_>>(),
+        "memberships": grants
+            .iter()
+            .map(|(ws, _)| membership("acme", ws, "active", Some(gateway_url)))
+            .collect::<Vec<_>>(),
+    })
+}
+
+#[tokio::test]
+async fn a_browser_login_approving_several_workspaces_writes_a_context_for_each() {
+    let gw = gateway(200).await;
+    let console = console(
+        200,
+        approved_scoped(&gw.uri(), "tok-1", &[("ws-a", "admin"), ("ws-b", "member")]),
+    )
+    .await;
+    let home = TempDir::new().unwrap();
+
+    let report = login(broker_options(&console.uri()), &config_in(&home))
+        .await
+        .unwrap();
+
+    let names: Vec<_> = report.written.iter().map(|w| w.name.as_str()).collect();
+    assert_eq!(names, ["acme/ws-a", "acme/ws-b"], "the approver's order");
+    // The role reported is the CAPPED one the gateway answers at, not the
+    // membership's own (both memberships here are admin).
+    assert_eq!(report.written[1].role, "member");
+    assert_eq!(report.current_context.as_deref(), Some("acme/ws-a"));
+
+    // One credential, held by every context it reaches.
+    let file = read_yaml(&config_in(&home));
+    for (i, ws) in ["ws-a", "ws-b"].iter().enumerate() {
+        let context = &file["contexts"][i];
+        assert_eq!(context["workspace"].as_str(), Some(*ws));
+        assert_eq!(context["token"].as_str(), Some("skardi_pat_tok-1"));
+        assert_eq!(context["token-id"].as_str(), Some("tok-1"));
+    }
+
+    // Each context was verified through its OWN workspace: reaching one says
+    // nothing about the next.
+    let probed: Vec<_> = gw
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter_map(|r| {
+            r.headers
+                .get("skardi-workspace")
+                .map(|v| v.to_str().unwrap().to_string())
+        })
+        .collect();
+    assert_eq!(probed, ["ws-a", "ws-b"]);
+}
+
+#[tokio::test]
+async fn a_membership_the_approval_does_not_name_gets_no_context() {
+    // `workspaces` is the grant. A membership riding along for any other
+    // workspace would be a context whose token 403s on its first query.
+    let gw = gateway(200).await;
+    let mut body = approved_scoped(&gw.uri(), "tok-1", &[("ws-a", "admin")]);
+    body["memberships"].as_array_mut().unwrap().push(membership(
+        "acme",
+        "ws-stray",
+        "active",
+        Some(&gw.uri()),
+    ));
+    let console = console(200, body).await;
+    let home = TempDir::new().unwrap();
+
+    let report = login(broker_options(&console.uri()), &config_in(&home))
+        .await
+        .unwrap();
+    let names: Vec<_> = report.written.iter().map(|w| w.name.as_str()).collect();
+    assert_eq!(names, ["acme/ws-a"]);
+}
+
+#[tokio::test]
+async fn context_with_several_approved_workspaces_is_refused_and_names_the_live_token() {
+    // `--context` names one context, and only once the browser has chosen is
+    // it known to be wrong — so the credential is reported, not lost.
+    let gw = gateway(200).await;
+    let console = console(
+        200,
+        approved_scoped(&gw.uri(), "tok-1", &[("ws-a", "admin"), ("ws-b", "admin")]),
+    )
+    .await;
+    let home = TempDir::new().unwrap();
+    let mut options = broker_options(&console.uri());
+    options.context_name = Some("mine".to_string());
+
+    let err = format!("{:#}", login(options, &config_in(&home)).await.unwrap_err());
+    assert!(err.contains("--context names ONE context"), "{err}");
+    assert!(err.contains("tok-1"), "{err}");
+    assert!(!config_in(&home).exists(), "nothing was written");
+}
+
+#[tokio::test]
+async fn a_shared_token_still_held_by_another_context_is_not_reported_for_revocation() {
+    // An earlier login approved ws-a and ws-b under one token; this one
+    // approves ws-a alone. Revoking tok-old would cut ws-b off, so it is not
+    // offered for revocation — and it is reported once, not per context, when
+    // nothing holds it any more.
+    let existing = [
+        "contexts:",
+        "  - name: acme/ws-a",
+        "    mode: cloud",
+        "    server: http://gw.example",
+        "    workspace: ws-a",
+        "    token: skardi_pat_old",
+        "    token-id: tok-old",
+        "  - name: acme/ws-b",
+        "    mode: cloud",
+        "    server: http://gw.example",
+        "    workspace: ws-b",
+        "    token: skardi_pat_old",
+        "    token-id: tok-old",
+    ]
+    .join("\n")
+        + "\n";
+
+    for (grants, expected) in [
+        (vec![("ws-a", "admin")], Vec::<String>::new()),
+        (
+            vec![("ws-a", "admin"), ("ws-b", "admin")],
+            vec!["tok-old".to_string()],
+        ),
+    ] {
+        let gw = gateway(200).await;
+        let console = console(200, approved_scoped(&gw.uri(), "tok-2", &grants)).await;
+        let home = TempDir::new().unwrap();
+        let path = config_in(&home);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &existing).unwrap();
+
+        let report = login(broker_options(&console.uri()), &path).await.unwrap();
+        let reported: Vec<_> = report
+            .revoke_failures
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect();
+        assert_eq!(reported, expected, "approving {grants:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_second_workspace_that_fails_verify_writes_no_context_at_all() {
+    // All or nothing: ws-a verified, but a set of contexts missing one the
+    // approver ticked is not what they asked for, so neither is written — and
+    // the one credential behind both is named for revocation.
+    let gw = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/query"))
+        .and(header("skardi-workspace", "ws-b"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+            "success": false,
+            "error": "unauthorized",
+            "error_type": "unauthorized",
+        })))
+        .with_priority(1)
+        .mount(&gw)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/query"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "success": true,
+            "columns": ["n"],
+            "rows": [[1]],
+        })))
+        .mount(&gw)
+        .await;
+    let console = console(
+        200,
+        approved_scoped(&gw.uri(), "tok-1", &[("ws-a", "admin"), ("ws-b", "admin")]),
+    )
+    .await;
+    let home = TempDir::new().unwrap();
+
+    let err = format!(
+        "{:#}",
+        login(broker_options(&console.uri()), &config_in(&home))
+            .await
+            .unwrap_err()
+    );
+    assert!(err.contains("Revoke token tok-1"), "{err}");
+    assert!(err.contains("'ws-b'"), "{err}");
+    assert!(!config_in(&home).exists(), "ws-a was not written either");
+}
+
+#[tokio::test]
+async fn an_approved_workspace_with_no_membership_is_refused_and_names_it() {
+    // The token reaches ws-b, but no membership came back to name its
+    // context after. Writing ws-a alone would be a silent partial login.
+    let gw = gateway(200).await;
+    let mut body = approved_scoped(&gw.uri(), "tok-1", &[("ws-a", "admin"), ("ws-b", "admin")]);
+    body["memberships"].as_array_mut().unwrap().truncate(1);
+    let console = console(200, body).await;
+    let home = TempDir::new().unwrap();
+
+    let err = login(broker_options(&console.uri()), &config_in(&home))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("'ws-b'"), "{err}");
+    assert!(err.contains("revoke token tok-1"), "{err}");
+    assert!(!config_in(&home).exists(), "nothing was written");
+}
+
+#[tokio::test]
+async fn an_approved_workspace_without_a_role_falls_back_to_the_membership_role() {
+    // `role` is display-only, and by the time it parses the exchange has
+    // minted: a missing one must not fail the parse and strand the token.
+    let gw = gateway(200).await;
+    let mut body = approved_scoped(
+        &gw.uri(),
+        "tok-1",
+        &[("ws-a", "member"), ("ws-b", "member")],
+    );
+    body["workspaces"][1]
+        .as_object_mut()
+        .unwrap()
+        .remove("role");
+    let console = console(200, body).await;
+    let home = TempDir::new().unwrap();
+
+    let report = login(broker_options(&console.uri()), &config_in(&home))
+        .await
+        .unwrap();
+    assert_eq!(
+        report.written[0].role, "member",
+        "the capped role, when sent"
+    );
+    assert_eq!(report.written[1].role, "admin", "the membership's own role");
+}
+
+/// Two contexts sharing one pair, as a multi-workspace `--control` login
+/// leaves them, with `current` as the current context.
+fn two_contexts_sharing_pair_old(current: &str) -> String {
+    [
+        &format!("current-context: {current}"),
+        "contexts:",
+        "  - name: acme/ws-a",
+        "    mode: cloud",
+        "    server: http://gw.example",
+        "    workspace: ws-a",
+        "    token: skardi_pat_old",
+        "    token-id: tok-old",
+        "    pair-id: pair-old",
+        "  - name: acme/ws-b",
+        "    mode: cloud",
+        "    server: http://gw.example",
+        "    workspace: ws-b",
+        "    token: skardi_pat_old",
+        "    token-id: tok-old",
+        "    pair-id: pair-old",
+    ]
+    .join("\n")
+        + "\n"
+}
+
+#[tokio::test]
+async fn a_sibling_left_holding_the_revoked_pair_is_named() {
+    // A re-login approving ws-a alone sends pair-old, and the exchange
+    // revokes both halves of it — under ws-b too, which still holds it. The
+    // old token is counted as revoked, not quietly kept for ws-b's sake, and
+    // ws-b is named so its next 401 is not a mystery.
+    let gw = gateway(200).await;
+    let console = console(
+        200,
+        approved_scoped(&gw.uri(), "tok-2", &[("ws-a", "admin")]),
+    )
+    .await;
+    let home = TempDir::new().unwrap();
+    let path = config_in(&home);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, two_contexts_sharing_pair_old("acme/ws-a")).unwrap();
+
+    let report = login(broker_options(&console.uri()), &path).await.unwrap();
+
+    let opened = opened_body(&console.received_requests().await.unwrap());
+    assert_eq!(opened["replaces_pair_id"], json!("pair-old"));
+    assert_eq!(report.replaced_revoked, vec!["tok-old".to_string()]);
+    assert!(report.revoke_failures.is_empty(), "{report:?}");
+    assert_eq!(
+        report.replaced_pair_elsewhere,
+        vec!["acme/ws-b".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn a_named_context_rewritten_after_the_first_is_not_reported_elsewhere() {
+    // The current context is ws-b, and the approver ticked ws-a THEN ws-b.
+    // `current-context` becomes ws-a, but ws-b was rewritten all the same, so
+    // telling the user to log ws-b in again would mint a token for nothing.
+    let gw = gateway(200).await;
+    let console = console(
+        200,
+        approved_scoped(&gw.uri(), "tok-2", &[("ws-a", "admin"), ("ws-b", "admin")]),
+    )
+    .await;
+    let home = TempDir::new().unwrap();
+    let path = config_in(&home);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, two_contexts_sharing_pair_old("acme/ws-b")).unwrap();
+
+    let report = login(broker_options(&console.uri()), &path).await.unwrap();
+
+    assert_eq!(report.current_context.as_deref(), Some("acme/ws-a"));
+    assert!(report.replaced_pair_elsewhere.is_empty(), "{report:?}");
+    assert_eq!(report.replaced_revoked, vec!["tok-old".to_string()]);
+}
+
+#[tokio::test]
+async fn an_unknown_exchange_status_is_reported_rather_than_polled_forever() {
+    // A control plane newer than this CLI. Treating an unrecognised terminal
+    // state as "pending" would spin until the deadline and then blame the
+    // human for not approving.
+    let console = console(200, json!({ "status": "superseded" })).await;
+    let home = TempDir::new().unwrap();
+    let err = login(broker_options(&console.uri()), &config_in(&home))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("unexpected status"), "{err}");
+    assert!(err.contains("older than the control plane"), "{err}");
+}
+
+/// `pending → clean gone` is an EXPIRY, and must not claim a credential exists.
+///
+/// This INVERTS an assertion from the previous review round, because its
+/// premise was wrong. A credential can only exist if the exchange committed; a
+/// clean `gone` says it did not consume on that call, and `pending` says the
+/// same about the call before. Only this process holds the PKCE verifier, so
+/// nobody else could have redeemed the request either. What is left is the
+/// request expiring between two polls — exactly what the plain message says.
+///
+/// Warning here would send the reader hunting through Agent access for a token
+/// that cannot exist. The real ambiguity is keyed on a lost RESPONSE, covered
+/// by the two cases below.
+#[tokio::test]
+async fn a_request_that_expires_between_polls_is_not_reported_as_ambiguous() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/global/v1/cli-login/requests"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "request_id": "7f3a9c0000000000000000000000abcd",
+            "confirm": "7f3a9c",
+            "expires_at": "2026-08-24T12:00:03Z",
+        })))
+        .mount(&server)
+        .await;
+    // Pending once, then gone — with every response arriving cleanly, so
+    // nothing was ever lost in transit.
+    Mock::given(method("POST"))
+        .and(path("/api/global/v1/cli-login/exchange"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "status": "pending" })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/global/v1/cli-login/exchange"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "error": { "code": "no_such_request", "message": "no such CLI login request" }
+        })))
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    let err = login(broker_options(&server.uri()), &config_in(&home))
+        .await
+        .unwrap_err();
+    let rendered = format!("{err:#}");
+    assert!(rendered.contains("no longer open"), "{rendered}");
+    assert!(
+        !rendered.contains("a credential may have been minted"),
+        "no response was lost, so nothing could have been minted: {rendered}"
+    );
+}
+
+/// A malformed SUCCESS body on the exchange is treated as a lost response.
+///
+/// The worst case this guards: the server consumed the request and minted the
+/// PAT, and the only copy of that token was in a body that will not parse.
+/// Reported as a clean error the loop exits silently; marked as transport it is
+/// retried, and the `no_such_request` that follows — because the request really
+/// was consumed — is reported as the ambiguity it is.
+#[tokio::test]
+async fn a_truncated_exchange_body_then_gone_warns_a_credential_may_exist() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/global/v1/cli-login/requests"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "request_id": "7f3a9c0000000000000000000000abcd",
+            "confirm": "7f3a9c",
+            "expires_at": "2026-08-24T12:00:03Z",
+        })))
+        .mount(&server)
+        .await;
+    // 200 with a truncated body: the mint committed, the token is unreadable.
+    Mock::given(method("POST"))
+        .and(path("/api/global/v1/cli-login/exchange"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{\"status\":\"appro"))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/global/v1/cli-login/exchange"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "error": { "code": "no_such_request", "message": "no such CLI login request" }
+        })))
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    let err = login(broker_options(&server.uri()), &config_in(&home))
+        .await
+        .unwrap_err();
+    let rendered = format!("{err:#}");
+    assert!(
+        rendered.contains("a credential may have been minted"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("Agent access"), "{rendered}");
+    assert!(rendered.contains("no longer open"), "{rendered}");
+}
+
+/// Approval landing BEFORE the first poll, with that first response lost.
+///
+/// The hole the previous fix left: the flag was set only by a `pending`
+/// answer, so a run that never sees one — approval already done when the first
+/// poll goes out — kept it false and reported a real ambiguity as a plain
+/// "rerun login". Keying on the lost response covers it, because there is no
+/// earlier poll to have seen anything.
+#[tokio::test]
+async fn a_lost_first_response_then_gone_warns_without_ever_seeing_pending() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/global/v1/cli-login/requests"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "request_id": "7f3a9c0000000000000000000000abcd",
+            "confirm": "7f3a9c",
+            "expires_at": "2026-08-24T12:00:03Z",
+        })))
+        .mount(&server)
+        .await;
+    // The very FIRST exchange: committed server-side, answer unreadable.
+    Mock::given(method("POST"))
+        .and(path("/api/global/v1/cli-login/exchange"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/global/v1/cli-login/exchange"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "error": { "code": "no_such_request", "message": "no such CLI login request" }
+        })))
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    let err = login(broker_options(&server.uri()), &config_in(&home))
+        .await
+        .unwrap_err();
+    let rendered = format!("{err:#}");
+    assert!(
+        rendered.contains("a credential may have been minted"),
+        "no `pending` was ever seen, and the warning must still fire: {rendered}"
+    );
+}
+
+/// A first poll that finds the request already gone is NOT the ambiguous case.
+///
+/// Nothing was ever approved through this run, so claiming a credential might
+/// exist would send the reader hunting for one that does not.
+#[tokio::test]
+async fn a_request_gone_on_the_first_poll_does_not_claim_a_credential_exists() {
+    let console = console(
+        404,
+        json!({ "error": { "code": "no_such_request",
+        "message": "no such CLI login request" } }),
+    )
+    .await;
+    let home = TempDir::new().unwrap();
+    let err = login(broker_options(&console.uri()), &config_in(&home))
+        .await
+        .unwrap_err();
+    let rendered = format!("{err:#}");
+    assert!(rendered.contains("no longer open"), "{rendered}");
+    assert!(
+        !rendered.contains("a credential may have been minted"),
+        "{rendered}"
+    );
+}
+
+/// An unparseable request expiry falls back to the local window rather than
+/// failing the login: a console that changes its timestamp format should
+/// shorten this loop, not break signing in.
+#[tokio::test]
+async fn an_unparseable_request_expiry_falls_back_to_the_local_window() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/global/v1/cli-login/requests"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "request_id": "7f3a9c0000000000000000000000abcd",
+            "confirm": "7f3a9c",
+            "expires_at": "next tuesday",
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/global/v1/cli-login/exchange"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "status": "pending" })))
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    let err = login(broker_options(&server.uri()), &config_in(&home))
+        .await
+        .unwrap_err()
+        .to_string();
+    // `options()`'s 50ms callback timeout renders as 0s — the local window,
+    // not a parsed one.
+    assert!(err.contains("nobody approved this login"), "{err}");
+    assert!(err.contains("within 0s"), "{err}");
+}
+
+/// A browser that will not launch is not a failure: the URL is already on
+/// screen, and a headless box is the normal case rather than an error.
+#[tokio::test]
+async fn a_browser_that_cannot_be_opened_does_not_fail_the_login() {
+    let gw = gateway(200).await;
+    let console = console(200, approved("my-ws", &gw.uri(), "tok-1")).await;
+    let home = TempDir::new().unwrap();
+    let mut options = broker_options(&console.uri());
+    // `no_browser` off, so the launch is attempted — and it refuses.
+    options.no_browser = false;
+    options.open_browser = |_| {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no browser here",
+        ))
+    };
+
+    let report = login(options, &config_in(&home)).await.unwrap();
+    assert_eq!(report.written.len(), 1, "the login still completed");
+}
+
+/// A console that answers the exchange with no recognizable error body still
+/// produces a message naming the status, not an empty one.
+#[tokio::test]
+async fn an_unrecognizable_refusal_still_names_the_status() {
+    let console = console(500, json!({ "unexpected": "shape" })).await;
+    let home = TempDir::new().unwrap();
+    let err = login(broker_options(&console.uri()), &config_in(&home))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("HTTP 500"), "{err}");
+    assert!(err.contains("refused the CLI-login request"), "{err}");
+}
+
+/// An oversized exchange body is refused by the read cap, and that counts as
+/// a TRANSPORT failure — so it is retried rather than ending the login, and
+/// exhausting the retries says the console stopped answering.
+///
+/// One test for two guards: the 1MiB ceiling that stops a runaway endpoint
+/// exhausting memory, and the retry loop that survives a console restarting
+/// mid-approval.
+#[tokio::test]
+async fn an_oversized_exchange_body_is_capped_retried_and_then_reported() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/global/v1/cli-login/requests"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "request_id": "7f3a9c0000000000000000000000abcd",
+            "confirm": "7f3a9c",
+            "expires_at": "2026-08-24T12:00:03Z",
+        })))
+        .mount(&server)
+        .await;
+    // Comfortably past the 1MiB cap.
+    Mock::given(method("POST"))
+        .and(path("/api/global/v1/cli-login/exchange"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("x".repeat(1_200_000)))
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    let err = login(broker_options(&server.uri()), &config_in(&home))
+        .await
+        .unwrap_err();
+    let rendered = format!("{err:#}");
+    assert!(rendered.contains("stopped answering"), "{rendered}");
+    assert!(rendered.contains("refusing to buffer it"), "{rendered}");
+}
+
+/// A config write that cannot land strands the credential, and says so by id.
+///
+/// The exchange already committed, so a PAT exists — and a browser login
+/// cannot revoke it. Pointing the config at a path whose parent is a FILE
+/// makes the write fail the way a read-only home would.
+#[tokio::test]
+async fn a_config_write_that_fails_reports_the_stranded_credential_by_id() {
+    let gw = gateway(200).await;
+    let console = console(200, approved("my-ws", &gw.uri(), "tok-stranded")).await;
+    let home = TempDir::new().unwrap();
+    let blocker = home.path().join(".skardi");
+    std::fs::write(&blocker, "not a directory").unwrap();
+
+    let err = login(broker_options(&console.uri()), &blocker.join("config.yaml"))
+        .await
+        .unwrap_err();
+    let rendered = format!("{err:#}");
+    assert!(rendered.contains("Revoke token tok-stranded"), "{rendered}");
+    assert!(rendered.contains("cannot revoke"), "{rendered}");
+}
+
+/// A reused request id is refused by PKCE, and the message says to start over
+/// rather than to retype anything.
+#[tokio::test]
+async fn a_verifier_mismatch_tells_the_user_to_start_a_fresh_login() {
+    let console = console(
+        403,
+        json!({ "error": { "code": "verifier_mismatch",
+        "message": "the PKCE verifier does not match this request" } }),
+    )
+    .await;
+    let home = TempDir::new().unwrap();
+    let err = login(broker_options(&console.uri()), &config_in(&home))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("proof of ownership"), "{err}");
+    assert!(err.contains("start a fresh"), "{err}");
+}
+
+/// An error envelope carrying a code but no message still names the status,
+/// rather than rendering an empty sentence.
+#[tokio::test]
+async fn a_refusal_with_no_message_names_the_status_instead() {
+    let console = console(500, json!({ "error": { "code": "internal" } })).await;
+    let home = TempDir::new().unwrap();
+    let err = login(broker_options(&console.uri()), &config_in(&home))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("HTTP 500"), "{err}");
+    assert!(!err.contains(": (HTTP"), "no empty message clause: {err}");
+}
+
+/// A console that opens a request with no id is refused, rather than polling
+/// an exchange that can never match.
+#[tokio::test]
+async fn an_opened_request_with_no_id_is_refused() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/global/v1/cli-login/requests"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "request_id": "",
+            "confirm": "",
+            "expires_at": "2026-08-24T12:00:03Z",
+        })))
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    let err = login(broker_options(&server.uri()), &config_in(&home))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("no id"), "{err}");
+}
+
+/// An exchange answering 200 with an empty body is an unknown state, not a
+/// pending one — polling forever on it would blame the human for not
+/// approving.
+#[tokio::test]
+async fn an_empty_exchange_body_is_reported_as_an_unexpected_status() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/global/v1/cli-login/requests"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "request_id": "7f3a9c0000000000000000000000abcd",
+            "confirm": "7f3a9c",
+            "expires_at": "2026-08-24T12:00:03Z",
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/global/v1/cli-login/exchange"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(""))
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    let err = login(broker_options(&server.uri()), &config_in(&home))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("unexpected status"), "{err}");
+}
+
+#[test]
+fn the_console_broker_is_the_default_and_either_credential_flag_opts_out() {
+    let base = |identity: Option<&str>, client_id: Option<&str>| {
+        let mut options = options("http://127.0.0.1:1", None);
+        options.identity = identity.map(str::to_string);
+        options.client_id = client_id.map(str::to_string);
+        options
+    };
+    // §9: with neither flag, the console brokers — which is what makes
+    // `skardi login --control-plane <url>` work with no other argument.
+    assert!(super::uses_console_broker(&base(None, None)));
+    // An empty client id counts as absent, the same way `acquire_bearer`
+    // treats it: `SKARDI_OAUTH_CLIENT_ID=` exported into a shell must not
+    // select a path that then fails for want of that variable's value.
+    assert!(super::uses_console_broker(&base(None, Some("   "))));
+    // Either flag names a way for the CLI to authenticate itself, and keeps
+    // the existing flow.
+    assert!(!super::uses_console_broker(&base(
+        None,
+        Some("client-123.apps.googleusercontent.com")
+    )));
+    assert!(!super::uses_console_broker(&base(Some("dev:alice"), None)));
+}
+
+// ─── The token pair (agent onboarding §2.1, §2.5) ──────────────────────────
+
+/// An exchange approved WITH `control`: the pair beside the token every CLI
+/// reads, and the MCP URL on the membership.
+fn approved_with_control(gateway_url: &str, token_id: &str, pair_id: &str) -> Value {
+    let mut body = approved("my-ws", gateway_url, token_id);
+    body["control_token"] = json!("skardi_pat_control_secret");
+    body["control_token_id"] = json!("tok-control");
+    body["control_expires_at"] = json!("2026-08-25T12:00:00Z");
+    body["pair_id"] = json!(pair_id);
+    body["memberships"][0]["mcp_url"] = json!(format!("{gateway_url}/mcp"));
+    body
+}
+
+fn opened_body(requests: &[Request]) -> Value {
+    requests
+        .iter()
+        .find(|r| r.url.path() == "/api/global/v1/cli-login/requests")
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .expect("the flow opens a request")
+}
+
+fn control_options(console_base: &str) -> LoginOptions {
+    let mut options = broker_options(console_base);
+    options.control = true;
+    options
+}
+
+#[tokio::test]
+async fn a_control_login_asks_for_control_and_stores_the_pair() {
+    let gw = gateway(200).await;
+    let console = console(200, approved_with_control(&gw.uri(), "tok-mcp", "pair-1")).await;
+    let home = TempDir::new().unwrap();
+
+    let report = login(control_options(&console.uri()), &config_in(&home))
+        .await
+        .unwrap();
+
+    let opened = opened_body(&console.received_requests().await.unwrap());
+    assert_eq!(opened["control"], json!(true));
+
+    // The existing `token` key holds the mcp_token, so every data-plane
+    // command — and every older CLI — keeps working unchanged (§2.4.2).
+    let file = read_yaml(&config_in(&home));
+    let context = &file["contexts"][0];
+    assert_eq!(context["token"].as_str(), Some("skardi_pat_tok-mcp"));
+    assert_eq!(context["token-id"].as_str(), Some("tok-mcp"));
+    assert_eq!(
+        context["control-token"].as_str(),
+        Some("skardi_pat_control_secret")
+    );
+    assert_eq!(
+        context["control-token-expires-at"].as_str(),
+        Some("2026-08-25T12:00:00Z")
+    );
+    assert_eq!(context["pair-id"].as_str(), Some("pair-1"));
+    assert_eq!(
+        context["mcp-url"].as_str(),
+        Some(format!("{}/mcp", gw.uri()).as_str())
+    );
+
+    assert!(!report.control_missing);
+    assert_eq!(
+        report.control_expires_at.as_deref(),
+        Some("2026-08-25T12:00:00Z")
+    );
+    // The report carries no token value, so printing it cannot leak one.
+    assert!(!format!("{report:?}").contains("control_secret"));
+
+    // The post-login probe used the mcp token, never the control token.
+    let probe = &gw.received_requests().await.unwrap()[0];
+    assert_eq!(
+        probe.headers.get("authorization").unwrap(),
+        "Bearer skardi_pat_tok-mcp"
+    );
+}
+
+/// A `--control` login approving several workspaces: the server mints the
+/// pair for the whole scope (skardi-cloud `control_needs_admin_cap` checks
+/// every workspace in it), so EVERY context carries both halves, and
+/// `skardi agent` works in whichever one is current. Every probe still uses
+/// the mcp token, never the control one.
+#[tokio::test]
+async fn a_control_login_for_several_workspaces_gives_every_context_the_pair() {
+    let gw = gateway(200).await;
+    let mut body = approved_scoped(
+        &gw.uri(),
+        "tok-mcp",
+        &[("ws-a", "admin"), ("ws-b", "admin")],
+    );
+    body["control_token"] = json!("skardi_pat_control_secret");
+    body["control_token_id"] = json!("tok-control");
+    body["control_expires_at"] = json!("2026-08-25T12:00:00Z");
+    body["pair_id"] = json!("pair-1");
+    let console = console(200, body).await;
+    let home = TempDir::new().unwrap();
+
+    let report = login(control_options(&console.uri()), &config_in(&home))
+        .await
+        .unwrap();
+
+    assert!(!report.control_missing);
+    let file = read_yaml(&config_in(&home));
+    for (i, ws) in ["ws-a", "ws-b"].iter().enumerate() {
+        let context = &file["contexts"][i];
+        assert_eq!(context["workspace"].as_str(), Some(*ws));
+        assert_eq!(context["token"].as_str(), Some("skardi_pat_tok-mcp"));
+        assert_eq!(
+            context["control-token"].as_str(),
+            Some("skardi_pat_control_secret"),
+            "{ws}"
+        );
+        assert_eq!(context["pair-id"].as_str(), Some("pair-1"), "{ws}");
+    }
+    // Counted, so the loop below cannot pass vacuously on zero probes.
+    let probes = gw.received_requests().await.unwrap();
+    let probed: Vec<_> = probes
+        .iter()
+        .map(|r| r.headers.get("skardi-workspace").unwrap().to_str().unwrap())
+        .collect();
+    assert_eq!(probed, ["ws-a", "ws-b"]);
+    for probe in &probes {
+        assert_eq!(
+            probe.headers.get("authorization").unwrap(),
+            "Bearer skardi_pat_tok-mcp"
+        );
+    }
+}
+
+/// Approved without `control` — the box unticked, or a member's cap: the
+/// context is still written so queries work, and the report says control is
+/// missing, which the command turns into exit 6.
+#[tokio::test]
+async fn a_control_login_approved_without_control_writes_the_context_and_reports_it() {
+    let gw = gateway(200).await;
+    let console = console(200, approved("my-ws", &gw.uri(), "tok-1")).await;
+    let home = TempDir::new().unwrap();
+
+    let report = login(control_options(&console.uri()), &config_in(&home))
+        .await
+        .unwrap();
+
+    assert!(report.control_missing);
+    assert_eq!(report.control_expires_at, None);
+    let file = read_yaml(&config_in(&home));
+    let context = &file["contexts"][0];
+    assert_eq!(context["token"].as_str(), Some("skardi_pat_tok-1"));
+    assert!(context.get("control-token").is_none(), "{file:?}");
+    assert!(context.get("pair-id").is_none(), "{file:?}");
+}
+
+/// A plain login sends exactly today's body: a server older than the pair is
+/// `deny_unknown_fields`, so even `"control": false` would break it.
+#[tokio::test]
+async fn a_plain_login_sends_none_of_the_new_fields() {
+    let gw = gateway(200).await;
+    let console = console(200, approved("my-ws", &gw.uri(), "tok-1")).await;
+    let home = TempDir::new().unwrap();
+    let report = login(broker_options(&console.uri()), &config_in(&home))
+        .await
+        .unwrap();
+    assert!(!report.control_missing, "control was not asked for");
+
+    let opened = opened_body(&console.received_requests().await.unwrap());
+    let keys: Vec<&String> = opened.as_object().unwrap().keys().collect();
+    assert_eq!(keys, ["challenge", "client_desc", "token_expires_at"]);
+}
+
+#[tokio::test]
+async fn setup_rides_the_open_call() {
+    let gw = gateway(200).await;
+    let console = console(200, approved_with_control(&gw.uri(), "tok-1", "pair-1")).await;
+    let home = TempDir::new().unwrap();
+    let mut options = control_options(&console.uri());
+    options.setup = Some(super::console_broker::Setup {
+        profile: "personal".to_string(),
+        name: "Alice".to_string(),
+        industry: None,
+    });
+    login(options, &config_in(&home)).await.unwrap();
+
+    let opened = opened_body(&console.received_requests().await.unwrap());
+    assert_eq!(
+        opened["setup"],
+        json!({"profile": "personal", "name": "Alice", "industry": null})
+    );
+    assert_eq!(opened["control"], json!(true));
+}
+
+/// A re-login names the context's pair as `replaces_pair_id`; the exchange
+/// revokes it under the approver's session, so the report counts the old
+/// token as revoked rather than as one the user must revoke by hand.
+#[tokio::test]
+async fn a_relogin_sends_replaces_pair_id_and_reports_the_old_pair_revoked() {
+    let gw = gateway(200).await;
+    let console = console(200, approved_with_control(&gw.uri(), "tok-new", "pair-new")).await;
+    let home = TempDir::new().unwrap();
+    let path = config_in(&home);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        format!(
+            "current-context: acme/my-ws\n{}    pair-id: pair-old\n    control-token: skardi_pat_old_control\n",
+            existing_cloud_context()
+        ),
+    )
+    .unwrap();
+
+    let report = login(control_options(&console.uri()), &path).await.unwrap();
+
+    let opened = opened_body(&console.received_requests().await.unwrap());
+    assert_eq!(opened["replaces_pair_id"], json!("pair-old"));
+    assert_eq!(report.replaced_revoked, vec!["tok-old".to_string()]);
+    assert!(report.revoke_failures.is_empty(), "{report:?}");
+    assert!(report.replaced_pair_elsewhere.is_empty());
+
+    let raw = std::fs::read_to_string(&path).unwrap();
+    assert!(!raw.contains("skardi_pat_old_control"), "{raw}");
+    let file = read_yaml(&path);
+    assert_eq!(file["contexts"][0]["pair-id"].as_str(), Some("pair-new"));
+}
+
+/// A re-login approved WITHOUT control must not leave the previous pair's
+/// control token beside the new query token.
+#[tokio::test]
+async fn a_relogin_without_control_drops_the_previous_control_token() {
+    let gw = gateway(200).await;
+    let console = console(200, approved("my-ws", &gw.uri(), "tok-new")).await;
+    let home = TempDir::new().unwrap();
+    let path = config_in(&home);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        format!(
+            "{}    pair-id: pair-old\n    control-token: skardi_pat_old_control\n    control-token-expires-at: 2026-08-25T00:00:00Z\n",
+            existing_cloud_context()
+        ),
+    )
+    .unwrap();
+
+    login(broker_options(&console.uri()), &path).await.unwrap();
+
+    let raw = std::fs::read_to_string(&path).unwrap();
+    assert!(!raw.contains("control-token"), "{raw}");
+    assert!(!raw.contains("pair-old"), "{raw}");
+}
+
+/// `--keep-old-token` keeps the predecessor pair too: nothing is named for
+/// the exchange to revoke.
+#[tokio::test]
+async fn keep_old_token_names_no_pair_to_replace() {
+    let gw = gateway(200).await;
+    let console = console(200, approved_with_control(&gw.uri(), "tok-new", "pair-new")).await;
+    let home = TempDir::new().unwrap();
+    let path = config_in(&home);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        format!(
+            "current-context: acme/my-ws\n{}    pair-id: pair-old\n",
+            existing_cloud_context()
+        ),
+    )
+    .unwrap();
+    let mut options = control_options(&console.uri());
+    options.keep_old_token = true;
+    let report = login(options, &path).await.unwrap();
+
+    let opened = opened_body(&console.received_requests().await.unwrap());
+    assert!(opened.get("replaces_pair_id").is_none(), "{opened}");
+    assert_eq!(report.replaced_kept, vec!["tok-old".to_string()]);
+}
+
+/// The pair named is the current context's; when the approval lands in a
+/// DIFFERENT context, the one whose pair was revoked is named in the report.
+#[tokio::test]
+async fn a_pair_replaced_in_another_context_is_reported() {
+    let gw = gateway(200).await;
+    let console = console(200, approved_with_control(&gw.uri(), "tok-new", "pair-new")).await;
+    let home = TempDir::new().unwrap();
+    let path = config_in(&home);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        "current-context: acme/other\ncontexts:\n  - name: acme/other\n    mode: cloud\n    server: http://gw.example\n    workspace: other\n    token: skardi_pat_other\n    token-id: tok-other\n    pair-id: pair-other\n",
+    )
+    .unwrap();
+    let report = login(control_options(&console.uri()), &path).await.unwrap();
+    assert_eq!(
+        report.replaced_pair_elsewhere,
+        vec!["acme/other".to_string()]
+    );
+}
+
+/// A server older than this answers the unknown field with `422
+/// invalid_body` (skardi-global's JSON extractor) — the design expected
+/// `400` — and either one says the server is too old for the flag.
+#[rstest]
+#[case::unprocessable(422)]
+#[case::bad_request(400)]
+#[tokio::test]
+async fn an_older_server_refusing_the_new_fields_is_reported_as_too_old(#[case] status: u16) {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/global/v1/cli-login/requests"))
+        .respond_with(ResponseTemplate::new(status).set_body_json(json!({
+            "error": {"code": "invalid_body", "message": "unknown field `control`"}
+        })))
+        .mount(&server)
+        .await;
+    let home = TempDir::new().unwrap();
+    let err = login(control_options(&server.uri()), &config_in(&home))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("too old for --control"), "{err}");
+    assert!(!config_in(&home).exists());
+}
+
+/// Without a new field in the request, the same refusal is not blamed on the
+/// server's age.
+#[tokio::test]
+async fn a_plain_logins_invalid_body_is_not_called_too_old() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/global/v1/cli-login/requests"))
+        .respond_with(ResponseTemplate::new(422).set_body_json(json!({
+            "error": {"code": "invalid_body", "message": "bad challenge"}
+        })))
+        .mount(&server)
+        .await;
+    let home = TempDir::new().unwrap();
+    let err = login(broker_options(&server.uri()), &config_in(&home))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(!err.contains("too old"), "{err}");
+    assert!(err.contains("bad challenge"), "{err}");
+}
+
+/// `--control` and `--setup` are answered on the console's page, which the
+/// direct flow never shows.
+#[tokio::test]
+async fn the_direct_flow_refuses_control_and_setup() {
+    let home = TempDir::new().unwrap();
+    let mut options = options("http://127.0.0.1:1", None);
+    options.control = true;
+    let err = login(options, &config_in(&home))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("--control"), "{err}");
+}
+
+/// A half-shaped control grant (a skewed rollout: a console or control plane
+/// older than the other) is an invalid answer, not "approved without
+/// control". The CLI writes nothing, fails non-zero rather than exit 6 (whose
+/// recovery would mint yet another pair), and names every id it was given and
+/// the page that revokes them — never the token.
+#[rstest]
+#[case::token_without_pair(
+    &["control_token", "control_token_id", "control_expires_at"],
+    "a control token with no pair id",
+    None
+)]
+#[case::pair_without_token(&["pair_id"], "a pair id with no control token", Some("pair-1"))]
+#[case::id_alone(&["control_token_id"], "control metadata with no control token", None)]
+#[tokio::test]
+async fn a_half_shaped_control_grant_fails_the_login_and_names_what_to_revoke(
+    #[case] fields: &[&str],
+    #[case] what: &str,
+    #[case] pair: Option<&str>,
+) {
+    let gw = gateway(200).await;
+    let full = approved_with_control(&gw.uri(), "tok-mcp", "pair-1");
+    let mut body = approved("my-ws", &gw.uri(), "tok-mcp");
+    for field in fields {
+        body[*field] = full[*field].clone();
+    }
+    let console = console(200, body).await;
+    let home = TempDir::new().unwrap();
+
+    let err = login(control_options(&console.uri()), &config_in(&home))
+        .await
+        .unwrap_err();
+    let rendered = format!("{err:#}");
+    assert!(rendered.contains(what), "{rendered}");
+    assert!(
+        !rendered.contains("skardi_pat_control_secret"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("query token tok-mcp"), "{rendered}");
+    let page = format!("{}/account/agent-access", console.uri());
+    match pair {
+        Some(pair) => assert!(
+            rendered.contains(&format!("{page}?pair={pair}")),
+            "{rendered}"
+        ),
+        None => assert!(rendered.contains(&page), "{rendered}"),
+    }
+    if fields.contains(&"control_token_id") {
+        assert!(rendered.contains("control token tok-control"), "{rendered}");
+    }
+    // Not an exit-6 "approved without control": a plain failure.
+    assert!(err.downcast_ref::<crate::exit::Exit>().is_none());
+    assert!(!config_in(&home).exists(), "nothing is written");
+}
+
+/// Codex on #311: a `login --control` context overwritten by the DIRECT flow
+/// (`--identity`/`--client-id`), which sends no `replaces_pair_id`. Its
+/// `token-id` is the pair's mcp token; revoking it revokes the pair on the
+/// server, control token included (`revoke_pat` takes the partner). Whatever
+/// becomes of that revoke, the pair id is reported — it is the only handle
+/// left on the control token once the context is overwritten.
+#[rstest]
+#[case::revoked(204, false)]
+#[case::revoke_failed(500, false)]
+#[case::kept(204, true)]
+#[tokio::test]
+async fn a_pair_context_overwritten_by_the_direct_flow_keeps_its_pair_in_the_report(
+    #[case] revoke_status: u16,
+    #[case] keep_old: bool,
+) {
+    let gw = gateway(200).await;
+    let cp = control_plane_with(vec![membership(
+        "acme",
+        "acme-prod",
+        "active",
+        Some(&gw.uri()),
+    )])
+    .await;
+    mint_ok(&cp, "acme-prod", "tok-new").await;
+    revoke_answers(&cp, revoke_status).await;
+    let home = TempDir::new().unwrap();
+    let path = config_in(&home);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        "console: https://console.example\n\
+         current-context: acme/acme-prod\n\
+         contexts:\n\
+         \x20 - name: acme/acme-prod\n\
+         \x20   mode: cloud\n\
+         \x20   server: http://old.example\n\
+         \x20   workspace: acme-prod\n\
+         \x20   token: skardi_pat_old_mcp\n\
+         \x20   token-id: tok-old\n\
+         \x20   control-token: skardi_pat_old_control\n\
+         \x20   control-token-expires-at: 2026-08-25T00:00:00Z\n\
+         \x20   pair-id: pair-old\n",
+    )
+    .unwrap();
+
+    let mut options = options(&cp.uri(), None);
+    options.keep_old_token = keep_old;
+    let report = login(options, &path).await.unwrap();
+
+    assert_eq!(
+        report.replaced_pairs,
+        [("tok-old".to_string(), "pair-old".to_string())]
+    );
+    assert_eq!(report.console.as_deref(), Some("https://console.example"));
+    let revoked = revoked_ids(&cp.received_requests().await.unwrap());
+    match (revoke_status, keep_old) {
+        (_, true) => {
+            assert!(revoked.is_empty());
+            assert_eq!(report.replaced_kept, ["tok-old"]);
+        }
+        (204, false) => {
+            // The mcp token's id: the server revokes its partner with it.
+            assert_eq!(revoked, ["tok-old"]);
+            assert_eq!(report.replaced_revoked, ["tok-old"]);
+        }
+        _ => {
+            assert_eq!(report.revoke_failures[0].0, "tok-old");
+            assert!(report.replaced_revoked.is_empty());
+        }
+    }
+    // The old control token is no longer on disk either way.
+    let raw = std::fs::read_to_string(&path).unwrap();
+    assert!(!raw.contains("skardi_pat_old_control"), "{raw}");
+}
+
+/// Codex on #311: with `--server` (or `$SKARDI_GATEWAY_URL`) overriding the
+/// membership's gateway, queries go to the override — so the recorded MCP
+/// URL must too, or `mcp register` would configure the token against the
+/// deployment the person did NOT name. The exchange's URL is reported.
+#[tokio::test]
+async fn an_overriding_gateway_is_where_the_recorded_mcp_url_points() {
+    let gw = gateway(200).await;
+    let console = console(
+        200,
+        approved_with_control("https://elsewhere.example", "tok-1", "pair-1"),
+    )
+    .await;
+    let home = TempDir::new().unwrap();
+    let mut options = control_options(&console.uri());
+    options.server_override = Some(format!("{}/", gw.uri()));
+
+    let report = login(options, &config_in(&home)).await.unwrap();
+
+    let expected = format!("{}/mcp", gw.uri());
+    let file = read_yaml(&config_in(&home));
+    assert_eq!(
+        file["contexts"][0]["mcp-url"].as_str(),
+        Some(expected.as_str())
+    );
+    assert_eq!(report.mcp_url.as_deref(), Some(expected.as_str()));
+    assert_eq!(
+        report.mcp_url_set_aside.as_deref(),
+        Some("https://elsewhere.example/mcp")
+    );
+    // The probe went to the override, which is what the URL now follows.
+    assert_eq!(gw.received_requests().await.unwrap().len(), 1);
+}
+
+/// The env override is the same case, through the direct flow.
+#[tokio::test]
+async fn an_env_gateway_is_where_the_recorded_mcp_url_points() {
+    let gw = gateway(200).await;
+    let mut listed = membership(
+        "acme",
+        "acme-prod",
+        "active",
+        Some("https://elsewhere.example"),
+    );
+    listed["mcp_url"] = json!("https://elsewhere.example/mcp");
+    let cp = control_plane_with(vec![listed]).await;
+    mint_ok(&cp, "acme-prod", "tok-1").await;
+    let home = TempDir::new().unwrap();
+    let mut options = options(&cp.uri(), None);
+    options.env_gateway_url = Some(gw.uri());
+
+    let report = login(options, &config_in(&home)).await.unwrap();
+
+    let expected = format!("{}/mcp", gw.uri());
+    let file = read_yaml(&config_in(&home));
+    assert_eq!(
+        file["contexts"][0]["mcp-url"].as_str(),
+        Some(expected.as_str())
+    );
+    assert_eq!(
+        report.mcp_url_set_aside.as_deref(),
+        Some("https://elsewhere.example/mcp")
+    );
+}
+
+/// An override on the SAME origin changes nothing: the exchange's URL is
+/// kept as it was named, and nothing is reported as set aside.
+#[test]
+fn an_override_on_the_same_origin_keeps_the_exchanges_mcp_url() {
+    let mut named = parsed("acme", "acme-prod", None);
+    named.mcp_url = Some("https://gw.example/mcp".to_string());
+    assert_eq!(
+        super::mcp_url_for("https://gw.example:443/", &named),
+        (Some("https://gw.example/mcp".to_string()), None)
+    );
+    // A different port is a different origin.
+    assert_eq!(
+        super::mcp_url_for("https://gw.example:8443", &named),
+        (
+            Some("https://gw.example:8443/mcp".to_string()),
+            Some("https://gw.example/mcp".to_string())
+        )
+    );
+    // No URL from the exchange: none is invented.
+    named.mcp_url = None;
+    assert_eq!(
+        super::mcp_url_for("https://other.example", &named),
+        (None, None)
+    );
+}
+
+/// Every field the older server could not know is named in the "too old"
+/// message, so the person knows what to drop — including a re-login's
+/// `replaces_pair_id`, which no flag of theirs asked for.
+#[tokio::test]
+async fn too_old_names_every_new_field_the_request_carried() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/global/v1/cli-login/requests"))
+        .respond_with(ResponseTemplate::new(422).set_body_json(json!({
+            "error": {"code": "invalid_body", "message": "unknown field `setup`"}
+        })))
+        .mount(&server)
+        .await;
+    let home = TempDir::new().unwrap();
+    let path = config_in(&home);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        format!(
+            "current-context: acme/my-ws\n{}    pair-id: pair-old\n",
+            existing_cloud_context()
+        ),
+    )
+    .unwrap();
+    let mut options = broker_options(&server.uri());
+    options.setup = Some(super::console_broker::Setup {
+        profile: "personal".to_string(),
+        name: "Alice".to_string(),
+        industry: None,
+    });
+    let err = login(options, &path).await.unwrap_err().to_string();
+    assert!(
+        err.contains("too old for --setup, replacing the previous login's pair"),
+        "{err}"
+    );
+}
+
+/// The pair to replace is read only off a CLOUD context: a server-mode one
+/// carrying a stray `pair-id` names nothing for the exchange to revoke.
+#[tokio::test]
+async fn a_server_context_names_no_pair_to_replace() {
+    let gw = gateway(200).await;
+    let console = console(200, approved("my-ws", &gw.uri(), "tok-1")).await;
+    let home = TempDir::new().unwrap();
+    let path = config_in(&home);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        "current-context: local\ncontexts:\n  - name: local\n    server: http://127.0.0.1:8080\n    pair-id: pair-stray\n",
+    )
+    .unwrap();
+    login(broker_options(&console.uri()), &path).await.unwrap();
+    let opened = opened_body(&console.received_requests().await.unwrap());
+    assert!(opened.get("replaces_pair_id").is_none(), "{opened}");
 }

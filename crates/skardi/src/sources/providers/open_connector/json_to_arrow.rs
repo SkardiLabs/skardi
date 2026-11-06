@@ -6,6 +6,11 @@
 //! type, and the found JSON *kind* (never the value, which may be
 //! sensitive).
 
+// The row-shape DECLARATIONS moved to the pack so a syncer can read a
+// provider's rows without linking Arrow. What stays here is the
+// conversion, which is the only part that wants a `RecordBatch`.
+pub use skardi_source_pack::schema::{ColumnDoc, ColumnSpec, ColumnType, FieldMapping, FieldType};
+
 use std::sync::Arc;
 
 use arrow::array::{
@@ -19,132 +24,56 @@ use serde_json::Value;
 use super::error::OpenConnectorError;
 use super::row_path::RowPath;
 
-/// Column type a source-pack field can declare. Deliberately small: it is
-/// the contract Skardi maintains, not every Arrow type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FieldType {
-    /// JSON boolean ↔ Arrow Boolean.
-    Boolean,
-    /// JSON integer ↔ Arrow Int64.
-    Int64,
-    /// JSON non-negative integer ↔ Arrow UInt64.
-    UInt64,
-    /// JSON number ↔ Arrow Float64.
-    Float64,
-    /// JSON string ↔ Arrow Utf8.
-    Utf8,
-    /// RFC 3339 string or epoch-millis number ↔ Arrow Timestamp(Millisecond, UTC).
-    TimestampMillisUtc,
-    /// JSON integer epoch **seconds** ↔ Arrow Timestamp(Millisecond, UTC).
-    /// For Slack-style APIs whose `created` / `updated` fields are whole
-    /// seconds — reading those through [`FieldType::TimestampMillisUtc`]
-    /// would silently misparse them as millis (dates in January 1970).
-    /// Strictly integers: fractional or string values fail with their kind.
-    TimestampSecondsUtc,
-    /// JSON string of decimal digits carrying epoch **milliseconds** ↔
-    /// Arrow Timestamp(Millisecond, UTC). For Feishu-style APIs whose
-    /// `create_time` / `update_time` fields are millisecond epochs
-    /// serialized as STRINGS (`"1609296809000"`) — neither an RFC 3339
-    /// string nor a JSON number, so [`FieldType::TimestampMillisUtc`]
-    /// rejects them. Strictly ASCII-digit strings: anything else fails
-    /// with its kind or a shape description, never parses as zero.
-    TimestampMillisStringUtc,
-    /// JSON string of decimal digits carrying epoch **seconds** ↔ Arrow
-    /// Timestamp(Millisecond, UTC) — the seconds-as-string sibling of
-    /// [`FieldType::TimestampMillisStringUtc`] (Feishu wiki
-    /// `obj_create_time`), with the same strict digit-string rule and the
-    /// same overflow guard as [`FieldType::TimestampSecondsUtc`].
-    TimestampSecondsStringUtc,
-    /// JSON array of strings ↔ Arrow List\<Utf8\>.
-    Utf8List,
-    /// JSON array of objects, each contributing the string under the given
-    /// key ↔ Arrow List\<Utf8\> — the design's `$.labels[*].name` /
-    /// `$.assignees[*].login` flattening for GitHub-style shapes.
-    Utf8ListFromObjectKey(&'static str),
-    /// Any JSON value serialized to a JSON string ↔ Arrow Utf8. For
-    /// intentionally opaque fields (arbitrary maps, unstable unions). A
-    /// present JSON null is SQL NULL (per the shared null rules), not the
-    /// string `"null"`.
-    Json,
-}
-
-impl FieldType {
-    /// The Arrow data type this field type maps to.
-    pub fn arrow_type(&self) -> DataType {
-        match self {
-            Self::Boolean => DataType::Boolean,
-            Self::Int64 => DataType::Int64,
-            Self::UInt64 => DataType::UInt64,
-            Self::Float64 => DataType::Float64,
-            Self::Utf8 | Self::Json => DataType::Utf8,
-            Self::TimestampMillisUtc
-            | Self::TimestampSecondsUtc
-            | Self::TimestampMillisStringUtc
-            | Self::TimestampSecondsStringUtc => {
-                DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()))
-            }
-            Self::Utf8List | Self::Utf8ListFromObjectKey(_) => {
-                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)))
-            }
+/// The Arrow data type a declared [`FieldType`] maps to.
+///
+/// A free function rather than a method, because `FieldType` now belongs
+/// to `skardi-source-pack` and Rust forbids an inherent `impl` on a type
+/// from another crate. The restriction states the design correctly: the
+/// Arrow mapping is not a property of the declaration, it is something
+/// this crate does to it — and the syncer that reads the same declaration
+/// never performs it.
+///
+/// # Examples
+///
+/// ```
+/// use skardi::sources::providers::open_connector::json_to_arrow::arrow_type;
+/// use skardi_source_pack::schema::FieldType;
+/// use arrow::datatypes::{DataType, TimeUnit};
+///
+/// assert_eq!(arrow_type(&FieldType::Int64), DataType::Int64);
+/// // The declared types name the WIRE encoding; Arrow has one timestamp type
+/// // for all of them. That many-to-one is the reason this mapping is the
+/// // engine's to make and not a property of the declaration: a pack says how
+/// // the provider spells a timestamp, not how it is stored.
+/// let millis = DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()));
+/// assert_eq!(arrow_type(&FieldType::TimestampMillisUtc), millis);
+/// assert_eq!(arrow_type(&FieldType::TimestampSecondsStringUtc), millis);
+/// ```
+///
+/// ```
+/// # use skardi::sources::providers::open_connector::json_to_arrow::arrow_type;
+/// # use skardi_source_pack::schema::FieldType;
+/// # use arrow::datatypes::DataType;
+/// // `Json` is carried as text: the engine does not parse a provider's nested
+/// // object into a struct type it would then have to keep in sync.
+/// assert_eq!(arrow_type(&FieldType::Json), DataType::Utf8);
+/// ```
+pub fn arrow_type(field_type: &FieldType) -> DataType {
+    match field_type {
+        FieldType::Boolean => DataType::Boolean,
+        FieldType::Int64 => DataType::Int64,
+        FieldType::UInt64 => DataType::UInt64,
+        FieldType::Float64 => DataType::Float64,
+        FieldType::Utf8 | FieldType::Json => DataType::Utf8,
+        FieldType::TimestampMillisUtc
+        | FieldType::TimestampSecondsUtc
+        | FieldType::TimestampMillisStringUtc
+        | FieldType::TimestampSecondsStringUtc
+        | FieldType::TimestampSecondsFractionalStringUtc => {
+            DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()))
         }
-    }
-
-    fn label(&self) -> &'static str {
-        match self {
-            Self::Boolean => "boolean",
-            Self::Int64 => "integer",
-            Self::UInt64 => "non-negative integer",
-            Self::Float64 => "number",
-            Self::Utf8 => "string",
-            Self::TimestampMillisUtc => "RFC 3339 timestamp or epoch millis",
-            Self::TimestampSecondsUtc => "epoch-seconds timestamp",
-            Self::TimestampMillisStringUtc => "epoch-millis digit string",
-            Self::TimestampSecondsStringUtc => "epoch-seconds digit string",
-            Self::Utf8List => "array of strings",
-            Self::Utf8ListFromObjectKey(_) => "array of objects each carrying a string key",
-            Self::Json => "any JSON value",
-        }
-    }
-}
-
-/// One source-pack field: where in the row JSON it lives, and its type.
-#[derive(Debug, Clone, Copy)]
-pub struct FieldMapping {
-    /// Arrow column name.
-    pub name: &'static str,
-    /// Row-relative dotted path, e.g. `user.login`. Must point at an object
-    /// key; array indexing is out of scope for relational mappings.
-    pub path: &'static str,
-    /// Column type.
-    pub field_type: FieldType,
-    /// Whether missing keys / JSON nulls become Arrow nulls (true) or fail
-    /// conversion (false).
-    pub nullable: bool,
-}
-
-/// An owned [`FieldMapping`]. Source packs declare columns statically; raw
-/// scans (`open_connector_scan`) derive them at planning time from discovered
-/// action metadata, so their names cannot be `&'static str`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ColumnSpec {
-    /// Arrow column name.
-    pub name: String,
-    /// Row-relative dotted path (see [`FieldMapping::path`]).
-    pub path: String,
-    /// Column type.
-    pub field_type: FieldType,
-    /// Whether missing keys / JSON nulls become Arrow nulls (true) or fail
-    /// conversion (false).
-    pub nullable: bool,
-}
-
-impl From<&FieldMapping> for ColumnSpec {
-    fn from(mapping: &FieldMapping) -> Self {
-        Self {
-            name: mapping.name.to_string(),
-            path: mapping.path.to_string(),
-            field_type: mapping.field_type,
-            nullable: mapping.nullable,
+        FieldType::Utf8List | FieldType::Utf8ListFromObjectKey(_) => {
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)))
         }
     }
 }
@@ -198,7 +127,7 @@ impl RowConverter {
             let path = RowPath::parse(&format!("$.{}", spec.path))?;
             arrow_fields.push(Field::new(
                 &spec.name,
-                spec.field_type.arrow_type(),
+                arrow_type(&spec.field_type),
                 spec.nullable,
             ));
             fields.push(CompiledField { spec, path });
@@ -351,6 +280,15 @@ impl RowConverter {
                     &cells,
                     spec,
                     |v| parse_epoch_digit_string(v, 1000),
+                    fail,
+                )?)
+                .with_timezone("UTC"),
+            )),
+            FieldType::TimestampSecondsFractionalStringUtc => Ok(Arc::new(
+                TimestampMillisecondArray::from(collect_cells_described(
+                    &cells,
+                    spec,
+                    parse_epoch_fractional_seconds_string,
                     fail,
                 )?)
                 .with_timezone("UTC"),
@@ -540,6 +478,43 @@ fn parse_epoch_digit_string(value: &Value, scale: i64) -> Result<i64, String> {
     epoch
         .checked_mul(scale)
         .ok_or_else(|| "an epoch out of range for millisecond timestamps".to_string())
+}
+
+/// Fractional epoch-seconds string → epoch millis, flooring anything below
+/// a millisecond (Slack `ts`: `"1700000000.123456"`).
+///
+/// Accepts `<digits>` and `<digits>.<digits>`; a bare `.`, a sign, an
+/// exponent, whitespace or any other shape is drift and fails with a
+/// description rather than parsing as zero — the same rule
+/// [`parse_epoch_digit_string`] applies, widened by exactly one dot.
+///
+/// Flooring is done on the digit string, not via floating point: `f64`
+/// cannot represent `1700000000.123456` exactly, and the nearest double
+/// rounds *below* it, which would put a value one millisecond early for
+/// some inputs and misorder rows against the `ts` string beside them.
+fn parse_epoch_fractional_seconds_string(value: &Value) -> Result<i64, String> {
+    const OUT_OF_RANGE: &str = "an epoch out of range for millisecond timestamps";
+
+    let Some(text) = value.as_str() else {
+        return Err(json_kind(value).to_string());
+    };
+    let (whole, fraction) = text.split_once('.').unwrap_or((text, "0"));
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if !digits(whole) || !digits(fraction) {
+        return Err("a non-epoch string".to_string());
+    }
+    let seconds: i64 = whole.parse().map_err(|_| OUT_OF_RANGE.to_string())?;
+    // First three fractional digits, right-padded — `.5` is 500ms, and
+    // `.123456` truncates to 123ms.
+    let millis = fraction
+        .bytes()
+        .chain(std::iter::repeat(b'0'))
+        .take(3)
+        .fold(0i64, |acc, b| acc * 10 + i64::from(b - b'0'));
+    seconds
+        .checked_mul(1000)
+        .and_then(|base| base.checked_add(millis))
+        .ok_or_else(|| OUT_OF_RANGE.to_string())
 }
 
 /// RFC 3339 string or epoch-millis number → epoch millis.
@@ -966,6 +941,112 @@ mod tests {
                     err,
                     OpenConnectorError::ConversionFailed { found: ref f, ref expected, .. }
                         if f == found && expected == "epoch-seconds timestamp"
+                ),
+                "got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn fractional_epoch_strings_floor_to_millis_and_reject_other_shapes() {
+        // Slack's message `ts` is "<epoch seconds>.<microseconds>", which
+        // every other reader refuses: the digit-string readers stop at the
+        // dot, and the numeric ones want a JSON number. Sub-millisecond
+        // precision floors, so the column stays ordered the same way as the
+        // `ts` string it is derived from.
+        let converter = RowConverter::new(&[FieldMapping {
+            name: "sent_at",
+            path: "ts",
+            field_type: FieldType::TimestampSecondsFractionalStringUtc,
+            nullable: true,
+        }])
+        .unwrap();
+
+        let batch = converter
+            .convert(
+                &[
+                    serde_json::json!({"ts": "1735689600.123456"}),
+                    // A bare seconds string is legal and means .000.
+                    serde_json::json!({"ts": "1735689600"}),
+                    // Fewer than three fractional digits right-pad: .5 is
+                    // half a second, not half a millisecond.
+                    serde_json::json!({"ts": "1735689600.5"}),
+                    serde_json::json!({"ts": null}),
+                ],
+                1,
+            )
+            .unwrap();
+        let ts = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMillisecondArray>()
+            .unwrap();
+        assert_eq!(ts.value(0), 1_735_689_600_123, "microseconds floor away");
+        assert_eq!(ts.value(1), 1_735_689_600_000);
+        assert_eq!(ts.value(2), 1_735_689_600_500);
+        assert!(ts.is_null(3));
+
+        // Two `ts` one microsecond apart land on the same millisecond —
+        // the reason the raw string stays its own column rather than this
+        // one doubling as the row key.
+        let collided = converter
+            .convert(
+                &[
+                    serde_json::json!({"ts": "1735689600.123456"}),
+                    serde_json::json!({"ts": "1735689600.123457"}),
+                ],
+                1,
+            )
+            .unwrap();
+        let collided = collided
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMillisecondArray>()
+            .unwrap();
+        assert_eq!(collided.value(0), collided.value(1));
+
+        for (bad, found) in [
+            // The number spelling belongs to the numeric readers; accepting
+            // it here would blur this variant's contract with theirs.
+            (
+                serde_json::json!({"ts": 1_735_689_600.123_456_f64}),
+                "a number",
+            ),
+            (
+                serde_json::json!({"ts": "2025-01-01T00:00:00Z"}),
+                "a non-epoch string",
+            ),
+            (serde_json::json!({"ts": ""}), "a non-epoch string"),
+            // A dot with nothing on one side of it is drift, not zero.
+            (
+                serde_json::json!({"ts": "1735689600."}),
+                "a non-epoch string",
+            ),
+            (serde_json::json!({"ts": ".123"}), "a non-epoch string"),
+            (
+                serde_json::json!({"ts": "-1735689600.1"}),
+                "a non-epoch string",
+            ),
+            (
+                serde_json::json!({"ts": "1735689600.1e3"}),
+                "a non-epoch string",
+            ),
+            // Two dots would otherwise leave "1.2" in the fraction.
+            (
+                serde_json::json!({"ts": "1735689600.1.2"}),
+                "a non-epoch string",
+            ),
+            (
+                serde_json::json!({"ts": "9223372036854775807.9"}),
+                "an epoch out of range for millisecond timestamps",
+            ),
+        ] {
+            let err = converter.convert(&[bad], 1).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    OpenConnectorError::ConversionFailed { found: ref f, ref expected, .. }
+                        if f == found && expected == "fractional epoch-seconds string"
                 ),
                 "got {err}"
             );

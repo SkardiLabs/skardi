@@ -14,11 +14,11 @@
     },
     "filter": {
       "type": "string",
-      "description": "OData filter expression for the messages query."
+      "description": "OData filter expression for the messages query. When combined with orderby, include every orderby property first, in the same order. Example: receivedDateTime ge 2026-01-01T00:00:00Z and isRead eq false."
     },
     "orderby": {
       "type": "string",
-      "description": "OData orderby expression for the messages query."
+      "description": "OData orderby expression for the messages query. When combined with filter, every ordered property must appear first in the filter and in the same order. Example: receivedDateTime desc."
     },
     "select": {
       "type": "array",
@@ -33,6 +33,15 @@
     "nextLink": {
       "type": "string",
       "description": "Opaque pagination URL returned by a previous Outlook response.",
+      "format": "uri"
+    },
+    "delta": {
+      "type": "boolean",
+      "description": "Track changes in a mail folder with a Microsoft Graph delta query instead of listing it; requires mailFolderId because Graph tracks message changes per folder. The first round returns every message, later rounds (started with deltaLink) return only additions, updates and removals (rows carrying @removed). Graph accepts top and select on delta queries but only filter on receivedDateTime (ge or gt) and orderby receivedDateTime desc."
+    },
+    "deltaLink": {
+      "type": "string",
+      "description": "Opaque delta URL (deltaLink) returned by a previous delta round; starts the next round of changes for the same mail folder. Ignored when nextLink is set.",
       "format": "uri"
     },
     "bodyContentType": {

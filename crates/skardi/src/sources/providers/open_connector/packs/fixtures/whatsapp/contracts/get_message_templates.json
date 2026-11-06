@@ -1,0 +1,85 @@
+{
+  "type": "object",
+  "properties": {
+    "templates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Meta template ID."
+          },
+          "name": {
+            "type": "string",
+            "description": "Template name."
+          },
+          "status": {
+            "type": "string",
+            "description": "Template status returned by Meta."
+          },
+          "category": {
+            "type": "string",
+            "description": "Template category."
+          },
+          "language": {
+            "type": "string",
+            "description": "Template language code."
+          },
+          "components": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": true,
+              "description": "A template component returned by Meta."
+            },
+            "description": "Template components."
+          }
+        },
+        "additionalProperties": true,
+        "description": "A WhatsApp message template."
+      },
+      "description": "Templates returned for the WABA."
+    },
+    "paging": {
+      "type": "object",
+      "properties": {
+        "cursors": {
+          "type": "object",
+          "properties": {
+            "before": {
+              "type": "string",
+              "description": "Cursor for the previous page."
+            },
+            "after": {
+              "type": "string",
+              "description": "Cursor for the next page."
+            }
+          },
+          "additionalProperties": true,
+          "description": "Cursor values returned by Meta."
+        },
+        "previous": {
+          "type": "string",
+          "description": "URL for the previous page, when provided."
+        },
+        "next": {
+          "type": "string",
+          "description": "URL for the next page, when provided."
+        },
+        "hasMore": {
+          "type": "boolean",
+          "description": "Whether another page exists. Meta returns `next` only when one does, so this is false on the final page even though `cursors.after` is still present."
+        }
+      },
+      "additionalProperties": true,
+      "description": "Pagination data returned by Meta."
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "templates",
+    "paging"
+  ],
+  "description": "Action output."
+}

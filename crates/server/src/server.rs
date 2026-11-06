@@ -8,6 +8,7 @@ use skardi::engine::datafusion::DataFusionEngine;
 use skardi::jobs::{JobExecutor, JobStore, SqliteJobStore};
 use skardi::sources::DataSourceType;
 use skardi::sources::providers::graph::udtf::GraphSources;
+use skardi::sources::providers::sqlx::register_pg_fts_udfs;
 use skardi::sources::sql_validator::AdhocSqlPolicy;
 use skardi::util::json_getters::register_json_getter_udfs;
 use skardi::util::json_pack::register_json_pack_udf;
@@ -35,7 +36,7 @@ use crate::gui::serve_dashboard;
 use crate::handlers::health_check;
 use crate::jobs_handlers::{cancel_job_run, get_job_run, list_job_runs, list_jobs, submit_job_run};
 use crate::logging::QUERY_PLAN_TARGET;
-use crate::metrics::PipelineMetrics;
+use crate::metrics::{PipelineMetrics, WebhookMetrics};
 use crate::pipeline_handlers::{
     execute_pipeline_by_name, get_data_sources, get_pipelines_info, list_pipelines,
     pipeline_health_check,
@@ -44,6 +45,8 @@ use crate::query_audit::QueryAuditStore;
 use crate::query_handlers::execute_query;
 #[cfg(test)]
 use crate::semantics::SemanticsRegistry;
+use crate::webhooks::WebhookRegistry;
+use crate::webhooks::handlers::{webhook_receive, webhook_verify};
 use crate::{OptimizerRegistry, auth::layer::AuthLayer};
 
 /// Shared application state containing pipeline and engine
@@ -75,6 +78,12 @@ pub struct AppState {
     /// OptimizerRegistry that data-source registration fills). Read by
     /// `/data_source` to report each graph source's registration health.
     pub graph_sources: GraphSources,
+    /// Compiled `kind: webhook` resources served at `/webhooks/:name`.
+    /// Empty unless [`AppState::with_webhooks`] installed a registry that
+    /// [`setup_app_state`] built against the runtime session.
+    pub webhooks: Arc<WebhookRegistry>,
+    /// OTel instruments for `/webhooks/:name`.
+    pub webhook_metrics: WebhookMetrics,
 }
 
 impl AppState {
@@ -108,7 +117,17 @@ impl AppState {
             adhoc_policy,
             query_audit,
             graph_sources,
+            webhooks: Arc::new(WebhookRegistry::empty()),
+            webhook_metrics: WebhookMetrics::new(),
         }
+    }
+
+    /// Install the compiled webhook registry. Separate from [`AppState::new`]
+    /// because compiling needs the populated runtime session (destination
+    /// preflight), which the constructor does not have.
+    pub fn with_webhooks(mut self, webhooks: Arc<WebhookRegistry>) -> Self {
+        self.webhooks = webhooks;
+        self
     }
 }
 
@@ -206,6 +225,10 @@ pub async fn setup_app_state(config: ServerConfig) -> Result<AppState> {
     // graph node/relationship properties included; UDFs only, never the
     // `->` operator rewrite — see util::json_getters.
     register_json_getter_udfs(&session_ctx)?;
+    // to_tsvector / websearch_to_tsquery / ts_rank: planned here, evaluated
+    // by PostgreSQL. Without them a raw-SQL full-text statement cannot even
+    // resolve — see sources::providers::sqlx::pg::fts_udfs.
+    register_pg_fts_udfs(&session_ctx);
 
     // Build auth layer and register auth.users / auth.sessions on the runtime SessionContext.
     let auth_layer = AuthLayer::build(&AuthMode::from_env()).await?;
@@ -335,6 +358,20 @@ pub async fn setup_app_state(config: ServerConfig) -> Result<AppState> {
         }
     }
 
+    // Compile webhooks against the populated session: every destination
+    // table must exist with the route's exact columns before a single
+    // delivery can be acknowledged, so a mismatch is a startup error.
+    let webhooks = Arc::new(
+        WebhookRegistry::build(&config.webhooks, &config.data_sources, &session_ctx_arc).await?,
+    );
+    if !webhooks.is_empty() {
+        tracing::info!(
+            "Serving {} webhook(s): {:?}",
+            webhooks.names().len(),
+            webhooks.names()
+        );
+    }
+
     // Create shared application state with RwLock for runtime updates
     let app_state = AppState::new(
         config,
@@ -346,7 +383,8 @@ pub async fn setup_app_state(config: ServerConfig) -> Result<AppState> {
         // The registry's map is the one data-source registration filled —
         // sharing the Arc is what makes /data_source's health read live.
         optimizer_registry.graph_sources(),
-    );
+    )
+    .with_webhooks(webhooks);
 
     tracing::info!("Application state setup completed successfully");
 
@@ -537,8 +575,24 @@ fn resolve_jobs_db_path(explicit: Option<&PathBuf>) -> Result<PathBuf> {
     Ok(home.join(".skardi").join("jobs.db"))
 }
 
-/// Configure all application routes
+/// Configure all application routes: the REST router exactly as before,
+/// plus the MCP service nested at `/mcp`. The MCP handler captures the
+/// PRE-middleware REST router — `configure_middleware` wraps the final
+/// router (transport middleware, applied once to the inbound `/mcp`
+/// request), while synthetic dispatches traverse routing + handlers only,
+/// which is where every execution concern lives (`require_session`,
+/// parameter validation, audit recording). If auth ever moved into
+/// `configure_middleware`, synthetic dispatch would bypass it — see the
+/// tripwire test on the MCP handler.
 pub fn configure_routes(state: AppState) -> Router {
+    let rest = rest_router(state.clone());
+    crate::mcp::attach(rest, state)
+}
+
+/// The REST routing table + handlers, without the `/mcp` nest and without
+/// transport middleware. `pub(crate)` so the MCP tests can pin that the
+/// captured router really is this pre-middleware one.
+pub(crate) fn rest_router(state: AppState) -> Router {
     tracing::info!("Configuring HTTP routes");
 
     let mut router = Router::new()
@@ -560,6 +614,9 @@ pub fn configure_routes(state: AppState) -> Router {
         .route("/jobs/runs", get(list_job_runs))
         .route("/jobs/runs/:run_id", get(get_job_run))
         .route("/jobs/runs/:run_id/cancel", post(cancel_job_run));
+    // Provider deliveries carry no Skardi token: these two handlers do not
+    // call `require_session` and verify the provider's own proof instead.
+    router = router.route("/webhooks/:name", get(webhook_verify).post(webhook_receive));
 
     if state.auth_layer.is_enabled() {
         tracing::info!("Auth enabled: mounting /api/auth/* routes");
@@ -686,17 +743,20 @@ spec:
         let config = ServerConfig {
             pipelines,
             jobs: std::collections::HashMap::new(),
+            webhooks: HashMap::new(),
             data_sources,
             semantics: SemanticsRegistry::default(),
             args: CliArgs {
                 pipeline_path: Some(PathBuf::from("test-pipeline.yaml")),
                 jobs_path: None,
                 jobs_db_path: None,
+                webhooks_path: None,
                 ctx_file: None,
                 semantics_path: None,
                 port: 8080,
                 query_audit_db: None,
                 query_audit_retention_days: None,
+                mcp_allowed_hosts: vec![],
             },
         };
 
@@ -711,17 +771,20 @@ spec:
         ServerConfig {
             pipelines,
             jobs: std::collections::HashMap::new(),
+            webhooks: HashMap::new(),
             data_sources: vec![],
             semantics: SemanticsRegistry::default(),
             args: CliArgs {
                 pipeline_path: Some(PathBuf::from("test-pipeline.yaml")),
                 jobs_path: None,
                 jobs_db_path: None,
+                webhooks_path: None,
                 ctx_file: None,
                 semantics_path: None,
                 port: 8080,
                 query_audit_db: None,
                 query_audit_retention_days: None,
+                mcp_allowed_hosts: vec![],
             },
         }
     }
@@ -760,11 +823,13 @@ spec:
             pipeline_path: Some(pipeline_path),
             jobs_path: None,
             jobs_db_path: None,
+            webhooks_path: None,
             ctx_file: None,
             semantics_path: None,
             port: 8080,
             query_audit_db: None,
             query_audit_retention_days: None,
+            mcp_allowed_hosts: vec![],
         };
         let config = crate::config::load_server_config(args)
             .await
@@ -790,6 +855,67 @@ spec:
             .unwrap()
             .value(0);
         assert_eq!(packed, r#"{"z":"v"}"#);
+    }
+
+    /// Both PRODUCTION registration paths for the Postgres FTS UDFs
+    /// (`register_pg_fts_udfs`), the same shape as the etl-runtime-UDF test
+    /// above: the planning context (`load_server_config`, which must infer a
+    /// schema for a pipeline naming all three) and the runtime context
+    /// (`setup_app_state`, which must PLAN a statement naming them).
+    ///
+    /// Note the asymmetry with the etl UDFs: these three must plan but must
+    /// NOT execute — `invoke_with_args` errors by design, because PostgreSQL
+    /// evaluates them and a NULL-returning stub would answer "no matches".
+    /// So this test asserts planning on both sides and never collects.
+    /// The unit tests in `sources::providers::sqlx::pg::fts_udfs` register
+    /// the functions directly and stay green if either production call is
+    /// deleted; THIS test is what fails in that case.
+    #[tokio::test]
+    async fn production_contexts_register_the_pg_fts_udfs() {
+        const FTS_SQL: &str = "SELECT ts_rank(to_tsvector('english', 'a doc'), \
+             websearch_to_tsquery('english', 'a')) AS rank";
+
+        let temp_dir = TempDir::new().unwrap();
+        let pipeline_path = temp_dir.path().join("pg-fts-udf-wiring.yaml");
+        fs::write(
+            &pipeline_path,
+            format!(
+                r#"
+kind: pipeline
+metadata:
+  name: "pg-fts-udf-wiring"
+  version: "1.0.0"
+spec:
+  query: |
+    {FTS_SQL}
+"#
+            ),
+        )
+        .unwrap();
+        let args = CliArgs {
+            pipeline_path: Some(pipeline_path),
+            jobs_path: None,
+            jobs_db_path: None,
+            webhooks_path: None,
+            ctx_file: None,
+            semantics_path: None,
+            port: 8080,
+            query_audit_db: None,
+            query_audit_retention_days: None,
+            mcp_allowed_hosts: vec![],
+        };
+        let config = crate::config::load_server_config(args)
+            .await
+            .expect("the PLANNING context resolves the three FTS functions");
+        assert!(config.pipelines.contains_key("pg-fts-udf-wiring"));
+
+        let state = setup_app_state(config).await.expect("app state");
+        state
+            .session_ctx
+            .state()
+            .create_logical_plan(FTS_SQL)
+            .await
+            .expect("the RUNTIME context plans the three FTS functions");
     }
 
     #[tokio::test]

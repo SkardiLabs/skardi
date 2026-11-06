@@ -1,0 +1,95 @@
+{
+  "items": [
+    {
+      "body": {
+        "content": "{\"template\": \"{to_chatters} joined {group_name}\", \"from_user\": [], \"to_chatters\": [\"member-0001\"], \"divider_text\": {}}"
+      },
+      "chat_id": "oc_0001",
+      "create_time": "1593441000000",
+      "deleted": false,
+      "message_id": "om_0002",
+      "message_position": "0",
+      "msg_type": "system",
+      "sender": {
+        "id": "",
+        "id_type": "",
+        "sender_type": "",
+        "tenant_key": "t-0001"
+      },
+      "update_time": "1593441000000",
+      "updated": false
+    },
+    {
+      "body": {
+        "content": "{\"text\": \"Redacted text\"}"
+      },
+      "chat_id": "oc_0003",
+      "create_time": "1681116000000",
+      "deleted": false,
+      "message_id": "om_0004",
+      "message_position": "6",
+      "msg_type": "text",
+      "parent_id": "om_0005",
+      "root_id": "om_0005",
+      "sender": {
+        "id": "ou_0006",
+        "id_type": "open_id",
+        "sender_type": "user",
+        "tenant_key": "t-0001"
+      },
+      "update_time": "1681116000000",
+      "updated": false
+    },
+    {
+      "body": {
+        "content": "{\"template\": \"{to_chatters} joined {group_name}\", \"from_user\": [\"member-0002\"], \"to_chatters\": [\"member-0003\"], \"divider_text\": {}}"
+      },
+      "chat_id": "oc_0007",
+      "create_time": "1631153000000",
+      "deleted": false,
+      "message_id": "om_0008",
+      "message_position": "0",
+      "msg_type": "system",
+      "sender": {
+        "id": "",
+        "id_type": "",
+        "sender_type": "",
+        "tenant_key": "t-0001"
+      },
+      "thread_id": "omt_0009",
+      "thread_message_position": "-1",
+      "update_time": "1631153000000",
+      "updated": false
+    },
+    {
+      "body": {
+        "content": "{\"text\": \"Redacted text\"}"
+      },
+      "chat_id": "oc_0010",
+      "create_time": "1775204000000",
+      "deleted": false,
+      "mentions": [
+        {
+          "id": "ou_0011",
+          "id_type": "open_id",
+          "key": "@_user_1",
+          "name": "Redacted",
+          "tenant_key": "t-0001"
+        }
+      ],
+      "message_id": "om_0012",
+      "message_position": "10",
+      "msg_type": "text",
+      "sender": {
+        "id": "ou_0013",
+        "id_type": "open_id",
+        "sender_type": "user",
+        "tenant_key": "t-0001"
+      },
+      "update_time": "1775204100000",
+      "updated": true
+    }
+  ],
+  "hasMore": false,
+  "pageToken": null
+}

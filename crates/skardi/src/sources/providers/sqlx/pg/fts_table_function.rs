@@ -130,6 +130,7 @@ impl TableFunctionImpl for PgFtsTableFunction {
         Ok(Arc::new(PgFtsProvider {
             pool: entry.pool,
             qualified_table: entry.qualified_table,
+            governed_array_key_budget: entry.governed_array_key_budget,
             text_col,
             query,
             limit,
@@ -142,6 +143,7 @@ impl TableFunctionImpl for PgFtsTableFunction {
 // ─── TableProvider ───────────────────────────────────────────────────────────
 
 struct PgFtsProvider {
+    governed_array_key_budget: Option<usize>,
     pool: Arc<sqlx::PgPool>,
     qualified_table: String,
     text_col: String,
@@ -184,7 +186,7 @@ impl TableProvider for PgFtsProvider {
         Ok(filters
             .iter()
             .map(|expr| {
-                if expr_to_pg_sql(expr).is_some() {
+                if expr_to_pg_sql(expr, self.governed_array_key_budget).is_some() {
                     TableProviderFilterPushDown::Exact
                 } else {
                     TableProviderFilterPushDown::Unsupported
@@ -203,7 +205,7 @@ impl TableProvider for PgFtsProvider {
         // Collect pushable WHERE-clause filters.
         let mut parts: Vec<String> = Vec::new();
         for expr in filters {
-            if let Some(sql) = expr_to_pg_sql(expr) {
+            if let Some(sql) = expr_to_pg_sql(expr, self.governed_array_key_budget) {
                 parts.push(sql);
             }
         }

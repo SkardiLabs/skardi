@@ -3,11 +3,12 @@
 //! Three things, all of them pre- or post-processing around an unchanged
 //! request path — `mode` never selects a URL, so nothing here touches routing:
 //!
-//! 1. **Capability gating.** A skardi-cloud gateway mounts `query` and
-//!    `schema`; it has no jobs, pipelines, or health surface. Those commands
-//!    fail before a request is built, because a 404 from a gateway that never
-//!    served the route reads as "the server is broken" rather than "this
-//!    context cannot do that".
+//! 1. **Capability gating.** A skardi-cloud gateway mounts `query`, `schema`,
+//!    `run` and `pipeline`; it has no jobs or health surface, and `mcp` stays
+//!    refused for its own reason (see [`Capability::served_by_gateway`]).
+//!    Those commands fail before a request is built, because a 404 from a
+//!    gateway that never served the route reads as "the server is broken"
+//!    rather than "this context cannot do that".
 //! 2. **Credential expiry.** A context carries `token-expires-at`, so an
 //!    expired PAT is knowable without spending a round trip.
 //! 3. **Error translation.** The gateway's typed refusals name the *deployment*
@@ -54,15 +55,33 @@ impl Capability {
         }
     }
 
-    /// Whether a skardi-cloud gateway serves this command.
+    /// Whether this CLI will *attempt* the command against a skardi-cloud
+    /// gateway.
     ///
-    /// The gateway's route table is `POST /query` and `GET /data_source`
-    /// (§7.4); everything else is an engine-local surface that only a
-    /// `mode: server` context reaches. `mcp` straddles both (its tools need
-    /// pipeline execution and `/pipelines`, which the gateway does not
-    /// mount), so it is refused as a whole rather than served half-broken.
+    /// Read this as a client-side gate and nothing more. `query` and `schema`
+    /// ride the gateway's long-standing `POST /query` and `GET /data_source`
+    /// (§7.4). `run` and `pipeline` are no longer refused here, because the
+    /// cloud side is growing routes for them — but **this list is not a
+    /// promise that any particular gateway mounts them**: whether it does
+    /// depends on that deployment's version, and one that predates the routes
+    /// fails at the request rather than before it, reporting the gateway's
+    /// own error. That is the better failure: a client-side refusal reports
+    /// "not available" for a capability the operator may already have
+    /// deployed, and no shipped CLI can know which.
+    ///
+    /// Everything else is an engine-local surface no gateway mounts, which
+    /// only a `mode: server` context reaches.
+    ///
+    /// `mcp` stays refused, and not because of which routes a gateway mounts:
+    /// the cloud gateway serves its **own** `/mcp` with its own tool
+    /// catalog (the console documents `claude mcp add --transport http
+    /// skardi <url>` as the cloud agent path), so this CLI's stdio bridge
+    /// would be a second, redundant surface rather than a missing one.
     pub const fn served_by_gateway(self) -> bool {
-        matches!(self, Capability::Query | Capability::Schema)
+        matches!(
+            self,
+            Capability::Query | Capability::Schema | Capability::Run | Capability::Pipeline
+        )
     }
 }
 
@@ -220,7 +239,8 @@ fn names_workspace(error_type: Option<&str>, message: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ALL_CAPABILITIES, Capability, diagnose, ensure_available, ensure_credential_fresh,
+        ALL_CAPABILITIES, Capability, cloud_capability_list, diagnose, ensure_available,
+        ensure_credential_fresh,
     };
     use crate::client::ApiError;
     use crate::config::{ClientConfig, ContextMode, SelectedContext};
@@ -289,8 +309,33 @@ mod tests {
             .to_string();
         assert_eq!(
             err,
-            "'job' is not available in a cloud context (acme/prod). Available: query, schema."
+            "'job' is not available in a cloud context (acme/prod). Available: query, schema, run, pipeline."
         );
+    }
+
+    #[test]
+    fn run_and_pipeline_are_available_in_a_cloud_context() {
+        for c in [Capability::Run, Capability::Pipeline] {
+            assert!(
+                c.served_by_gateway(),
+                "{:?} is served by the gateway now",
+                c
+            );
+        }
+    }
+
+    #[test]
+    fn the_available_list_stays_derived_and_now_names_four() {
+        assert_eq!(cloud_capability_list(), "query, schema, run, pipeline");
+    }
+
+    #[test]
+    fn job_and_health_are_still_refused() {
+        // Engine-local surfaces the gateway does not mount. `mcp` is its
+        // own question — see the doc comment.
+        for c in [Capability::Job, Capability::Health] {
+            assert!(!c.served_by_gateway());
+        }
     }
 
     #[test]

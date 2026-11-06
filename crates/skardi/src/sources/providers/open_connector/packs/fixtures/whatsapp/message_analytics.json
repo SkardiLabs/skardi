@@ -1,0 +1,23 @@
+{
+  "granularity": "DAY",
+  "phone_numbers": [
+    "15550100"
+  ],
+  "country_codes": [
+    "US"
+  ],
+  "data_points": [
+    {
+      "start": 1759276800,
+      "end": 1759363200,
+      "sent": 196,
+      "delivered": 179
+    },
+    {
+      "start": 1759363200,
+      "end": 1759449600,
+      "sent": 147,
+      "delivered": 139
+    }
+  ]
+}

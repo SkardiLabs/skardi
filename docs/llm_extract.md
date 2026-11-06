@@ -105,6 +105,10 @@ Behavior per input row:
 | `LLM_EXTRACT_MAX_CALLS` | unlimited | per-query cap on multimodal escalation calls; once exhausted, weak rows stay `low_confidence` |
 | `LLM_EXTRACT_VISION` | model-id heuristic | `true`/`false` override for whether the active model is vision-capable (gates multimodal escalation — see below) |
 | `LLM_EXTRACT_IMAGE_FETCH` | `0` (off) | opt-in to fetch `http(s)://`/`file://`/local-path `image_ref`s; **off by default for SSRF/path-traversal safety** (see below) |
+| `LLM_EXTRACT_API_KEY` | unset | a key for whichever provider is selected, read before the provider's own variable (below) |
+| `LLM_EXTRACT_BASE_URL` | per-provider default (below) | API root the selected OpenAI-compatible provider POSTs `/chat/completions` to |
+| `LLM_EXTRACT_AUTH_STYLE` | `bearer` | how the key is sent: `bearer` (`Authorization: Bearer`) or `api-key` (an `api-key` header, Azure AI Foundry) |
+| `LLM_EXTRACT_API_VERSION` | unset | appended as `?api-version=` (Azure AI Foundry requires it) |
 | `<PROVIDER>_API_KEY` | — | API key for the selected provider (see table); warned about at startup if missing |
 
 ### Providers
@@ -127,6 +131,28 @@ All four built-in providers are OpenAI-compatible chat APIs; a single
 OpenAI-compatible provider is constructed at startup and warns (does not panic)
 if its API-key env var is unset. An unknown `LLM_EXTRACT_PROVIDER` falls back to
 `deepseek` with a warning.
+
+### Serving a table model from your own deployment (Azure AI Foundry)
+
+The three endpoint variables point the selected provider at a gateway that
+serves the same `/chat/completions` shape under its own host and auth. An
+Azure AI Foundry model-inference deployment of DeepSeek, for example:
+
+```bash
+LLM_EXTRACT_PROVIDER=deepseek \
+LLM_EXTRACT_MODEL=DeepSeek-V4-Flash \
+LLM_EXTRACT_BASE_URL=https://<resource>.services.ai.azure.com/models \
+LLM_EXTRACT_AUTH_STYLE=api-key \
+LLM_EXTRACT_API_VERSION=2024-05-01-preview \
+LLM_EXTRACT_API_KEY=<the resource's key>
+```
+
+`LLM_EXTRACT_PROVIDER` still names the table row (it fixes the default model
+and the provider-specific key variable); the overrides replace where it is
+sent and how it authenticates. They apply to the OpenAI-compatible providers
+only — `anthropic` has its own endpoint and ignores them. `response_format`
+support varies by gateway and model; the tool-call fallback above covers a
+gateway that rejects it.
 
 ### Multimodal escalation — vision gate
 

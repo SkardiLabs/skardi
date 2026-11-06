@@ -30,6 +30,11 @@
 //! domain/anyone grants and a user-grant expiration needs a second real
 //! account).
 //!
+//! The optional permission metadata columns and the `files.list` output
+//! schema extension are derived from Open Connector source at `0e4dc775`
+//! (2026-11-01), not a new live-account capture. The historical row fixtures
+//! stay unchanged; the new conversion cases below are authored examples.
+//!
 //! Design decisions and their rationale. Each is held by a named test
 //! below unless marked as an upstream property no Skardi-side test can
 //! hold:
@@ -157,7 +162,7 @@ mod tests {
     use crate::sources::hierarchy::HierarchyLevel;
     use crate::sources::providers::open_connector::action_registry::fingerprint_schema;
     use crate::sources::providers::open_connector::json_to_arrow::RowConverter;
-    use crate::sources::providers::open_connector::pagination::PaginationStrategy;
+    use crate::sources::providers::open_connector::pagination::{AbsentCursor, PaginationStrategy};
     use crate::sources::providers::open_connector::row_path::RowPath;
     use crate::sources::providers::open_connector::source_pack::{FixedValue, SourcePackTable};
     use crate::sources::providers::open_connector::testutil::{
@@ -190,7 +195,7 @@ mod tests {
             .unwrap_or_else(|| panic!("table {short}"))
     }
 
-    /// Discovery serving the captured contracts, so every mock
+    /// Discovery serving the committed contracts, so every mock
     /// registration exercises the fingerprint gate's pass side. The
     /// dotted action ids are matched as full path suffixes — which is
     /// itself part of what these tests exercise: a two-dot action id
@@ -270,10 +275,13 @@ mod tests {
         // every shape the seeded phase-4 corpus produced — a shared
         // My Drive file, a shared-drive file, a trashed file, a native
         // Google Doc, a starred CJK-named file and a folder.
-        let batch = convert_fixture(
-            table("files"),
-            include_str!("fixtures/google_drive/files.json"),
-        );
+        let mut page: Value =
+            serde_json::from_str(include_str!("fixtures/google_drive/files.json")).unwrap();
+        // Synthetic binary observations overlay the captured row shapes;
+        // native files and folders retain their actual omission spelling.
+        page["files"][0]["md5Checksum"] = json!("8b1a9953c4611296a827abf8c47804d7");
+        page["files"][0]["headRevisionId"] = json!("revision-1");
+        let batch = convert_first_page(table("files"), &page);
         assert_eq!(batch.num_rows(), 6);
 
         // Row 0 — a shared My Drive file, fully populated: real byte
@@ -286,6 +294,15 @@ mod tests {
         assert_eq!(utf8(&batch, "mime_type").value(0), "text/plain");
         assert_eq!(int64(&batch, "size_bytes").value(0), 63);
         assert!(utf8(&batch, "drive_id").is_null(0));
+        assert_eq!(
+            utf8(&batch, "md5_checksum").value(0),
+            "8b1a9953c4611296a827abf8c47804d7"
+        );
+        assert_eq!(utf8(&batch, "head_revision_id").value(0), "revision-1");
+        for row in [1, 3, 5] {
+            assert!(utf8(&batch, "md5_checksum").is_null(row));
+            assert!(utf8(&batch, "head_revision_id").is_null(row));
+        }
         assert!(
             utf8(&batch, "web_view_link")
                 .value(0)
@@ -372,6 +389,32 @@ mod tests {
         // emits no `kind` at all — confirmed live on every row.
         for absent in ["owners", "kind", "permission_id", "photo_link"] {
             assert!(batch.column_by_name(absent).is_none(), "{absent}");
+        }
+
+        // Authored optional-metadata cases, not additions to the historical
+        // live capture above. False/empty differ from absent/explicit null.
+        let observed = convert_first_page(
+            table("files"),
+            &json!({"files":[
+                {"id":"reported", "name":"metadata.txt", "mimeType":"text/plain", "inheritedPermissionsDisabled":true, "permissionIds":["grantee-one","grantee-two"]},
+                {"id":"no-break", "name":"metadata.txt", "mimeType":"text/plain", "inheritedPermissionsDisabled":false, "permissionIds":[]},
+                {"id":"unreported", "name":"metadata.txt", "mimeType":"text/plain"},
+                {"id":"null", "name":"metadata.txt", "mimeType":"text/plain", "inheritedPermissionsDisabled":null, "permissionIds":null}
+            ]}),
+        );
+        assert!(boolean(&observed, "inherited_permissions_disabled").value(0));
+        assert!(!boolean(&observed, "inherited_permissions_disabled").value(1));
+        assert_eq!(
+            list_items(utf8_list(&observed, "permission_ids"), 0),
+            vec![Some("grantee-one".into()), Some("grantee-two".into())]
+        );
+        assert_eq!(
+            list_items(utf8_list(&observed, "permission_ids"), 1),
+            Vec::<Option<String>>::new()
+        );
+        for row in [2, 3] {
+            assert!(boolean(&observed, "inherited_permissions_disabled").is_null(row));
+            assert!(utf8_list(&observed, "permission_ids").is_null(row));
         }
     }
 
@@ -808,9 +851,9 @@ mod tests {
     fn empty_page_keeps_schema_stable() {
         // An empty first page must still produce the full declared
         // schema, or a first-page-empty scan would change shape. The
-        // widths are this pack's column counts: 14 / 13 / 11.
+        // widths are this pack's column counts: 18 / 13 / 11.
         for (short, row_key, columns) in [
-            ("files", "files", 14),
+            ("files", "files", 18),
             ("drives", "drives", 13),
             ("file_permissions", "permissions", 11),
         ] {
@@ -869,6 +912,24 @@ mod tests {
                 );
             }
             other => panic!("expected ConversionFailed, got {other}"),
+        }
+        for (field, column, malformed) in [
+            (
+                "inheritedPermissionsDisabled",
+                "inherited_permissions_disabled",
+                json!("false"),
+            ),
+            ("permissionIds", "permission_ids", json!([42])),
+        ] {
+            let mut row = json!({"id":"authored-metadata-mismatch", "name":"metadata.txt", "mimeType":"text/plain"});
+            row[field] = malformed;
+            let err = RowConverter::new(t.fields)
+                .expect("converter")
+                .convert(&[row], 1)
+                .expect_err("malformed optional metadata must fail the page");
+            assert!(
+                matches!(err, OpenConnectorError::ConversionFailed { column: ref actual, .. } if actual == column)
+            );
         }
     }
 
@@ -1011,6 +1072,7 @@ mod tests {
                     page_size_param,
                     page_size: declared,
                     has_more_path,
+                    absent_cursor,
                 } => {
                     assert_eq!(cursor_param, "pageToken", "{short}");
                     assert_eq!(next_cursor_path, "$.nextPageToken", "{short}");
@@ -1020,13 +1082,20 @@ mod tests {
                     // credentials; 1001/101/0 each 400).
                     assert_eq!(declared, page_size, "{short}");
                     assert!(has_more_path.is_none(), "{short}");
+                    // Drive OMITS `nextPageToken` on the final page, so its
+                    // absence is the end of the collection rather than drift.
+                    assert_eq!(absent_cursor, AbsentCursor::EndsTheScan, "{short}");
                 }
                 other => panic!("{short} must paginate by cursor, got {other:?}"),
             }
             assert_eq!(t.row_path, row_path, "{short}");
             // In-band Google errors are consumed by `assertGoogleResponse`
             // upstream into the failure envelope; nothing to forward.
-            assert!(t.error_path.is_none(), "{short}");
+            assert_eq!(
+                t.error_path,
+                (short == "files").then_some("$.incompleteSearch"),
+                "{short}"
+            );
         }
     }
 
@@ -1799,6 +1868,53 @@ bindings:
             message.contains("pagination loop") && message.contains(FILES_PAGE2_TOKEN),
             "the loop names the cursor the gateway would not advance: {message}"
         );
+    }
+
+    #[tokio::test]
+    async fn incomplete_files_listing_never_returns_partial_rows() {
+        for incomplete in [false, true] {
+            let gateway = MockGateway::start(move |req| {
+                if req.method == "GET" && req.path == "/v1/health" {
+                    return MockResponse::ok("{}");
+                }
+                if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                    return google_drive_discovery(&req.path);
+                }
+                if req.method == "POST" && req.path == "/v1/actions/googledrive.files.list" {
+                    return MockResponse::ok(&envelope_ok(
+                        &json!({"files": [file_row("f-1")], "nextPageToken": null,
+                            "incompleteSearch": incomplete})
+                        .to_string(),
+                    ));
+                }
+                MockResponse::new(404, "{}")
+            })
+            .await;
+            let (_gateway, ctx) =
+                setup_with_gateway(gateway, "SKARDI_TEST_OC_GDRIVE_COMPLETE", "files", "").await;
+            let result = ctx
+                .sql("SELECT id FROM saas.gdrive.files")
+                .await
+                .expect("plan")
+                .collect()
+                .await;
+            if incomplete {
+                let error = result.expect_err("incomplete search must not publish partial rows");
+                assert!(
+                    error.to_string().contains("provider reported error"),
+                    "{error}"
+                );
+            } else {
+                assert_eq!(
+                    result
+                        .expect("complete listing")
+                        .iter()
+                        .map(RecordBatch::num_rows)
+                        .sum::<usize>(),
+                    1
+                );
+            }
+        }
     }
 
     #[tokio::test]

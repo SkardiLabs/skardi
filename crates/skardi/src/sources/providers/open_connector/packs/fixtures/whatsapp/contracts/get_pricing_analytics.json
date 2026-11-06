@@ -1,0 +1,57 @@
+{
+  "type": "object",
+  "properties": {
+    "data_points": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "start": {
+            "type": "integer",
+            "description": "Start of the data point window as a UNIX timestamp in seconds."
+          },
+          "end": {
+            "type": "integer",
+            "description": "End of the data point window as a UNIX timestamp in seconds."
+          },
+          "volume": {
+            "type": "integer",
+            "description": "Number of delivered messages the row covers."
+          },
+          "cost": {
+            "type": "number",
+            "description": "Cost of the row in the WABA's billing currency. Omitted when COST is not requested or not available."
+          },
+          "phone_number": {
+            "type": "string",
+            "description": "Business phone number, present when PHONE is a requested dimension."
+          },
+          "country": {
+            "type": "string",
+            "description": "Two-letter country code, present when COUNTRY is a requested dimension."
+          },
+          "pricing_category": {
+            "type": "string",
+            "description": "Pricing category, present when PRICING_CATEGORY is a requested dimension."
+          },
+          "pricing_type": {
+            "type": "string",
+            "description": "Pricing type, present when PRICING_TYPE is a requested dimension."
+          },
+          "tier": {
+            "type": "string",
+            "description": "Volume tier, present when TIER is a requested dimension."
+          }
+        },
+        "additionalProperties": true,
+        "description": "Message volume and cost for one window and dimension combination."
+      },
+      "description": "One entry per window and dimension combination."
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "data_points"
+  ],
+  "description": "Action output."
+}

@@ -95,7 +95,7 @@ impl TableProvider for DocumentsTable {
             projected_schema,
             projection,
             limit,
-            properties,
+            properties: Arc::new(properties),
         }))
     }
 }
@@ -108,7 +108,7 @@ struct DocumentsScanExec {
     projected_schema: SchemaRef,
     projection: Vec<usize>,
     limit: Option<usize>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl DocumentsScanExec {
@@ -209,7 +209,7 @@ impl ExecutionPlan for DocumentsScanExec {
         self.projected_schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

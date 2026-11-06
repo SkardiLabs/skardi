@@ -55,7 +55,7 @@ pub struct PgFtsExec {
     /// Output schema: table columns + `_score Float64`.
     schema: SchemaRef,
     /// Cached DataFusion plan metadata.
-    plan_properties: PlanProperties,
+    plan_properties: Arc<PlanProperties>,
 }
 
 impl PgFtsExec {
@@ -85,7 +85,7 @@ impl PgFtsExec {
             filter,
             scan_limit: None,
             schema,
-            plan_properties,
+            plan_properties: Arc::new(plan_properties),
         }
     }
 
@@ -126,7 +126,7 @@ impl PgFtsExec {
     /// `to_tsvector('lang', col)` when one exists. With the index the double
     /// computation is negligible (ts_rank only runs on matched rows); without one
     /// the real fix is to create the index, not to restructure the query.
-    fn build_query(&self) -> String {
+    pub(super) fn build_query(&self) -> String {
         let cols = self.select_columns();
         let text_col = format!("\"{}\"", self.text_col.replace('"', "\"\""));
         let lang = &self.language;
@@ -199,7 +199,7 @@ impl ExecutionPlan for PgFtsExec {
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.plan_properties
     }
 

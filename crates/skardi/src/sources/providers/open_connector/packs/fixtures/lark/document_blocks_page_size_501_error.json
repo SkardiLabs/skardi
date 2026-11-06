@@ -1,0 +1,15 @@
+{
+  "code": 99992402,
+  "msg": "field validation failed",
+  "error": {
+    "troubleshooter": "排查建议查看(Troubleshooting suggestions): https://open.feishu.cn/search?from=openapi&log_id=redacted-log-id&code=99992402&method_id=7055124481601781762",
+    "field_violations": [
+      {
+        "field": "page_size",
+        "value": "501",
+        "description": "the max value is 500"
+      }
+    ],
+    "log_id": "redacted-log-id"
+  }
+}

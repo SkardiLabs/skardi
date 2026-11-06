@@ -17,6 +17,7 @@
 #[cfg(test)]
 mod tests;
 
+pub mod console_broker;
 pub mod control_plane;
 pub mod loopback;
 pub mod oauth;
@@ -26,8 +27,9 @@ use crate::client::ApiClient;
 use crate::config::{self, Context, ContextMode, ContextsFile, SelectedContext};
 use anyhow::{Context as _, Result, anyhow, bail};
 use chrono::{DateTime, Duration, Utc};
-use control_plane::{ControlPlane, CpError, Membership, Minted};
+use control_plane::{ControlGrant, ControlPlane, CpError, Membership, Minted};
 use std::path::Path;
+use tokio::time::{Instant, sleep};
 
 /// Default PAT lifetime (§6.1 step 5), as `--expires` spells it. A string so
 /// clap's default and this documented value are the same token, parsed by the
@@ -82,12 +84,25 @@ pub struct LoginOptions {
     /// browser path covered rather than argued.
     pub open_browser: fn(&str) -> std::io::Result<()>,
     pub callback_timeout: std::time::Duration,
+    /// How long the brokered flow waits between polls of the exchange.
+    ///
+    /// Injectable for the same reason the timeouts are: the deadline now comes
+    /// from the SERVER's five-minute request expiry, so a test that exercises
+    /// the give-up path would otherwise sleep for five real minutes — which it
+    /// did, taking the suite from 0.3s to 298s.
+    pub poll_interval: std::time::Duration,
     /// Ceiling on the post-mint verification probe (§6.1 step 6).
     pub verify_timeout: std::time::Duration,
     /// The PAT's name at the control plane, `cli@<hostname>`.
     pub token_name: String,
     /// Injected so the expiry a test asserts is not the wall clock.
     pub now: DateTime<Utc>,
+    /// `--control`: ask the approver for the token pair (agent onboarding
+    /// §2.1). Brokered flow only.
+    pub control: bool,
+    /// `--setup`/`--name`/`--industry`: what the consent page prefills for a
+    /// person with no org yet (§2.5). Brokered flow only.
+    pub setup: Option<console_broker::Setup>,
 }
 
 /// One context this run wrote.
@@ -118,6 +133,51 @@ pub struct LoginReport {
     /// `(token id, reason)` for a replacement revocation that failed. Reported
     /// but not fatal: the new context is already good (§6.5).
     pub revoke_failures: Vec<(String, String)>,
+    /// When the `control` token of a pair stops working. `Some` only when
+    /// `--control` was asked for AND approved; the token itself is never in
+    /// a report.
+    pub control_expires_at: Option<String>,
+    /// `--control` was asked for and the approval came back without it: the
+    /// box was unticked, or the approver's role is not admin. The context is
+    /// still written — queries work — and the command exits 6 (§2.4.2).
+    pub control_missing: bool,
+    /// The workspace's MCP server, as the context records it: the
+    /// exchange's, or one derived from the gateway the context queries when
+    /// an override put that elsewhere (see `mcp_url_for`).
+    pub mcp_url: Option<String>,
+    /// The MCP URL the exchange named, when it was set aside because
+    /// `--server` or `$SKARDI_GATEWAY_URL` sent this context's queries to a
+    /// different origin. Reported, so the substitution is never silent.
+    pub mcp_url_set_aside: Option<String>,
+    /// Contexts this login did NOT write that hold the pair it named as
+    /// `replaces_pair_id`: the exchange revoked a pair they still hold, so
+    /// each needs a login of its own. The named context when the approval
+    /// did not include it, and any sibling a multi-workspace login gave the
+    /// same pair.
+    pub replaced_pair_elsewhere: Vec<String>,
+    /// `(token id, pair id)` for each replaced credential that was one half
+    /// of a `login --control` pair. Its control token is the other half, and
+    /// no context holds it after the overwrite, so the pair id is the only
+    /// handle left on it: the report names it whatever became of the token.
+    pub replaced_pairs: Vec<(String, String)>,
+    /// The console that revokes a pair (`/account/agent-access?pair=`):
+    /// the one this login went through, or the one the config file records.
+    pub console: Option<String>,
+}
+
+/// A credential a context held before this run overwrote it.
+struct Replaced {
+    token_id: String,
+    pair_id: Option<String>,
+}
+
+/// What [`write_contexts`] changed beyond the contexts themselves.
+struct Written {
+    /// The credentials it replaced, for §6.5's replacement revocation.
+    replaced: Vec<Replaced>,
+    /// Contexts it did NOT write that hold the pair sent as
+    /// `replaces_pair_id` — revoked under them by the exchange.
+    still_holding_sent_pair: Vec<String>,
 }
 
 /// A PAT this run created, retained so the saga can revoke it.
@@ -129,9 +189,28 @@ struct MintedRef {
 /// Run the whole flow. `config_path` is a parameter so tests write to a temp
 /// directory instead of the developer's own config.
 pub async fn login(options: LoginOptions, config_path: &Path) -> Result<LoginReport> {
+    // The pair and the inline setup exist only on the console's consent page:
+    // the direct flow mints with an ID token and never shows a person a page
+    // that could ask either question. Refused rather than ignored, because
+    // a `--control` silently dropped is an agent that later finds it cannot
+    // connect anything and has no idea why.
+    if !uses_console_broker(&options) && (options.control || options.setup.is_some()) {
+        bail!(
+            "--control and --setup are answered on the console's approval page, so they work only with the browser login — drop --client-id/--identity"
+        );
+    }
+    // With neither `--identity` nor a client id, the console brokers (design
+    // 2026-09-08 §9). That path is not a different way to get a bearer — it
+    // returns a PAT that is already minted and already scoped, so it skips
+    // membership listing, minting, and the saga entirely. Hence a branch here
+    // rather than a third arm inside `acquire_bearer`.
+    if uses_console_broker(&options) {
+        return console_brokered_login(options, config_path).await;
+    }
+    let idp = control_plane::identity_provider_client(control_plane::CONTROL_PLANE_TIMEOUT)?;
+    let bearer = acquire_bearer(&idp, &options).await?;
     let http = control_plane::client(control_plane::CONTROL_PLANE_TIMEOUT)?;
-    let bearer = acquire_bearer(&http, &options).await?;
-    let cp = ControlPlane::new(http.clone(), &options.control_plane, bearer);
+    let cp = ControlPlane::new(http, &options.control_plane, bearer);
 
     let memberships = cp.memberships().await.map_err(describe_cp_failure)?;
     let mut report = LoginReport::default();
@@ -209,8 +288,13 @@ pub async fn login(options: LoginOptions, config_path: &Path) -> Result<LoginRep
         pending.push((membership, token, server));
     }
 
-    match write_contexts(config_path, &options, &pending) {
-        Ok(replaced) => {
+    match write_contexts(config_path, &options, &pending, None) {
+        Ok(Written { replaced, .. }) => {
+            record_mcp_url(&mut report, &pending);
+            report.replaced_pairs = pairs_of(&replaced);
+            // A pair context was written by a browser login, which recorded
+            // its console; that is where a pair left live is revoked.
+            report.console = config::load(config_path).and_then(|file| file.console);
             report.written = pending
                 .iter()
                 .map(|(membership, token, server)| WrittenContext {
@@ -229,8 +313,400 @@ pub async fn login(options: LoginOptions, config_path: &Path) -> Result<LoginRep
     }
 }
 
+/// Whether this run goes through the console broker.
+///
+/// `--identity` and `--client-id` both name a way for the CLI to authenticate
+/// itself, and either one keeps the existing flow. Neither means there is no
+/// IdP for the CLI to talk to, which is exactly the case the console broker
+/// exists for — and it is the default, so `skardi login --control-plane <url>`
+/// works with no other argument (§9).
+///
+/// An empty client id counts as absent, the same way `acquire_bearer` treats
+/// it: `SKARDI_OAUTH_CLIENT_ID=` exported into a shell must not select a path
+/// that then fails for want of the value that variable was supposed to carry.
+fn uses_console_broker(options: &LoginOptions) -> bool {
+    selects_console_broker(options.identity.as_deref(), options.client_id.as_deref())
+}
+
+/// The same question, asked before a [`LoginOptions`] exists.
+///
+/// `commands::login` needs it to decide which recorded URL to fall back to —
+/// the console that brokers, or the control-plane API itself — and those are
+/// different keys in the config file. One predicate, so the key a brokered
+/// login WRITES is always the key the next brokered login READS.
+pub fn selects_console_broker(identity: Option<&str>, client_id: Option<&str>) -> bool {
+    identity.is_none() && client_id.is_none_or(|id| id.trim().is_empty())
+}
+
+/// The console-brokered flow (design 2026-09-08 §4).
+///
+/// # Why this is not the saga
+///
+/// The ID-token flow mints, verifies, and can revoke everything it created,
+/// so a failure anywhere rolls the run back and leaves nothing behind. Here
+/// the credential is minted by skardi-global at the moment the CLI redeems an
+/// approval, and what the CLI holds afterwards is a **PAT** — which
+/// authenticates to the gateway and NOT to skardi-global's `/v1/*`, whose
+/// verifiers accept ID tokens, first-party sessions and `dev:` bearers, and
+/// whose PAT resolution is reachable only over the gRPC directory the gateway
+/// uses.
+///
+/// So there is no rollback available, and pretending otherwise would be worse
+/// than not having one: every point where the saga would revoke, this flow
+/// PRINTS the `token_id` and names the console. A credential nobody can revoke
+/// and nobody knows exists is the outcome §6.5 was written to prevent, and the
+/// id is the only thing that prevents it here.
+async fn console_brokered_login(options: LoginOptions, config_path: &Path) -> Result<LoginReport> {
+    // Refused, not ignored. The consent screen chooses the workspaces, so there
+    // is no honest reading of either flag on this path — and silently logging
+    // into a set the browser chose when `--workspace` named another is the
+    // kind of success that gets discovered much later.
+    match &options.selection {
+        Selection::Auto => {}
+        Selection::Named(slug) => bail!(
+            "--workspace '{slug}' cannot be honoured through a browser login: the console's consent screen chooses the workspaces. Tick '{slug}' in the browser, or select it from the terminal with --client-id <ID> (or --identity dev:<id> against a loopback control plane)"
+        ),
+        Selection::All => bail!(
+            "--all-workspaces cannot be honoured through a browser login: the console's consent screen chooses the workspaces. Tick every one you want there and this login writes a context for each, or select from the terminal with --client-id <ID> (or --identity dev:<id> against a loopback control plane)"
+        ),
+    }
+
+    let http = control_plane::client(control_plane::CONTROL_PLANE_TIMEOUT)?;
+    let pkce = pkce::Pkce::generate()?;
+    // The pair this login replaces (§2.1.1): the one held by the context it
+    // will most likely overwrite — `--context` when named, else the current
+    // one. The exchange revokes it only where the approving identity owns it,
+    // so naming the wrong one revokes nothing that is not the approver's.
+    // `--keep-old-token` keeps the predecessor, as it does for a single token.
+    let replaces = if options.keep_old_token {
+        None
+    } else {
+        pair_to_replace(config_path, options.context_name.as_deref())
+    };
+    // The same ceiling check the saga does, for the same reason: `DateTime +
+    // TimeDelta` panics on overflow and `parse_expires` cannot catch every
+    // case, because its bound is `TimeDelta`'s range and not `DateTime`'s.
+    let token_expires_at = options
+        .now
+        .checked_add_signed(options.expires)
+        .ok_or_else(|| anyhow!("--expires is longer than any usable credential"))?
+        .to_rfc3339();
+
+    let opened = console_broker::open_request(
+        &http,
+        &options.control_plane,
+        &pkce.challenge,
+        // `client_desc` is what the consent screen shows AND what becomes the
+        // PAT's name upstream, so it is the same `cli@<hostname>` the other
+        // path mints under — one name for one machine, whichever flow wrote it.
+        &options.token_name,
+        &token_expires_at,
+        &console_broker::OpenExtras {
+            control: options.control,
+            setup: options.setup.clone(),
+            replaces_pair_id: replaces.as_ref().map(|(_, pair_id)| pair_id.clone()),
+        },
+    )
+    .await?;
+    let url = console_broker::approval_url(&options.control_plane, &opened.request_id);
+
+    // The code goes to stderr with the URL, because the human needs both in
+    // front of them: the browser will ask for it, and the pending list under
+    // Agent access shows the same six characters against no request id. That
+    // pairing is what proves the approver is looking at this terminal.
+    eprintln!("opening {url}");
+    eprintln!(
+        "waiting for approval in the browser (the request expires at {})",
+        opened.expires_at
+    );
+    eprintln!("  confirmation code: {}", opened.confirm);
+    if options.no_browser {
+        eprintln!("  --no-browser: open the URL above yourself, on this machine or another");
+    } else if let Err(err) = (options.open_browser)(&url) {
+        // Not fatal: the URL is already on screen, and a headless box failing
+        // to launch a browser is the normal case rather than an error.
+        eprintln!("could not open a browser ({err}) — open the URL above yourself");
+    }
+
+    let brokered = poll_for_approval(&http, &options, &opened, &pkce.verifier).await?;
+
+    // §11.2: the memberships ride along, so the contexts are written without a
+    // second round trip — one per approved workspace, every one carrying the
+    // single token the approval minted. Their absence is exceptional — it means
+    // the approved memberships vanished between approval and redemption — and
+    // it is fatal here because a context NAME is `<org>/<workspace>` and the
+    // org slug has nowhere else to come from. The token id is printed because
+    // at this point a credential exists that this CLI cannot revoke.
+    if brokered.memberships.is_empty() {
+        bail!(
+            "the console approved workspace '{}' but returned no membership for it, so there is no organization to name the context after. The credential it minted is live and this CLI cannot revoke it — revoke token {} in the console",
+            brokered.workspace,
+            brokered.token_id
+        );
+    }
+    // The token reaches every workspace the approver ticked, so a context set
+    // that misses one would be a silent partial login. Refused the same way
+    // the empty case is, naming what the token reaches and how to revoke it.
+    if !brokered.unmatched.is_empty() {
+        bail!(
+            "the console approved workspace(s) {} but returned no membership for them, so no context can be named for them and this login wrote none. The credential it minted is live and reaches them, and this CLI cannot revoke it — revoke token {} in the console",
+            brokered
+                .unmatched
+                .iter()
+                .map(|w| format!("'{w}'"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            brokered.token_id
+        );
+    }
+    let memberships = brokered.memberships;
+    let roles = brokered.roles;
+    let token = Minted {
+        token: brokered.token,
+        token_id: brokered.token_id,
+        expires_at: brokered.expires_at,
+        control: brokered.control,
+    };
+    // `--context` names ONE context. Only known to be wrong now, after the
+    // browser chose the set, so the credential is reported rather than lost:
+    // writing every workspace under one name would leave only the last.
+    if options.context_name.is_some() && memberships.len() > 1 {
+        return Err(abandoned(
+            &token,
+            anyhow!(
+                "--context names ONE context, but {} workspaces were approved — run `skardi login` again without it, or tick a single workspace",
+                memberships.len()
+            ),
+        ));
+    }
+
+    // Each context is verified through its own `Skardi-Workspace`, because the
+    // token reaching one approved workspace says nothing about the next.
+    let mut pending = Vec::with_capacity(memberships.len());
+    for membership in memberships {
+        let server = resolve_server(&options, &membership).map_err(|err| abandoned(&token, err))?;
+        if !options.no_verify
+            && let Err(err) = verify(&server, &membership, &token, options.verify_timeout).await
+        {
+            return Err(abandoned(&token, err));
+        }
+        // The pair travels whole: the server minted its control half for the
+        // same scope as the PAT (approval refuses `control` below admin in ANY
+        // workspace in scope), so every context gets both, and `skardi agent`
+        // works in whichever one is current.
+        let shared = Minted {
+            token: token.token.clone(),
+            token_id: token.token_id.clone(),
+            expires_at: token.expires_at.clone(),
+            control: token.control.as_ref().map(|c| ControlGrant {
+                token: c.token.clone(),
+                expires_at: c.expires_at.clone(),
+                pair_id: c.pair_id.clone(),
+            }),
+        };
+        pending.push((membership, shared, server));
+    }
+
+    let sent_pair = replaces.as_ref().map(|(_, pair_id)| pair_id.as_str());
+    let written = write_contexts(config_path, &options, &pending, sent_pair).map_err(|err| {
+        // The write failed, and the credential is stranded.
+        abandoned(&token, err)
+    })?;
+    let replaced = written.replaced;
+
+    let mut report = LoginReport::default();
+    report.written = pending
+        .iter()
+        .map(|(membership, token, server)| WrittenContext {
+            name: context_name(&options, membership),
+            server: server.clone(),
+            workspace: membership.tenant_slug.clone(),
+            // What the gateway will answer at, which a role cap can lower.
+            role: roles
+                .get(&membership.tenant_slug)
+                .cloned()
+                .unwrap_or_else(|| membership.role.clone()),
+            expires_at: token.expires_at.clone(),
+        })
+        .collect();
+    report.current_context = report.written.first().map(|w| w.name.clone());
+    record_mcp_url(&mut report, &pending);
+    report.replaced_pairs = pairs_of(&replaced);
+    report.console = Some(options.control_plane.clone());
+    let (_, token, _) = &pending[0];
+    report.control_expires_at = token.control.as_ref().and_then(|c| c.expires_at.clone());
+    report.control_missing = options.control && token.control.is_none();
+    // Every context this write left alone that still holds the pair the
+    // exchange was asked to revoke — the one `--context` or the current
+    // context named, when it was not rewritten, and any sibling a multi-
+    // workspace login gave the same pair. Compared against what was WRITTEN,
+    // not the current context, which is only the first of them.
+    report.replaced_pair_elsewhere = written.still_holding_sent_pair;
+
+    // The replacement rule. A credential whose pair this login named was
+    // revoked by the exchange itself (§2.1.1), under the approver's session —
+    // the one authority that may revoke a token here. Anything else is the
+    // revoke this path cannot perform, routed through `revoke_failures`
+    // because that is already the channel that prints "revoke it in the
+    // console": the outcome is identical to a revoke that failed, and the
+    // reason is stated rather than left as a bare id.
+    for old in replaced {
+        if options.keep_old_token {
+            report.replaced_kept.push(old.token_id);
+        } else if old.pair_id.is_some() && old.pair_id.as_deref() == sent_pair {
+            report.replaced_revoked.push(old.token_id);
+        } else {
+            report.revoke_failures.push((
+                old.token_id,
+                "a browser login holds only a PAT, which cannot revoke tokens at the control plane"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(report)
+}
+
+/// Poll the exchange until a human approves, the request expires, or the
+/// console says the request is gone.
+///
+/// The deadline is the REQUEST's own expiry as the console reported it, parsed
+/// rather than recomputed locally: the server owns the TTL, and a CLI that
+/// kept its own copy would poll past a dead request or give up on a live one
+/// whenever the two drifted. An unparseable stamp falls back to the local
+/// window rather than making the flow depend on the format.
+async fn poll_for_approval(
+    http: &reqwest::Client,
+    options: &LoginOptions,
+    opened: &console_broker::Opened,
+    verifier: &str,
+) -> Result<console_broker::Brokered> {
+    // The SERVER's expiry, not the local OAuth callback timeout. Those differ
+    // by design — the request lives five minutes and the loopback listener
+    // waits 120 seconds — so using the local one gave up while the request was
+    // still open, and told the human they had not approved in time when they
+    // had two more minutes. The doc above claimed this behaviour before the
+    // code had it.
+    //
+    // An unparseable stamp falls back to the local window rather than failing:
+    // a console that changes its timestamp format should shorten this loop, not
+    // break the login.
+    let budget = match DateTime::parse_from_rfc3339(&opened.expires_at) {
+        Ok(at) => (at.with_timezone(&Utc) - options.now)
+            .to_std()
+            .unwrap_or(options.callback_timeout),
+        Err(_) => options.callback_timeout,
+    };
+    let deadline = Instant::now() + budget;
+    // Whether any poll failed in transit. THIS is what makes a later "gone"
+    // ambiguous, and the reason is what a credential requires to exist: the
+    // exchange must have committed.
+    //
+    //   - `pending` says the server did not consume — no credential;
+    //   - a clean `gone` says it did not consume on that call either;
+    //   - a TRANSPORT failure says nothing, because the call may have
+    //     committed and the answer been lost on the way back.
+    //
+    // So a `gone` following a transport failure may be hiding a live PAT,
+    // whatever the request looked like before. An earlier version keyed this on
+    // "was the request ever seen alive", which was wrong twice over: it missed
+    // the case where approval lands before the first poll (nothing is ever
+    // seen pending, so the flag stayed false and a real ambiguity was reported
+    // as a plain expiry), and it warned on `pending → clean gone`, where no
+    // credential can exist because only this process holds the verifier.
+    let mut lost_a_response = false;
+    let mut transport_failures = 0_u32;
+
+    loop {
+        match console_broker::poll_once(http, &options.control_plane, &opened.request_id, verifier)
+            .await
+        {
+            Ok(Some(brokered)) => return Ok(brokered),
+            Ok(None) => {
+                // Consecutive-only, so a single blip mid-login does not spend
+                // the budget a later outage needs. `lost_a_response` is NOT
+                // reset: a poll that may already have committed stays a
+                // possibility for the rest of the run.
+                transport_failures = 0;
+            }
+            Err(err) => {
+                // Gone AFTER a lost response is the ambiguous case: the console
+                // answers gone/expired/redeemed identically, so a redemption
+                // whose answer we never received looks exactly like an expiry.
+                // Say so, because a credential may exist that this run will
+                // never name.
+                if lost_a_response && console_broker::is_gone(&err) {
+                    return Err(err.context(
+ "the login request is gone. If you approved it, a credential may have been minted and this run never received it — check Agent access in the console and revoke anything you did not keep",
+                    ));
+                }
+                // Transport failures are retried rather than fatal: the poll is
+                // idempotent while the request is pending, and a console
+                // restarting mid-approval should not end a login the human is
+                // still working through.
+                if !console_broker::is_transport(&err) {
+                    return Err(err);
+                }
+                transport_failures += 1;
+                lost_a_response = true;
+                if transport_failures > MAX_TRANSPORT_FAILURES {
+                    return Err(err.context(
+ "the console stopped answering the CLI-login exchange. If you approved the request, check Agent access in the console for a credential this run never received",
+                    ));
+                }
+            }
+        }
+        if Instant::now() + options.poll_interval >= deadline {
+            bail!(
+                "nobody approved this login within {}s — the request has expired; run `skardi login` again",
+                budget.as_secs()
+            );
+        }
+        sleep(options.poll_interval).await;
+    }
+}
+
+/// Consecutive transport failures tolerated while polling the exchange.
+///
+/// Small on purpose: the point is to survive a console restart or a dropped
+/// connection mid-approval, not to keep trying at a console that is gone. At
+/// the default poll interval this is a few seconds of grace.
+const MAX_TRANSPORT_FAILURES: u32 = 3;
+
+/// `(context name, pair id)` of the pair a brokered login should replace: the
+/// context `--context` names, else the current one, when it is a cloud
+/// context holding a `pair-id`. Read-only and best effort — a file that does
+/// not parse yet is the next step's problem, and it says so there.
+fn pair_to_replace(config_path: &Path, context_name: Option<&str>) -> Option<(String, String)> {
+    let file = config::load(config_path)?;
+    let name = context_name
+        .map(str::to_string)
+        .or_else(|| file.current_context.clone())?;
+    let context = file.contexts.iter().find(|c| c.name == name)?;
+    if context.mode != ContextMode::Cloud {
+        return None;
+    }
+    let pair_id = context.pair_id.as_deref()?.trim();
+    (!pair_id.is_empty()).then(|| (name, pair_id.to_string()))
+}
+
+/// Attach the "this credential is live and unrevokable" note to a failure that
+/// happens after the exchange succeeded.
+///
+/// One function so every such site says the same thing: the ID-token flow's
+/// equivalent is `rollback`, which can actually revoke. Here the id is all the
+/// user gets, so it must always be there.
+fn abandoned(token: &Minted, cause: anyhow::Error) -> anyhow::Error {
+    cause.context(format!(
+        "the credential the console minted is live and no context holds it — a browser login holds only a PAT, which cannot revoke tokens at the control plane. Revoke token {} in the console",
+        token.token_id
+    ))
+}
+
 /// Step 1-3: the credential presented to the control plane.
-async fn acquire_bearer(http: &reqwest::Client, options: &LoginOptions) -> Result<String> {
+/// `idp` talks to the identity provider only — see
+/// [`control_plane::identity_provider_client`] for why it is not the
+/// control-plane client.
+async fn acquire_bearer(idp: &reqwest::Client, options: &LoginOptions) -> Result<String> {
     if let Some(identity) = &options.identity {
         check_dev_identity(
             identity,
@@ -244,13 +720,19 @@ async fn acquire_bearer(http: &reqwest::Client, options: &LoginOptions) -> Resul
         .client_id
         .as_deref()
         .filter(|id| !id.trim().is_empty());
+    // Unreachable through `login` since the console broker became the default
+    // (design 2026-09-08 §9): the condition this refuses — no identity and no
+    // usable client id — is exactly what `uses_console_broker` matches, so
+    // that branch returns before this one is reached. Kept because it is the
+    // invariant THIS function depends on, and one line here is cheaper than a
+    // future caller discovering it by sending an empty client id to Google.
     let Some(client_id) = client_id else {
         bail!(
             "no OAuth client id: pass --client-id, set $SKARDI_OAUTH_CLIENT_ID, or use --identity dev:<id> against a loopback control plane"
         )
     };
     oauth::acquire_id_token(
-        http,
+        idp,
         &options.endpoints,
         client_id,
         options.no_browser,
@@ -505,16 +987,64 @@ fn context_name(options: &LoginOptions, membership: &Membership) -> String {
         .unwrap_or_else(|| membership.context_name())
 }
 
+/// The MCP URL to record beside `server`, and the exchange's own when it was
+/// set aside.
+///
+/// The exchange names the MCP server on the gateway IT knows (§2.9.2). When
+/// `--server` or `$SKARDI_GATEWAY_URL` won instead, queries go to that
+/// gateway, and recording the exchange's URL would have `mcp register` hand
+/// the same token to a different deployment — a host the person never named
+/// for it. So when the two origins differ, the URL is the gateway this
+/// context actually queries plus `/mcp`, and the exchange's is returned to
+/// be reported. Same origin (or no override), the exchange's stands. No URL
+/// from the exchange means the deployment has no gateway URL set, and none
+/// is invented (`mcp register` names the missing setting).
+fn mcp_url_for(server: &str, membership: &Membership) -> (Option<String>, Option<String>) {
+    let Some(named) = membership
+        .mcp_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+    else {
+        return (None, None);
+    };
+    let origin = |url: &str| reqwest::Url::parse(url).ok().map(|url| url.origin());
+    match (origin(named), origin(server)) {
+        (Some(a), Some(b)) if a == b => (Some(named.to_string()), None),
+        _ => (
+            Some(format!("{}/mcp", server.trim().trim_end_matches('/'))),
+            Some(named.to_string()),
+        ),
+    }
+}
+
+/// The first context's MCP URL, as written, into the report — and the
+/// exchange's, when it was set aside.
+fn record_mcp_url(report: &mut LoginReport, pending: &[(Membership, Minted, String)]) {
+    if let Some((membership, _, server)) = pending.first() {
+        (report.mcp_url, report.mcp_url_set_aside) = mcp_url_for(server, membership);
+    }
+}
+
+/// `(token id, pair id)` of each replaced credential that belonged to a pair.
+fn pairs_of(replaced: &[Replaced]) -> Vec<(String, String)> {
+    replaced
+        .iter()
+        .filter_map(|r| Some((r.token_id.clone(), r.pair_id.clone()?)))
+        .collect()
+}
+
 /// Write every verified context and point `current-context` at the first.
 ///
-/// Returns the token ids of credentials this write REPLACED, for §6.5's
-/// replacement revocation. The whole file is written once, so a partial set of
-/// contexts cannot land.
+/// Returns the credentials this write REPLACED — each token id, and the pair
+/// it belonged to — for §6.5's replacement revocation. The whole file is
+/// written once, so a partial set of contexts cannot land.
 fn write_contexts(
     path: &Path,
     options: &LoginOptions,
     pending: &[(Membership, Minted, String)],
-) -> Result<Vec<String>> {
+    sent_pair: Option<&str>,
+) -> Result<Written> {
     let mut file: ContextsFile = config::load_for_mutation(path)?;
     file.promote_legacy_spec();
     let mut replaced = Vec::new();
@@ -525,7 +1055,10 @@ fn write_contexts(
         if let Some(index) = existing {
             // Retained BEFORE the overwrite: after it, the id is gone.
             if let Some(token_id) = file.contexts[index].token_id.clone() {
-                replaced.push(token_id);
+                replaced.push(Replaced {
+                    token_id,
+                    pair_id: file.contexts[index].pair_id.clone(),
+                });
             }
         }
         let index = existing.unwrap_or_else(|| {
@@ -542,16 +1075,71 @@ fn write_contexts(
         context.token = Some(token.token.clone());
         context.token_id = Some(token.token_id.clone());
         context.token_expires_at = token.expires_at.clone();
+        // Every pair field is ASSIGNED, never merged: a re-login approved
+        // without `control` must not leave the previous pair's control token
+        // beside a new `token`, where an agent would keep driving a grant the
+        // person did not renew. The previous pair was revoked by the exchange
+        // or is about to expire; either way it is not this login's.
+        let control = token.control.as_ref();
+        context.control_token = control.map(|c| c.token.clone());
+        context.control_token_expires_at = control.and_then(|c| c.expires_at.clone());
+        context.pair_id = control.and_then(|c| c.pair_id.clone());
+        context.mcp_url = mcp_url_for(server, membership).0;
     }
 
     if let Some((membership, _, _)) = pending.first() {
         file.current_context = Some(context_name(options, membership));
     }
+    // One token can now back several contexts (a browser login approving
+    // several workspaces), so a replaced id is reported for revocation only
+    // once, and not at all while a context this write left alone still holds
+    // it — revoking it would cut that context off too.
+    // Keyed on the token id: every context the shared token backed held the
+    // same pair, so one entry per id keeps its pair id too.
+    replaced.sort_by(|a, b| a.token_id.cmp(&b.token_id));
+    replaced.dedup_by(|a, b| a.token_id == b.token_id);
+    //
+    // Except a token whose pair this login sent as `replaces_pair_id`: the
+    // exchange revoked that pair server-side whoever still holds it, so it is
+    // reported as revoked, and the contexts left holding it are named.
+    let was_sent = |pair_id: Option<&str>| pair_id.is_some() && pair_id == sent_pair;
+    replaced.retain(|old| {
+        was_sent(old.pair_id.as_deref())
+            || !file
+                .contexts
+                .iter()
+                .any(|c| c.token_id.as_deref() == Some(old.token_id.as_str()))
+    });
+    let written_names: Vec<String> = pending
+        .iter()
+        .map(|(membership, _, _)| context_name(options, membership))
+        .collect();
+    let still_holding_sent_pair = file
+        .contexts
+        .iter()
+        .filter(|c| !written_names.contains(&c.name) && was_sent(c.pair_id.as_deref()))
+        .map(|c| c.name.clone())
+        .collect();
     // Recorded so a later `login` with no --control-plane reaches the same
-    // control plane this one did.
-    file.control_plane = Some(options.control_plane.clone());
+    // place this one did — under the key that matches WHICH place it is.
+    //
+    // Both flows take the URL from the same `--control-plane` flag, but they
+    // point at different services: the brokered flow is given a console, whose
+    // control-plane API lives under `/api/global/v1/...` and only answers a
+    // browser with a session. Recording a console URL as `control-plane`
+    // poisoned every later direct call — a `logout --revoke` cleared the local
+    // credential and then sent `DELETE /v1/me/tokens/{id}` at the console,
+    // which replied with its own 404 page.
+    if uses_console_broker(options) {
+        file.console = Some(options.control_plane.clone());
+    } else {
+        file.control_plane = Some(options.control_plane.clone());
+    }
     config::save(path, &file)?;
-    Ok(replaced)
+    Ok(Written {
+        replaced,
+        still_holding_sent_pair,
+    })
 }
 
 /// §6.5's rollback: revoke everything this run minted, then report the ORIGINAL
@@ -592,13 +1180,20 @@ async fn rollback(
 /// token it replaced, unless `--keep-old-token` retains it for an agent that
 /// is mid-task. A failure here is reported, not fatal — the new context is
 /// already good.
+///
+/// A replaced credential that was half of a `login --control` pair is revoked
+/// by its own token id like any other: skardi-global revokes a pair's tokens
+/// together (`revoke_pat`, onboarding design §2.1.1), so the control token
+/// goes with it. The pair id is in [`LoginReport::replaced_pairs`] either
+/// way, so a revoke that fails, or one `--keep-old-token` skips, still names
+/// the control token it leaves live.
 async fn revoke_replaced(
     cp: &ControlPlane,
-    replaced: Vec<String>,
+    replaced: Vec<Replaced>,
     options: &LoginOptions,
     report: &mut LoginReport,
 ) {
-    for token_id in replaced {
+    for Replaced { token_id, .. } in replaced {
         if options.keep_old_token {
             report.replaced_kept.push(token_id);
             continue;

@@ -77,7 +77,7 @@ pub(super) struct PgVectorFetchExec {
     /// SQL that returns `embedding::text` for one row.
     sql: String,
     schema: SchemaRef,
-    plan_properties: PlanProperties,
+    plan_properties: Arc<PlanProperties>,
 }
 
 impl PgVectorFetchExec {
@@ -93,7 +93,7 @@ impl PgVectorFetchExec {
             pool,
             sql,
             schema,
-            plan_properties,
+            plan_properties: Arc::new(plan_properties),
         }
     }
 }
@@ -120,7 +120,7 @@ impl ExecutionPlan for PgVectorFetchExec {
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.plan_properties
     }
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -223,7 +223,7 @@ pub struct PgKnnExec {
     /// Output schema: non-vector columns + `_score Float64`
     schema: SchemaRef,
     /// Cached DataFusion plan metadata (partitioning, emission type, boundedness)
-    plan_properties: PlanProperties,
+    plan_properties: Arc<PlanProperties>,
 }
 
 impl PgKnnExec {
@@ -250,7 +250,7 @@ impl PgKnnExec {
             filter,
             scan_limit: None,
             schema,
-            plan_properties,
+            plan_properties: Arc::new(plan_properties),
         }
     }
 
@@ -280,7 +280,7 @@ impl PgKnnExec {
             filter,
             scan_limit: None,
             schema,
-            plan_properties,
+            plan_properties: Arc::new(plan_properties),
         }
     }
 
@@ -325,7 +325,7 @@ impl PgKnnExec {
     /// The raw distance expression appears in ORDER BY so pgvector indexes
     /// (HNSW / IVFFlat) can be utilised. The `::float8` cast is only applied
     /// in the SELECT list (`_score` column) to avoid breaking index matching.
-    fn build_query(&self) -> String {
+    pub(super) fn build_query(&self) -> String {
         let cols = self.select_columns();
         let vec_col = format!("\"{}\"", self.vector_col.replace('"', "\"\""));
         let where_clause = self
@@ -419,7 +419,7 @@ impl ExecutionPlan for PgKnnExec {
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.plan_properties
     }
 

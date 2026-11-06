@@ -450,6 +450,60 @@ Ensure the Lance dataset has an INVERTED index on the target column. Without an 
 #### "Phrase search returns unexpected results"
 Verify the INVERTED index was created with `with_position=True`. Without positions, phrase queries fall back to term matching.
 
+### `fts_match`: a full-text predicate for engines that push it down
+
+`fts_match(column, query)` is a boolean predicate that names a full-text
+search in a `WHERE` clause instead of building a table, for an engine that
+authorizes queries by walking their plan and therefore cannot allow table
+functions such as `lance_fts`:
+
+```sql
+SELECT path, title
+FROM corpus
+WHERE fts_match(body, 'onboarding checklist')
+  AND "type" = 'document'
+```
+
+**The OSS server does not register or execute it.** No provider in this
+repository answers it yet, so the server leaves it out of its session, and
+a query naming it fails to plan there. It is a building block for an engine
+whose own Lance provider recognizes the predicate and turns it into a Lance
+full-text query:
+
+- call `skardi::sources::providers::lance::register_fts_match_udf(&ctx)` on
+  the session;
+- in the provider's `supports_filters_pushdown` and `scan`, find the call with
+  `as_fts_match(expr)`, which returns the column and the query, and classify
+  the query with `FtsMatch::query_text()`.
+
+If no provider takes the predicate, evaluating it is an error that says so,
+never an empty result, so "nothing matched" and "nothing searched" cannot be
+confused. Use `lance_fts` for full-text search on the OSS server.
+
+**What a query means.** The query's syntax is the provider's: `lance_fts`
+reads `foo bar` as either word, and a provider may read it as both. Every
+provider agrees on three cases: a NULL query matches no row (SQL's rule), an
+empty or whitespace-only query matches no row, and a query that is not a
+literal (a column, a subquery) is refused.
+
+**The provider contract.** A provider that answers `fts_match` must:
+
+1. **Answer `Exact`, never `Inexact`.** `Inexact` keeps a `Filter` above the
+   scan, the `Filter` calls the predicate, and every query errors. A wrapper
+   that downgrades `Exact` to `Inexact` breaks it the same way.
+2. **Return every match, with no implicit top-k.** It may stop early only at
+   a `limit` DataFusion hands the scan, which happens only when every
+   conjunct was claimed `Exact`. Setting a Lance `FullTextSearchQuery` limit,
+   or a `wand_factor` above 1, while claiming `Exact` silently drops rows.
+3. **Refuse what it cannot translate** by answering `Unsupported`, for
+   example a non-literal query or a column with no full-text index, so the
+   call fails loudly.
+
+**Ranking.** `fts_match` has no score, so `ORDER BY relevance` cannot be
+written in SQL. A provider may return matches best first. A query sees that
+order when every conjunct is claimed and its `LIMIT` reaches the scan;
+otherwise DataFusion does not promise to keep it.
+
 ## Creating Your Own Vector Search Pipeline
 
 ### 1. Create Context Configuration

@@ -6,13 +6,52 @@
 //! options and remains testable without a process.
 
 use crate::config::{self, ContextsFile};
+use crate::exit::Exit;
+use crate::login::console_broker::Setup;
 use crate::login::{self, LoginOptions, LoginReport, Selection, control_plane, oauth};
 use anyhow::{Context as _, Result, bail};
-use clap::Args;
+use clap::{Args, ValueEnum};
 use std::path::Path;
+
+/// The exit code for a `login --control` approved without `control` (agent
+/// onboarding §2.4.2): the context is written, and the agent learns it cannot
+/// connect anything without parsing a sentence.
+pub const EXIT_NO_CONTROL: u8 = 6;
+
+/// What `login --control` says when the approval came back without it. The
+/// first clause is the design's (§2.4.2); the rest is what to do about it.
+pub const NO_CONTROL_MESSAGE: &str = "approved without control: the box was unticked, or your role is not admin; ask an admin to connect sources. The context was written, so queries work. To connect data sources yourself, run `skardi login --control` again and tick \"may connect data sources\" when you approve";
+
+/// `--setup`'s two values: `/setup`'s org profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum SetupProfile {
+    Personal,
+    Team,
+}
+
+impl SetupProfile {
+    fn as_str(self) -> &'static str {
+        match self {
+            SetupProfile::Personal => "personal",
+            SetupProfile::Team => "team",
+        }
+    }
+}
 
 /// `--control-plane`'s environment step (§6.1 step 1).
 const CONTROL_PLANE_ENV: &str = "SKARDI_CONTROL_PLANE_URL";
+
+/// The hosted console, and the ONLY compiled-in URL in this binary.
+///
+/// It closes the chain for the brokered flow alone. The direct flow appends
+/// bare `/v1/me/...` and needs skardi-global's own API address, which the
+/// hosted deployment does not expose — global answers only behind the console
+/// at `/api/global/v1/...` — so there is nothing correct to write here for it,
+/// and it keeps failing by name.
+///
+/// The value is prod's `deploy/gitops/envs/prod/origin.yaml`, the one file in
+/// skardi-cloud allowed to name a public host. Change it there first.
+pub(super) const DEFAULT_CONSOLE: &str = "https://console.skardi.ai";
 /// `--server`'s environment step for the gateway URL (§6.2).
 const GATEWAY_URL_ENV: &str = "SKARDI_GATEWAY_URL";
 /// The OAuth client id, so a deployment can pin it once per shell instead of
@@ -28,11 +67,14 @@ pub struct LoginArgs {
     #[arg(long, value_name = "URL")]
     pub control_plane: Option<String>,
 
-    /// log in to one workspace by slug (non-interactive)
+    /// log in to one workspace by slug (non-interactive). Needs --client-id or
+    /// --identity: a browser-brokered login is approved for one workspace in
+    /// the console, so the terminal does not choose
     #[arg(long, value_name = "SLUG", conflicts_with = "all_workspaces")]
     pub workspace: Option<String>,
 
-    /// log in to every active workspace this identity belongs to
+    /// log in to every active workspace this identity belongs to. Needs
+    /// --client-id or --identity, for the same reason as --workspace
     #[arg(long)]
     pub all_workspaces: bool,
 
@@ -40,11 +82,14 @@ pub struct LoginArgs {
     #[arg(long, value_name = "DURATION", default_value = login::DEFAULT_EXPIRES)]
     pub expires: String,
 
-    /// print the sign-in URL instead of opening a browser
+    /// print the sign-in URL instead of opening a browser. On the default
+    /// console-brokered path this is enough to log in from another machine
     #[arg(long)]
     pub no_browser: bool,
 
-    /// OAuth client id; overrides $SKARDI_OAUTH_CLIENT_ID
+    /// OAuth client id, selecting the direct provider flow; overrides
+    /// $SKARDI_OAUTH_CLIENT_ID. Omit it and the console brokers the sign-in,
+    /// which needs no client id and works over SSH
     #[arg(long, value_name = "ID")]
     pub client_id: Option<String>,
 
@@ -64,6 +109,26 @@ pub struct LoginArgs {
     /// keep the credential a re-login replaces, instead of revoking it
     #[arg(long)]
     pub keep_old_token: bool,
+
+    /// ask the approver for a 24-hour `control` token beside the query
+    /// token, so `skardi integrations` can connect data sources. Exits 6 when
+    /// the approval comes back without it. Browser login only
+    #[arg(long)]
+    pub control: bool,
+
+    /// for a person with no account yet: create a personal or team
+    /// workspace on the approval page. Needs --name. Browser login only
+    #[arg(long, value_enum, value_name = "PROFILE", requires = "name")]
+    pub setup: Option<SetupProfile>,
+
+    /// the new workspace's name, which its members will see (with --setup)
+    #[arg(long, value_name = "NAME", requires = "setup")]
+    pub name: Option<String>,
+
+    /// the new workspace's industry, one of the console's setup values
+    /// (with --setup)
+    #[arg(long, value_name = "INDUSTRY", requires = "setup")]
+    pub industry: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -106,7 +171,41 @@ pub async fn run(
     let options = options_from(&args, flag_context, flag_server, &path)?;
     let report = login::login(options, &path).await?;
     print_report(&report);
+    if report.control_missing {
+        return Err(Exit {
+            code: EXIT_NO_CONTROL,
+            message: Some(NO_CONTROL_MESSAGE.to_string()),
+        }
+        .into());
+    }
     Ok(())
+}
+
+/// `--setup`/`--name`/`--industry` as the request carries them.
+///
+/// The name's bounds are `/setup`'s (1–100 characters); checked here so a
+/// typo costs nothing, and checked again by the server, which owns them —
+/// as it owns the industry list, which this binary does not copy.
+fn setup_from(args: &LoginArgs) -> Result<Option<Setup>> {
+    let Some(profile) = args.setup else {
+        return Ok(None);
+    };
+    let name = args.name.as_deref().unwrap_or_default().trim().to_string();
+    let length = name.chars().count();
+    if length == 0 || length > 100 {
+        bail!("--name must be 1 to 100 characters, not {length}");
+    }
+    let industry = args
+        .industry
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    Ok(Some(Setup {
+        profile: profile.as_str().to_string(),
+        name,
+        industry,
+    }))
 }
 
 /// Assemble [`LoginOptions`] from flags, environment, and the config file.
@@ -120,11 +219,42 @@ fn options_from(
     path: &Path,
 ) -> Result<LoginOptions> {
     let file = config::load(path);
-    let control_plane = resolve_control_plane(
+    let client_id = args
+        .client_id
+        .clone()
+        .or_else(|| std::env::var(CLIENT_ID_ENV).ok());
+    let identity = args
+        .identity
+        .clone()
+        .or_else(|| std::env::var(DEV_IDENTITY_ENV).ok());
+    // Which URL this run falls back to depends on which flow it will take, so
+    // the credential flags are resolved FIRST. The predicate is `login`'s own,
+    // shared rather than restated, so the key written by a brokered login is
+    // always the key the next brokered login reads.
+    let kind = if login::selects_console_broker(identity.as_deref(), client_id.as_deref()) {
+        UrlKind::Console
+    } else {
+        UrlKind::ControlPlane
+    };
+    let resolved = resolve_control_plane(
         args.control_plane.clone(),
         std::env::var(CONTROL_PLANE_ENV).ok(),
         file.as_ref(),
+        kind,
     )?;
+    // Said BEFORE the browser opens, and only when nothing chose the URL.
+    //
+    // The risk a default introduces is not that it points at prod; it is that
+    // someone on a dev cluster forgets to configure theirs and signs in to prod
+    // without noticing. Configured URLs are the person's own choice and need no
+    // announcement; the default is the one case where the CLI decided for
+    // them, so it says so, names the three ways to override, and does it while
+    // there is still time to Ctrl-C. On stderr, like the cleartext warning, so
+    // a script capturing the report is not disturbed.
+    if resolved.defaulted {
+        eprintln!("{}", default_notice(&resolved.url));
+    }
+    let control_plane = resolved.url;
     let selection = match (&args.workspace, args.all_workspaces) {
         (Some(slug), _) => Selection::Named(slug.clone()),
         (None, true) => Selection::All,
@@ -132,14 +262,8 @@ fn options_from(
     };
     Ok(LoginOptions {
         control_plane,
-        client_id: args
-            .client_id
-            .clone()
-            .or_else(|| std::env::var(CLIENT_ID_ENV).ok()),
-        identity: args
-            .identity
-            .clone()
-            .or_else(|| std::env::var(DEV_IDENTITY_ENV).ok()),
+        client_id,
+        identity,
         allow_dev_auth_off_loopback: args.i_know_this_is_dev_auth,
         selection,
         context_name: flag_context,
@@ -152,35 +276,104 @@ fn options_from(
         endpoints: oauth::Endpoints::default(),
         open_browser: oauth::open_in_browser,
         callback_timeout: oauth::CALLBACK_TIMEOUT,
+        poll_interval: login::console_broker::POLL_INTERVAL,
         verify_timeout: control_plane::CONTROL_PLANE_TIMEOUT,
         token_name: login::default_token_name(),
         now: chrono::Utc::now(),
+        control: args.control,
+        setup: setup_from(args)?,
     })
 }
 
-/// §6.1 step 1: `--control-plane` > `$SKARDI_CONTROL_PLANE_URL` >
-/// `control-plane:` in the file > hard error.
+/// §6.1 step 1: `--control-plane` > `$SKARDI_CONTROL_PLANE_URL` > the flow's
+/// key in the file > a built-in default for the brokered flow, or a hard error
+/// for the direct one.
 ///
-/// The design's chain ends in a "built-in default"; there is no hosted
-/// skardi-cloud control plane to encode yet, and inventing a hostname that
-/// answers nothing would fail at DNS with no mention of the three real inputs.
-/// So the chain ends the way §6.2's does — a typed error naming them — and a
-/// one-line constant replaces it the day the hosted URL exists.
+/// The design's chain always ended in a built-in default. This comment used to
+/// explain why there was none — no hosted control plane existed, and inventing
+/// a hostname that answered nothing would have failed at DNS with no mention
+/// of the three real inputs — and promised that "a one-line constant replaces
+/// it the day the hosted URL exists". That day is `console.skardi.ai`, and the
+/// constant is [`DEFAULT_CONSOLE`].
+///
+/// Only the brokered flow gets it. The direct flow still ends the way §6.2's
+/// does, a typed error naming the three inputs, because there is no hosted
+/// address for what it calls (see the constant's doc).
+/// Which recorded URL a flow should fall back to.
+///
+/// Both arrive through `--control-plane`, and they are NOT interchangeable: a
+/// console serves the control-plane API under `/api/global/v1/...` and only to
+/// a browser holding a session, while `ControlPlane` appends bare
+/// `/v1/me/...`. Reading the wrong one sent `logout --revoke` at a console,
+/// which answered with its 404 page after the local credential was already
+/// cleared — so the fallback key is part of the flow's identity, not a detail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum UrlKind {
+    /// The console that brokers a browser login (`console:` in the file).
+    Console,
+    /// The control-plane API itself (`control-plane:` in the file), for the
+    /// OAuth/dev login and for `logout --revoke`.
+    ControlPlane,
+}
+
+impl UrlKind {
+    /// The file key this kind falls back to, named in the error too so the
+    /// message and the lookup cannot drift.
+    const fn file_key(self) -> &'static str {
+        match self {
+            UrlKind::Console => "console:",
+            UrlKind::ControlPlane => "control-plane:",
+        }
+    }
+}
+
+/// The line printed when the CLI chose the URL. A function, not an inline
+/// format, so its wording is a tested value: it deliberately names the same
+/// three inputs the no-URL error names, and a test that only grepped for those
+/// strings could not tell the notice from the error it replaced.
+pub(super) fn default_notice(url: &str) -> String {
+    format!(
+        "signing in through {url} (the built-in default; pass --control-plane <URL>, set \
+         ${CONTROL_PLANE_ENV}, or add 'console:' to ~/.skardi/config.yaml to use another)"
+    )
+}
+
+/// A resolved URL and whether the CLI chose it.
+///
+/// `defaulted` is carried rather than recomputed by the caller (`url ==
+/// DEFAULT_CONSOLE`) because a person who WRITES the default into their file,
+/// or passes it as a flag, has configured it — and the notice exists to flag
+/// the one case where nobody did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Resolved {
+    pub url: String,
+    pub defaulted: bool,
+}
+
 fn resolve_control_plane(
     flag: Option<String>,
     env: Option<String>,
     file: Option<&ContextsFile>,
-) -> Result<String> {
-    let from_file = file.and_then(|f| f.control_plane.clone());
-    let resolved = [flag, env, from_file]
+    kind: UrlKind,
+) -> Result<Resolved> {
+    let from_file = file.and_then(|f| match kind {
+        UrlKind::Console => f.console.clone(),
+        UrlKind::ControlPlane => f.control_plane.clone(),
+    });
+    let configured = [flag, env, from_file]
         .into_iter()
         .flatten()
         .map(|url| url.trim().to_string())
         .find(|url| !url.is_empty());
-    let Some(url) = resolved else {
-        bail!(
-            "no control plane configured: pass --control-plane <URL>, set ${CONTROL_PLANE_ENV}, or add 'control-plane:' to ~/.skardi/config.yaml"
-        )
+    let (url, defaulted) = match (configured, kind) {
+        (Some(url), _) => (url, false),
+        (None, UrlKind::Console) => (DEFAULT_CONSOLE.to_string(), true),
+        (None, UrlKind::ControlPlane) => {
+            let key = kind.file_key();
+            bail!(
+                "no control plane configured: pass --control-plane <URL>, set ${CONTROL_PLANE_ENV}, or add '{key}' to ~/.skardi/config.yaml"
+            )
+        }
     };
     // This is the leg carrying the most sensitive traffic in the flow — the ID
     // token goes up on every call and `POST /v1/me/tokens` returns the RAW PAT
@@ -195,7 +388,7 @@ fn resolve_control_plane(
             "warning: {url} is plain http to a non-loopback host — the sign-in assertion and the minted credential would cross the network in the clear; prefer an https:// control plane"
         );
     }
-    Ok(url)
+    Ok(Resolved { url, defaulted })
 }
 
 /// The control plane `logout --revoke` should talk to, resolved by the same
@@ -209,7 +402,11 @@ pub(super) fn control_plane_for_revoke(
         args.control_plane.clone(),
         env_control_plane.map(str::to_string),
         config::load(path).as_ref(),
+        // Never the console: `--revoke` calls `DELETE /v1/me/tokens/{id}`
+        // directly, which a console does not serve.
+        UrlKind::ControlPlane,
     )
+    .map(|resolved| resolved.url)
 }
 
 /// Print what the run did.
@@ -219,12 +416,53 @@ pub(super) fn control_plane_for_revoke(
 /// then asserted directly, instead of only through a subprocess's stdout.
 fn print_report(report: &LoginReport) {
     print!("{}", render_report(report));
+    eprint!("{}", render_warnings(report));
+}
+
+/// What `print_report` puts on stderr: what this login could not clean up.
+///
+/// Not failures of the login (§6.5) — the new context is already good — so
+/// they warn beside the summary rather than joining it.
+fn render_warnings(report: &LoginReport) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
     for (token_id, reason) in &report.revoke_failures {
-        // Not a failure of the login (§6.5): the new context is already good,
-        // so this warns on stderr rather than joining the summary.
-        eprintln!(
+        let _ = writeln!(
+            out,
             "warning: could not revoke the replaced credential {token_id} ({reason}) — revoke it in the console"
         );
+    }
+    // A replaced credential that was half of a `login --control` pair and was
+    // NOT revoked leaves the pair's control token live for up to 24 hours,
+    // and no context holds it any more: the pair id is the one handle left,
+    // so it is named with the page that revokes it.
+    for (token_id, pair_id) in &report.replaced_pairs {
+        if report.replaced_revoked.contains(token_id) {
+            continue;
+        }
+        let page = agent_access(report.console.as_deref(), pair_id);
+        let _ = writeln!(
+            out,
+            "warning: {token_id} was part of the `login --control` pair {pair_id}, whose control token stays live until it expires (24 hours after that login) — revoke the pair at {page}"
+        );
+    }
+    out
+}
+
+/// The console page that revokes `pair_id`, or its path when no console is
+/// on record.
+fn agent_access(console: Option<&str>, pair_id: &str) -> String {
+    let path = format!(
+        "/account/agent-access?pair={}",
+        crate::client::encode_component(pair_id)
+    );
+    match console
+        .map(|c| c.trim().trim_end_matches('/'))
+        .filter(|c| !c.is_empty())
+    {
+        Some(console) => format!("{console}{path}"),
+        None => format!("the console's {path}"),
     }
 }
 
@@ -252,11 +490,42 @@ fn render_report(report: &LoginReport) -> String {
     if let Some(current) = &report.current_context {
         let _ = writeln!(out, "current context is now {current}");
     }
+    // Never the token: when it stops working is what a person plans around.
+    if let Some(at) = &report.control_expires_at {
+        let _ = writeln!(
+            out,
+            "control granted until {at}: `skardi integrations` can connect data sources until then"
+        );
+    }
+    if let Some(url) = &report.mcp_url {
+        let _ = writeln!(
+            out,
+            "MCP server: {url} — run `skardi mcp register claude-code` to add it to Claude Code"
+        );
+    }
+    if let Some(named) = &report.mcp_url_set_aside {
+        let _ = writeln!(
+            out,
+            "  (the control plane named {named}, but this context queries the gateway --server or $SKARDI_GATEWAY_URL chose, so its MCP server is taken from there)"
+        );
+    }
+    for name in &report.replaced_pair_elsewhere {
+        let _ = writeln!(
+            out,
+            "this login replaced the credentials context {name} held, which the exchange revoked if they were yours — run `skardi login --context {name}` to sign it in again"
+        );
+    }
     for token_id in &report.replaced_revoked {
         let _ = writeln!(
             out,
             "revoked the credential this login replaced ({token_id})"
         );
+        if let Some((_, pair_id)) = report.replaced_pairs.iter().find(|(id, _)| id == token_id) {
+            let _ = writeln!(
+                out,
+                "  and its control token with it: revoking either token of a `login --control` pair revokes both (pair {pair_id})"
+            );
+        }
     }
     for token_id in &report.replaced_kept {
         let _ = writeln!(
@@ -269,10 +538,14 @@ fn render_report(report: &LoginReport) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{LoginArgs, options_from, render_report, resolve_control_plane};
+    use super::{
+        DEFAULT_CONSOLE, LoginArgs, SetupProfile, UrlKind, default_notice, options_from,
+        render_report, render_warnings, resolve_control_plane, setup_from,
+    };
     use crate::config::ContextsFile;
     use crate::login::{LoginReport, Selection, WrittenContext};
     use chrono::Duration;
+    use rstest::rstest;
     use std::path::Path;
 
     fn login_args() -> LoginArgs {
@@ -287,6 +560,10 @@ mod tests {
             i_know_this_is_dev_auth: false,
             no_verify: false,
             keep_old_token: false,
+            control: false,
+            setup: None,
+            name: None,
+            industry: None,
         }
     }
 
@@ -363,6 +640,7 @@ mod tests {
             replaced_revoked: vec!["tok-old".to_string()],
             replaced_kept: vec!["tok-kept".to_string()],
             revoke_failures: vec![("tok-stuck".to_string(), "HTTP 500".to_string())],
+            ..LoginReport::default()
         };
 
         let rendered = render_report(&report);
@@ -432,17 +710,28 @@ mod tests {
             resolve_control_plane(
                 Some("https://flag.example".into()),
                 Some("https://env.example".into()),
-                Some(&file)
+                Some(&file),
+                UrlKind::ControlPlane,
             )
-            .unwrap(),
+            .unwrap()
+            .url,
             "https://flag.example"
         );
         assert_eq!(
-            resolve_control_plane(None, Some("https://env.example".into()), Some(&file)).unwrap(),
+            resolve_control_plane(
+                None,
+                Some("https://env.example".into()),
+                Some(&file),
+                UrlKind::ControlPlane,
+            )
+            .unwrap()
+            .url,
             "https://env.example"
         );
         assert_eq!(
-            resolve_control_plane(None, None, Some(&file)).unwrap(),
+            resolve_control_plane(None, None, Some(&file), UrlKind::ControlPlane)
+                .unwrap()
+                .url,
             "https://file.example"
         );
     }
@@ -453,18 +742,270 @@ mod tests {
     fn blank_values_are_skipped_not_honoured() {
         let file = file_with(Some("https://file.example"));
         assert_eq!(
-            resolve_control_plane(Some("   ".into()), Some(String::new()), Some(&file)).unwrap(),
+            resolve_control_plane(
+                Some("   ".into()),
+                Some(String::new()),
+                Some(&file),
+                UrlKind::ControlPlane,
+            )
+            .unwrap()
+            .url,
             "https://file.example"
         );
     }
 
     #[test]
     fn no_control_plane_names_all_three_inputs() {
-        let err = resolve_control_plane(None, None, Some(&file_with(None)))
+        let err = resolve_control_plane(None, None, Some(&file_with(None)), UrlKind::ControlPlane)
             .unwrap_err()
             .to_string();
         assert!(err.contains("--control-plane"), "{err}");
         assert!(err.contains("SKARDI_CONTROL_PLANE_URL"), "{err}");
         assert!(err.contains("control-plane:"), "{err}");
+    }
+
+    /// Each flow falls back to ITS OWN recorded URL, and never the other's.
+    ///
+    /// The defect this pins: a brokered login recorded the console URL as
+    /// `control-plane`, so a later `logout --revoke` sent
+    /// `DELETE /v1/me/tokens/{id}` at a console — which answered with its 404
+    /// page, after the local credential had already been cleared. The two URLs
+    /// are different services with different path layouts, so the fallback key
+    /// is part of the flow's identity.
+    #[rstest]
+    #[case::console_reads_console(UrlKind::Console, "https://console.example")]
+    #[case::direct_reads_control_plane(UrlKind::ControlPlane, "https://cp.example")]
+    fn each_kind_falls_back_to_its_own_key(#[case] kind: UrlKind, #[case] expected: &str) {
+        let file = ContextsFile {
+            control_plane: Some("https://cp.example".to_string()),
+            console: Some("https://console.example".to_string()),
+            ..ContextsFile::default()
+        };
+        assert_eq!(
+            resolve_control_plane(None, None, Some(&file), kind)
+                .unwrap()
+                .url,
+            expected
+        );
+    }
+
+    /// A file holding ONLY a console URL leaves the direct flows unconfigured,
+    /// which is the point: they say so by name instead of aiming
+    /// `/v1/me/tokens` at a console.
+    #[test]
+    fn a_console_only_file_does_not_configure_the_direct_flows() {
+        let file = ContextsFile {
+            console: Some("https://console.example".to_string()),
+            ..ContextsFile::default()
+        };
+        let err = resolve_control_plane(None, None, Some(&file), UrlKind::ControlPlane)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--control-plane"), "{err}");
+        assert!(err.contains("control-plane:"), "{err}");
+        // And the reverse: the brokered flow is configured by it.
+        assert_eq!(
+            resolve_control_plane(None, None, Some(&file), UrlKind::Console)
+                .unwrap()
+                .url,
+            "https://console.example"
+        );
+    }
+
+    /// **With nothing configured, the brokered flow goes to the hosted
+    /// console — and says that it decided.** This is the one built-in URL in
+    /// the binary, and the notice hangs off `defaulted`, so both halves are
+    /// pinned: the value, and the fact that the caller can tell.
+    #[test]
+    fn the_brokered_flow_defaults_to_the_hosted_console() {
+        let resolved = resolve_control_plane(None, None, None, UrlKind::Console).unwrap();
+        assert_eq!(resolved.url, DEFAULT_CONSOLE);
+        assert!(resolved.defaulted);
+        // A file with no `console:` key is the same as no file.
+        let resolved =
+            resolve_control_plane(None, None, Some(&file_with(None)), UrlKind::Console).unwrap();
+        assert_eq!(resolved.url, DEFAULT_CONSOLE);
+        assert!(resolved.defaulted);
+    }
+
+    /// The default is the LAST step, never a tie-break: anything configured
+    /// wins and is reported as configured — including someone who wrote the
+    /// default's own value into their file, which is a choice, not a default.
+    #[rstest]
+    #[case::flag(Some("https://flag.example"), None, None, "https://flag.example")]
+    #[case::env(None, Some("https://env.example"), None, "https://env.example")]
+    #[case::file(None, None, Some("https://console.example"), "https://console.example")]
+    #[case::the_default_written_by_hand(None, None, Some(DEFAULT_CONSOLE), DEFAULT_CONSOLE)]
+    fn a_configured_console_beats_the_default_and_is_not_reported_as_one(
+        #[case] flag: Option<&str>,
+        #[case] env: Option<&str>,
+        #[case] file_console: Option<&str>,
+        #[case] expected: &str,
+    ) {
+        let file = ContextsFile {
+            console: file_console.map(str::to_string),
+            ..ContextsFile::default()
+        };
+        let resolved = resolve_control_plane(
+            flag.map(str::to_string),
+            env.map(str::to_string),
+            Some(&file),
+            UrlKind::Console,
+        )
+        .unwrap();
+        assert_eq!(resolved.url, expected);
+        assert!(!resolved.defaulted);
+    }
+
+    /// The notice says it is a default and names every way to override it. It
+    /// shares the three input names with the no-URL error on purpose — they
+    /// are the same three inputs — which is exactly why it also has to carry a
+    /// word the error does not, so the two cannot be mistaken for each other by
+    /// an assertion that only looks for the inputs.
+    #[test]
+    fn the_default_notice_says_it_is_one_and_names_every_override() {
+        let notice = default_notice(DEFAULT_CONSOLE);
+        assert!(notice.contains(DEFAULT_CONSOLE), "{notice}");
+        assert!(notice.contains("built-in default"), "{notice}");
+        assert!(notice.contains("--control-plane"), "{notice}");
+        assert!(notice.contains("SKARDI_CONTROL_PLANE_URL"), "{notice}");
+        assert!(notice.contains("console:"), "{notice}");
+        // And it is not the error: no "no control plane configured".
+        assert!(!notice.contains("no control plane configured"), "{notice}");
+    }
+
+    /// The direct flow has NO default — there is no hosted address for what it
+    /// calls — so it still fails by name, and the message names the direct
+    /// flow's key rather than the brokered one's.
+    #[test]
+    fn the_direct_flow_still_has_no_default_and_names_its_own_key() {
+        let err = resolve_control_plane(None, None, None, UrlKind::ControlPlane)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("control-plane:"), "{err}");
+        assert!(!err.contains("console:"), "{err}");
+    }
+
+    // ─── The agent-onboarding additions (§2.1, §2.5) ────────────────────────
+
+    /// `--control` and `--setup`/`--name`/`--industry` reach the options as
+    /// the request carries them: a trimmed name, and a blank industry as
+    /// none rather than an empty value the server would refuse.
+    #[test]
+    fn control_and_setup_reach_the_options() {
+        let missing = Path::new("/nonexistent/skardi/config.yaml");
+        let mut args = login_args();
+        args.control = true;
+        args.setup = Some(SetupProfile::Team);
+        args.name = Some("  Acme Research  ".to_string());
+        args.industry = Some("   ".to_string());
+        let options = options_from(&args, None, None, missing).unwrap();
+        assert!(options.control);
+        let setup = options.setup.unwrap();
+        assert_eq!(setup.profile, "team");
+        assert_eq!(setup.name, "Acme Research");
+        assert_eq!(setup.industry, None);
+
+        args.setup = Some(SetupProfile::Personal);
+        args.industry = Some(" finance ".to_string());
+        let setup = setup_from(&args).unwrap().unwrap();
+        assert_eq!(setup.profile, "personal");
+        assert_eq!(setup.industry.as_deref(), Some("finance"));
+
+        // No --setup, no setup — whatever else was typed.
+        assert_eq!(setup_from(&login_args()).unwrap(), None);
+    }
+
+    /// `/setup`'s bounds on the name, checked before a browser opens.
+    #[rstest]
+    #[case::blank("   ", 0)]
+    #[case::too_long(&"n".repeat(101), 101)]
+    fn a_setup_name_outside_the_bounds_is_refused(#[case] name: &str, #[case] length: usize) {
+        let mut args = login_args();
+        args.setup = Some(SetupProfile::Personal);
+        args.name = Some(name.to_string());
+        let err = setup_from(&args).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            format!("--name must be 1 to 100 characters, not {length}")
+        );
+    }
+
+    fn written() -> WrittenContext {
+        WrittenContext {
+            name: "acme/prod".to_string(),
+            server: "https://gw.example".to_string(),
+            workspace: "acme-prod".to_string(),
+            role: "admin".to_string(),
+            expires_at: None,
+        }
+    }
+
+    /// What a `login --control` says beyond today's summary: when control
+    /// ends (never the token), the MCP server and where its URL came from,
+    /// and a replaced pair revoked along with its query token.
+    #[test]
+    fn a_control_login_reports_the_grant_the_mcp_server_and_the_pair_it_replaced() {
+        let report = LoginReport {
+            written: vec![written()],
+            current_context: Some("acme/prod".to_string()),
+            control_expires_at: Some("2026-10-31T12:00:00Z".to_string()),
+            mcp_url: Some("https://gw.example/mcp".to_string()),
+            mcp_url_set_aside: Some("https://elsewhere.example/mcp".to_string()),
+            replaced_pair_elsewhere: vec!["acme/other".to_string()],
+            replaced_revoked: vec!["tok-old".to_string()],
+            replaced_pairs: vec![("tok-old".to_string(), "pair-old".to_string())],
+            ..LoginReport::default()
+        };
+        let rendered = render_report(&report);
+        for line in [
+            "control granted until 2026-10-31T12:00:00Z",
+            "MCP server: https://gw.example/mcp — run `skardi mcp register claude-code`",
+            "the control plane named https://elsewhere.example/mcp, but this context queries the gateway --server or $SKARDI_GATEWAY_URL chose",
+            "replaced the credentials context acme/other held",
+            "run `skardi login --context acme/other`",
+            "revoked the credential this login replaced (tok-old)\n  and its control token with it",
+            "(pair pair-old)",
+        ] {
+            assert!(rendered.contains(line), "missing {line:?} in:\n{rendered}");
+        }
+        // A revoked pair is not also a warning.
+        assert_eq!(render_warnings(&report), "");
+    }
+
+    /// Codex on #311: a pair whose query token was NOT revoked — the revoke
+    /// failed, or `--keep-old-token` — leaves a live control token nothing
+    /// holds. Its pair is named, with the page that revokes it.
+    #[test]
+    fn a_pair_left_live_is_named_with_the_page_that_revokes_it() {
+        let report = LoginReport {
+            written: vec![written()],
+            revoke_failures: vec![("tok-stuck".to_string(), "HTTP 500".to_string())],
+            replaced_kept: vec!["tok-kept".to_string()],
+            replaced_pairs: vec![
+                ("tok-stuck".to_string(), "pair-1".to_string()),
+                ("tok-kept".to_string(), "pair 2".to_string()),
+            ],
+            console: Some("https://console.example/".to_string()),
+            ..LoginReport::default()
+        };
+        let warnings = render_warnings(&report);
+        assert_eq!(
+            warnings,
+            "warning: could not revoke the replaced credential tok-stuck (HTTP 500) — revoke it in the console\n\
+             warning: tok-stuck was part of the `login --control` pair pair-1, whose control token stays live until it expires (24 hours after that login) — revoke the pair at https://console.example/account/agent-access?pair=pair-1\n\
+             warning: tok-kept was part of the `login --control` pair pair 2, whose control token stays live until it expires (24 hours after that login) — revoke the pair at https://console.example/account/agent-access?pair=pair%202\n"
+        );
+        // No console on record: the page is still named, by its path.
+        let report = LoginReport {
+            console: None,
+            ..report
+        };
+        assert!(
+            render_warnings(&report)
+                .contains("revoke the pair at the console's /account/agent-access?pair=pair-1"),
+            "{}",
+            render_warnings(&report)
+        );
     }
 }

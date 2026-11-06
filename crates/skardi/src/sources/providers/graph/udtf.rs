@@ -608,7 +608,7 @@ impl fmt::Debug for GraphScanKind {
 pub(crate) struct GraphScanExec {
     kind: GraphScanKind,
     projection: Option<Vec<usize>>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl GraphScanExec {
@@ -637,7 +637,7 @@ impl GraphScanExec {
         Ok(Self {
             kind,
             projection,
-            properties,
+            properties: Arc::new(properties),
         })
     }
 
@@ -669,7 +669,7 @@ impl ExecutionPlan for GraphScanExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

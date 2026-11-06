@@ -4,16 +4,15 @@
 //! for efficient BM25-scored text search over inverted indexes.
 
 use anyhow::Result;
-use arrow::array::RecordBatch;
+use arrow::array::{RecordBatch, RecordBatchOptions};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
-    SendableRecordBatchStream, Statistics,
+    SendableRecordBatchStream,
     execution_plan::{Boundedness, EmissionType},
 };
 use futures::{StreamExt, stream};
@@ -44,7 +43,7 @@ pub struct LanceFtsExec {
     /// Optional row limit applied after FTS + filter
     scan_limit: Option<usize>,
     /// Plan properties
-    plan_properties: PlanProperties,
+    plan_properties: Arc<PlanProperties>,
 }
 
 impl LanceFtsExec {
@@ -71,7 +70,7 @@ impl LanceFtsExec {
             projection: None,
             filter: None,
             scan_limit: None,
-            plan_properties,
+            plan_properties: Arc::new(plan_properties),
         })
     }
 
@@ -84,12 +83,12 @@ impl LanceFtsExec {
         let projected_schema: SchemaRef = Arc::new(Schema::new(projected_fields));
         self.schema = projected_schema.clone();
         self.projection = Some(projection);
-        self.plan_properties = PlanProperties::new(
+        self.plan_properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(projected_schema),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
         Ok(self)
     }
 
@@ -162,7 +161,15 @@ impl LanceFtsExec {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        Ok(RecordBatch::try_new(self.schema.clone(), columns)?)
+        // The row count is explicit because a projection can be empty: for
+        // `COUNT(*)` DataFusion asks for no columns at all, and Arrow refuses a
+        // zero-column batch that does not say how many rows it has.
+        let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+        Ok(RecordBatch::try_new_with_options(
+            self.schema.clone(),
+            columns,
+            &options,
+        )?)
     }
 }
 
@@ -185,7 +192,7 @@ impl ExecutionPlan for LanceFtsExec {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.plan_properties
     }
 
@@ -229,13 +236,5 @@ impl ExecutionPlan for LanceFtsExec {
         });
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
-    }
-
-    fn statistics(&self) -> DFResult<Statistics> {
-        Ok(Statistics {
-            num_rows: Precision::Absent,
-            total_byte_size: Precision::Absent,
-            column_statistics: vec![],
-        })
     }
 }

@@ -73,6 +73,10 @@ rss = [
 ]
 
 [dependencies]
+# The shared SaaS connector runtime. A path dependency within this
+# revision, which is how cloud pins the engine and the pack to one commit;
+# the workspace entry also carries the version crates.io publishing needs.
+skardi-source-pack = { workspace = true }
 # engine
 anyhow = { workspace = true }
 async-trait = { workspace = true }
@@ -97,6 +101,10 @@ regex = { workspace = true }
 # held only through transitive unification (bson enables it).
 serde_json = { workspace = true, features = ["preserve_order"] }
 serde_yaml = { workspace = true }
+# rss: `RssConfig::deny_cidrs`. Unconditional because `RssConfig` itself
+# compiles without the `rss` feature (the server holds the typed field in
+# every build); already in the lock through reqwest/hyper-util.
+ipnet = { version = "2", features = ["serde"] }
 # model
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 base64 = { version = "0.22", optional = true }
@@ -149,7 +157,7 @@ redis = { version = "1.0.0-rc.2", default-features = false, features = ["cluster
 # `tesseract-rs -> zip -> xz2 -> lzma-sys` chain collides with DataFusion's `liblzma-sys`
 # (two crates can't both `links = "lzma"`) and also forces a newer tokio. OCR is still
 # available at runtime via liteparse's HTTP OCR engine (config `ocr_server_url`).
-liteparse = { version = "2.4.0", default-features = false, optional = true }
+liteparse = { version = "=2.4.0", default-features = false, optional = true }
 # Stable fingerprints for Open Connector contracts and document IDs.
 blake3 = "1"
 # include_globs (documents) / exclude_globs (obsidian) matching.
@@ -180,7 +188,7 @@ uuid = { workspace = true }
 # instead of a homegrown twin. Registered by the server session (its
 # register_all also installs ->/->>/? operator rewrites session-wide, so
 # it must not hide behind graph::register_graph_udtfs).
-datafusion-functions-json = "0.52"
+datafusion-functions-json = "0.53.1"
 
 [target.'cfg(unix)'.dependencies]
 # `openat` + `O_NOFOLLOW` for blob.rs's per-component no-follow read. rustix
@@ -194,7 +202,12 @@ datafusion-functions-json = "0.52"
 rustix = { version = "1", features = ["fs"], optional = true }
 
 [dev-dependencies]
+# The pack's gateway mock, which this crate's pack suites use.
+skardi-source-pack = { workspace = true, features = ["testing"] }
 tokio-test = "0.4"
+# Parametric test cases, per AGENTS.md's testing standards. The workspace
+# already pins it; `crates/cli` was simply the first consumer.
+rstest = { workspace = true }
 tempfile = { workspace = true }
 redis-test = "0.13.0"
 gguf-rs-lib = "0.2"

@@ -449,7 +449,7 @@ impl TableProvider for MongoTableProvider {
         Ok(Arc::new(MongoExecPlan {
             schema,
             batch: Arc::new(RwLock::new(Some(batch))),
-            properties,
+            properties: Arc::new(properties),
         }))
     }
 
@@ -707,7 +707,7 @@ fn arrow_value_to_bson(array: &ArrayRef, row: usize, data_type: &DataType) -> Re
 struct MongoExecPlan {
     schema: SchemaRef,
     batch: Arc<RwLock<Option<RecordBatch>>>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl DisplayAs for MongoExecPlan {
@@ -725,7 +725,7 @@ impl ExecutionPlan for MongoExecPlan {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -793,7 +793,7 @@ impl ExecutionPlan for MongoInsertExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         self.input.properties()
     }
 
@@ -1049,7 +1049,7 @@ struct MongoDmlExec {
     collection: Collection<Document>,
     op: MongoDmlOp,
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl MongoDmlExec {
@@ -1069,7 +1069,7 @@ impl MongoDmlExec {
             collection,
             op,
             schema,
-            properties,
+            properties: Arc::new(properties),
         }
     }
 }
@@ -1095,7 +1095,7 @@ impl ExecutionPlan for MongoDmlExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

@@ -30,11 +30,13 @@ fn args(jobs_path: PathBuf, jobs_db: PathBuf, audit_db: PathBuf) -> CliArgs {
         pipeline_path: None,
         jobs_path: Some(jobs_path),
         jobs_db_path: Some(jobs_db),
+        webhooks_path: None,
         ctx_file: None,
         semantics_path: None,
         port: 8080,
         query_audit_db: Some(audit_db),
         query_audit_retention_days: None,
+        mcp_allowed_hosts: vec![],
     }
 }
 
@@ -80,6 +82,7 @@ async fn a_restart_repairs_a_correlation_lost_before_the_previous_shutdown() {
             rows_written: Some(1),
             snapshot_id: None,
             error: None,
+            provider_failure: None,
             submission_id: Some(audit_id.clone()),
         })
         .await
@@ -145,6 +148,7 @@ async fn a_clean_restart_repairs_nothing_and_leaves_stamped_rows_alone() {
             rows_written: Some(1),
             snapshot_id: None,
             error: None,
+            provider_failure: None,
             submission_id: Some(audit_id.clone()),
         })
         .await

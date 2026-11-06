@@ -181,10 +181,25 @@ pub(crate) use crate::util::mock_http::{
     MockHttpServer as MockFeedServer, MockResponse, RecordedRequest,
 };
 
-impl MockResponse {
+/// The feed suite's convenience constructor over the generic mock response.
+///
+/// An extension trait rather than an inherent `impl`, because `MockResponse`
+/// belongs to `skardi-source-pack` now and Rust reserves inherent `impl`s for
+/// the crate that defines the type. A trait's associated function is still
+/// callable as `MockResponse::xml(..)` wherever the trait is in scope, so
+/// every call site reads as it did.
+///
+/// Deliberately NOT pushed down into the pack. The pack is the Open Connector
+/// runtime; "a feed response is XML" is this suite's idea, and a library
+/// should not grow conveniences for a consumer it does not have.
+pub(crate) trait MockResponseExt {
     /// `200 OK`, `content-type: application/xml`, UTF-8 body — the common
     /// case for a well-formed feed response.
-    pub(crate) fn xml(body: &str) -> Self {
+    fn xml(body: &str) -> Self;
+}
+
+impl MockResponseExt for MockResponse {
+    fn xml(body: &str) -> Self {
         Self::new(200, body.as_bytes().to_vec()).with_header("content-type", "application/xml")
     }
 }

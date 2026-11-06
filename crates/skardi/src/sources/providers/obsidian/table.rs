@@ -181,7 +181,7 @@ impl TableProvider for ObsidianTable {
             projected_schema,
             projection,
             limit,
-            properties,
+            properties: Arc::new(properties),
         }))
     }
 }
@@ -195,7 +195,7 @@ struct ObsidianScanExec {
     projected_schema: SchemaRef,
     projection: Vec<usize>,
     limit: Option<usize>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl DisplayAs for ObsidianScanExec {
@@ -234,7 +234,7 @@ impl ExecutionPlan for ObsidianScanExec {
         self.projected_schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

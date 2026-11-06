@@ -1,0 +1,23 @@
+{
+  "data_points": [
+    {
+      "start": 1759276800,
+      "end": 1759363200,
+      "country": "US",
+      "tier": "0:MAX",
+      "pricing_type": "REGULAR",
+      "pricing_category": "MARKETING",
+      "volume": 4,
+      "cost": 40.0
+    },
+    {
+      "start": 1759276800,
+      "end": 1759363200,
+      "country": "US",
+      "pricing_type": "FREE_CUSTOMER_SERVICE",
+      "pricing_category": "SERVICE",
+      "volume": 2,
+      "cost": 0
+    }
+  ]
+}

@@ -20,9 +20,17 @@ dirs = "5.0"
 percent-encoding = "2.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # The MCP-over-stdio bridge (`skardi mcp`). default-features = false keeps
-# rmcp's HTTP stack (and any axum version skew) out of the dependency graph;
-# `transport-io` is the server-side stdio transport.
+# rmcp's optional stacks out of THIS crate's own dependency graph;
+# `transport-io` is the server-side stdio transport. Note: with resolver = "2",
+# a whole-workspace build unifies features across members, so skardi-server's
+# rmcp HTTP features do get compiled into that build graph — the pin here
+# governs what `cargo build -p skardi-cli` alone pulls in. rmcp has no runtime
+# axum dependency (verified against the 3.1.4 source), so no axum skew either way.
 rmcp = { version = "=3.1.4", default-features = false, features = ["server", "transport-io"] }
+skardi-mcp-core = { path = "../mcp-core" }
+# mcp-core emits its projection warnings via `tracing`; the bridge installs a
+# stderr subscriber (stdout is the JSON-RPC channel) so hosts still see them.
+tracing-subscriber = "0.3"
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
@@ -40,6 +48,10 @@ uuid = { workspace = true }
 # Feature unification: these add the MCP *client* side (spawning the binary
 # as a child process) for the e2e tests only.
 rmcp = { version = "=3.1.4", default-features = false, features = ["client", "transport-child-process"] }
+# Parametric cases, per AGENTS.md's testing standard. Declared in
+# `[workspace.dependencies]` already; this is the crate opting in — it is the
+# first one to, so this is also what puts rstest in `Cargo.lock`.
+rstest = { workspace = true }
 tempfile = { workspace = true }
 wiremock = "0.6"
 

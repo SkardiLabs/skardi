@@ -1,9 +1,11 @@
 pub mod fts_exec;
+pub mod fts_query;
 pub mod fts_table_function;
 pub mod knn_exec;
 pub mod knn_table_function;
 pub mod vec_to_binary;
 
+pub use fts_query::websearch_to_fts5;
 pub use fts_table_function::register_sqlite_fts_udtf;
 pub use knn_table_function::{SqliteEntry, register_sqlite_knn_udtf};
 pub use vec_to_binary::register_vec_to_binary_udf;
@@ -820,7 +822,7 @@ struct SqliteScanExec {
     projection: Option<Vec<usize>>,
     filters: Vec<Expr>,
     limit: Option<usize>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl SqliteScanExec {
@@ -851,7 +853,7 @@ impl SqliteScanExec {
             projection,
             filters,
             limit,
-            properties,
+            properties: Arc::new(properties),
         }
     }
 
@@ -918,7 +920,7 @@ impl ExecutionPlan for SqliteScanExec {
         Arc::clone(&self.output_schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -1080,7 +1082,7 @@ struct SqliteInsertExec {
     input: Arc<dyn ExecutionPlan>,
     op: InsertOp,
     output_schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl SqliteInsertExec {
@@ -1109,7 +1111,7 @@ impl SqliteInsertExec {
             input,
             op,
             output_schema,
-            properties,
+            properties: Arc::new(properties),
         }
     }
 }
@@ -1139,7 +1141,7 @@ impl ExecutionPlan for SqliteInsertExec {
         Arc::clone(&self.output_schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -1387,7 +1389,7 @@ struct SqliteDmlExec {
     conn: Arc<Connection>,
     sql: String,
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl SqliteDmlExec {
@@ -1407,7 +1409,7 @@ impl SqliteDmlExec {
             conn,
             sql,
             schema,
-            properties,
+            properties: Arc::new(properties),
         }
     }
 }
@@ -1437,7 +1439,7 @@ impl ExecutionPlan for SqliteDmlExec {
         Arc::clone(&self.schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

@@ -37,6 +37,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -46,6 +47,7 @@ pub const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:8080";
 const SERVER_URL_ENV: &str = "SKARDI_SERVER_URL";
 const API_TOKEN_ENV: &str = "SKARDI_API_TOKEN";
 const CONTEXT_ENV: &str = "SKARDI_CONTEXT";
+const CONFIG_DIR_ENV: &str = "SKARDI_CONFIG_DIR";
 
 /// How old a temp file must be before the sweep treats it as abandoned
 /// rather than as a concurrent writer's work in progress.
@@ -96,7 +98,11 @@ impl fmt::Display for ContextMode {
 /// survive an older CLI's `use-context` rewrite — the file is shared state
 /// between versions, and a rewrite that dropped unknown keys would quietly
 /// downgrade it.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+///
+/// `Debug` is written by hand: the struct carries two credentials, and the
+/// `control` token in particular must not reach a log line or a panic message
+/// through an `{:?}` (agent onboarding §5.0, invariant 10).
+#[derive(Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct Context {
     pub name: String,
@@ -111,6 +117,11 @@ pub struct Context {
     pub workspace: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
+    /// The data-plane credential: every `query`, `run` and upload, and the
+    /// one `mcp register` writes into an agent's MCP configuration. After a
+    /// `login --control` this is the pair's `mcp_token`, which has no
+    /// control-plane reach — kept under the key every older CLI already
+    /// reads, so a context written by this one still works there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
     /// The PAT's id, needed by `logout --revoke` — the token itself cannot
@@ -119,8 +130,46 @@ pub struct Context {
     pub token_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_expires_at: Option<String>,
+    /// The pair's `control` token (agent onboarding §2.1): the only key that
+    /// reaches `/control/v1`, for 24 hours. **No command prints it** —
+    /// `config view --show-tokens` included — and it is sent nowhere but the
+    /// gateway's control door, so an agent driving the CLI never reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_token_expires_at: Option<String>,
+    /// The login this context's tokens came from. Sent as `replaces_pair_id`
+    /// on the next `login`, so the exchange revokes the pair it replaces —
+    /// the CLI holds only PATs, and no PAT may revoke a token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pair_id: Option<String>,
+    /// The workspace's MCP server, as the exchange named it
+    /// (`gateway_url + "/mcp"`): what `mcp register` writes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_url: Option<String>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_yaml::Value>,
+}
+
+impl fmt::Debug for Context {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let redacted = |value: &Option<String>| value.as_ref().map(|_| "(redacted)");
+        f.debug_struct("Context")
+            .field("name", &self.name)
+            .field("server", &self.server)
+            .field("mode", &self.mode)
+            .field("workspace", &self.workspace)
+            .field("user", &self.user)
+            .field("token", &redacted(&self.token))
+            .field("token_id", &self.token_id)
+            .field("token_expires_at", &self.token_expires_at)
+            .field("control_token", &redacted(&self.control_token))
+            .field("control_token_expires_at", &self.control_token_expires_at)
+            .field("pair_id", &self.pair_id)
+            .field("mcp_url", &self.mcp_url)
+            .field("extra", &self.extra.keys().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 fn is_default_mode(mode: &ContextMode) -> bool {
@@ -136,9 +185,27 @@ pub struct ContextsFile {
     /// Present so a rewrite keeps the manifest recognizable; not read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
-    /// Where `login` talks. Optional: only the cloud flow reads it.
+    /// The control-plane API base, for the flows that call it directly:
+    /// the OAuth/dev `login` and `logout --revoke`. Optional — only the cloud
+    /// flow reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_plane: Option<String>,
+    /// The CONSOLE's base URL, for the browser-brokered `login`.
+    ///
+    /// Deliberately a separate key rather than reusing `control-plane`, even
+    /// though both arrive through the same `--control-plane` flag. The two are
+    /// different services with different path layouts: `ControlPlane` appends
+    /// bare `/v1/me/...`, while a console serves that API under
+    /// `/api/global/v1/...` and only for a session-carrying browser.
+    ///
+    /// Writing a console URL into `control-plane` therefore poisoned it for
+    /// every later direct call: a `logout --revoke` after a brokered login
+    /// cleared the local credential and then sent `DELETE /v1/me/tokens/{id}`
+    /// at the console, which answered with its 404 page. Keeping them apart
+    /// means a direct flow with no `control-plane` of its own says so by name
+    /// instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub console: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_context: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -552,9 +619,26 @@ fn non_empty(value: Option<String>) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// `~/.skardi/config.yaml`, or `None` when the home directory is unknowable.
+/// `config.yaml` in `$SKARDI_CONFIG_DIR` when that is set, else
+/// `~/.skardi/config.yaml`; `None` when neither directory is knowable.
+///
+/// The override exists because the home directory cannot always be moved: on
+/// Windows `dirs::home_dir()` asks the shell for the profile folder and reads
+/// neither `HOME` nor `USERPROFILE`, so a test harness or sandbox has no other
+/// way to keep the CLI away from the real credentials file.
 pub fn default_config_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|home| home.join(".skardi").join("config.yaml"))
+    config_path_from(std::env::var_os(CONFIG_DIR_ENV), dirs::home_dir())
+}
+
+/// [`default_config_path`] with its two inputs passed in, so the choice is
+/// testable without touching process-global environment. An empty override
+/// counts as unset, like every other `SKARDI_*` variable.
+fn config_path_from(dir_override: Option<OsString>, home: Option<PathBuf>) -> Option<PathBuf> {
+    let dir = match dir_override.filter(|dir| !dir.is_empty()) {
+        Some(dir) => PathBuf::from(dir),
+        None => home?.join(".skardi"),
+    };
+    Some(dir.join("config.yaml"))
 }
 
 /// The per-context keys this binary reads. Used only to spot a typo in
@@ -878,6 +962,7 @@ fn warn_if_loose_permissions(_path: &Path) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
     use std::io::Write as _;
     use tempfile::{NamedTempFile, TempDir};
 
@@ -1390,6 +1475,24 @@ mod tests {
         assert!(err.to_string().contains("refusing to modify"));
     }
 
+    #[rstest]
+    #[case::home_when_unset(None, Some("home"), Some("home/.skardi/config.yaml"))]
+    #[case::override_wins_over_home(Some("custom"), Some("home"), Some("custom/config.yaml"))]
+    #[case::override_needs_no_home(Some("custom"), None, Some("custom/config.yaml"))]
+    #[case::empty_override_is_unset(Some(""), Some("home"), Some("home/.skardi/config.yaml"))]
+    #[case::nothing_knowable(None, None, None)]
+    fn config_path_prefers_the_dir_override(
+        #[case] dir_override: Option<&str>,
+        #[case] home: Option<&str>,
+        #[case] expected: Option<&str>,
+    ) {
+        // Paths compare by component, so `/` matches `\` on Windows.
+        assert_eq!(
+            config_path_from(dir_override.map(OsString::from), home.map(PathBuf::from)),
+            expected.map(PathBuf::from)
+        );
+    }
+
     #[test]
     fn load_for_mutation_on_a_missing_file_starts_a_fresh_tree() {
         let dir = TempDir::new().unwrap();
@@ -1588,5 +1691,55 @@ mod tests {
         // would ignore the width and return "cloud" here.
         assert_eq!(format!("[{:<8}]", ContextMode::Cloud), "[cloud   ]");
         assert_eq!(format!("{}", ContextMode::Server), "server");
+    }
+
+    /// `Context`'s `Debug` is hand-written so neither credential reaches a
+    /// log line or a panic message through `{:?}` (agent onboarding §5.0,
+    /// invariant 10) — nor an unmodeled key's value, which may be one. What
+    /// identifies the context and its login is still shown.
+    #[test]
+    fn a_contexts_debug_shows_no_credential() {
+        let mut extra = BTreeMap::new();
+        extra.insert(
+            "refresh-token".to_string(),
+            serde_yaml::Value::String("extra_secret_value".to_string()),
+        );
+        let context = Context {
+            name: "acme/prod".to_string(),
+            mode: ContextMode::Cloud,
+            server: Some("https://gw.example".to_string()),
+            workspace: Some("acme-prod".to_string()),
+            user: Some("alice@example.com".to_string()),
+            token: Some("skardi_pat_mcp_secret".to_string()),
+            token_id: Some("tok-mcp".to_string()),
+            token_expires_at: Some("2027-01-01T00:00:00Z".to_string()),
+            control_token: Some("skardi_pat_control_secret".to_string()),
+            control_token_expires_at: Some("2026-10-31T12:00:00Z".to_string()),
+            pair_id: Some("pair-1".to_string()),
+            mcp_url: Some("https://gw.example/mcp".to_string()),
+            extra,
+        };
+        let rendered = format!("{context:?}");
+        for secret in [
+            "skardi_pat_mcp_secret",
+            "skardi_pat_control_secret",
+            "extra_secret_value",
+        ] {
+            assert!(!rendered.contains(secret), "{rendered}");
+        }
+        for shown in [
+            "acme/prod",
+            "tok-mcp",
+            "2026-10-31T12:00:00Z",
+            "pair-1",
+            "https://gw.example/mcp",
+            "refresh-token",
+            "(redacted)",
+        ] {
+            assert!(rendered.contains(shown), "missing {shown}: {rendered}");
+        }
+        // An absent credential reads as absent, not as redacted.
+        let bare = format!("{:?}", Context::default());
+        assert!(bare.contains("token: None"), "{bare}");
     }
 }

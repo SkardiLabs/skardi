@@ -53,7 +53,7 @@ cookie = { workspace = true }
 dirs = "5.0"
 datafusion = { workspace = true }
 datafusion-federation = { workspace = true }
-datafusion-tracing = "52.0.0"
+datafusion-tracing = "53.0.2"
 futures = { workspace = true }
 lance = { workspace = true }
 object_store = { workspace = true }
@@ -63,11 +63,27 @@ serde_yaml = { workspace = true }
 skardi = { path = "../skardi" }
 anyhow = "1.0"
 base64 = "0.22"
+# Webhook delivery verification: HMAC-SHA256 over the raw body (Meta's
+# X-Hub-Signature-256) and a constant-time handshake-token comparison.
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+subtle = "2"
+# The /mcp streamable-HTTP binding. default-features = false mirrors the
+# CLI's pin; the transport feature brings rmcp's tower service (no runtime
+# axum dependency — verified against the 3.1.4 source).
+rmcp = { version = "=3.1.4", default-features = false, features = ["server", "transport-streamable-http-server"] }
+skardi-mcp-core = { path = "../mcp-core" }
 thiserror = "1.0"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "sync", "time"] }
 tokio-rusqlite = { workspace = true }
 skardi-query-audit = { path = "../query-audit" }
-tower = { workspace = true }
+# `util` is explicit: production code (the /mcp handler's self-dispatch)
+# uses tower::ServiceExt::oneshot, which must not lean on the feature
+# arriving transitively via axum/tower-http.
+tower = { workspace = true, features = ["util"] }
+# One v4 UUID per stateless MCP request: the audit-attribution fallback id.
+uuid = { workspace = true }
 tower-http = { workspace = true, features = ["fs", "trace", "cors"] }
 tracing = { workspace = true }
 tracing-opentelemetry = "0.28"
@@ -82,6 +98,14 @@ url = { workspace = true }
 arrow = { workspace = true }
 datafusion = { workspace = true }
 http-body-util = "0.1"
+# Client half of the /mcp end-to-end suite (tests/mcp_http.rs): a real rmcp
+# client over HTTP against the served router. Same pin as the main
+# dependency; features union in test builds.
+rmcp = { version = "=3.1.4", default-features = false, features = ["client", "transport-streamable-http-client-reqwest"] }
+# Raw HTTP probes for what the rmcp client can't express (an invented
+# Mcp-Session-Id). Loopback plain-HTTP only, so no TLS backend.
+reqwest = { version = "0.12", default-features = false }
+rstest = { workspace = true }
 skardi = { path = "../skardi" }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

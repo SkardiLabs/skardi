@@ -27,6 +27,62 @@ jobs:
         # The script checks git-tracked *.md relative links + fragments.
         run: python3 scripts/check_markdown_links.py
 
+  install-script:
+    name: Install script
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test install.sh agent setup
+        # Runs install.sh --agents-only against fake homes and a local skills
+        # tarball: no network, no real agent config.
+        run: bash scripts/install_test.sh
+
+  release-scripts:
+    name: Release scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        # Version comes from rust-toolchain.toml.
+        run: rustup toolchain install
+      - name: Test the version bump and publish scripts
+        # Offline: runs the bump against a copy of Cargo.toml and the publish
+        # plan against a fake index, and checks every path dependency of a
+        # published crate is itself published.
+        run: ./scripts/release_scripts_test.sh
+      - name: The published crates package
+        # The v0.6.0 release failed here, at crates.io publish time, on a path
+        # dependency with no version. Packaging without verification is the
+        # same manifest check in seconds, without building.
+        run: cargo package -p skardi-source-pack -p skardi --no-verify
+
+  windows-cli:
+    name: CLI (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        # Version comes from rust-toolchain.toml.
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Test skardi-cli
+        # The release ships a Windows binary, so its tests run on Windows,
+        # integration tests included: they point SKARDI_CONFIG_DIR at a temp
+        # directory, since dirs::home_dir() ignores HOME on Windows.
+        run: cargo test -p skardi-cli
+      - name: The binary starts
+        run: |
+          cargo run -q -p skardi-cli -- --version
+          cargo run -q -p skardi-cli -- --help
+      - name: Test install.ps1
+        # Installs a stand-in release zip into a temp directory: no network,
+        # and the runner's real PATH is left alone.
+        shell: pwsh
+        run: ./scripts/install_test.ps1
+
   docs:
     name: Docs
     runs-on: ubuntu-latest
@@ -46,14 +102,25 @@ jobs:
           # cache-directories note).
           cache-directories: ~/.cache/pdfium-rs
       - name: Install protoc
-        run: sudo apt-get install -y protobuf-compiler
+        # Update first, as every other install in these workflows does: the
+        # runner image's package index goes stale, and installing from it asks
+        # the mirror for versions it has already replaced (404, exit 100).
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
       - name: Build documentation
         # `--all-features`, because that is what docs.rs builds
         # (package.metadata.docs.rs sets all-features = true): a featureless
         # pass cannot see feature-gated modules, so their rustdoc warnings
         # (private_intra_doc_links, say) would sail through CI and surface
         # as broken links on docs.rs.
-        run: cargo doc --no-deps -p skardi --all-features
+        # `-p skardi-source-pack` as well: the pack's rustdoc had never been
+        # gated, and four broken intra-doc links survived the extraction into
+        # it unnoticed. Every module there is documented twice — a summary on
+        # the `pub mod` in lib.rs plus the module's own `//!` — and rustdoc
+        # resolves the merged text in LIB.RS's scope, so a module-local name
+        # silently fails to link while a crate-root re-export resolves.
+        run: cargo doc --no-deps -p skardi -p skardi-source-pack --all-features
 
   test:
     name: Test
@@ -229,6 +296,23 @@ jobs:
       - name: Check code format
         run: cargo fmt --all -- --check
       - name: Check the package for errors
+        # `--all`, deliberately NOT `--all-targets`: this step compiles the
+        # libraries and binaries, and nothing under `#[cfg(test)]`. Read the
+        # job name and you will assume otherwise, so: **a green Check is not
+        # evidence that the tree compiles.** Only the nextest job below is
+        # equivalent to `--all-targets`, and a break confined to test code
+        # therefore shows up as a red Test job, which reads like a flaky
+        # test rather than a compile error.
+        #
+        # Widening it here is not the fix — it would double this job's cost
+        # to duplicate what nextest already does before it runs anything.
+        # The point is to stop the name being read as a stronger claim than
+        # it makes, which this PR has three instances of: extracting a crate
+        # moves code out from under whatever was watching it, and each
+        # instrument has to be re-aimed separately. Five stale
+        # `use skardi::util::…` paths survived this step AND the unit suite
+        # and were caught only by the doctest step below; a `#[cfg(test)]`
+        # allowlist entry survived it and was caught only by `--all-targets`.
         run: cargo check --all
       - name: Check single-feature builds
         # `documents` and `obsidian` share providers/blob.rs and each must
@@ -239,6 +323,15 @@ jobs:
         run: |
           cargo check -p skardi-server --features documents
           cargo check -p skardi-server --features obsidian
+      - name: The source pack stays importable by a syncer
+        # `skardi-source-pack` exists so the engine, cloud's ETL runner
+        # and cloud's rbac syncer share one Open Connector client. Two of
+        # those three cannot carry DataFusion or Arrow, so a transitive
+        # dependency on either removes the crate's reason to exist —
+        # silently, since nobody adds them on purpose. The script asks the
+        # resolved tree rather than the manifest, and carries its own
+        # positive control so a broken probe cannot pass.
+        run: ./scripts/assert_pack_boundary.sh
       - name: Execute rust tests
         run: cargo llvm-cov --no-report nextest --all-features
       - name: Execute doc tests
@@ -248,7 +341,13 @@ jobs:
         # doctests) in this job rather than Docs, because `--all-features`
         # links PDFium and only this job carries the pdfium-rs cache
         # arrangement above.
-        run: cargo test --doc -p skardi --all-features
+        # `-p skardi -p skardi-source-pack`: the pack carries doc examples
+        # too, and they are the only thing that caught five stale
+        # `use skardi::util::…` paths when its modules moved out of the
+        # engine — `cargo check` and the unit tests both passed. Naming
+        # only `skardi` here would have let them rot exactly as the
+        # comment above warns.
+        run: cargo test --doc -p skardi -p skardi-source-pack --all-features
 
       - name: Install integration test dependencies
         run: |
@@ -627,28 +726,48 @@ jobs:
           SKARDI_QUERY_AUDIT_LIVE_URL: postgres://skardi_user:skardi_pass@127.0.0.1:5432/mydb
         run: cargo llvm-cov --no-report nextest --all-features -- --ignored
 
-      # MinIO gives the `documents` connector's object-store path real S3
+      # RustFS gives the `documents` connector's object-store path real S3
       # coverage without needing an AWS account or credentials in CI. Started
-      # with `docker run` rather than a `services:` entry because service
-      # containers cannot override the image command, and the MinIO image needs
-      # `server /data`.
-      - name: Start MinIO for documents S3 tests
+      # with `docker run` rather than a `services:` entry so the container can
+      # be torn down explicitly.
+      #
+      # **Why RustFS, and not MinIO.** This step ran `quay.io/minio/minio`
+      # until 2026-09-28, when that registry — and `docker.io/minio/minio`
+      # with it — stopped answering anonymous pulls (`unauthorized`; quay's
+      # API now demands a login, Hub lists zero tags). main was green on this
+      # step five days earlier with no change here, so it was the registry
+      # that moved. A frozen Bitnami copy would pull, but frozen is the wrong
+      # shape for a dependency that just vanished once. RustFS is an
+      # actively released, Apache-2.0, S3-compatible server that pulls
+      # anonymously today (1.0.0, 2026-09-16), and it serves MinIO's own
+      # health alias, which is what keeps the readiness poll below unchanged.
+      #
+      # Pinned to a release tag rather than `latest`: a floating tag is
+      # precisely what disappeared out from under us.
+      #
+      # Credentials are `RUSTFS_ACCESS_KEY` / `RUSTFS_SECRET_KEY` — the only
+      # names its entrypoint reads (the `MINIO_ROOT_*` spelling appears there
+      # in an error message, not as an input). The S3 step below authenticates
+      # with the same pair through `AWS_*`, so it is untouched. Port 9000 and
+      # a data directory under `/data` are the image's defaults.
+      - name: Start RustFS for documents S3 tests
         run: |
-          docker run -d --name skardi-minio \
+          docker run -d --name skardi-rustfs \
             -p 127.0.0.1:9000:9000 \
-            -e MINIO_ROOT_USER=skardiminio \
-            -e MINIO_ROOT_PASSWORD=skardiminio123 \
-            quay.io/minio/minio server /data
-          # The image has no shell tooling for a container healthcheck, so poll
-          # readiness from the runner (same approach as DynamoDB Local above).
+            -e RUSTFS_ACCESS_KEY=skardiminio \
+            -e RUSTFS_SECRET_KEY=skardiminio123 \
+            rustfs/rustfs:1.0.0
+          # Poll readiness from the runner (same approach as DynamoDB Local
+          # above). `/minio/health/live` is served by RustFS as a public,
+          # unauthenticated alias of its own `/health/live`.
           for i in $(seq 1 30); do
             if curl -fsS http://127.0.0.1:9000/minio/health/live >/dev/null 2>&1; then
-              echo "minio ready after ${i}s"
+              echo "rustfs ready after ${i}s"
               break
             fi
             if [ "$i" = "30" ]; then
-              echo "minio failed to become ready"
-              docker logs skardi-minio
+              echo "rustfs failed to become ready"
+              docker logs skardi-rustfs
               exit 1
             fi
             sleep 1
@@ -659,9 +778,9 @@ jobs:
       # These are `#[ignore]`d and skip themselves unless DOCUMENTS_S3_LIVE=1, so
       # the step above's credentials are what actually arms them. Set at step
       # scope, not job scope: the job-level AWS_* values are the `dummy`
-      # placeholders DynamoDB Local expects, and MinIO rejects a root password
-      # shorter than 8 characters.
-      - name: Execute documents S3 live tests against MinIO
+      # placeholders DynamoDB Local expects, and an S3 server may reject a
+      # root password shorter than 8 characters.
+      - name: Execute documents S3 live tests against RustFS
         env:
           DOCUMENTS_S3_LIVE: "1"
           DOCUMENTS_S3_BUCKET: skardi-ci-documents
@@ -679,15 +798,15 @@ jobs:
           cargo llvm-cov --no-report nextest --all-features \
             -E 'test(/live_s3_/)' --no-tests=fail -- --ignored
 
-      - name: Stop MinIO
+      - name: Stop RustFS
         if: always()
-        run: docker rm -f skardi-minio || true
+        run: docker rm -f skardi-rustfs || true
 
       # Apache AGE gives the graph provider's Postgres path real coverage —
       # the AgeClient/register_graph_source code is exercised ONLY by the
       # graph_age_live suite, which self-skips without this backend (the
       # PR #203 codecov report showed client.rs at 11% for exactly that
-      # reason). Docker-run like MinIO above, but the readiness poll must
+      # reason). Docker-run like RustFS above, but the readiness poll must
       # go over TCP: the postgres entrypoint runs a TEMPORARY
       # unix-socket-only server for initdb, so a socket-side pg_isready
       # can answer "ready" during bootstrap while the real server is

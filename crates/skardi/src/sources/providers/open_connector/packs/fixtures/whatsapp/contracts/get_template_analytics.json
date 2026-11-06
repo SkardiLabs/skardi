@@ -1,0 +1,125 @@
+{
+  "type": "object",
+  "properties": {
+    "waba_timezone": {
+      "type": "string",
+      "description": "Timezone the windows are expressed in, present when use_waba_timezone is true."
+    },
+    "data_points": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "template_id": {
+            "type": "string",
+            "description": "Meta template ID."
+          },
+          "start": {
+            "type": "integer",
+            "description": "Start of the data point window as a UNIX timestamp in seconds."
+          },
+          "end": {
+            "type": "integer",
+            "description": "End of the data point window as a UNIX timestamp in seconds."
+          },
+          "sent": {
+            "type": "integer",
+            "description": "Template messages sent on the day."
+          },
+          "delivered": {
+            "type": "integer",
+            "description": "Template messages delivered on the day."
+          },
+          "read": {
+            "type": "integer",
+            "description": "Template messages read on the day."
+          },
+          "clicked": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "description": "Button type, such as quick_reply_button or unique_url_button."
+                },
+                "button_content": {
+                  "type": "string",
+                  "description": "Button label as shown to the user."
+                },
+                "count": {
+                  "type": "integer",
+                  "description": "Number of clicks."
+                }
+              },
+              "additionalProperties": true,
+              "description": "Clicks on one template button."
+            },
+            "description": "Button clicks on the day, one entry per button. Only reported for MARKETING and UTILITY templates."
+          },
+          "cost": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "description": "Cost metric type, such as amount_spent or cost_per_delivered."
+                },
+                "value": {
+                  "type": "number",
+                  "description": "Metric value in the WABA's billing currency."
+                }
+              },
+              "additionalProperties": true,
+              "description": "One template cost metric."
+            },
+            "description": "Cost metrics on the day, present when COST is requested."
+          }
+        },
+        "additionalProperties": true,
+        "description": "Daily metrics for one template."
+      },
+      "description": "One entry per template and day."
+    },
+    "paging": {
+      "type": "object",
+      "properties": {
+        "cursors": {
+          "type": "object",
+          "properties": {
+            "before": {
+              "type": "string",
+              "description": "Cursor for the previous page."
+            },
+            "after": {
+              "type": "string",
+              "description": "Cursor for the next page."
+            }
+          },
+          "additionalProperties": true,
+          "description": "Cursor values returned by Meta."
+        },
+        "previous": {
+          "type": "string",
+          "description": "URL for the previous page, when provided."
+        },
+        "next": {
+          "type": "string",
+          "description": "URL for the next page, when provided."
+        },
+        "hasMore": {
+          "type": "boolean",
+          "description": "Whether another page exists. Meta returns `next` only when one does, so this is false on the final page even though `cursors.after` is still present."
+        }
+      },
+      "additionalProperties": true,
+      "description": "Pagination data returned by Meta."
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "data_points"
+  ],
+  "description": "Action output."
+}

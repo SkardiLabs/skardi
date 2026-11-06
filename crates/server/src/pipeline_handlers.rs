@@ -1281,16 +1281,19 @@ spec:
             pipeline_path: Some(PathBuf::from("test-pipeline.yaml")),
             jobs_path: None,
             jobs_db_path: None,
+            webhooks_path: None,
             ctx_file: None,
             semantics_path: None,
             port: 8080,
             query_audit_db: None,
             query_audit_retention_days: None,
+            mcp_allowed_hosts: vec![],
         };
 
         let config = ServerConfig {
             pipelines,
             jobs: HashMap::new(),
+            webhooks: HashMap::new(),
             data_sources,
             semantics: SemanticsRegistry::default(),
             args,
@@ -1371,16 +1374,19 @@ spec:
             pipeline_path: Some(PathBuf::from("test-pipeline.yaml")),
             jobs_path: None,
             jobs_db_path: None,
+            webhooks_path: None,
             ctx_file: None,
             semantics_path: None,
             port: 8080,
             query_audit_db: None,
             query_audit_retention_days: None,
+            mcp_allowed_hosts: vec![],
         };
 
         let config = ServerConfig {
             pipelines,
             jobs: HashMap::new(),
+            webhooks: HashMap::new(),
             data_sources: vec![data_source],
             semantics: SemanticsRegistry::default(),
             args,
@@ -2109,15 +2115,18 @@ spec:
             pipeline_path: None,
             jobs_path: None,
             jobs_db_path: None,
+            webhooks_path: None,
             ctx_file: None,
             semantics_path: None,
             port: 8080,
             query_audit_db: None,
             query_audit_retention_days: None,
+            mcp_allowed_hosts: vec![],
         };
         let config = ServerConfig {
             pipelines: HashMap::new(),
             jobs: HashMap::new(),
+            webhooks: HashMap::new(),
             data_sources: vec![source],
             semantics,
             args,

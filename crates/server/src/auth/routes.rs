@@ -373,17 +373,20 @@ mod tests {
         let config = ServerConfig {
             pipelines: Default::default(),
             jobs: Default::default(),
+            webhooks: HashMap::new(),
             data_sources: vec![],
             semantics: SemanticsRegistry::default(),
             args: CliArgs {
                 pipeline_path: Some(PathBuf::from("p.yaml")),
                 jobs_path: None,
                 jobs_db_path: None,
+                webhooks_path: None,
                 ctx_file: None,
                 semantics_path: None,
                 port: 8080,
                 query_audit_db: None,
                 query_audit_retention_days: None,
+                mcp_allowed_hosts: vec![],
             },
         };
         let session_ctx = Arc::new(SessionContext::new());
@@ -433,17 +436,20 @@ mod tests {
         let config = ServerConfig {
             pipelines: Default::default(),
             jobs: Default::default(),
+            webhooks: HashMap::new(),
             data_sources: vec![],
             semantics: SemanticsRegistry::default(),
             args: CliArgs {
                 pipeline_path: Some(PathBuf::from("p.yaml")),
                 jobs_path: None,
                 jobs_db_path: None,
+                webhooks_path: None,
                 ctx_file: None,
                 semantics_path: None,
                 port: 8080,
                 query_audit_db: None,
                 query_audit_retention_days: None,
+                mcp_allowed_hosts: vec![],
             },
         };
         let session_ctx = Arc::new(SessionContext::new());

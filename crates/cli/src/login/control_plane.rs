@@ -14,10 +14,13 @@
 //! and a mint answers `201 {"token": "<raw>", "pat": {"token_id": …}}`.
 
 use anyhow::{Context, Result};
+use reqwest::ClientBuilder;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::fmt;
 use std::time::Duration;
+
+use crate::identity::{ClientIdentity, Surface};
 
 /// Per-request ceiling on control-plane calls.
 ///
@@ -36,11 +39,37 @@ pub const CONTROL_PLANE_TIMEOUT: Duration = Duration::from_secs(30);
 /// parameter only so a test can prove the bound bites without waiting
 /// [`CONTROL_PLANE_TIMEOUT`] for it.
 pub fn client(timeout: Duration) -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .no_proxy()
-        .timeout(timeout)
+    client_for(timeout, ClientIdentity::from_env(Surface::Cli))
+}
+
+/// As [`client`], presenting `identity` — the CLI's User-Agent, and `DNT: 1`
+/// when the person opted out (`crate::identity`). The control plane reads the
+/// first to tell CLI sign-ins from console ones, and the second to record
+/// nothing about the client at all.
+pub fn client_for(timeout: Duration, identity: ClientIdentity) -> Result<reqwest::Client> {
+    bounded(timeout)
+        .default_headers(identity.headers())
         .build()
         .context("build the HTTP client for the control plane")
+}
+
+/// The HTTP client for the identity provider's token endpoint — Google, unless
+/// `--client-id` names another — that `login --client-id` and
+/// `logout --revoke` redeem their authorization code at.
+///
+/// Bounded like [`client`], and deliberately WITHOUT the CLI's identity
+/// headers: the provider is a third party, and the User-Agent and `DNT` are
+/// skardi-cloud's to read, not Google's. Sharing one client is how they
+/// leaked there, so the bearer acquisition gets this one and the control
+/// plane gets [`client`].
+pub fn identity_provider_client(timeout: Duration) -> Result<reqwest::Client> {
+    bounded(timeout)
+        .build()
+        .context("build the HTTP client for the identity provider")
+}
+
+fn bounded(timeout: Duration) -> ClientBuilder {
+    ClientBuilder::new().no_proxy().timeout(timeout)
 }
 
 /// Cap on a control-plane response body. Memberships and one PAT are a few
@@ -70,6 +99,11 @@ pub struct Membership {
     pub provisioning_state: String,
     #[serde(default)]
     pub gateway_url: Option<String>,
+    /// The workspace's MCP server, `gateway_url + "/mcp"` (agent onboarding
+    /// §2.9.2). Sent only by a `skardi login` exchange, and only where the
+    /// control plane has a gateway URL; what `mcp register` writes.
+    #[serde(default)]
+    pub mcp_url: Option<String>,
 }
 
 impl Membership {
@@ -91,6 +125,29 @@ pub struct Minted {
     pub token: String,
     pub token_id: String,
     pub expires_at: Option<String>,
+    /// The pair's other half, when a brokered `login --control` was approved
+    /// with `control` (agent onboarding §2.1.1). Always `None` on the direct
+    /// flow, which mints one token per workspace itself.
+    pub control: Option<ControlGrant>,
+}
+
+/// The `control` token of a pair, and the id that names the pair.
+///
+/// Carries a raw credential, so `Debug` is hand-written below.
+pub struct ControlGrant {
+    pub token: String,
+    pub expires_at: Option<String>,
+    pub pair_id: Option<String>,
+}
+
+impl fmt::Debug for ControlGrant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ControlGrant")
+            .field("token", &"(redacted)")
+            .field("expires_at", &self.expires_at)
+            .field("pair_id", &self.pair_id)
+            .finish()
+    }
 }
 
 /// Hand-written so the raw token cannot reach a log line, a panic message, or
@@ -101,6 +158,7 @@ impl fmt::Debug for Minted {
             .field("token", &"(redacted)")
             .field("token_id", &self.token_id)
             .field("expires_at", &self.expires_at)
+            .field("control", &self.control)
             .finish()
     }
 }
@@ -183,6 +241,7 @@ impl ControlPlane {
             token: parsed.token,
             token_id: parsed.pat.token_id,
             expires_at: parsed.pat.expires_at,
+            control: None,
         })
     }
 
@@ -309,15 +368,98 @@ fn parse_error(status: u16, text: &str) -> CpError {
         Err(_) => CpError {
             status,
             code: None,
-            message: text.lines().next().unwrap_or("").to_string(),
+            message: snippet(text),
             orgs: Vec::new(),
         },
     }
 }
 
+/// How much of an UNRECOGNIZED error body may reach the terminal.
+///
+/// Bodies that parse as skardi-global's envelope are unaffected; this bounds
+/// only the fallback, and the fallback is what a *non*-control-plane answer
+/// lands in.
+const MAX_SNIPPET_CHARS: usize = 200;
+
+/// The first line of an unrecognized body, bounded.
+///
+/// "First line" alone was not a bound. A Next.js 404 page is a single enormous
+/// line, so pointing this client at a console — which is exactly what a
+/// `logout --revoke` did after a brokered login recorded a console URL as its
+/// control plane — printed the whole HTML document as the reason a credential
+/// could not be revoked, burying the one fact that mattered. Truncation is
+/// marked so a reader can tell the message was cut.
+fn snippet(text: &str) -> String {
+    let line = text.lines().next().unwrap_or_default().trim();
+    if line.chars().count() <= MAX_SNIPPET_CHARS {
+        return line.to_string();
+    }
+    let head: String = line.chars().take(MAX_SNIPPET_CHARS).collect();
+    format!("{head}… (truncated)")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Membership, MembershipsBody, Minted, parse_error};
+    use super::{
+        ControlGrant, MAX_SNIPPET_CHARS, Membership, MembershipsBody, Minted, client_for,
+        identity_provider_client, parse_error,
+    };
+    use crate::identity::{ClientIdentity, Surface};
+    use std::time::Duration;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Sign-in traffic carries the CLI's identity too, so the control plane
+    /// can tell a CLI login from a console one — and an opt-out reaches it.
+    #[tokio::test]
+    async fn the_control_plane_client_carries_the_cli_identity() {
+        for do_not_track in [false, true] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+            let identity = ClientIdentity {
+                surface: Surface::Cli,
+                do_not_track,
+            };
+            client_for(Duration::from_secs(5), identity)
+                .unwrap()
+                .get(server.uri())
+                .send()
+                .await
+                .unwrap();
+            let requests = server.received_requests().await.unwrap();
+            let headers = &requests[0].headers;
+            assert_eq!(
+                headers["user-agent"].to_str().unwrap(),
+                identity.user_agent(),
+                "do_not_track={do_not_track}"
+            );
+            assert_eq!(headers.contains_key("dnt"), do_not_track);
+        }
+    }
+
+    /// The identity provider is a third party: its client carries neither the
+    /// CLI's User-Agent nor `DNT`, whatever `DO_NOT_TRACK` says.
+    #[tokio::test]
+    async fn the_identity_provider_client_does_not_identify_the_cli() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        identity_provider_client(Duration::from_secs(5))
+            .unwrap()
+            .post(server.uri())
+            .send()
+            .await
+            .unwrap();
+        let requests = server.received_requests().await.unwrap();
+        let headers = &requests[0].headers;
+        assert!(!headers.contains_key("user-agent"), "{headers:?}");
+        assert!(!headers.contains_key("dnt"), "{headers:?}");
+    }
 
     /// The raw token must not reach a log line, a panic message, or an
     /// `{err:?}` rendering through this type — so `Debug` is hand-written, and
@@ -328,8 +470,15 @@ mod tests {
             token: "skardi_pat_the_real_secret".to_string(),
             token_id: "tok-1".to_string(),
             expires_at: Some("2026-11-22T12:00:00Z".to_string()),
+            control: Some(ControlGrant {
+                token: "skardi_pat_the_control_secret".to_string(),
+                expires_at: Some("2026-08-25T12:00:00Z".to_string()),
+                pair_id: Some("pair-1".to_string()),
+            }),
         };
         let rendered = format!("{minted:?}");
+        assert!(!rendered.contains("the_control_secret"), "{rendered}");
+        assert!(rendered.contains("pair-1"), "{rendered}");
         assert!(!rendered.contains("the_real_secret"), "{rendered}");
         assert!(rendered.contains("(redacted)"), "{rendered}");
         // The id and expiry are what a caller legitimately needs to see.
@@ -424,5 +573,47 @@ mod tests {
         // A well-formed envelope with no message still says something.
         let bare = parse_error(500, r#"{"error": {"code": "internal"}}"#);
         assert_eq!(bare.message, "no message");
+    }
+
+    /// A non-control-plane answer is summarized, not dumped.
+    ///
+    /// Measured, not hypothetical: after a brokered login recorded a console
+    /// URL as its control plane, `logout --revoke` sent
+    /// `DELETE /v1/me/tokens/{id}` at that console and printed the entire
+    /// Next.js 404 page as the reason the credential could not be revoked.
+    /// "First line" was no bound at all — that page is one enormous line — so
+    /// several kilobytes of markup buried the one fact that mattered.
+    #[test]
+    fn an_unparseable_error_body_is_bounded_and_marked() {
+        let page = format!(
+            "<!DOCTYPE html><html><head><title>Not found</title></head><body>{}</body></html>",
+            "<div class=\"filler\"></div>".repeat(200)
+        );
+        assert!(page.lines().count() == 1, "the real page is a single line");
+
+        let err = parse_error(404, &page);
+        assert_eq!(err.status, 404);
+        assert_eq!(err.code, None);
+        assert!(
+            err.message.chars().count() <= MAX_SNIPPET_CHARS + "… (truncated)".chars().count(),
+            "message was {} chars",
+            err.message.chars().count()
+        );
+        assert!(err.message.ends_with("… (truncated)"), "{}", err.message);
+        // The head is kept, so a reader can still tell WHAT answered.
+        assert!(
+            err.message.starts_with("<!DOCTYPE html>"),
+            "{}",
+            err.message
+        );
+    }
+
+    /// A short unparseable body is passed through untouched — the cap must not
+    /// mangle the ordinary case (a proxy's one-line plaintext error).
+    #[test]
+    fn a_short_unparseable_body_is_not_truncated() {
+        let err = parse_error(502, "upstream connect error");
+        assert_eq!(err.message, "upstream connect error");
+        assert!(!err.message.contains("truncated"));
     }
 }

@@ -133,7 +133,7 @@ pub struct SeekDbKnnExec {
     filter: Option<String>,
     scan_limit: Option<usize>,
     schema: SchemaRef,
-    plan_properties: PlanProperties,
+    plan_properties: Arc<PlanProperties>,
 }
 
 impl SeekDbKnnExec {
@@ -159,7 +159,7 @@ impl SeekDbKnnExec {
             filter,
             scan_limit: None,
             schema,
-            plan_properties,
+            plan_properties: Arc::new(plan_properties),
         }
     }
 
@@ -185,7 +185,7 @@ impl SeekDbKnnExec {
             filter,
             scan_limit: None,
             schema,
-            plan_properties,
+            plan_properties: Arc::new(plan_properties),
         }
     }
 
@@ -335,7 +335,7 @@ impl ExecutionPlan for SeekDbKnnExec {
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.plan_properties
     }
 

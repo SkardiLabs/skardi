@@ -243,7 +243,7 @@ mod tests {
     struct BatchPlan {
         batch: RecordBatch,
         schema: SchemaRef,
-        props: PlanProperties,
+        props: Arc<PlanProperties>,
     }
 
     impl BatchPlan {
@@ -258,7 +258,7 @@ mod tests {
             Self {
                 batch,
                 schema,
-                props,
+                props: Arc::new(props),
             }
         }
     }
@@ -285,7 +285,7 @@ mod tests {
         fn schema(&self) -> SchemaRef {
             self.schema.clone()
         }
-        fn properties(&self) -> &PlanProperties {
+        fn properties(&self) -> &Arc<PlanProperties> {
             &self.props
         }
         fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {

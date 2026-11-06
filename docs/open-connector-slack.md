@@ -1,7 +1,8 @@
 # Slack Source Pack
 
 The built-in `slack` source pack exposes Slack workspace metadata —
-conversations (channels), users, and files — as stable SQL tables through an
+conversations (channels), users, and files — plus one conversation's
+**message history** as stable SQL tables through an
 [Open Connector gateway](open-connector.md). The Slack OAuth bot token lives
 in Open Connector; Skardi holds only the gateway runtime token.
 
@@ -16,8 +17,10 @@ that normalized contract, reconciled against a live gateway (v1.3.1).
 
 ## Binding
 
-No resource inputs are required — the tables cover whatever the bot's token
-can see:
+`conversations`, `users` and `files` need no resource input — they cover
+whatever the bot's token can see. `messages` is the exception: it reads
+**one** conversation, so it requires a `channelId` resource and therefore its
+own binding.
 
 ```yaml
 spec:
@@ -37,6 +40,15 @@ spec:
               - conversations
               - users
               - files
+          # `messages` needs a channelId, so it needs its own binding —
+          # adding it to `acme_workspace` fails startup with
+          # `missing required resource input`.
+          - name: standup              # per-channel binding for history
+            source_pack: slack
+            resource:
+              channelId: C0123456789   # `id` from the conversations table
+            tables:
+              - messages
 ```
 
 ```sql
@@ -45,20 +57,29 @@ FROM saas.acme_workspace.conversations
 WHERE NOT is_archived
 ORDER BY member_count DESC;
 
+-- One channel's history since a point in time. The lower bound reaches
+-- Slack as `oldest`, so a scheduled run fetches the delta rather than the
+-- channel's whole history.
+SELECT ts, user_id, text
+FROM saas.standup.messages
+WHERE sent_at >= TIMESTAMP '2026-07-01T00:00:00Z'
+ORDER BY sent_at;
+
 -- The same definition, ad hoc, without a binding:
 SELECT id, real_name, display_name
 FROM open_connector_query('saas', 'slack.users', '{}')
 WHERE NOT is_bot AND NOT deleted;
 ```
 
-`files` optionally takes a `channelId` resource to scope the listing to
-one channel; the other tables take none.
+`messages` requires a `channelId` resource; `files` optionally takes one to
+scope the listing to a single channel; `conversations` and `users` take none.
 
 ## Tables
 
 | Table | Action | Resources | Pagination | Filter pushdown |
 |---|---|---|---|---|
 | `conversations` | `slack.list_conversations` | — | cursor (`limit` 200) | none |
+| `messages` | `slack.get_channel_messages` | `channelId` (required) | cursor (`limit` 999) | `sent_at >=` → `oldest` (inexact, re-applied locally) |
 | `users` | `slack.list_users` | — | cursor (`limit` 200) | none |
 | `files` | `slack.list_files` | `channelId` (optional) | classic `page`/`count` (100), ends at `paging.pages` | `user_id =` → `userId` (inexact, re-applied locally) |
 
@@ -72,11 +93,14 @@ count, so a short non-final page (permission filtering can legally produce
 one) never truncates the scan.
 
 The default safety bounds put a hard ceiling on an unfiltered scan: with
-`max_pages: 100`, the cursor tables reach at most 200 × 100 = 20,000 rows
-and `files` at most 100 × 100 = 10,000 rows before the scan **fails** with
+`max_pages: 100`, `conversations` and `users` reach at most
+200 × 100 = 20,000 rows, `messages` at most 999 × 100 = 99,900, and `files`
+at most 100 × 100 = 10,000 rows before the scan **fails** with
 `ScanBoundsExceeded` — per the fail-don't-truncate rule, a workspace
 larger than the ceiling surfaces as an error, never as a silently partial
-result. Raise `max_pages` (and `max_rows`, default 100,000) in the
+result. A busy channel therefore reaches the ceiling on an unfiltered
+`messages` scan; a `sent_at >=` bound is the cheap way to stay under it.
+Raise `max_pages` (and `max_rows`, default 100,000) in the
 gateway's `open_connector:` block for larger workspaces, or push a
 narrowing predicate/`LIMIT`; the knobs are documented in
 [the integration guide](open-connector.md#bounds-retries-and-errors).
@@ -93,6 +117,33 @@ highlights and caveats:
   The `type` column carries the gateway's classification per row.
 - **`users` pins `includeLocale: true`** so the `locale` column is
   populated — Slack omits the field without the flag.
+- **`messages` splits Slack's `ts` into two columns.** `ts` keeps the raw
+  fractional-epoch-seconds string, which is the message's identity — unique
+  within a conversation, and the handle `conversations.replies` and
+  permalinks take. `sent_at` reads the *same* field as a
+  `Timestamp(ms, UTC)`, because a pushdown needs a timestamp-typed column
+  and Arrow's millisecond unit cannot hold Slack's microseconds. Two
+  messages a microsecond apart therefore share one `sent_at`; join and
+  de-duplicate on `ts`.
+- **`sent_at >=` is pushed as `conversations.history`'s `oldest`**, and it
+  is the table's whole incremental story: without it a scheduled run
+  re-reads the channel's entire history through Slack's API. The bound is
+  rendered as a digit **string** (the action types `oldest` as a Slack `ts`
+  string under `additionalProperties: false`, where a JSON number is a 400,
+  not a coercion), which floors it to a whole second. That makes the fetch
+  *wider* than the predicate, so the mapping is `Inexact` and DataFusion
+  re-applies the filter locally. The pack also pins `inclusive: true`,
+  because Slack's `oldest` is exclusive by default and a message sitting
+  exactly on the floored second would otherwise never arrive — and local
+  re-filtering can drop rows, never recover them. No upper bound is pushed:
+  `endTime`-style exclusivity plus flooring would drop rows.
+- **`messages` requests `limit: 999`**, `conversations.history`'s
+  documented ceiling, not the 100 default.
+- **`messages` carries thread metadata but not thread replies.**
+  `thread_ts`, `parent_user_id`, `reply_count`, `reply_users_count`,
+  `latest_reply` and `is_locked` describe a thread parent; the replies
+  themselves live behind `conversations.replies` and have no table yet
+  (see below).
 - **`files.created` is Slack epoch seconds**, converted to a
   `Timestamp(ms, UTC)` column. The normalized conversation and user rows
   carry no timestamps.
@@ -108,8 +159,17 @@ highlights and caveats:
   contract declares no `ts_from`-style input (its strict schema would
   reject one), so `created` predicates are evaluated by DataFusion after
   the bounded fetch.
+- **`messages` needs a gateway build whose `get_channel_messages` returns
+  a cursor.** Its fingerprint is pinned from the vendored Open Connector
+  build `b2b33e57` (branch `skardi/slack-acl`), not from an upstream
+  oomol-lab release: the upstream action dropped Slack's `next_cursor` on
+  the floor, which the source-pack admission gate's complete-pagination
+  requirement rejects. A gateway without that change fails registration
+  with `ActionContractMismatch` on this table — the other three tables are
+  unaffected and can be bound on their own.
 - **Action-contract fingerprints are pinned** against a live gateway
-  (v1.3.1). Registration compares each pinned fingerprint with the
+  (v1.3.1, and the vendored build above for `messages`). Registration
+  compares each pinned fingerprint with the
   discovered output schema and refuses a differing contract with
   `ActionContractMismatch` — schema drift fails at startup, never as
   silently reshaped rows mid-query. Upgrading Open Connector may change
@@ -123,22 +183,36 @@ configured in Open Connector:
 
 - `conversations` needs `channels:read` (+ `groups:read` for private
   channels); private channels appear only where the bot is a member.
+- `messages` reads `conversations.history`, whose scope follows the
+  channel's type: `channels:history` for a public channel, `groups:history`
+  for a private one (and `im:history` / `mpim:history` for the DM shapes
+  `conversations` deliberately excludes). The bot must also be a member of
+  the channel it reads. A missing scope surfaces as Slack's own
+  `missing_scope` code on the failing scan, per the in-band error rule
+  below — not as an empty result. (Scope NAMES here are from Slack's own
+  documentation, not measured against a live workspace the way the
+  pagination caps below were; treat them as the starting point and let
+  `missing_scope` correct you.)
 - `users` needs `users:read`. Deleted members stay listed with
   `deleted = true`. (Emails are not part of the gateway's normalized user
   contract, so there is no `email` column.)
 - `files` needs `files:read` and lists files visible to the bot.
 
-Advertised per the design's marketing rule as **Slack workspace metadata**
-— not full Slack access.
+`messages` is real conversation content, so a binding that includes it is
+no longer **Slack workspace metadata** in the design's marketing sense —
+scope the `channelId` deliberately and treat the resulting tables as
+governed content.
 
-## No message or thread tables (yet)
+## No thread table (yet)
 
-Per the integration design's Slack caveat, complete message-history cursor
-handling is not yet available through Open Connector, and an incomplete
-message table would violate the source-pack admission gate's
-complete-pagination requirement. Message and thread tables land in a later
-pack version once upstream support exists; until then, allowlisted read
-actions remain reachable ad hoc through
+`messages` covers a conversation's top-level history. Thread *replies* are
+a separate Slack endpoint (`conversations.replies`) and have no table in
+this pack version. That is no longer an upstream blocker — the vendored
+build gives `get_thread` the same cursor contract (`cursor` in,
+`nextCursor` out, the same time window) that let `messages` clear the
+admission gate's complete-pagination requirement — so a `threads` table is
+a pack change rather than a gateway one. Until it lands, the action stays
+reachable ad hoc through
 [`open_connector_scan`](open-connector.md#3-open_connector_scan--allowlisted-raw-read-actions).
 
 ## Rate limits and freshness

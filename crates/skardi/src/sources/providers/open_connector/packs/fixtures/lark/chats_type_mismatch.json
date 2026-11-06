@@ -1,0 +1,14 @@
+{
+  "items": [
+    {
+      "chat_id": "oc_ok",
+      "name": "fine"
+    },
+    {
+      "chat_id": 12345,
+      "name": "broken"
+    }
+  ],
+  "hasMore": false,
+  "pageToken": null
+}

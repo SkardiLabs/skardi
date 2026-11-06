@@ -17,12 +17,17 @@ gateway **runtime token**.
 > provider packs have landed alongside the synthetic `mock` pack used by
 > the test suite: [GitHub](open-connector-github.md) (repositories, issues,
 > pull requests, reviews, commits, workflow runs, releases),
-> [Slack](open-connector-slack.md) (conversations, users, files — message
-> tables are gated on upstream cursor support), and
+> [Slack](open-connector-slack.md) (conversations, messages, users,
+> files — per-channel history with a `sent_at >=` time-window pushdown;
+> thread replies are not a table yet), and
 > [Notion](open-connector-notion.md) (users, pages, data sources, block
 > children — dynamic-schema rows are gated on binding-time schema
 > freeze), [Feishu](open-connector-feishu.md) (chats, messages,
-> chat members, tasks, wiki — live-verified against a real workspace),
+> chat members, docx document content and blocks, tasks, wiki —
+> live-verified against a real workspace),
+> [Lark](open-connector-lark.md) (the same eight tables as Feishu under
+> `lark.*` actions — Lark is Feishu's international edition; NOT yet
+> independently live-verified against a real Lark gateway),
 > [Discord](open-connector-discord.md) (guilds, connections, sticker
 > packs — live-verified against a real account; entitlements gated on
 > upstream pagination inputs),
@@ -41,9 +46,15 @@ gateway **runtime token**.
 > file permissions — live-verified against a real Workspace account,
 > shared-drive rows included; three structurally unreachable columns
 > stay documented as residuals per the pack doc),
-> and [Dropbox](open-connector-dropbox.md) (files, shared links, file
+> [Dropbox](open-connector-dropbox.md) (files, shared links, file
 > search — split-action cursor continuation; live-verified against a real
-> account, all five pins captured from a live gateway).
+> account, all five pins captured from a live gateway),
+> and [WhatsApp](open-connector-whatsapp.md) (phone numbers, business
+> profile, message templates, and the message / pricing / template
+> analytics fields — the account side of a WABA; messages themselves are
+> delivered only by webhook and belong to the
+> [`kind: webhook` receiver](webhooks.md); pins captured from a live
+> gateway, live pass against a real WABA pending per the pack doc).
 > Further provider packs (Google Calendar, Jira, …) ship one pack per
 > release per the
 > [design spec](superpowers/specs/2026-07-11-open-connector-integration-design.md);
@@ -263,6 +274,84 @@ JOIN 'labels.csv' l ON i.id = l.id;
   enforcement boundary — and the live one during the staleness window
   above.
 
+## The runtime is a separate crate
+
+Everything above the SQL layer — the gateway client, its retry and transport
+policy, the response envelope, action discovery and fingerprinting, row paths,
+pagination and the page walk itself — lives in `skardi-source-pack`, which the
+`skardi` crate depends on rather than contains.
+
+It is split out because the engine is not its only consumer. Skardi Cloud's
+ETL runner and its RBAC syncer talk to the same gateway, run the same
+paginated walks against the same actions, and **cannot depend on the engine**:
+a process that mirrors an access-control list has no business compiling
+DataFusion and Arrow to do it. Before the split each of them carried its own
+copy of the client and its own page loop, which is how two of them ended up
+disagreeing about what an absent pagination cursor means on the same provider.
+
+The boundary is enforced, not merely intended: `scripts/assert_pack_boundary.sh`
+asks the resolved dependency tree — not the manifest, because nobody adds
+`datafusion` on purpose, they add a crate that happens to pull it in — and
+fails if `datafusion`, `arrow`, `sqlx`, `kube` or `k8s-openapi` appear
+anywhere beneath the pack. It carries a positive control so a broken probe
+cannot report a pass.
+
+What stays in `skardi` is what genuinely needs Arrow or DataFusion:
+
+| in the pack | in the engine |
+| --- | --- |
+| which filters an action supports | translating a DataFusion `Expr` into action input |
+| a field's declared wire type | mapping that type to an Arrow `DataType` |
+| the page walk, producing JSON rows | converting rows to `RecordBatch`, projection, LIMIT |
+| the scan's page budget and deadline | the scan cache, keyed on the Arrow schema |
+
+### Durable, one-page-at-a-time walks
+
+A caller that spreads one walk over several processes (Skardi Cloud lists one
+page per durable work) resumes it from a saved position instead of re-running
+the pack's pagination rules itself:
+
+1. After handling a page, call `ActionScan::advance`. If it returns `false`
+   the walk is complete; persist nothing further.
+2. Otherwise persist `ActionScan::position()` (a serializable `PagePosition`:
+   page number and opaque cursor; `Debug` hides the cursor) together with the
+   page's rows, in one transaction.
+3. The next process builds a fresh `ActionScan` for the same table and
+   resource, calls `resume(position)` before any request, and fetches one page.
+   A scan that has already fetched refuses to be re-positioned.
+
+A resumed scan keeps every in-process check: authoritative raw page counts,
+has-more validation, split continuation actions, and immediate cursor-repeat
+detection. What it cannot see is history from other processes, so the owner
+of the walk must refuse a position it has already accepted (cross-process loop
+fencing), and owns the walk's overall deadline: `ScanBounds::timeout` bounds
+only the resumed process's share. A refused action's structured `data` (for
+example Dropbox's `reset` cursor) is kept on `ActionExecutionFailed` as a
+`ProviderData`, which never prints its contents.
+
+### What the client does not gate
+
+`OpenConnectorClient::execute` and the `ActionScan` walk validate an action id
+**syntactically** — a namespace-escape guard — and nothing else. They check
+neither registry membership nor the read-only classification, and that is
+worth stating plainly because an absence is easy to mistake for a guarantee.
+
+The gates live where they can be enforced:
+
+- Open Connector's own `OOMOL_CONNECT_ALLOWED_ACTIONS` is the authoritative
+  one, server-side, answering `400 action_not_allowed`. A client-side check
+  cannot be the boundary, because the client is the thing being constrained.
+- `open_connector_scan` adds Skardi's gate above the client, where a user's
+  SQL can name an arbitrary action: a default-deny allowlist plus a
+  `read_only: true` classification, both refused at planning time (see
+  [Security model](#security-model)).
+- Pack-declared tables are gated at registration instead, against the same
+  discovered metadata.
+
+A consumer whose action ids come from anywhere a user can influence must add
+a gate of its own. One whose action ids are compile-time constants — every
+syncer built on this crate — is already as constrained as its source code.
+
 ## Caching and freshness
 
 Live reads are the default (`cache_ttl_seconds: 0`). With a positive TTL,
@@ -346,8 +435,25 @@ read/write classification — as is a `required` list that is present but is
 not an array of strings, since a gate that cannot read its input has
 verified nothing.
 
-Four authoring invariants are enforced by the loader:
+Five authoring invariants are enforced by the loader:
 
+- `values` on a filter mapping — the column's COMPLETE value domain — is
+  legal only on an `eq` mapping over a `utf8` column, and may not be blank
+  or repeat an entry. Declare it for any input the action types as a
+  closed enum (GitHub's `state: open | closed | all`): the gateway
+  validates inputs strictly, so without it `state = 'OPEN'` is forwarded
+  and refused as `invalid_input`, surfacing as an execution failure where
+  SQL promises zero rows. With the domain declared, a literal outside it
+  can match no row, so the scan answers zero rows without a request — no
+  page budget spent, and no `max_rows` / `max_pages` to trip on a large
+  collection. That is why the list must be the whole domain and not merely
+  the values worth pushing; a pin-only spelling such as GitHub's `all` is
+  in the enum, not in `values`. Registration checks the declaration
+  against the discovered input schema of every action the pushed input
+  reaches (the table's own, and a full-input continuation's): a declared
+  value the enum does not accept fails the table's compatibility check,
+  and an enum-typed input with no `values` logs a warning naming the
+  accepted values;
 - a `continuation` on a non-cursor strategy is a parse error;
 - a table that pins its continuation's fingerprint must pin its own
   action's too (half a gate reads as gated while verifying only pages 2..N);

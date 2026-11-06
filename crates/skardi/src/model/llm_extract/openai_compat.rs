@@ -16,6 +16,12 @@
 //!
 //! Multimodal escalation attaches the image as an OpenAI `image_url` base64
 //! data-URI content block — only present when escalating.
+//!
+//! The same shape is served by gateways that front these models under their
+//! own host and auth — Azure AI Foundry's model inference endpoint takes the
+//! key in an `api-key` header and an `api-version` query parameter — so the
+//! endpoint and auth style can be overridden per deployment
+//! ([`EndpointOverrides`]) without a provider of their own.
 
 use std::time::Duration;
 
@@ -29,9 +35,59 @@ use super::provider::{CompletionProvider, CompletionRequest};
 use crate::util::http::parse_retry_after;
 
 const DEFAULT_RETRY_WAIT: Duration = Duration::from_secs(2);
+/// A key that applies to whichever provider is selected, read before the
+/// provider's own variable. Lets a deployment-specific key (an Azure
+/// resource's) be named for what it is rather than as `DEEPSEEK_API_KEY`.
+pub const GENERIC_API_KEY_ENV: &str = "LLM_EXTRACT_API_KEY";
 const MAX_TOKENS: u32 = 4096;
 const TOOL_NAME: &str = "record_entities";
 const SCHEMA_NAME: &str = "entities_extraction";
+
+/// How the API key is presented to the endpoint.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AuthStyle {
+    /// `Authorization: Bearer <key>` — every public provider in the table.
+    #[default]
+    Bearer,
+    /// `api-key: <key>` — Azure AI Foundry's model inference endpoint.
+    ApiKey,
+}
+
+impl AuthStyle {
+    /// Parse the `LLM_EXTRACT_AUTH_STYLE` spelling: `bearer` or `api-key`,
+    /// case-insensitive. `None` for anything else.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "bearer" => Some(Self::Bearer),
+            "api-key" | "api_key" | "apikey" => Some(Self::ApiKey),
+            _ => None,
+        }
+    }
+}
+
+/// Deployment-specific overrides of a table provider's endpoint and auth:
+/// a different host serving the same `/chat/completions` shape, the auth
+/// header it expects, and an `api-version` query parameter when it requires
+/// one. Everything unset keeps the provider table's defaults.
+///
+/// ```
+/// use skardi::model::llm_extract::openai_compat::{AuthStyle, EndpointOverrides};
+///
+/// let azure = EndpointOverrides {
+///     base_url: Some("https://my-resource.services.ai.azure.com/models".into()),
+///     auth: AuthStyle::ApiKey,
+///     api_version: Some("2024-05-01-preview".into()),
+/// };
+/// assert_eq!(azure.auth, AuthStyle::ApiKey);
+/// ```
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EndpointOverrides {
+    /// The API root; requests POST to `{base_url}/chat/completions`.
+    pub base_url: Option<String>,
+    pub auth: AuthStyle,
+    /// Appended as `?api-version=<value>`.
+    pub api_version: Option<String>,
+}
 
 /// An OpenAI-compatible completion provider (DeepSeek / GLM / Gemini / OpenAI).
 pub struct OpenAiCompatibleCompletionProvider {
@@ -40,6 +96,8 @@ pub struct OpenAiCompatibleCompletionProvider {
     api_key_env: String,
     client: Client,
     model: String,
+    auth: AuthStyle,
+    api_version: Option<String>,
 }
 
 impl OpenAiCompatibleCompletionProvider {
@@ -53,7 +111,20 @@ impl OpenAiCompatibleCompletionProvider {
             api_key_env: api_key_env.to_string(),
             client,
             model: model.to_string(),
+            auth: AuthStyle::Bearer,
+            api_version: None,
         }
+    }
+
+    /// Apply a deployment's [`EndpointOverrides`]: an unset field keeps what
+    /// the provider table said.
+    pub fn with_overrides(mut self, overrides: &EndpointOverrides) -> Self {
+        if let Some(base_url) = overrides.base_url.as_deref() {
+            self.base_url = base_url.trim_end_matches('/').to_string();
+        }
+        self.auth = overrides.auth;
+        self.api_version = overrides.api_version.clone();
+        self
     }
 
     /// Human-readable provider name.
@@ -61,11 +132,20 @@ impl OpenAiCompatibleCompletionProvider {
         &self.provider_name
     }
 
+    /// The key: [`GENERIC_API_KEY_ENV`] when set, else the provider's own
+    /// variable. Read per request, as before, so a rotated key is picked up
+    /// without a restart.
     fn api_key(&self) -> anyhow::Result<String> {
+        if let Ok(key) = std::env::var(GENERIC_API_KEY_ENV)
+            && !key.trim().is_empty()
+        {
+            return Ok(key);
+        }
         std::env::var(&self.api_key_env).map_err(|_| {
             anyhow!(
-                "Missing API key: set the {} environment variable for the '{}' llm_extract provider",
+                "Missing API key: set the {} (or {}) environment variable for the '{}' llm_extract provider",
                 self.api_key_env,
+                GENERIC_API_KEY_ENV,
                 self.provider_name
             )
         })
@@ -73,6 +153,21 @@ impl OpenAiCompatibleCompletionProvider {
 
     fn endpoint(&self) -> String {
         format!("{}/chat/completions", self.base_url)
+    }
+
+    /// A POST to the endpoint with this provider's auth and query parameters;
+    /// the caller adds the body. One place, so both attempts of [`Self::complete`]
+    /// and the tests agree on how a request is addressed.
+    fn request(&self, url: &str, api_key: &str) -> reqwest::RequestBuilder {
+        let mut request = self.client.post(url);
+        request = match self.auth {
+            AuthStyle::Bearer => request.bearer_auth(api_key),
+            AuthStyle::ApiKey => request.header("api-key", api_key),
+        };
+        if let Some(version) = self.api_version.as_deref() {
+            request = request.query(&[("api-version", version)]);
+        }
+        request
     }
 
     /// Wrap the caller's JSON Schema in an `entities` array object, falling back
@@ -304,7 +399,7 @@ impl CompletionProvider for OpenAiCompatibleCompletionProvider {
 
         // Attempt 1: response_format json_schema.
         let rf_body = self.build_body_response_format(&req);
-        let rf_request = || self.client.post(&url).bearer_auth(&api_key).json(&rf_body);
+        let rf_request = || self.request(&url, &api_key).json(&rf_body);
         match send_once_with_retry(rf_request, &self.provider_name).await {
             Attempt::Ok(text) => {
                 let entities = parse_entities(&text)?;
@@ -323,12 +418,7 @@ impl CompletionProvider for OpenAiCompatibleCompletionProvider {
 
         // Attempt 2: forced tool call.
         let tool_body = self.build_body_tool(&req);
-        let tool_request = || {
-            self.client
-                .post(&url)
-                .bearer_auth(&api_key)
-                .json(&tool_body)
-        };
+        let tool_request = || self.request(&url, &api_key).json(&tool_body);
         match send_once_with_retry(tool_request, &self.provider_name).await {
             Attempt::Ok(text) => {
                 let entities = parse_entities(&text)?;
@@ -368,6 +458,67 @@ mod tests {
             "gpt-4o-mini",
         );
         assert_eq!(p2.endpoint(), "https://api.openai.com/v1/chat/completions");
+    }
+
+    fn built(p: &OpenAiCompatibleCompletionProvider) -> reqwest::Request {
+        p.request(&p.endpoint(), "k3y")
+            .json(&json!({}))
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn default_request_is_bearer_with_no_api_version() {
+        let req = built(&provider());
+        assert_eq!(
+            req.url().as_str(),
+            "https://api.deepseek.com/v1/chat/completions"
+        );
+        assert_eq!(req.headers().get("authorization").unwrap(), "Bearer k3y");
+        assert!(req.headers().get("api-key").is_none());
+    }
+
+    #[test]
+    fn azure_overrides_move_the_host_the_auth_header_and_the_api_version() {
+        let p = provider().with_overrides(&EndpointOverrides {
+            base_url: Some("https://my-resource.services.ai.azure.com/models/".into()),
+            auth: AuthStyle::ApiKey,
+            api_version: Some("2024-05-01-preview".into()),
+        });
+        assert_eq!(
+            p.name(),
+            "deepseek",
+            "the provider table's row is still the one selected"
+        );
+        let req = built(&p);
+        assert_eq!(
+            req.url().as_str(),
+            "https://my-resource.services.ai.azure.com/models/chat/completions?api-version=2024-05-01-preview"
+        );
+        assert_eq!(req.headers().get("api-key").unwrap(), "k3y");
+        assert!(
+            req.headers().get("authorization").is_none(),
+            "an Azure endpoint rejects a bearer it did not ask for"
+        );
+    }
+
+    #[test]
+    fn unset_overrides_keep_the_table_defaults() {
+        let p = provider().with_overrides(&EndpointOverrides::default());
+        let req = built(&p);
+        assert_eq!(
+            req.url().as_str(),
+            "https://api.deepseek.com/v1/chat/completions"
+        );
+        assert!(req.headers().get("authorization").is_some());
+    }
+
+    #[test]
+    fn auth_style_spellings() {
+        assert_eq!(AuthStyle::parse(" Bearer "), Some(AuthStyle::Bearer));
+        assert_eq!(AuthStyle::parse("api-key"), Some(AuthStyle::ApiKey));
+        assert_eq!(AuthStyle::parse("API_KEY"), Some(AuthStyle::ApiKey));
+        assert_eq!(AuthStyle::parse("token"), None);
     }
 
     #[test]

@@ -1,0 +1,54 @@
+{
+  "type": "object",
+  "properties": {
+    "owner": {
+      "type": "string",
+      "minLength": 1
+    },
+    "repo": {
+      "type": "string",
+      "minLength": 1
+    },
+    "state": {
+      "type": "string",
+      "enum": [
+        "open",
+        "closed",
+        "all"
+      ]
+    },
+    "head": {
+      "type": "string"
+    },
+    "base": {
+      "type": "string"
+    },
+    "sort": {
+      "type": "string",
+      "enum": [
+        "created",
+        "updated",
+        "popularity",
+        "long-running"
+      ]
+    },
+    "direction": {
+      "type": "string",
+      "enum": [
+        "asc",
+        "desc"
+      ]
+    },
+    "perPage": {
+      "type": "integer"
+    },
+    "page": {
+      "type": "integer"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "owner",
+    "repo"
+  ]
+}

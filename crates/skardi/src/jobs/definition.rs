@@ -18,8 +18,10 @@
 //!       AND updated_at <  {to_date}
 //!   destination:
 //!     table: "wiki_lake"          # DataFusion table ident (or dotted path)
-//!     mode: append                # append (overwrite is deferred — see below)
+//!     mode: append                # append | upsert (overwrite is deferred — see below)
 //!     create_if_missing: true     # lake destinations only
+//!     # merge_keys: [id]          # required with `mode: upsert`, refused otherwise
+//!     # repeated_keys: keep_last  # upsert only: refuse (default) | keep_last
 //!   execution:
 //!     timeout_ms: 3600000         # optional; default = no timeout
 //! ```
@@ -31,6 +33,7 @@
 use anyhow::{Context, Result, anyhow};
 use datafusion::prelude::SessionContext;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -52,7 +55,12 @@ pub enum JobKind {
 
 /// Write mode for the destination.
 ///
-/// MVP supports `append` only. `overwrite` is deferred because the
+/// `append` adds every row. `upsert` merges on [`Destination::merge_keys`]:
+/// a row whose keys match an existing row replaces it, and any other row is
+/// inserted. Upsert is Lance-only — the SQL destinations refuse it at submit,
+/// since DataFusion's DML has no MERGE to drive them with.
+///
+/// `overwrite` is deferred because the
 /// DataFusion SQL interface we drive DB destinations through cannot wrap
 /// a `DELETE FROM` + `INSERT INTO` pair in a single transaction, so an
 /// overwrite whose INSERT failed after a successful DELETE would silently
@@ -64,6 +72,7 @@ pub enum JobKind {
 pub enum DestinationMode {
     #[default]
     Append,
+    Upsert,
 }
 
 fn default_create_if_missing() -> bool {
@@ -84,6 +93,82 @@ pub struct Destination {
     /// table is missing, regardless of this flag.
     #[serde(default = "default_create_if_missing")]
     pub create_if_missing: bool,
+    /// The columns an `upsert` matches rows on. Required with `mode: upsert`
+    /// and refused with any other mode, so a key list can never be silently
+    /// ignored. Each must be a column of the query's output; the executor
+    /// checks that at submit, once the output schema is known.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub merge_keys: Vec<String>,
+    /// What an `upsert` does with a key that appears more than once in one
+    /// run's output: [`RepeatedKeys::Refuse`] (the default) or
+    /// [`RepeatedKeys::KeepLast`]. Only meaningful with `mode: upsert`.
+    #[serde(default, skip_serializing_if = "RepeatedKeys::is_refuse")]
+    pub repeated_keys: RepeatedKeys,
+}
+
+/// What an upsert does with a merge key repeated within one run's output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepeatedKeys {
+    /// Fail the write, naming the key, and commit nothing: the run is never
+    /// resolved by picking one copy silently.
+    #[default]
+    Refuse,
+    /// Keep the copy that comes LAST in the query's output order, for a
+    /// source whose listing can return one record twice in a window (a
+    /// record updated mid-pagination reappears on a later page, so the last
+    /// copy is the newest). The run's whole output is buffered to find the
+    /// last copy, and `rows_written` counts every row the query produced, so
+    /// a caller comparing it against a LIMIT still sees a full page as full.
+    KeepLast,
+}
+
+impl RepeatedKeys {
+    fn is_refuse(&self) -> bool {
+        *self == RepeatedKeys::Refuse
+    }
+}
+
+impl Destination {
+    /// The load-time half of the upsert contract: what can be checked
+    /// without planning the query.
+    pub fn validate(&self) -> Result<()> {
+        match self.mode {
+            DestinationMode::Upsert if self.merge_keys.is_empty() => Err(anyhow!(
+                "destination `{}`: `mode: upsert` needs `merge_keys`, the columns rows are \
+                 matched on",
+                self.table
+            )),
+            DestinationMode::Append if !self.merge_keys.is_empty() => Err(anyhow!(
+                "destination `{}`: `merge_keys` only applies to `mode: upsert`; with \
+                 `mode: append` it would be ignored",
+                self.table
+            )),
+            DestinationMode::Append if self.repeated_keys != RepeatedKeys::Refuse => Err(anyhow!(
+                "destination `{}`: `repeated_keys` only applies to `mode: upsert`; with \
+                 `mode: append` it would be ignored",
+                self.table
+            )),
+            _ => {
+                let mut seen = HashSet::new();
+                for key in &self.merge_keys {
+                    if key.trim().is_empty() {
+                        return Err(anyhow!(
+                            "destination `{}`: `merge_keys` has an empty column name",
+                            self.table
+                        ));
+                    }
+                    if !seen.insert(key.as_str()) {
+                        return Err(anyhow!(
+                            "destination `{}`: `merge_keys` names `{key}` twice",
+                            self.table
+                        ));
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 /// The `execution:` block of a job YAML.
@@ -133,43 +218,57 @@ impl JobDefinition {
         let path = path.as_ref();
         let content = fs::read_to_string(path)
             .with_context(|| format!("Failed to read job file: {}", path.display()))?;
+        Self::load_from_yaml(&content, ctx).await.map_err(|error| {
+            let message = format!("{error} (job file {})", path.display());
+            error.context(message)
+        })
+    }
 
-        let root: serde_yaml::Value = serde_yaml::from_str(&content)
-            .with_context(|| format!("Failed to parse job YAML: {}", path.display()))?;
+    /// Load an already-read job YAML using the same validation and schema
+    /// inference as [`Self::load_from_file`]. Returns `None` for a pipeline.
+    ///
+    /// ```no_run
+    /// use std::sync::Arc;
+    /// use datafusion::prelude::SessionContext;
+    /// use skardi::jobs::definition::JobDefinition;
+    /// # async fn example() -> anyhow::Result<()> {
+    /// let yaml = "kind: pipeline";
+    /// let ctx = Arc::new(SessionContext::new());
+    /// assert!(JobDefinition::load_from_yaml(yaml, ctx).await?.is_none());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn load_from_yaml(content: &str, ctx: Arc<SessionContext>) -> Result<Option<Self>> {
+        let root: serde_yaml::Value =
+            serde_yaml::from_str(content).context("Failed to parse job YAML")?;
 
         let kind_value = root.get("kind").ok_or_else(|| {
-            anyhow!(
-                "Missing `kind:` at root of {} — expected `kind: job` or `kind: pipeline`",
-                path.display()
-            )
+            anyhow!("Missing `kind:` at root — expected `kind: job` or `kind: pipeline`")
         })?;
-        let kind: JobKind = serde_yaml::from_value(kind_value.clone())
-            .with_context(|| format!("Invalid `kind:` in {}", path.display()))?;
+        let kind: JobKind =
+            serde_yaml::from_value(kind_value.clone()).context("Invalid `kind:`")?;
 
         if kind != JobKind::Job {
             return Ok(None);
         }
 
-        let spec = root.get("spec").ok_or_else(|| {
-            anyhow!(
-                "`kind: job` YAML {} is missing a `spec:` block",
-                path.display()
-            )
-        })?;
+        let spec = root
+            .get("spec")
+            .ok_or_else(|| anyhow!("`kind: job` YAML is missing a `spec:` block"))?;
 
-        let destination_value = spec.get("destination").ok_or_else(|| {
-            anyhow!(
-                "`kind: job` YAML {} is missing `spec.destination`",
-                path.display()
-            )
-        })?;
+        let destination_value = spec
+            .get("destination")
+            .ok_or_else(|| anyhow!("`kind: job` YAML is missing `spec.destination`"))?;
         let destination: Destination = serde_yaml::from_value(destination_value.clone())
-            .with_context(|| format!("Failed to parse destination block in {}", path.display()))?;
+            .context("Failed to parse destination block")?;
+        destination
+            .validate()
+            .context("Invalid destination block")?;
 
         let execution: Execution = match spec.get("execution") {
-            Some(v) => serde_yaml::from_value(v.clone()).with_context(|| {
-                format!("Failed to parse execution block in {}", path.display())
-            })?,
+            Some(v) => {
+                serde_yaml::from_value(v.clone()).context("Failed to parse execution block")?
+            }
             None => Execution::default(),
         };
 
@@ -180,7 +279,7 @@ impl JobDefinition {
         // (which is now strict to `kind: pipeline`).
         let pipeline = StandardPipeline::build_from_parsed(root, ctx)
             .await
-            .with_context(|| format!("Failed to load pipeline section of {}", path.display()))?;
+            .context("Failed to load pipeline section of job YAML")?;
 
         Ok(Some(Self {
             pipeline,
@@ -240,7 +339,18 @@ spec:
     timeout_ms: 60000
 "#;
         let ctx = Arc::new(SessionContext::new());
-        let res = write_and_load(yaml, ctx).await.unwrap().unwrap();
+        let res = write_and_load(yaml, Arc::clone(&ctx))
+            .await
+            .unwrap()
+            .unwrap();
+        let memory = JobDefinition::load_from_yaml(yaml, ctx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(memory.name(), res.name());
+        assert_eq!(memory.sql(), res.sql());
+        assert_eq!(memory.destination.table, res.destination.table);
+        assert_eq!(memory.execution.timeout_ms, res.execution.timeout_ms);
         assert_eq!(res.name(), "ingest-j1");
         assert_eq!(res.destination.table, "target_table");
         assert_eq!(res.destination.mode, DestinationMode::Append);
@@ -290,6 +400,91 @@ spec:
             err.contains("overwrite") || err.contains("unknown variant"),
             "unexpected error: {err}"
         );
+    }
+
+    fn upsert_yaml(destination: &str) -> String {
+        format!(
+            r#"
+kind: job
+metadata:
+  name: "merge"
+  version: "1.0.0"
+spec:
+  query: "SELECT 1 AS id"
+  destination:
+{destination}
+"#
+        )
+    }
+
+    #[tokio::test]
+    async fn job_yaml_reads_repeated_keys_and_refuses_it_without_upsert() {
+        let load = |destination: &str| {
+            let yaml = upsert_yaml(destination);
+            async move { write_and_load(&yaml, Arc::new(SessionContext::new())).await }
+        };
+        let keep_last = load(
+            "    table: \"t\"\n    mode: upsert\n    merge_keys: [id]\n    repeated_keys: keep_last",
+        )
+        .await
+        .expect("keep_last loads")
+        .expect("it is a job");
+        assert_eq!(keep_last.destination.repeated_keys, RepeatedKeys::KeepLast);
+
+        let default = load("    table: \"t\"\n    mode: upsert\n    merge_keys: [id]")
+            .await
+            .expect("loads")
+            .expect("it is a job");
+        assert_eq!(default.destination.repeated_keys, RepeatedKeys::Refuse);
+
+        let err = load("    table: \"t\"\n    mode: append\n    repeated_keys: keep_last")
+            .await
+            .expect_err("repeated_keys without upsert");
+        assert!(
+            format!("{err:#}").contains("only applies to `mode: upsert`"),
+            "{err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn job_yaml_accepts_upsert_with_merge_keys() {
+        let yaml = upsert_yaml("    table: \"t\"\n    mode: upsert\n    merge_keys: [id, part]");
+        let job = write_and_load(&yaml, Arc::new(SessionContext::new()))
+            .await
+            .expect("upsert with keys loads")
+            .expect("it is a job");
+        assert_eq!(job.destination.mode, DestinationMode::Upsert);
+        assert_eq!(job.destination.merge_keys, vec!["id", "part"]);
+    }
+
+    #[rstest::rstest]
+    #[case::upsert_without_keys("    table: \"t\"\n    mode: upsert", "needs `merge_keys`")]
+    #[case::keys_without_upsert(
+        "    table: \"t\"\n    mode: append\n    merge_keys: [id]",
+        "only applies to `mode: upsert`"
+    )]
+    #[case::keys_with_default_mode("    table: \"t\"\n    merge_keys: [id]", "only applies")]
+    #[case::duplicate_key(
+        "    table: \"t\"\n    mode: upsert\n    merge_keys: [id, id]",
+        "names `id` twice"
+    )]
+    #[case::empty_key(
+        "    table: \"t\"\n    mode: upsert\n    merge_keys: [\"\"]",
+        "empty column"
+    )]
+    #[tokio::test]
+    async fn job_yaml_refuses_an_inconsistent_upsert(
+        #[case] destination: &str,
+        #[case] expected: &str,
+    ) {
+        let yaml = upsert_yaml(destination);
+        let err = format!(
+            "{:#}",
+            write_and_load(&yaml, Arc::new(SessionContext::new()))
+                .await
+                .unwrap_err()
+        );
+        assert!(err.contains(expected), "expected {expected:?} in: {err}");
     }
 
     #[tokio::test]

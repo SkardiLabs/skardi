@@ -153,13 +153,10 @@ async fn build_file_io(warehouse_path: &str, options: &HashMap<String, String>) 
 
     let factory: Arc<dyn iceberg::io::StorageFactory> =
         if warehouse_path.starts_with("s3://") || warehouse_path.starts_with("s3a://") {
-            let scheme = if warehouse_path.starts_with("s3a://") {
-                "s3a://"
-            } else {
-                "s3://"
-            };
+            // iceberg-storage-opendal 0.10 derives the scheme from each path
+            // it is handed (`s3`, `s3a`, `s3n`, ...), so there is no
+            // configured scheme to keep in step with the warehouse URL.
             Arc::new(OpenDalStorageFactory::S3 {
-                configured_scheme: scheme.to_string(),
                 customized_credential_load: None,
             })
         } else {

@@ -8,6 +8,11 @@
 # in the URL path, and the `rsplit('.')` lookups elsewhere read TABLE
 # ids, not action ids.
 #
+# The files.list output contract now comes from Open Connector source
+# `0e4dc775` (2026-11-01), including optional permission metadata. This
+# source-derived schema update is not new live-account evidence; historical
+# row fixtures remain unchanged and authored cases cover the new columns.
+#
 # Rows are NORMALIZED upstream — the opposite of `one_drive`, and the
 # reason no column below uses Google's own REST field names. Every
 # executor rebuilds its rows through a `normalize*` function into a
@@ -44,7 +49,8 @@
 # Google publishes no has-more flag and no total, so no override is
 # declared. In-band Google errors are consumed by the executor
 # (`assertGoogleResponse` throws on any non-2xx), so no table declares
-# `error_path`.
+# `error_path`, except the files listing: incompleteSearch=true is an
+# in-band incomplete result and must fail before any rows are returned.
 #
 # Inputs are strict camelCase (`additionalProperties: false`). Verified
 # live on `files.list`: `fields`, `page`, `perPage`, `limit`,
@@ -72,13 +78,15 @@
 # caveat in `docs/open-connector-google-drive.md`.
 kind: pack
 pack: google_drive
-version: 1
+version: 2
 
 tables:
   files:
     action: googledrive.files.list
     row_path: "$.files"
-    fingerprint: 5da2805b9646b6e775d0126fe25917eb6cc84874e27c6e22a10fac4ad9b4c20f
+    # A successful HTTP response can still omit a requested corpus.
+    error_path: "$.incompleteSearch"
+    fingerprint: 8fc57df3637855fcdd9b3490bd2c2bdb52a1790631a778995076e4f467b620ec
     pagination:
       strategy: cursor
       cursor_input: pageToken
@@ -154,6 +162,9 @@ tables:
       # epoch-millis alike (see gmail.yaml's message_timestamp).
       - { name: created_time, path: createdTime, type: timestamp_ms_utc, nullable: true }
       - { name: modified_time, path: modifiedTime, type: timestamp_ms_utc, nullable: true }
+      # Binary-content observations; absent on native Workspace files.
+      - { name: md5_checksum, path: md5Checksum, type: utf8, nullable: true }
+      - { name: head_revision_id, path: headRevisionId, type: utf8, nullable: true }
       # A normalization win worth naming: Google's REST API returns
       # `size` as a decimal STRING; the executor's `parseSizeBytes`
       # emits a real number (or null for anything without a byte size of
@@ -172,6 +183,10 @@ tables:
       # included; otherwise an array of parent folder IDs, in practice
       # at most one since Drive dropped multi-parenting.
       - { name: parents, path: parents, type: utf8_list, nullable: true }
+      # Optional observations: neither a missing break flag nor missing IDs
+      # imply false or an empty ACL. These are metadata, not an ACL version.
+      - { name: inherited_permissions_disabled, path: inheritedPermissionsDisabled, type: boolean, nullable: true }
+      - { name: permission_ids, path: permissionIds, type: utf8_list, nullable: true }
       # Two columns from ONE `owners` array under different pluck keys:
       # the engine deliberately has no scalar array indexing, so these
       # are lists rather than `owners[0].…` scalars. My Drive files

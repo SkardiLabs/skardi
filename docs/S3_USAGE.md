@@ -154,7 +154,42 @@ Your AWS credentials need these minimum permissions:
 
 - **CSV**: `type: "csv", location: "remote_s3"`
 - **Parquet**: `type: "parquet", location: "remote_s3"`
-- **Lance**: `type: "lance", location: "remote_s3"`
+- **Lance**: `type: "lance", location: "remote_s3"`, read and written (see below)
+
+## Lance Datasets in S3 and S3-Compatible Stores
+
+A Lance dataset is a prefix, not one object, and Skardi both reads it as a
+table and writes it as a job destination. Point `path` at the dataset's URI:
+
+```yaml
+spec:
+  data_sources:
+    - name: "corpus"
+      type: "lance"
+      location: "remote_s3"
+      path: "s3://my-bucket/datasets/corpus.lance"
+```
+
+A job whose `destination.table` is `corpus` writes there with `append` or
+`upsert` ([jobs](jobs.md)). The dataset may not exist yet: the server skips
+registering a missing one at boot, and the job's first run creates it.
+
+Credentials and endpoint come from the environment, exactly as for CSV and
+Parquet, and never from `options` (refused at boot). For MinIO, RustFS or
+another S3-compatible store, add the endpoint and, for a plain-HTTP endpoint,
+allow HTTP:
+
+```bash
+export AWS_ACCESS_KEY_ID=...
+export AWS_SECRET_ACCESS_KEY=...
+export AWS_REGION=us-east-1
+export AWS_ENDPOINT=http://127.0.0.1:9000   # S3-compatible stores only
+export AWS_ALLOW_HTTP=true                  # only for an http:// endpoint
+```
+
+The bucket must already exist. `crates/skardi/tests/lance_s3_live.rs` runs a
+create, upsert and append round trip against such a store when
+`DOCUMENTS_S3_LIVE=1`, and CI runs it against RustFS.
 
 ## Error Messages
 

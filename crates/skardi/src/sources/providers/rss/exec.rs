@@ -163,7 +163,7 @@ pub struct RssScanExec {
     projection: Option<Vec<usize>>,
     limit: Option<usize>,
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     shared: Arc<ScanShared>,
 }
 
@@ -218,7 +218,7 @@ impl RssScanExec {
             projection,
             limit,
             schema,
-            properties,
+            properties: Arc::new(properties),
             shared,
         })
     }
@@ -245,7 +245,7 @@ impl ExecutionPlan for RssScanExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -432,8 +432,8 @@ mod tests {
     use crate::sources::providers::open_connector::testutil::{CapturedEvent, capture_events};
     use crate::sources::providers::rss::schema::WINDOW_STATUS_IDX;
     use crate::sources::providers::rss::testutil::{
-        MockFeedServer, MockResponse, RSS2_MINIMAL, collect_stream, feed_urls, str_col,
-        test_engine, total_rows,
+        MockFeedServer, MockResponse, MockResponseExt, RSS2_MINIMAL, collect_stream, feed_urls,
+        str_col, test_engine, total_rows,
     };
 
     fn ctx() -> Arc<TaskContext> {

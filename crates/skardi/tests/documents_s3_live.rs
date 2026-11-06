@@ -11,14 +11,16 @@
 //!     cargo test -p skardi --test documents_s3_live \
 //!       --features documents,llm-extract -- --ignored
 //!
-//! Against MinIO (no AWS account needed):
-//!   docker run -d -p 127.0.0.1:9000:9000 -e MINIO_ROOT_USER=minioadmin \
-//!     -e MINIO_ROOT_PASSWORD=minioadmin quay.io/minio/minio server /data
+//! Against RustFS (no AWS account needed — the same S3-compatible server CI
+//! uses; MinIO's public images stopped answering anonymous pulls on
+//! 2026-09-28, so the old `quay.io/minio/minio` recipe no longer works):
+//!   docker run -d -p 127.0.0.1:9000:9000 -e RUSTFS_ACCESS_KEY=rustfsadmin \
+//!     -e RUSTFS_SECRET_KEY=rustfsadmin rustfs/rustfs:1.0.0
 //!   aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://skardi-test
 //!   DOCUMENTS_S3_LIVE=1 DOCUMENTS_S3_BUCKET=skardi-test \
 //!     AWS_ENDPOINT=http://127.0.0.1:9000 AWS_ALLOW_HTTP=true \
-//!     AWS_REGION=us-east-1 AWS_ACCESS_KEY_ID=minioadmin \
-//!     AWS_SECRET_ACCESS_KEY=minioadmin \
+//!     AWS_REGION=us-east-1 AWS_ACCESS_KEY_ID=rustfsadmin \
+//!     AWS_SECRET_ACCESS_KEY=rustfsadmin \
 //!     cargo test -p skardi --test documents_s3_live \
 //!       --features documents,llm-extract -- --ignored
 //!
@@ -31,7 +33,7 @@ use std::sync::Arc;
 
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path as OsPath;
-use object_store::{ObjectStore, PutPayload};
+use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 
 /// Fixture PDF shipped with the crate — a real 2-page PDF liteparse can parse
 /// without LibreOffice or ImageMagick installed.
@@ -98,6 +100,7 @@ async fn live_s3_scan_reads_objects_and_writes_image_store() {
         image_mode: skardi::sources::providers::documents::ImageMode::Embedded,
         image_store: Some(format!("s3://{bucket}/{base}/extracted")),
         render_page_images: true,
+        retain_empty_text: false,
         ocr: skardi::sources::providers::documents::OcrMode::Off,
         ocr_server_url: None,
     };
@@ -171,6 +174,7 @@ async fn live_s3_self_ingestion_guard_holds_across_scans() {
         image_mode: skardi::sources::providers::documents::ImageMode::Embedded,
         image_store: Some(format!("s3://{bucket}/{base}/docs/crops")),
         render_page_images: true,
+        retain_empty_text: false,
         ocr: skardi::sources::providers::documents::OcrMode::Off,
         ocr_server_url: None,
     };

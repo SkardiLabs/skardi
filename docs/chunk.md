@@ -11,7 +11,9 @@
 >
 > The `rag` umbrella feature bundles `embedding` and `chunking` so the
 > chunk → embed → write loop ships in one flag. The pre-built Docker image
-> `ghcr.io/skardilabs/skardi/skardi-server-rag:<tag>` includes both.
+> `ghcr.io/skardilabs/skardi/skardi-server-full:<tag>` includes both (along
+> with every other stable feature); `skardi-server-lite:<tag>` is the
+> default build — chunking, no embedding.
 
 `chunk` is a DataFusion scalar UDF that splits text into smaller pieces directly inside SQL, so document ingestion can chunk inline alongside embedding and writing — no out-of-band Python step. It wraps the [`text-splitter`](https://crates.io/crates/text-splitter) crate.
 

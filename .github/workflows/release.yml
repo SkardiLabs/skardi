@@ -50,6 +50,8 @@ jobs:
             os: ubuntu-latest
           - target: aarch64-apple-darwin
             os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
 
     steps:
       - name: Checkout code
@@ -117,13 +119,31 @@ jobs:
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }} -p skardi-cli
+        env:
+          # Static MSVC runtime, so skardi.exe runs on a machine without the
+          # Visual C++ Redistributable. Target-scoped: the other matrix
+          # entries see no RUSTFLAGS change.
+          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: "-C target-feature=+crt-static"
 
       - name: Package binary (Unix)
+        if: runner.os != 'Windows'
         run: |
           cd target/${{ matrix.target }}/release
           tar czf ../../../skardi-${{ matrix.target }}.tar.gz skardi
           cd ../../..
           shasum -a 256 skardi-${{ matrix.target }}.tar.gz > skardi-${{ matrix.target }}.tar.gz.sha256
+
+      # A .zip, not a .tar.gz: it is what Windows opens natively and what
+      # install.ps1 expands. The .sha256 keeps shasum's "<hash>  <file>" shape
+      # so every platform's checksum file reads the same way.
+      - name: Package binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $archive = "skardi-${{ matrix.target }}.zip"
+          Compress-Archive -Path "target/${{ matrix.target }}/release/skardi.exe" -DestinationPath $archive
+          $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLower()
+          [IO.File]::WriteAllText("$archive.sha256", "$hash  $archive`n")
 
       - name: Upload artifact
         if: ${{ !inputs.dry_run }}
@@ -133,6 +153,9 @@ jobs:
           path: |
             skardi-${{ matrix.target }}.tar.gz
             skardi-${{ matrix.target }}.tar.gz.sha256
+            skardi-${{ matrix.target }}.zip
+            skardi-${{ matrix.target }}.zip.sha256
+          if-no-files-found: error
 
   docker:
     name: "Docker ${{ matrix.variant }} (${{ matrix.platform }}, ${{ inputs.version }})"
@@ -142,24 +165,28 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - variant: default
+          # lite = default server build (includes `chunking` so stock servers
+          # run generated etl bundles); full = every stable server feature.
+          # Anything in between is a local build:
+          #   docker build --build-arg FEATURES=<flags> .
+          - variant: lite
             features: ""
-            suffix: ""
+            suffix: "-lite"
             platform: linux/amd64
             runner: ubuntu-latest
-          - variant: default
+          - variant: lite
             features: ""
-            suffix: ""
+            suffix: "-lite"
             platform: linux/arm64
             runner: ubuntu-24.04-arm
-          - variant: rag
-            features: "rag"
-            suffix: "-rag"
+          - variant: full
+            features: "rag,llm-extract,documents,rss"
+            suffix: "-full"
             platform: linux/amd64
             runner: ubuntu-latest
-          - variant: rag
-            features: "rag"
-            suffix: "-rag"
+          - variant: full
+            features: "rag,llm-extract,documents,rss"
+            suffix: "-full"
             platform: linux/arm64
             runner: ubuntu-24.04-arm
     steps:
@@ -220,10 +247,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - variant: default
-            suffix: ""
-          - variant: rag
-            suffix: "-rag"
+          - variant: lite
+            suffix: "-lite"
+          - variant: full
+            suffix: "-full"
     steps:
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
@@ -279,13 +306,15 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Publish skardi
-        run: cargo publish -p skardi ${{ inputs.dry_run && '--dry-run' || '' }}
+      # Publishes skardi-source-pack and skardi in one cargo invocation, skipping
+      # any whose version is already on crates.io so a re-run after a partial
+      # publish finishes the job instead of failing on the uploaded crate.
+      - name: Publish skardi-source-pack and skardi
+        run: ./scripts/publish_crates.sh ${{ inputs.dry_run && '--dry-run' || '' }}
 
       # skardi-sources is not published yet: it depends on lance via git which crates.io disallows.
       # Once lance v4 is stable on crates.io, replace the git deps in Cargo.toml, add it to
-      # the skardi facade crate, and publish with:
-      #   cargo publish -p skardi-sources  (before cargo publish -p skardi)
+      # the skardi facade crate, and add it to CRATES in scripts/publish_crates.sh.
 
   release:
     name: "Create Release (${{ inputs.version }})"
@@ -315,3 +344,60 @@ jobs:
       - name: Dry run summary
         if: ${{ inputs.dry_run }}
         run: echo "Dry run complete. All build steps passed for ${{ inputs.version }}. No artifacts were pushed or published."
+
+  homebrew:
+    name: "Publish Homebrew formula (${{ inputs.version }})"
+    # Runs after the GitHub Release exists: the formula's urls point at the
+    # release tarballs, so publishing before `release` would create a window
+    # where the tap serves 404s.
+    needs: [build, release]
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    env:
+      TAP_REPO: SkardiLabs/homebrew-tap
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.version }}
+
+      - name: Download CLI artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: skardi-*
+          merge-multiple: true
+
+      - name: Render and push formula
+        env:
+          VERSION: ${{ inputs.version }}
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          version="${VERSION#v}"
+          formula="$(cat packaging/homebrew/skardi.rb)"
+          formula="${formula//@VERSION@/$version}"
+          for target in aarch64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            key="$(tr 'a-z-' 'A-Z_' <<< "$target")"
+            sha="$(cut -d' ' -f1 "artifacts/skardi-${target}.tar.gz.sha256")"
+            formula="${formula//@SHA256_${key}@/$sha}"
+          done
+          if grep -q '@[A-Z_]*@' <<< "$formula"; then
+            echo "Unsubstituted placeholder remains in formula:"
+            grep -n '@[A-Z_]*@' <<< "$formula"
+            exit 1
+          fi
+
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/${TAP_REPO}.git" tap
+          mkdir -p tap/Formula
+          printf '%s\n' "$formula" > tap/Formula/skardi.rb
+
+          git -C tap config user.name "github-actions[bot]"
+          git -C tap config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C tap add Formula/skardi.rb
+          if git -C tap diff --cached --quiet; then
+            echo "Formula already up to date for ${VERSION}; nothing to push."
+            exit 0
+          fi
+          git -C tap commit -m "skardi ${version}"
+          git -C tap push

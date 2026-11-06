@@ -43,9 +43,8 @@ pub mod exec;
 #[cfg(feature = "rss")]
 pub mod engine;
 // The bounded HTTP fetcher (conditional GET, retries, egress enforcement)
-// built on top of `egress`. Not `pub` for the same reason `egress` isn't:
-// it is an implementation detail of the engine a later task builds on top,
-// not part of this provider's public surface.
+// built on top of `egress`. The module stays private; the types a caller
+// fetching feeds itself needs are re-exported below.
 #[cfg(feature = "rss")]
 mod fetch;
 // Hand-rolled mock feed server the fetcher's tests drive. Test-only (never
@@ -94,9 +93,22 @@ pub use opml::resolve_subscriptions;
 // The egress-policy seam, re-exported so an embedder (Skardi Cloud, or an
 // operator running Skardi as a library) can name the trait to implement a
 // destination filter and inject it via `register_rss_tables_with_policy`.
-// OSS ships only `AllowAll`; supplying anything stricter is the caller's.
+// OSS's default is `AllowAll`; supplying anything stricter is the caller's.
+// `DenyCidrs` is the mechanism `RssConfig::deny_cidrs` installs — it carries
+// no ranges of its own.
 #[cfg(feature = "rss")]
-pub use egress::{AllowAll, EgressDenied, EgressPolicy, EgressReason};
+pub use egress::{AllowAll, DenyCidrs, EgressDenied, EgressPolicy, EgressReason};
+// The fetcher itself, for an embedder that fetches feeds outside the engine's
+// scan: Skardi Cloud runs each feed as one work on its executor, with
+// `FeedFetcher::single_attempt` so its own scheduler owns the retries.
+#[cfg(feature = "rss")]
+pub use fetch::{FeedFetcher, FetchError, FetchOutcome, Validators};
+// `RssConfig::deny_cidrs` and `DenyCidrs::new` both speak `ipnet::IpNet`, so
+// `ipnet` is part of this crate's public API whether or not it is named here.
+// Naming it spares a caller a second Cargo dependency whose version it would
+// have to keep compatible with ours by hand. Ungated, like the config field:
+// that one exists in builds without the `rss` feature too.
+pub use ipnet::IpNet;
 
 #[cfg(feature = "rss")]
 use std::sync::Arc;
@@ -198,6 +210,11 @@ const ITEMS_TABLE: &str = "items";
 /// `EgressPolicy` through [`register_rss_tables_with_policy`] (an operator's
 /// own, or Skardi Cloud's at registration) to restrict egress; see
 /// `docs/superpowers/specs/2026-08-03-rss-cloud-egress-design.md`.
+///
+/// The exception is a config whose `deny_cidrs` is non-empty: that installs a
+/// [`DenyCidrs`] policy, with everything injection implies (proxies off). It
+/// is how a stock `skardi-server`, which only ever calls this function, is
+/// given a policy from its ctx. Empty — the default — changes nothing above.
 #[cfg(feature = "rss")]
 pub async fn register_rss_tables(
     session_ctx: &mut SessionContext,
@@ -214,7 +231,8 @@ pub async fn register_rss_tables(
 /// policy, or an operator's own) in place of the `AllowAll` default. OSS ships
 /// no non-`AllowAll` policy itself; this is the entry point an embedder calls
 /// to supply one. In-crate tests use it the same way to prove a refusal
-/// reaches `feeds.last_error`.
+/// reaches `feeds.last_error`. A config that also lists `deny_cidrs` gets
+/// both: an address must pass `policy` and the CIDR list.
 #[cfg(feature = "rss")]
 pub async fn register_rss_tables_with_policy(
     session_ctx: &mut SessionContext,
@@ -274,6 +292,21 @@ async fn register_with_policy(
     // `ConfigError::DataSourceRegistrationFailed`, so nothing is re-stamped
     // here — the same bare call `register_open_connector_tables` makes.
     config.validate()?;
+
+    // `deny_cidrs` is folded in here, not by the server, so every entry point
+    // honors it: a config that lists ranges cannot be registered without them
+    // by calling the policy-less `register_rss_tables`. An empty list leaves
+    // `policy` exactly as given — `None` stays `None`, proxies stay honored.
+    let policy =
+        match (policy, config.deny_cidrs.is_empty()) {
+            (policy, true) => policy,
+            (None, false) => Some(Arc::new(DenyCidrs::new(config.deny_cidrs.iter().copied()))
+                as Arc<dyn EgressPolicy>),
+            (Some(injected), false) => Some(Arc::new(egress::AllOf(vec![
+                Arc::new(DenyCidrs::new(config.deny_cidrs.iter().copied())),
+                injected,
+            ])) as Arc<dyn EgressPolicy>),
+        };
 
     // The one I/O step: an `opml:` path is read here, not by `validate()`.
     let subscriptions = resolve_subscriptions(name, config)?;
@@ -347,7 +380,7 @@ mod tests {
     use crate::sources::providers::rss::config::inline_config;
     use crate::sources::providers::rss::schema::{feeds_schema, items_schema};
     use crate::sources::providers::rss::testutil::{
-        MockFeedServer, MockResponse, RSS2_MINIMAL, feed_urls, str_col,
+        MockFeedServer, MockResponse, MockResponseExt, RSS2_MINIMAL, feed_urls, str_col,
     };
     use arrow::array::RecordBatch;
 

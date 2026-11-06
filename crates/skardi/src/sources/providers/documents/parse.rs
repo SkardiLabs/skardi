@@ -67,6 +67,10 @@ pub struct ParseOptions {
     pub image_store: Option<String>,
     pub ocr: OcrMode,
     pub render_page_images: bool,
+    /// Keep one row with empty markdown for an empty or whitespace-only text
+    /// file. For example, `options: { retain_empty_text: "true" }` preserves a
+    /// rendered document's catalog identity even when it has no body.
+    pub retain_empty_text: bool,
     /// Optional HTTP OCR server URL. liteparse is built here without the
     /// bundled Tesseract engine (see Cargo.toml), so OCR is only actually
     /// performed when this is set; otherwise `on`/`auto` degrade to no-OCR.
@@ -84,16 +88,40 @@ impl Default for ParseOptions {
             image_store: None,
             ocr: OcrMode::Auto,
             render_page_images: false,
+            retain_empty_text: false,
             ocr_server_url: None,
         }
     }
 }
 
 /// The default set of supported file globs.
+///
+/// The last three take the direct-ingest path in [`super::text`] and never
+/// reach liteparse, which cannot read them at all — see that module for why.
+/// They are listed here because a caller who asks for the defaults wants
+/// "everything this connector can read", and that now includes text.
 fn default_globs() -> Vec<String> {
     [
-        "*.pdf", "*.docx", "*.xlsx", "*.pptx", "*.doc", "*.xls", "*.ppt", "*.odt", "*.ods",
-        "*.odp", "*.png", "*.jpg", "*.jpeg", "*.tif", "*.tiff", "*.bmp", "*.gif",
+        "*.pdf",
+        "*.docx",
+        "*.xlsx",
+        "*.pptx",
+        "*.doc",
+        "*.xls",
+        "*.ppt",
+        "*.odt",
+        "*.ods",
+        "*.odp",
+        "*.png",
+        "*.jpg",
+        "*.jpeg",
+        "*.tif",
+        "*.tiff",
+        "*.bmp",
+        "*.gif",
+        "*.md",
+        "*.markdown",
+        "*.txt",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -145,6 +173,9 @@ impl ParseOptions {
         if let Some(v) = map.get("render_page_images") {
             opts.render_page_images = parse_bool(v, opts.render_page_images);
         }
+        if let Some(v) = map.get("retain_empty_text") {
+            opts.retain_empty_text = parse_bool(v, opts.retain_empty_text);
+        }
         if let Some(v) = map.get("ocr_server_url") {
             let v = v.trim();
             if !v.is_empty() {
@@ -181,12 +212,12 @@ fn lp_image_mode(mode: ImageMode) -> LpImageMode {
 }
 
 /// Stable id for a file derived from its relative path.
-fn doc_id_for(rel_path: &str) -> String {
+pub(super) fn doc_id_for(rel_path: &str) -> String {
     blake3::hash(rel_path.as_bytes()).to_hex().to_string()
 }
 
 /// File extension (lowercased) → coarse `file_type` label.
-fn file_type_for(path: &Path) -> String {
+pub(super) fn file_type_for(path: &Path) -> String {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -194,6 +225,12 @@ fn file_type_for(path: &Path) -> String {
         .to_ascii_lowercase();
     match ext.as_str() {
         "png" | "jpg" | "jpeg" | "tif" | "tiff" | "bmp" | "gif" => "image".to_string(),
+        // One format, one label. `.markdown` is a second spelling of the same
+        // thing, and a corpus holding both spellings under two `file_type`s
+        // would silently halve every `WHERE file_type = 'md'` written against
+        // it. The spelling survives in `path`, which is where a question about
+        // the original filename belongs.
+        "markdown" => "md".to_string(),
         other => other.to_string(),
     }
 }
@@ -285,6 +322,7 @@ fn loc_is_under(entry: &Loc, base: &Loc) -> bool {
             if eb != bb {
                 return false;
             }
+            let (ek, bk): (&str, &str) = (ek.as_ref(), bk.as_ref());
             let trimmed = bk.trim_end_matches('/');
             trimmed.is_empty() || ek == trimmed || ek.starts_with(&format!("{trimmed}/"))
         }
@@ -609,17 +647,33 @@ fn parse_source_blocking(root: &str, opts: &ParseOptions) -> Result<Vec<ParsedPa
         None => (None, None),
     };
 
+    scan_blocking(
+        &read_store,
+        &prefix_loc,
+        write_store.as_ref(),
+        image_base.as_ref(),
+        opts,
+    )
+}
+
+/// List -> read -> parse over already-resolved backends: the scan loop behind
+/// [`parse_source`]. Builds its own current-thread runtime, so it must be
+/// called from a thread that is not inside one (the dedicated parse thread).
+/// Split from [`parse_source_blocking`] only so tests can drive the real loop
+/// over an in-memory object store.
+fn scan_blocking(
+    read_store: &BlobStore,
+    prefix_loc: &Loc,
+    write_store: Option<&BlobStore>,
+    image_base: Option<&Loc>,
+    opts: &ParseOptions,
+) -> Result<Vec<ParsedPage>> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .context("failed to build tokio runtime for documents parse")?;
 
-    let entries = runtime.block_on(list_docs(
-        &read_store,
-        &prefix_loc,
-        opts,
-        image_base.as_ref(),
-    ))?;
+    let entries = runtime.block_on(list_docs(read_store, prefix_loc, opts, image_base))?;
     let total = entries.len();
 
     let mut rows = Vec::new();
@@ -638,13 +692,24 @@ fn parse_source_blocking(root: &str, opts: &ParseOptions) -> Result<Vec<ParsedPa
                 continue;
             }
         };
-        match runtime.block_on(parse_file(
-            &bytes,
-            &rel_path,
-            opts,
-            write_store.as_ref(),
-            &mut writes,
-        )) {
+        // Markdown and plain text are content already, so they take a path
+        // that never constructs a `LiteParse` — see `super::text`. Dispatched
+        // on the extension BEFORE the parser is built, because liteparse
+        // cannot read these formats at all: handed one, it sniffs the bytes as
+        // `PlainText`, renames the input `input.txt`, finds no conversion
+        // route for that extension, and fails the file.
+        let parsed = if super::text::is_text_path(&rel_path) {
+            super::text::parse_text(&bytes, &rel_path, opts.retain_empty_text)
+        } else {
+            runtime.block_on(parse_file(
+                &bytes,
+                &rel_path,
+                opts,
+                write_store,
+                &mut writes,
+            ))
+        };
+        match parsed {
             Ok(mut page_rows) => {
                 ok_files += 1;
                 rows.append(&mut page_rows);
@@ -737,9 +802,17 @@ pub fn preflight(opts: &ParseOptions) -> Result<()> {
     // Office/ODF/image conversion needs LibreOffice (and ImageMagick for some
     // image inputs). Only relevant when the globs admit non-PDF inputs. Not
     // fatal: a PDF-only directory still works when LibreOffice is absent.
+    // Text is excluded as well as PDF: it is read directly and converts
+    // nothing, so a text-only source must not warn about a LibreOffice it has
+    // no use for.
     let needs_conversion = opts.include_globs.iter().any(|g| {
         let g = g.to_ascii_lowercase();
-        !(g.ends_with(".pdf") || g == "*" || g == "*.*")
+        !(g.ends_with(".pdf")
+            || g.ends_with(".md")
+            || g.ends_with(".markdown")
+            || g.ends_with(".txt")
+            || g == "*"
+            || g == "*.*")
     });
     if needs_conversion && !tool_available("soffice") && !tool_available("libreoffice") {
         tracing::warn!(
@@ -765,6 +838,8 @@ fn tool_available(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
 
     #[test]
@@ -776,6 +851,7 @@ mod tests {
             image_store: None,
             ocr: OcrMode::Off,
             render_page_images: false,
+            retain_empty_text: false,
             ocr_server_url: None,
         };
         let rows = parse_source("tests/fixtures/documents", &opts).unwrap();
@@ -783,6 +859,139 @@ mod tests {
         assert!(rows.iter().all(|r| r.file_type == "pdf"));
         assert!(rows.iter().all(|r| !r.markdown.is_empty()));
         assert_eq!(rows[0].page, 1);
+    }
+
+    /// The direct-ingest path end to end, through the same entry point the
+    /// table uses — the dispatch, the globs and the row shape together.
+    ///
+    /// Worth having beside the unit tests in `text.rs`: those exercise the
+    /// chunker on strings, and this is the one that would fail if
+    /// `parse_source_blocking` stopped routing text away from liteparse.
+    #[test]
+    fn markdown_and_text_are_ingested_directly_beside_pdfs() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("readme.md"), b"# Title\n\nbody text\n").unwrap();
+        fs::write(dir.path().join("notes.markdown"), b"# Other\n\nmore\n").unwrap();
+        fs::write(dir.path().join("log.txt"), b"plain line one\n\nline two\n").unwrap();
+        fs::write(dir.path().join("empty.md"), b"").unwrap();
+        fs::write(dir.path().join("whitespace.md"), b"   \n\n\t\n").unwrap();
+        let opts = ParseOptions {
+            include_globs: vec!["*.md".into(), "*.markdown".into(), "*.txt".into()],
+            ocr: OcrMode::Off,
+            ..ParseOptions::default()
+        };
+
+        let rows = parse_source(dir.path().to_str().unwrap(), &opts).unwrap();
+
+        assert_eq!(rows.len(), 3, "one section each: {rows:#?}");
+        let mut types: Vec<&str> = rows.iter().map(|r| r.file_type.as_str()).collect();
+        types.sort_unstable();
+        assert_eq!(types, ["md", "md", "txt"], "`.markdown` reports `md`");
+        assert!(rows.iter().all(|r| r.page == 1));
+        assert!(rows.iter().all(|r| r.tables_json == "[]"));
+        assert!(rows.iter().all(|r| r.page_image_ref.is_none()));
+        // The body is the file verbatim — nothing was reconstructed.
+        let readme = rows.iter().find(|r| r.path == "readme.md").unwrap();
+        assert_eq!(readme.markdown, "# Title\n\nbody text\n");
+
+        let options = HashMap::from([
+            ("include_globs".into(), "*.md,*.markdown,*.txt".into()),
+            ("ocr".into(), "off".into()),
+            ("retain_empty_text".into(), "true".into()),
+        ]);
+        let retained = parse_source(
+            dir.path().to_str().unwrap(),
+            &ParseOptions::from_map(Some(&options)),
+        )
+        .unwrap();
+        assert_eq!(retained.len(), 5, "empty text must retain its catalog row");
+        for path in ["empty.md", "whitespace.md"] {
+            let row = retained.iter().find(|row| row.path == path).unwrap();
+            assert_eq!(row.doc_id, doc_id_for(path));
+            assert_eq!(row.page, 1);
+            assert!(row.markdown.is_empty());
+            assert_eq!(row.file_type, "md");
+            assert_eq!(row.tables_json, "[]");
+            assert!(row.page_image_ref.is_none());
+            assert!(row.image_refs.is_empty());
+        }
+        assert_eq!(
+            retained
+                .iter()
+                .find(|row| row.path == "readme.md")
+                .unwrap()
+                .markdown,
+            readme.markdown,
+            "retaining empty text must not change populated files"
+        );
+    }
+
+    /// The failure this whole path exists to avoid: liteparse cannot read
+    /// text, so a `.md` reaching `parse_file` fails, and with one file in the
+    /// source the wholesale-failure guard makes that a hard error.
+    ///
+    /// Asserted from the other side — the file parses and the scan succeeds —
+    /// because a test that pinned the old error would have to be deleted to
+    /// make this change, rather than proving it.
+    #[test]
+    fn a_text_only_source_scans_successfully_where_liteparse_would_hard_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("only.md"), b"# One\n\njust this\n").unwrap();
+        let opts = ParseOptions {
+            include_globs: vec!["*.md".into()],
+            ocr: OcrMode::Off,
+            ..ParseOptions::default()
+        };
+
+        let rows = parse_source(dir.path().to_str().unwrap(), &opts).unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    /// A text file that cannot be ingested is a per-file skip like any other,
+    /// and — as the only file — trips the wholesale-failure guard rather than
+    /// returning an empty corpus.
+    #[test]
+    fn a_non_utf8_text_file_is_a_skip_and_the_lone_file_hard_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("latin.txt"), b"caf\xe9 notes").unwrap();
+        let opts = ParseOptions {
+            include_globs: vec!["*.txt".into()],
+            ocr: OcrMode::Off,
+            ..ParseOptions::default()
+        };
+
+        let err = parse_source(dir.path().to_str().unwrap(), &opts).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("failed to fetch/parse"),
+            "expected the wholesale-failure guard: {err:#}"
+        );
+    }
+
+    /// The defaults admit text, so a caller who asks for "everything this
+    /// connector reads" gets it — and `file_type_for` folds the second
+    /// spelling.
+    #[test]
+    fn the_default_globs_admit_text_and_markdown_has_one_file_type() {
+        let globs = default_globs();
+        for expected in ["*.md", "*.markdown", "*.txt"] {
+            assert!(globs.contains(&expected.to_string()), "{expected} missing");
+        }
+        assert_eq!(file_type_for(Path::new("a.markdown")), "md");
+        assert_eq!(file_type_for(Path::new("a.md")), "md");
+        assert_eq!(file_type_for(Path::new("a.txt")), "txt");
+        assert_eq!(file_type_for(Path::new("a.pdf")), "pdf");
+    }
+
+    /// Text converts nothing, so a text-only source must not be told it needs
+    /// a LibreOffice it has no use for.
+    #[test]
+    fn preflight_does_not_want_libreoffice_for_a_text_only_source() {
+        let opts = ParseOptions {
+            include_globs: vec!["*.md".into(), "*.txt".into()],
+            ocr: OcrMode::Off,
+            ..ParseOptions::default()
+        };
+        assert!(preflight(&opts).is_ok());
     }
 
     #[test]
@@ -796,6 +1005,7 @@ mod tests {
             image_store: None,
             ocr: OcrMode::Off,
             render_page_images: false,
+            retain_empty_text: false,
             ocr_server_url: None,
         };
         let err = parse_source("tests/fixtures/documents/does-not-exist", &opts).unwrap_err();
@@ -1130,6 +1340,130 @@ mod tests {
             .map(|e| e.rel_key)
             .collect();
         assert_eq!(without_excl, vec!["a.pdf", "crops/a.pdf_img0.png"]);
+    }
+
+    #[tokio::test]
+    async fn list_docs_reads_hostile_names_at_their_listed_location() {
+        use super::super::HOSTILE_OBJECT_NAMES;
+        use object_store::path::Path as OsPath;
+        use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
+        use std::sync::Arc;
+
+        // Raw writers store each fixture name verbatim: `OsPath::parse` keeps the
+        // string as-is (no percent-encoding, no Unicode normalisation). Assert
+        // that explicitly so a name `parse` cannot represent fails loudly here
+        // instead of being skipped.
+        let mut seeded: Vec<(OsPath, Vec<u8>)> = Vec::new();
+        for name in HOSTILE_OBJECT_NAMES {
+            let key = format!("docs/{name}");
+            let path = OsPath::parse(&key)
+                .unwrap_or_else(|e| panic!("Path::parse rejects fixture name {name:?}: {e}"));
+            assert_eq!(path.as_ref(), key, "Path::parse altered {name:?}");
+            seeded.push((path, name.as_bytes().to_vec()));
+        }
+        // The shape an encoding writer (`OsPath::child` / `OsPath::from`)
+        // produces: the stored key literally contains `%E5…`.
+        let encoded = OsPath::from("docs/enc/团体.pdf");
+        assert!(encoded.as_ref().starts_with("docs/enc/%E5"), "{encoded}");
+        seeded.push((encoded.clone(), b"ENC".to_vec()));
+        seeded.push((OsPath::parse("docs/plain.pdf").unwrap(), b"ASCII".to_vec()));
+
+        let mem = Arc::new(object_store::memory::InMemory::new());
+        for (key, body) in &seeded {
+            mem.put(key, PutPayload::from(body.clone())).await.unwrap();
+        }
+        let store = BlobStore::Remote(mem as Arc<dyn ObjectStore>);
+        let prefix = Loc::parse("s3://bk/docs").unwrap();
+        let opts = ParseOptions {
+            recursive: true,
+            include_globs: vec!["*.pdf".into()],
+            ..ParseOptions::default()
+        };
+
+        let entries = list_docs(&store, &prefix, &opts, None).await.unwrap();
+        let mut got: Vec<(String, Vec<u8>)> = Vec::new();
+        for entry in &entries {
+            // The provider's fetch: the listed location, never a rebuilt name.
+            let bytes = store
+                .get(&entry.loc, ReadOptions::follow())
+                .await
+                .unwrap_or_else(|e| panic!("fetch {:?}: {e:#}", entry.rel_key));
+            got.push((entry.rel_key.clone(), bytes));
+        }
+        got.sort();
+
+        let mut want: Vec<(String, Vec<u8>)> = seeded
+            .iter()
+            .map(|(k, body)| {
+                let rel = k.as_ref().strip_prefix("docs/").unwrap().to_string();
+                (rel, body.clone())
+            })
+            .collect();
+        want.sort();
+        // Every name, including the NFC/NFD pair as two distinct entries.
+        assert_eq!(got.len(), HOSTILE_OBJECT_NAMES.len() + 2);
+        assert_eq!(got, want);
+    }
+
+    /// End to end through the provider's real scan loop (list -> read ->
+    /// liteparse -> rows) over an in-memory object store: every hostile fixture
+    /// name, stored under its raw key, must come out as rows whose `path` is
+    /// the raw name. Before the fix every non-ASCII / `%` / `#` / `?` / `[ ]`
+    /// name was listed, fetched at a re-encoded key, and skipped.
+    #[test]
+    fn scan_parses_hostile_names_from_an_object_store_into_rows() {
+        use super::super::HOSTILE_OBJECT_NAMES;
+        use object_store::path::Path as OsPath;
+        use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        let pdf = std::fs::read("tests/fixtures/documents/two_pages.pdf").unwrap();
+        let mem = Arc::new(object_store::memory::InMemory::new());
+        let seed = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        for name in HOSTILE_OBJECT_NAMES {
+            let key = format!("docs/{name}");
+            let path = OsPath::parse(&key)
+                .unwrap_or_else(|e| panic!("Path::parse rejects fixture name {name:?}: {e}"));
+            assert_eq!(path.as_ref(), key, "Path::parse altered {name:?}");
+            seed.block_on(mem.put(&path, PutPayload::from(pdf.clone())))
+                .unwrap();
+        }
+        drop(seed);
+
+        let opts = ParseOptions {
+            recursive: true,
+            include_globs: vec!["*.pdf".into()],
+            image_mode: ImageMode::Off,
+            image_store: None,
+            ocr: OcrMode::Off,
+            render_page_images: false,
+            retain_empty_text: false,
+            ocr_server_url: None,
+        };
+        let store = BlobStore::Remote(mem as Arc<dyn ObjectStore>);
+        let prefix = Loc::parse("s3://bk/docs").unwrap();
+        let rows = scan_blocking(&store, &prefix, None, None, &opts).unwrap();
+
+        let mut pages_by_path: BTreeMap<&str, Vec<i32>> = BTreeMap::new();
+        for row in &rows {
+            assert_eq!(row.doc_id, doc_id_for(&row.path), "{:?}", row.path);
+            assert_eq!(row.file_type, "pdf", "{:?}", row.path);
+            assert!(!row.markdown.is_empty(), "{:?}", row.path);
+            pages_by_path
+                .entry(row.path.as_str())
+                .or_default()
+                .push(row.page);
+        }
+        let mut want: Vec<&str> = HOSTILE_OBJECT_NAMES.to_vec();
+        want.sort_unstable();
+        // Every name, raw (NFC and NFD as two documents), each fully parsed.
+        assert_eq!(pages_by_path.keys().copied().collect::<Vec<_>>(), want);
+        for (path, pages) in &pages_by_path {
+            assert_eq!(pages, &vec![1, 2], "{path:?}");
+        }
     }
 
     #[test]

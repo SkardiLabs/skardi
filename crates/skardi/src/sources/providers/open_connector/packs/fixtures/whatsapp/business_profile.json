@@ -1,0 +1,13 @@
+{
+  "messaging_product": "whatsapp",
+  "about": "Open 9-5",
+  "address": "1 Example Way",
+  "description": "Example store",
+  "email": "shop@example.com",
+  "profile_picture_url": "https://pps.example.com/profile.jpg",
+  "websites": [
+    "https://example.com",
+    "https://shop.example.com"
+  ],
+  "vertical": "RETAIL"
+}

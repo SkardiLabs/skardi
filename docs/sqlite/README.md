@@ -466,12 +466,37 @@ WHERE category = 'ai'
 ORDER BY _score DESC
 ```
 
-FTS5 query syntax supports:
-- Plain terms (AND'd by default): `machine learning`
-- Quoted phrases: `"neural network"`
-- NOT operator: `learning NOT database`
-- OR operator: `machine OR database`
-- Prefix queries: `mach*`
+**Web-search-style queries** — `query` is search text, not an FTS5 expression.
+It is parsed the same way `pg_fts` parses its own `query` argument (PostgreSQL's
+`websearch_to_tsquery`), so the two backends answer the same question the same
+way:
+
+| Syntax | Meaning | Example |
+|---|---|---|
+| `foo bar` | AND (both terms required) | `machine learning` |
+| `"foo bar"` | Exact phrase | `"neural network"` |
+| `foo or bar` | OR (either term) | `machine or database` |
+| `-foo` | NOT (exclude term) | `learning -database` |
+
+`or` binds loosest, so it splits the query into alternatives:
+`neural network or database` finds rows carrying both `neural` and `network`,
+plus rows carrying `database`. An exclusion belongs to the alternative it sits
+in, so in `neural or database -sql` the `-sql` narrows the `database` side
+only. That is the grouping `websearch_to_tsquery` gives the same text.
+
+Everything else is literal text. Apostrophes, colons and hyphens are ordinary
+characters — `what's the retry policy`, `note: check the gateway` and
+`read-only mode` are all searched for as written, and no input can turn a
+question into a query error. Text with nothing to search for (empty, blank, or
+pure punctuation) returns no rows.
+
+Because the parameter is search text, FTS5's own operator syntax is not
+reachable through it: `mach*` prefix queries, `NEAR()`, `column : term` filters
+and the `AND` / `NOT` keywords are searched for literally rather than executed.
+Use the `or` and `-` forms above for boolean logic. `or` is the one word that
+stays an operator, and it is matched in any case: `or`, `OR` and `Or` all mean
+the same thing, as they do in `websearch_to_tsquery`. To search for the word
+itself, quote it as `"or"`.
 
 ### Write
 

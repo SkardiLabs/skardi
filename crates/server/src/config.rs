@@ -24,6 +24,7 @@ use skardi::sources::providers::rss::register_rss_tables;
 use skardi::sources::providers::seekdb::register_seekdb_tables;
 use skardi::sources::providers::sqlite::register_sqlite_tables;
 use skardi::sources::providers::sqlx::postgres::register_postgres_tables;
+use skardi::sources::providers::sqlx::register_pg_fts_udfs;
 use skardi::sources::sql_validator::{AdhocSqlPolicy, SqlValidatorConfig, validate_sql};
 use skardi::util::json_getters::register_json_getter_udfs;
 use skardi::util::json_pack::register_json_pack_udf;
@@ -36,6 +37,7 @@ use thiserror::Error;
 use crate::OptimizerRegistry;
 use crate::remote_storage::{RemoteStorage, S3Storage};
 use crate::semantics::{SemanticsRegistry, resolve_semantics_source};
+use crate::webhooks::WebhookDefinition;
 pub use skardi::sources::AccessMode;
 pub use skardi::sources::DataSourceType;
 pub use skardi::sources::HierarchyLevel;
@@ -70,6 +72,16 @@ pub struct CliArgs {
         help = "Path to the SQLite job run ledger (default: ~/.skardi/jobs.db)"
     )]
     pub jobs_db_path: Option<PathBuf>,
+
+    /// Path to a `kind: webhook` YAML file or directory of them. Files in
+    /// a directory whose root `kind:` is not `webhook` are silently
+    /// skipped, mirroring `--semantics`. Each file becomes a public
+    /// `GET|POST /webhooks/<name>` route; see docs/webhooks.md.
+    #[arg(
+        long = "webhooks",
+        help = "Path to webhook YAML file or directory containing webhook definitions"
+    )]
+    pub webhooks_path: Option<PathBuf>,
 
     /// Path to context YAML configuration file (optional)
     #[arg(
@@ -116,6 +128,19 @@ pub struct CliArgs {
         help = "Prune /query audit records older than N days (default: keep forever)"
     )]
     pub query_audit_retention_days: Option<u32>,
+
+    /// Extra `Host` header values `/mcp` accepts, appended to the
+    /// always-allowed loopback trio (localhost / 127.0.0.1 / ::1). rmcp's
+    /// loopback-only default is a DNS-rebinding defense; a remote deployment
+    /// declares its public hostnames here — deliberately no allow-any escape
+    /// hatch. An entry with a port matches that port exactly; without one it
+    /// matches any port. Repeatable.
+    #[arg(
+        long = "mcp-allowed-host",
+        help = "Allow this Host header value on /mcp, in addition to loopback \
+                (repeatable; host or host:port)"
+    )]
+    pub mcp_allowed_hosts: Vec<String>,
 }
 
 /// Main server configuration containing pipelines and data sources
@@ -126,6 +151,10 @@ pub struct ServerConfig {
     /// Loaded job definitions keyed by name. `kind: job` YAMLs populate
     /// this map; plain pipeline YAMLs do not.
     pub jobs: HashMap<String, JobDefinition>,
+    /// Loaded `kind: webhook` definitions keyed by route name. Compiled
+    /// against the live session (converters, destination preflight) in
+    /// `setup_app_state`, not here.
+    pub webhooks: HashMap<String, WebhookDefinition>,
     /// Data sources to register with DataFusion
     pub data_sources: Vec<DataSource>,
     /// Natural-language descriptions overlaid on top of the catalog,
@@ -534,6 +563,10 @@ pub async fn load_server_config(args: CliArgs) -> Result<ServerConfig> {
     // graph node/relationship properties included; UDFs only, never the
     // `->` operator rewrite — see util::json_getters.
     register_json_getter_udfs(&session_ctx)?;
+    // to_tsvector / websearch_to_tsquery / ts_rank: planned here, evaluated
+    // by PostgreSQL. Without them a raw-SQL full-text statement cannot even
+    // resolve — see sources::providers::sqlx::pg::fts_udfs.
+    register_pg_fts_udfs(&session_ctx);
 
     // This auth layer is used only for SQL planning and is discarded after current function returns.
     // The live auth layer is built separately in setup_app_state.
@@ -650,6 +683,46 @@ pub async fn load_server_config(args: CliArgs) -> Result<ServerConfig> {
         );
     }
 
+    // Load webhook definitions (if a --webhooks path was specified).
+    // Secrets are resolved from the environment here so a missing variable
+    // fails startup rather than the first delivery; destinations are
+    // preflighted later, against the runtime session, in `setup_app_state`.
+    let webhook_files = resolve_pipeline_files(args.webhooks_path.as_ref())
+        .with_context(|| "Failed to resolve webhook files")?;
+    let mut webhooks: HashMap<String, WebhookDefinition> = HashMap::new();
+    for webhook_file in &webhook_files {
+        match WebhookDefinition::load_from_file(webhook_file)? {
+            Some(webhook) => {
+                let name = webhook.name.clone();
+                if webhooks.contains_key(&name) {
+                    return Err(anyhow::anyhow!(
+                        "Duplicate webhook name '{name}' found. Each webhook must have a unique name."
+                    ));
+                }
+                tracing::info!(
+                    "Webhook definition loaded: {} ({} route(s))",
+                    name,
+                    webhook.routes.len()
+                );
+                webhooks.insert(name, webhook);
+            }
+            None => {
+                tracing::debug!("Skipping {:?}: no `kind: webhook` at root", webhook_file);
+            }
+        }
+    }
+    if let Some(webhooks_path) = args.webhooks_path.as_ref()
+        && !webhook_files.is_empty()
+        && webhooks.is_empty()
+    {
+        tracing::warn!(
+            "--webhooks {:?} scanned {} YAML file(s) but none had `kind: webhook` at the root; \
+             no /webhooks/* route will be served",
+            webhooks_path,
+            webhook_files.len(),
+        );
+    }
+
     // Load semantics overlays. The path is either:
     //   1. `--semantics <path>` (explicit override), or
     //   2. auto-discovered next to the ctx file (`<ctx_dir>/semantics/`
@@ -676,6 +749,7 @@ pub async fn load_server_config(args: CliArgs) -> Result<ServerConfig> {
     Ok(ServerConfig {
         pipelines,
         jobs,
+        webhooks,
         data_sources,
         semantics,
         args,
@@ -708,6 +782,17 @@ fn extract_pipeline_sql(path: &Path) -> Result<(String, String)> {
 
     let pipeline: MinimalPipeline = serde_yaml::from_str(&content)
         .with_context(|| format!("Failed to parse pipeline YAML: {:?}", path))?;
+
+    // The name is the URL segment of `/<name>/execute` (and the identity every
+    // MCP binding dispatches on), so an empty one is unreachable everywhere.
+    // Reject it here, before SQL validation and the full load.
+    if pipeline.metadata.name.trim().is_empty() {
+        anyhow::bail!(
+            "Pipeline {:?} has an empty metadata.name; every pipeline needs a \
+             non-empty name — it is the URL segment of /<name>/execute",
+            path
+        );
+    }
 
     Ok((pipeline.metadata.name, pipeline.spec.query))
 }
@@ -1343,7 +1428,16 @@ async fn register_data_source_for_pass(
             // further down; the missing-path check is deliberately
             // omitted here.
         }
-        (DataSourceType::Csv | DataSourceType::Parquet | DataSourceType::Lance, true) => {
+        (DataSourceType::Lance, true) => {
+            // A Lance dataset is a directory of objects, not one object, so
+            // the CSV/Parquet path below — which HEADs the object at `path` to
+            // test connectivity — would refuse every remote dataset. Lance
+            // opens the store itself, with `AWS_*` from the environment;
+            // this only refuses credentials written into the config file.
+            // The dataset may not exist yet, as for a local one.
+            s3_storage.validate_lance_configuration(source)?;
+        }
+        (DataSourceType::Csv | DataSourceType::Parquet, true) => {
             // For S3 files, validate S3 configuration and setup object store
             s3_storage.validate_configuration(source)?;
             let s3_path = source.path.to_str().unwrap_or("");
@@ -1917,7 +2011,13 @@ async fn register_data_source_for_pass(
             // table. A plain SELECT against the name will still error,
             // which is the right UX for "this dataset hasn't been written
             // to yet".
-            if !skardi::sources::providers::lance::lance_dataset_exists(path_str) {
+            let exists = skardi::sources::providers::lance::lance_dataset_exists_at(path_str)
+                .await
+                .map_err(|e| ConfigError::DataSourceRegistrationFailed {
+                    name: source.name.clone(),
+                    error: format!("{e:#}"),
+                })?;
+            if !exists {
                 tracing::warn!(
                     "Lance dataset '{}' at {} does not exist yet — skipping table \
                      registration. A job with `create_if_missing: true` will create it \
@@ -2025,6 +2125,12 @@ async fn register_data_source_for_pass(
                 // `sources/providers/rss/mod.rs` is the single enforcement
                 // point that this arm and the public embedder seam
                 // (`register_rss_tables_with_policy`) both feed into.
+                //
+                // Egress policy too: this arm injects none, so the default is
+                // `AllowAll`, and a ctx that lists `rss.deny_cidrs` gets a
+                // CIDR deny policy installed by that same function. Folding it
+                // in there rather than choosing the entry point here means no
+                // caller can register a config's ranges away.
                 register_rss_tables(
                     session_ctx,
                     &source.name,
@@ -2387,11 +2493,13 @@ spec:
             pipeline_path: Some(pipeline_path),
             jobs_path: None,
             jobs_db_path: None,
+            webhooks_path: None,
             ctx_file: Some(context_path),
             semantics_path: None,
             port: 8080,
             query_audit_db: None,
             query_audit_retention_days: None,
+            mcp_allowed_hosts: vec![],
         };
 
         let config = load_server_config(args).await.unwrap();
@@ -2414,11 +2522,13 @@ spec:
             pipeline_path: Some(pipeline_path),
             jobs_path: None,
             jobs_db_path: None,
+            webhooks_path: None,
             ctx_file: None,
             semantics_path: None,
             port: 3000,
             query_audit_db: None,
             query_audit_retention_days: None,
+            mcp_allowed_hosts: vec![],
         };
 
         let config = load_server_config(args).await.unwrap();
@@ -2470,11 +2580,13 @@ spec:
             pipeline_path: Some(pipelines_dir),
             jobs_path: None,
             jobs_db_path: None,
+            webhooks_path: None,
             ctx_file: None,
             semantics_path: None,
             port: 3000,
             query_audit_db: None,
             query_audit_retention_days: None,
+            mcp_allowed_hosts: vec![],
         };
 
         let config = load_server_config(args).await.unwrap();
@@ -2500,11 +2612,13 @@ spec:
             pipeline_path: Some(missing_pipeline),
             jobs_path: None,
             jobs_db_path: None,
+            webhooks_path: None,
             ctx_file: None,
             semantics_path: None,
             port: 8080,
             query_audit_db: None,
             query_audit_retention_days: None,
+            mcp_allowed_hosts: vec![],
         };
 
         let result = load_server_config(args).await;
@@ -2520,17 +2634,62 @@ spec:
         );
     }
 
+    /// An empty `metadata.name` is unreachable on every surface — it is the
+    /// `:name` segment of `/:name/execute`, which cannot bind an empty string,
+    /// and both MCP bindings dispatch on the same path — so the loader rejects
+    /// it up front instead of advertising a tool that can only 404.
+    #[tokio::test]
+    async fn test_load_server_config_rejects_empty_pipeline_name() {
+        let temp_dir = TempDir::new().unwrap();
+        let pipeline_path = temp_dir.path().join("unnamed.yaml");
+        fs::write(
+            &pipeline_path,
+            r#"
+kind: pipeline
+metadata:
+  name: ""
+  version: "1.0.0"
+spec:
+  query: "SELECT 1"
+"#,
+        )
+        .unwrap();
+
+        let args = CliArgs {
+            pipeline_path: Some(pipeline_path),
+            jobs_path: None,
+            jobs_db_path: None,
+            webhooks_path: None,
+            ctx_file: None,
+            semantics_path: None,
+            port: 8080,
+            query_audit_db: None,
+            query_audit_retention_days: None,
+            mcp_allowed_hosts: vec![],
+        };
+
+        let error = load_server_config(args).await.unwrap_err();
+        let error_string = format!("{:?}", error);
+        assert!(
+            error_string.contains("empty metadata.name"),
+            "Expected the empty-name rejection, got: {}",
+            error_string
+        );
+    }
+
     #[tokio::test]
     async fn test_load_server_config_no_pipelines() {
         let args = CliArgs {
             pipeline_path: None,
             jobs_path: None,
             jobs_db_path: None,
+            webhooks_path: None,
             ctx_file: None,
             semantics_path: None,
             port: 8080,
             query_audit_db: None,
             query_audit_retention_days: None,
+            mcp_allowed_hosts: vec![],
         };
 
         let config = load_server_config(args).await.unwrap();
@@ -2703,6 +2862,78 @@ spec:
         assert_eq!(n, 2);
     }
 
+    fn lance_context(dir: &std::path::Path, source: &str) -> std::path::PathBuf {
+        let content = format!(
+            r#"
+kind: context
+metadata:
+  name: lance-context
+  version: 1.0.0
+spec:
+  data_sources:
+{source}
+"#
+        );
+        let path = dir.join("context.yaml");
+        fs::write(&path, content).unwrap();
+        path
+    }
+
+    /// A Lance dataset a job has not created yet is not an error at boot:
+    /// registration is deferred, for local paths and object-store URIs alike.
+    #[tokio::test]
+    async fn a_lance_dataset_that_does_not_exist_yet_is_deferred() {
+        let temp_dir = TempDir::new().unwrap();
+        let missing = temp_dir.path().join("never-written.lance");
+        let context = lance_context(
+            temp_dir.path(),
+            &format!(
+                "    - name: \"corpus\"\n      type: \"lance\"\n      path: \"{}\"",
+                missing.display()
+            ),
+        );
+        let data_sources = load_context_config(&context).unwrap();
+        let mut session_ctx = SessionContext::new();
+        register_data_sources(&mut session_ctx, &data_sources)
+            .await
+            .expect("a missing dataset defers, it does not fail boot");
+        assert!(
+            session_ctx.table("corpus").await.is_err(),
+            "not registered yet"
+        );
+    }
+
+    /// A remote Lance source with credentials written into its options is
+    /// refused when the context loads; one whose URI names no bucket is
+    /// refused at registration. Neither dials the store.
+    #[tokio::test]
+    async fn a_remote_lance_source_is_validated_before_the_store_is_dialled() {
+        let temp_dir = TempDir::new().unwrap();
+        let with_credentials = lance_context(
+            temp_dir.path(),
+            "    - name: \"corpus\"\n      type: \"lance\"\n      location: \"remote_s3\"\n      \
+             path: \"s3://bucket/corpus.lance\"\n      options:\n        \
+             aws_secret_access_key: \"nope\"",
+        );
+        let err = load_context_config(&with_credentials).expect_err("inline credentials");
+        assert!(format!("{err:#}").contains("must not be stored"), "{err:#}");
+
+        let no_bucket = lance_context(
+            temp_dir.path(),
+            "    - name: \"corpus\"\n      type: \"lance\"\n      location: \"remote_s3\"\n      \
+             path: \"s3:///corpus.lance\"",
+        );
+        let data_sources = load_context_config(&no_bucket).unwrap();
+        let mut session_ctx = SessionContext::new();
+        let err = register_data_sources(&mut session_ctx, &data_sources)
+            .await
+            .expect_err("a URI with no bucket");
+        assert!(
+            format!("{err:#}").to_lowercase().contains("bucket"),
+            "{err:#}"
+        );
+    }
+
     /// `ocr: on` with no `ocr_server_url` must fail at registration (preflight),
     /// not silently produce empty pages mid-scan. This build links liteparse
     /// without the bundled Tesseract engine, so OCR needs an HTTP engine.
@@ -2788,6 +3019,30 @@ spec:
         assert!(args.pipeline_path.is_none());
         assert_eq!(args.ctx_file, None);
         assert_eq!(args.port, 8080); // default value
+    }
+
+    #[test]
+    fn mcp_allowed_host_is_repeatable_and_defaults_empty() {
+        use clap::Parser;
+
+        let args = CliArgs::try_parse_from([
+            "skardi-server",
+            "--mcp-allowed-host",
+            "api.example.com",
+            "--mcp-allowed-host",
+            "skardi.internal:8443",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.mcp_allowed_hosts,
+            vec![
+                "api.example.com".to_string(),
+                "skardi.internal:8443".to_string()
+            ]
+        );
+
+        let args = CliArgs::try_parse_from(["skardi-server"]).unwrap();
+        assert!(args.mcp_allowed_hosts.is_empty());
     }
 
     #[test]
@@ -3689,6 +3944,104 @@ spec:
             .unwrap_err();
         let msg = format!("{err:?}");
         assert!(msg.contains("read-only"), "unexpected error: {msg}");
+    }
+
+    /// `rss.deny_cidrs` in a ctx file reaches the fetcher: a subscription to
+    /// the run's own loopback listener and one to cloud metadata are both
+    /// refused before any connection, and say why in `last_error`. Zero
+    /// network when the policy holds — neither target is ever dialled; were
+    /// it not installed, the loopback row would carry a connect error and the
+    /// metadata one a timeout, neither of which names `deny_cidrs`.
+    #[cfg(feature = "rss")]
+    #[tokio::test]
+    async fn test_rss_deny_cidrs_from_context_refuses_targets() {
+        let temp_dir = TempDir::new().unwrap();
+        let context_content = r#"
+kind: context
+metadata:
+  name: rss-context
+  version: 1.0.0
+spec:
+  data_sources:
+    - name: "news"
+      type: "rss"
+      hierarchy_level: catalog
+      access_mode: read_only
+      rss:
+        feeds:
+          - url: "http://127.0.0.1:18080/query"
+            name: loopback
+          - url: "http://169.254.169.254/latest/meta-data/"
+            name: metadata
+        request_timeout_seconds: 2
+        scan_timeout_seconds: 5
+        deny_cidrs:
+          - 127.0.0.0/8
+          - 169.254.0.0/16
+"#;
+        let context_path = temp_dir.path().join("context.yaml");
+        fs::write(&context_path, context_content).unwrap();
+
+        let data_sources = load_context_config(&context_path).unwrap();
+        let mut session_ctx = SessionContext::new();
+        register_data_sources(&mut session_ctx, &data_sources)
+            .await
+            .expect("rss source should register");
+
+        let items = session_ctx
+            .sql("SELECT feed FROM news.main.items")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(items.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
+
+        let batches = session_ctx
+            .sql("SELECT name, last_status, last_error FROM news.main.feeds ORDER BY name")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let mut rows = Vec::new();
+        for batch in &batches {
+            let text = |i: usize| {
+                batch
+                    .column(i)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap()
+                    .clone()
+            };
+            let (name, status, error) = (text(0), text(1), text(2));
+            for row in 0..batch.num_rows() {
+                rows.push((
+                    name.value(row).to_string(),
+                    status.value(row).to_string(),
+                    error.value(row).to_string(),
+                ));
+            }
+        }
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "loopback".to_string(),
+                    "error".to_string(),
+                    "egress blocked: host '127.0.0.1' resolves to deny_cidrs \
+                     127.0.0.0/8 address 127.0.0.1"
+                        .to_string(),
+                ),
+                (
+                    "metadata".to_string(),
+                    "error".to_string(),
+                    "egress blocked: host '169.254.169.254' resolves to deny_cidrs \
+                     169.254.0.0/16 address 169.254.169.254"
+                        .to_string(),
+                ),
+            ]
+        );
     }
 
     #[test]

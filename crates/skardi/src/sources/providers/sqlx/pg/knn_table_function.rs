@@ -24,6 +24,7 @@
 //! The score is the raw pgvector distance value for the chosen metric — lower is more similar
 //! (for `inner_product` the score is negative).
 
+use super::dialect::GovernedPostgresDialect;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
@@ -32,7 +33,6 @@ use datafusion::datasource::TableType;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::sql::unparser::Unparser;
-use datafusion::sql::unparser::dialect::PostgreSqlDialect;
 use sqlx::PgPool;
 use sqlx::Row;
 use std::any::Any;
@@ -54,6 +54,8 @@ pub struct PgKnnEntry {
     /// All non-vector columns and their Arrow types.
     /// Populated at registration time from `information_schema.columns`.
     pub columns: Vec<(String, DataType)>,
+    /// The same measured overlap budget as the registered table scan.
+    pub governed_array_key_budget: Option<usize>,
 }
 
 // ─── TableFunctionImpl ───────────────────────────────────────────────────────
@@ -126,7 +128,7 @@ impl TableFunctionImpl for PgKnnTableFunction {
         // (bypassing datafusion-table-providers, which can't decode the `vector` type).
         let literal_vector = extract_literal_vector(&exprs[2], "pg_knn").ok();
         let query_vector_sql = if literal_vector.is_none() {
-            build_vector_fetch_sql(&exprs[2]).ok()
+            build_vector_fetch_sql(&exprs[2], entry.governed_array_key_budget).ok()
         } else {
             None
         };
@@ -144,6 +146,7 @@ impl TableFunctionImpl for PgKnnTableFunction {
         Ok(Arc::new(PgKnnProvider {
             pool: entry.pool,
             qualified_table: entry.qualified_table,
+            governed_array_key_budget: entry.governed_array_key_budget,
             vector_col,
             literal_vector,
             query_vector_sql,
@@ -158,6 +161,7 @@ impl TableFunctionImpl for PgKnnTableFunction {
 // ─── TableProvider ───────────────────────────────────────────────────────────
 
 struct PgKnnProvider {
+    governed_array_key_budget: Option<usize>,
     pool: Arc<PgPool>,
     qualified_table: String,
     vector_col: String,
@@ -212,7 +216,7 @@ impl TableProvider for PgKnnProvider {
         Ok(filters
             .iter()
             .map(|expr| {
-                if expr_to_pg_sql(expr).is_some() {
+                if expr_to_pg_sql(expr, self.governed_array_key_budget).is_some() {
                     TableProviderFilterPushDown::Exact
                 } else {
                     TableProviderFilterPushDown::Unsupported
@@ -235,7 +239,7 @@ impl TableProvider for PgKnnProvider {
             parts.push(f.clone());
         }
         for expr in filters {
-            if let Some(sql) = expr_to_pg_sql(expr) {
+            if let Some(sql) = expr_to_pg_sql(expr, self.governed_array_key_budget) {
                 parts.push(sql);
             }
         }
@@ -309,7 +313,10 @@ impl TableProvider for PgKnnProvider {
 /// ```sql
 /// SELECT "<col>"::text FROM (<inner>) AS _knn_subq LIMIT 1
 /// ```
-fn build_vector_fetch_sql(expr: &Expr) -> DFResult<String> {
+fn build_vector_fetch_sql(
+    expr: &Expr,
+    governed_array_key_budget: Option<usize>,
+) -> DFResult<String> {
     let Expr::ScalarSubquery(subquery) = expr else {
         return Err(datafusion::error::DataFusionError::Plan(
             "pg_knn: expected a scalar subquery for the vector argument".to_string(),
@@ -323,7 +330,8 @@ fn build_vector_fetch_sql(expr: &Expr) -> DFResult<String> {
         .name()
         .replace('"', "\"\"");
 
-    let unparser = Unparser::new(&PostgreSqlDialect {});
+    let dialect = GovernedPostgresDialect::new(governed_array_key_budget);
+    let unparser = Unparser::new(&dialect);
     let inner_sql = unparser
         .plan_to_sql(subquery.subquery.as_ref())
         .map_err(|e| {
@@ -373,8 +381,8 @@ pub async fn fetch_table_columns(
         let col_name: String = row.try_get("column_name")?;
         let data_type: String = row.try_get("data_type")?;
         let udt_name: String = row.try_get("udt_name")?;
-        let precision: Option<i32> = row.try_get("numeric_precision")?;
-        let scale: Option<i32> = row.try_get("numeric_scale")?;
+        let precision = try_get_opt_int(row, "numeric_precision")?;
+        let scale = try_get_opt_int(row, "numeric_scale")?;
 
         let arrow_type = pg_type_to_arrow(&data_type, &udt_name, precision, scale);
         columns.push((col_name, arrow_type));
@@ -413,7 +421,7 @@ mod tests {
     #[test]
     fn test_build_vector_fetch_sql_normal_col_name() {
         let expr = subquery_expr_with_col("embedding");
-        let sql = build_vector_fetch_sql(&expr).unwrap();
+        let sql = build_vector_fetch_sql(&expr, None).unwrap();
         assert!(sql.contains("\"embedding\"::text"), "sql={sql}");
         assert!(sql.contains("AS _knn_subq LIMIT 1"), "sql={sql}");
     }
@@ -422,7 +430,7 @@ mod tests {
     fn test_build_vector_fetch_sql_col_name_with_embedded_quote() {
         // A column name containing " must be doubled inside the SQL identifier.
         let expr = subquery_expr_with_col("weird\"col");
-        let sql = build_vector_fetch_sql(&expr).unwrap();
+        let sql = build_vector_fetch_sql(&expr, None).unwrap();
         // weird"col → "weird""col"
         assert!(
             sql.contains("\"weird\"\"col\"::text"),
@@ -435,7 +443,7 @@ mod tests {
         let expr = Expr::Column(datafusion::common::Column::new_unqualified(
             "not_a_subquery",
         ));
-        assert!(build_vector_fetch_sql(&expr).is_err());
+        assert!(build_vector_fetch_sql(&expr, None).is_err());
     }
 
     fn knn_args(filter: Expr) -> Vec<Expr> {
@@ -487,6 +495,37 @@ mod tests {
     }
 }
 
+/// Read an optional integer column without assuming its wire width.
+///
+/// On Postgres, `information_schema.columns.numeric_precision` and
+/// `numeric_scale` are `cardinal_number`, which decodes as INT4. A
+/// Postgres-compatible server is free to expose them wider or narrower:
+/// TiDB Cloud's Postgres mode returns INT8 (seen 2026-10-16 — every table on
+/// such a source failed registration with "Rust type `Option<i32>` (as SQL
+/// type `INT4`) is not compatible with SQL type `INT8`", taking the whole
+/// engine down with it, since one failed registration fails boot). The
+/// datafusion-table-providers crate beside this one already reads the same
+/// columns with a width-tolerant decoder (`row_opt_int` in its
+/// `postgresconn.rs`); this is the same posture for the one query that did
+/// not.
+///
+/// A value wider than `i32` is treated as absent rather than an error: a
+/// precision past `i32::MAX` is not a precision Postgres can have, and the
+/// caller already treats `None` as "use the type's default".
+pub fn try_get_opt_int(row: &sqlx::postgres::PgRow, col: &str) -> anyhow::Result<Option<i32>> {
+    let narrow = match row.try_get::<Option<i32>, _>(col) {
+        Ok(v) => return Ok(v),
+        Err(e) => e,
+    };
+    if let Ok(v) = row.try_get::<Option<i64>, _>(col) {
+        return Ok(v.and_then(|v| i32::try_from(v).ok()));
+    }
+    if let Ok(v) = row.try_get::<Option<i16>, _>(col) {
+        return Ok(v.map(i32::from));
+    }
+    Err(anyhow::Error::from(narrow).context(format!("decoding '{col}' as any of INT2/INT4/INT8")))
+}
+
 fn pg_type_to_arrow(
     data_type: &str,
     udt_name: &str,
@@ -501,6 +540,9 @@ fn pg_type_to_arrow(
     match data_type {
         "smallint" | "integer" => DataType::Int32,
         "bigint" => DataType::Int64,
+        "ARRAY" if udt_name == "_int8" => {
+            DataType::List(Arc::new(Field::new("item", DataType::Int64, true)))
+        }
         "real" => DataType::Float32,
         "double precision" => DataType::Float64,
         // Use Decimal128 to match what datafusion-table-providers returns when reading.

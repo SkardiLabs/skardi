@@ -4,8 +4,9 @@
 //! for efficient approximate nearest neighbor search.
 
 use anyhow::Result;
-use arrow::array::{ArrayRef, Float32Array, RecordBatch};
+use arrow::array::{ArrayRef, Float32Array, RecordBatch, RecordBatchOptions};
 use arrow::datatypes::{Field, Schema, SchemaRef};
+use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::EquivalenceProperties;
@@ -56,7 +57,7 @@ pub struct LanceKnnExec {
     /// Optional row limit applied after KNN + filter (from SQL LIMIT clause)
     scan_limit: Option<usize>,
     /// Plan properties
-    plan_properties: PlanProperties,
+    plan_properties: Arc<PlanProperties>,
 }
 
 // Note: DistanceMetric enum removed - distance metric is embedded in the Lance index
@@ -106,7 +107,7 @@ impl LanceKnnExec {
             projection: None,
             filter: None,
             scan_limit: None,
-            plan_properties,
+            plan_properties: Arc::new(plan_properties),
         })
     }
 
@@ -155,7 +156,7 @@ impl LanceKnnExec {
             projection: None,
             filter: None,
             scan_limit: None,
-            plan_properties,
+            plan_properties: Arc::new(plan_properties),
         })
     }
 
@@ -168,12 +169,12 @@ impl LanceKnnExec {
         let projected_schema: SchemaRef = Arc::new(Schema::new(projected_fields));
         self.schema = projected_schema.clone();
         self.projection = Some(projection);
-        self.plan_properties = PlanProperties::new(
+        self.plan_properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(projected_schema),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        ));
         Ok(self)
     }
 
@@ -300,7 +301,15 @@ impl LanceKnnExec {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        Ok(RecordBatch::try_new(self.schema.clone(), columns)?)
+        // The row count is explicit because a projection can be empty: for
+        // `COUNT(*)` DataFusion asks for no columns at all, and Arrow refuses a
+        // zero-column batch that does not say how many rows it has.
+        let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+        Ok(RecordBatch::try_new_with_options(
+            self.schema.clone(),
+            columns,
+            &options,
+        )?)
     }
 }
 
@@ -335,7 +344,7 @@ impl ExecutionPlan for LanceKnnExec {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.plan_properties
     }
 
@@ -399,13 +408,20 @@ impl ExecutionPlan for LanceKnnExec {
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 
-    fn statistics(&self) -> DFResult<Statistics> {
-        // Return statistics indicating we'll return k rows
-        Ok(Statistics {
-            num_rows: datafusion::common::stats::Precision::Exact(self.k),
-            total_byte_size: datafusion::common::stats::Precision::Absent,
-            column_statistics: vec![],
-        })
+    // One partition (`UnknownPartitioning(1)`), so the one partition's
+    // statistics and the whole plan's are the same answer.
+    fn partition_statistics(&self, _partition: Option<usize>) -> DFResult<Statistics> {
+        // One column entry per output column, which DataFusion requires:
+        // since 53 a ProjectionExec above this plan indexes them by column,
+        // and an empty list panicked there.
+        //
+        // `k` is an upper bound, not a count. A search returns fewer rows
+        // when the dataset is smaller or a pushed-down filter rejects
+        // candidates, and an `Exact` row count lets the optimizer answer
+        // `COUNT(*)` from statistics without running the search at all.
+        let mut stats = Statistics::new_unknown(&self.schema());
+        stats.num_rows = Precision::Inexact(self.k);
+        Ok(stats)
     }
 }
 

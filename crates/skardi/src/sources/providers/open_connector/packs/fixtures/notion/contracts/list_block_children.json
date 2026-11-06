@@ -54,7 +54,8 @@
         {
           "type": "null"
         }
-      ]
+      ],
+      "description": "Cursor for the next page."
     },
     "has_more": {
       "type": "boolean",

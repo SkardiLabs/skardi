@@ -54,7 +54,7 @@ pub struct SqliteKnnExec {
     /// Output schema: non-vector columns + `_score Float64`.
     schema: SchemaRef,
     /// Cached DataFusion plan metadata.
-    plan_properties: PlanProperties,
+    plan_properties: Arc<PlanProperties>,
 }
 
 impl SqliteKnnExec {
@@ -79,7 +79,7 @@ impl SqliteKnnExec {
             filter,
             scan_limit: None,
             schema,
-            plan_properties,
+            plan_properties: Arc::new(plan_properties),
         }
     }
 
@@ -104,7 +104,7 @@ impl SqliteKnnExec {
             filter,
             scan_limit: None,
             schema,
-            plan_properties,
+            plan_properties: Arc::new(plan_properties),
         }
     }
 
@@ -267,7 +267,7 @@ impl ExecutionPlan for SqliteKnnExec {
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.plan_properties
     }
 

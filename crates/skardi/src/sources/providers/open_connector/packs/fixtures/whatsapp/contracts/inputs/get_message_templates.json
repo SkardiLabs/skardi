@@ -1,0 +1,39 @@
+{
+  "type": "object",
+  "properties": {
+    "waba_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "WhatsApp Business Account ID. Omit to use the default credential WABA ID."
+    },
+    "after": {
+      "type": "string",
+      "description": "Pagination cursor returned by a previous response."
+    },
+    "limit": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 100,
+      "description": "Maximum number of templates to return.",
+      "default": 25
+    },
+    "status": {
+      "type": "string",
+      "description": "Optional template status filter."
+    },
+    "category": {
+      "type": "string",
+      "description": "Optional template category filter."
+    },
+    "language": {
+      "type": "string",
+      "description": "Optional template language filter."
+    },
+    "name_or_content": {
+      "type": "string",
+      "description": "Optional filter that matches template name or content."
+    }
+  },
+  "additionalProperties": false,
+  "description": "Input for listing WhatsApp message templates."
+}

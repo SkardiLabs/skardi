@@ -16,7 +16,10 @@
 //! Extraction is an easy task, so the default providers are cheap
 //! OpenAI-compatible chat models (DeepSeek / GLM / Gemini / OpenAI). A native
 //! Anthropic provider is available behind the same trait but is optional and not
-//! the default.
+//! the default. A deployment that serves one of those models under its own
+//! host and auth (Azure AI Foundry) points the selected provider at it with
+//! `LLM_EXTRACT_BASE_URL`, `LLM_EXTRACT_AUTH_STYLE` and `LLM_EXTRACT_API_VERSION`
+//! ([`endpoint_overrides`]).
 
 pub mod anthropic;
 pub mod openai_compat;
@@ -211,9 +214,12 @@ fn build_provider_from_env() -> (Arc<dyn CompletionProvider>, String) {
     let selected = active_provider_name();
 
     // Eager warn for every OpenAI-compatible provider whose key is missing, so
-    // misconfiguration is visible at startup (mirrors remote_embed).
+    // misconfiguration is visible at startup (mirrors remote_embed). A generic
+    // key serves whichever provider is selected, so none is missing then.
+    let generic_key =
+        std::env::var(openai_compat::GENERIC_API_KEY_ENV).is_ok_and(|key| !key.trim().is_empty());
     for (name, _url, env_var, _model) in OPENAI_COMPAT_PROVIDERS {
-        if std::env::var(env_var).is_err() {
+        if !generic_key && std::env::var(env_var).is_err() {
             tracing::warn!(
                 "llm_extract provider '{}': {} not set — queries using this provider will fail",
                 name,
@@ -253,8 +259,56 @@ fn build_provider_from_env() -> (Arc<dyn CompletionProvider>, String) {
     let model = model_override.unwrap_or_else(|| default_model.to_string());
 
     let provider = build_openai_compat(resolved_name, Some(&model))
-        .expect("resolved provider must exist in the table");
+        .expect("resolved provider must exist in the table")
+        .with_overrides(&endpoint_overrides(|name| std::env::var(name).ok()));
     (Arc::new(provider), model)
+}
+
+/// The deployment's endpoint overrides, from `LLM_EXTRACT_BASE_URL`,
+/// `LLM_EXTRACT_AUTH_STYLE` (`bearer`, the default, or `api-key`) and
+/// `LLM_EXTRACT_API_VERSION`. They apply to the selected OpenAI-compatible
+/// provider; the Anthropic provider has its own endpoint and ignores them.
+///
+/// Takes the variable reader so it is testable without touching the process
+/// environment. An unrecognised auth style is a warning and `bearer`, like
+/// an unknown provider name — the failure is then a 401 from the endpoint,
+/// which names the real problem better than a silent default would hide it.
+///
+/// ```
+/// use skardi::model::llm_extract::endpoint_overrides;
+/// use skardi::model::llm_extract::openai_compat::AuthStyle;
+///
+/// let overrides = endpoint_overrides(|name| match name {
+///     "LLM_EXTRACT_BASE_URL" => Some("https://r.services.ai.azure.com/models".into()),
+///     "LLM_EXTRACT_AUTH_STYLE" => Some("api-key".into()),
+///     _ => None,
+/// });
+/// assert_eq!(overrides.auth, AuthStyle::ApiKey);
+/// assert_eq!(overrides.api_version, None);
+/// ```
+pub fn endpoint_overrides(
+    var: impl Fn(&str) -> Option<String>,
+) -> openai_compat::EndpointOverrides {
+    let non_empty = |name: &str| {
+        var(name)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    let auth = match non_empty("LLM_EXTRACT_AUTH_STYLE") {
+        None => openai_compat::AuthStyle::Bearer,
+        Some(raw) => openai_compat::AuthStyle::parse(&raw).unwrap_or_else(|| {
+            tracing::warn!(
+                "llm_extract: unknown LLM_EXTRACT_AUTH_STYLE '{}' (bearer | api-key), using bearer",
+                raw
+            );
+            openai_compat::AuthStyle::Bearer
+        }),
+    };
+    openai_compat::EndpointOverrides {
+        base_url: non_empty("LLM_EXTRACT_BASE_URL"),
+        auth,
+        api_version: non_empty("LLM_EXTRACT_API_VERSION"),
+    }
 }
 
 /// Heuristic for whether a model id names a vision-capable model. Used at
@@ -1831,6 +1885,36 @@ mod tests {
     }
 
     // ----- Provider registry / selection (Task 4 multi-provider) -----
+
+    #[test]
+    fn endpoint_overrides_read_the_three_variables_and_default_to_bearer() {
+        let none = endpoint_overrides(|_| None);
+        assert_eq!(none, openai_compat::EndpointOverrides::default());
+        assert_eq!(none.auth, openai_compat::AuthStyle::Bearer);
+
+        let azure = endpoint_overrides(|name| match name {
+            "LLM_EXTRACT_BASE_URL" => Some(" https://r.services.ai.azure.com/models ".into()),
+            "LLM_EXTRACT_AUTH_STYLE" => Some("api-key".into()),
+            "LLM_EXTRACT_API_VERSION" => Some("2024-05-01-preview".into()),
+            _ => None,
+        });
+        assert_eq!(
+            azure.base_url.as_deref(),
+            Some("https://r.services.ai.azure.com/models"),
+            "trimmed"
+        );
+        assert_eq!(azure.auth, openai_compat::AuthStyle::ApiKey);
+        assert_eq!(azure.api_version.as_deref(), Some("2024-05-01-preview"));
+
+        // Empty is unset, and an unknown auth style is bearer, not an error.
+        let odd = endpoint_overrides(|name| match name {
+            "LLM_EXTRACT_BASE_URL" => Some("   ".into()),
+            "LLM_EXTRACT_AUTH_STYLE" => Some("token".into()),
+            _ => None,
+        });
+        assert_eq!(odd.base_url, None);
+        assert_eq!(odd.auth, openai_compat::AuthStyle::Bearer);
+    }
 
     #[test]
     fn provider_table_has_all_four() {

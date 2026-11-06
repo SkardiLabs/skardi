@@ -47,7 +47,12 @@ jobs:
           restore-keys: ${{ runner.os }}-docs-
 
       - name: Install protoc
-        run: sudo apt-get install -y protobuf-compiler
+        # Update first, as every other install in these workflows does: the
+        # runner image's package index goes stale, and installing from it asks
+        # the mirror for versions it has already replaced (404, exit 100).
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
 
       - name: Build documentation
         # --no-deps keeps the output focused on skardi's own APIs.

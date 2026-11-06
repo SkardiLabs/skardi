@@ -55,6 +55,15 @@ Cloud must inject Layer 2 **without forking** the OSS fetcher. OSS therefore gua
 
 The fetcher constructor accepts the policy as a parameter (`Arc<dyn EgressPolicy>`, defaulting to `AllowAll`); Cloud passes its implementation at construction. No OSS source change is required to add Cloud egress governance — only the injected object.
 
+**Injection into a stock `skardi-server`.** Constructor injection reaches only a caller that embeds the library (`register_rss_tables_with_policy`). Cloud's runner does not: it runs the upstream `skardi-server` binary, which registers every `type: rss` source through the policy-less `register_rss_tables`. For that path OSS also guarantees a config-level seam:
+
+- **`rss.deny_cidrs: [<CIDR>, …]`** in the source's ctx block (`RssConfig::deny_cidrs`, `Vec<IpNet>`). Non-empty, registration installs `DenyCidrs` — an `EgressPolicy` that refuses any address inside a listed range, with reason `deny_cidrs <range>` — through the same seam, so `PolicyDns`, the per-hop re-check, `FetchError::Egress` and the `feeds.last_error` contract above all apply unchanged. IPv4-mapped IPv6 addresses are matched as the IPv4 they reach.
+- **Empty or absent is exactly the old behaviour**: no policy is installed, the fetcher is `AllowAll`, and system proxy variables stay honored. Any non-empty list disables proxies for that source, as constructor injection does.
+- **It is folded in at the single registration point**, so it holds on every entry: an embedder that also injects a policy gets both (an address must pass each), and no caller can register a config's ranges away by choosing the policy-less function.
+- **OSS ships the mechanism, never a list.** The reserved-range taxonomy above (loopback, link-local, RFC 1918, CGNAT, unique-local, …) remains Cloud policy: Cloud's operator writes its ranges into each run's ctx when it renders it. That is the same split this document draws everywhere — which addresses to refuse is policy, and policy is what Cloud owns.
+
+What `deny_cidrs` cannot express is a decision that needs the hostname, a per-tenant allowlist, or an audit sink; those still need constructor injection (or a future config seam), and stay Layer 2 work.
+
 ## Non-goals
 
 - **General multi-tenant quotas** beyond SSRF/egress-abuse containment — a separate quota/limits design.

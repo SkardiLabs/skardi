@@ -29,7 +29,8 @@
               {
                 "type": "null"
               }
-            ]
+            ],
+            "description": "The user's display name."
           },
           "avatar_url": {
             "anyOf": [
@@ -40,7 +41,8 @@
               {
                 "type": "null"
               }
-            ]
+            ],
+            "description": "The user's avatar URL."
           },
           "type": {
             "type": "string",
@@ -83,7 +85,8 @@
         {
           "type": "null"
         }
-      ]
+      ],
+      "description": "Cursor for the next page."
     },
     "has_more": {
       "type": "boolean",

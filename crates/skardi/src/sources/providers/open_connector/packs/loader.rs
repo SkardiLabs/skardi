@@ -28,23 +28,28 @@
 //! produces a startup diagnostic, and the parse-all test below keeps
 //! shipped assets valid in the first place.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::OnceLock;
 
-use datafusion::logical_expr::Operator;
 use serde::Deserialize;
 
 use crate::sources::providers::open_connector::error::OpenConnectorError;
-use crate::sources::providers::open_connector::filters::{Fidelity, FilterMapping, ValueFormat};
+// `Operator` here is the pack's neutral declaration, not DataFusion's.
+// The loader reads YAML and writes declarations; nothing about that needs
+// a query planner, and it used to convert to DataFusion's on the way in
+// for no reason other than where the type happened to live.
 use crate::sources::providers::open_connector::json_to_arrow::RowConverter;
-use crate::sources::providers::open_connector::json_to_arrow::{FieldMapping, FieldType};
+use crate::sources::providers::open_connector::json_to_arrow::{
+    ColumnDoc, FieldMapping, FieldType,
+};
 use crate::sources::providers::open_connector::pagination::{
-    CursorContinuation, PaginationStrategy,
+    AbsentCursor, CursorContinuation, PaginationStrategy,
 };
 use crate::sources::providers::open_connector::row_path::RowPath;
 use crate::sources::providers::open_connector::source_pack::{
-    FixedValue, SourcePack, SourcePackTable,
+    FixedValue, RowShape, SourcePack, SourcePackTable,
 };
+use skardi_source_pack::filters::{Fidelity, FilterMapping, Operator, ValueFormat};
 
 /// Parse an embedded pack asset, memoized in `cell`.
 ///
@@ -141,6 +146,7 @@ fn convert_table(
         id,
         action_id,
         row_path: leak_str(doc.row_path),
+        row_shape: doc.row_shape.into(),
         fields: leak_slice(fields),
         pagination,
         required_resources: leak_str_slice(doc.resources.required),
@@ -163,7 +169,26 @@ fn validate_table(table: &SourcePackTable) -> Result<(), String> {
     let id = table.id;
     // Structural pieces the engine parses lazily elsewhere fail HERE so a
     // generated asset gets one complete diagnostic pass.
-    RowPath::parse(table.row_path).map_err(|e| format!("{id}: {e}"))?;
+    // Two shapes, two contracts. Array tables keep the strict path parser;
+    // object tables get the root-only one, so `$` never becomes valid for a
+    // table that is supposed to locate a row array.
+    match table.row_shape {
+        RowShape::Array => {
+            RowPath::parse(table.row_path).map_err(|e| format!("{id}: {e}"))?;
+        }
+        RowShape::Object => {
+            RowPath::parse_object_root(table.row_path).map_err(|e| format!("{id}: {e}"))?;
+            // An object row IS the whole response, so there is nothing for a
+            // second request to return. Any multi-page strategy here is a
+            // declaration error that would otherwise re-fetch the same row
+            // until a page limit stopped it.
+            if !matches!(table.pagination, PaginationStrategy::SinglePage { .. }) {
+                return Err(format!(
+                    "{id}: row_shape 'object' requires pagination strategy 'single_page'"
+                ));
+            }
+        }
+    }
     if let Some(path) = table.error_path {
         RowPath::parse(path).map_err(|e| format!("{id}: {e}"))?;
     }
@@ -173,13 +198,13 @@ fn validate_table(table: &SourcePackTable) -> Result<(), String> {
         .map_err(|e| format!("{id}: {e}"))?;
     RowConverter::new(table.fields).map_err(|e| format!("{id}: {e}"))?;
 
-    let mut columns = std::collections::HashSet::new();
+    let mut columns = HashSet::new();
     for field in table.fields {
         if !columns.insert(field.name) {
             return Err(format!("{id}: duplicate column '{}'", field.name));
         }
     }
-    let mut mappings = std::collections::HashSet::new();
+    let mut mappings = HashSet::new();
     for filter in table.filters {
         if !columns.contains(filter.column) {
             return Err(format!(
@@ -192,6 +217,50 @@ fn validate_table(table: &SourcePackTable) -> Result<(), String> {
                 "{id}: duplicate filter mapping for column '{}' and operator {:?}",
                 filter.column, filter.operator
             ));
+        }
+        // A value domain is a finite list of equalities; under a range
+        // operator it has no meaning the translation could honor, so an
+        // author who wrote one has misread what it gates. Blanks and
+        // repeats are the same kind of slip — a list that says nothing.
+        if !filter.values.is_empty() {
+            if filter.operator != Operator::Eq {
+                return Err(format!(
+                    "{id}: filter on '{}' declares `values`, which only an eq mapping can \
+                     honor — operator {:?} has no finite domain to list",
+                    filter.column, filter.operator
+                ));
+            }
+            let mut seen = HashSet::new();
+            for value in filter.values {
+                if value.is_empty() {
+                    return Err(format!(
+                        "{id}: filter on '{}' declares an empty string in `values`",
+                        filter.column
+                    ));
+                }
+                if !seen.insert(*value) {
+                    return Err(format!(
+                        "{id}: filter on '{}' lists '{value}' twice in `values`",
+                        filter.column
+                    ));
+                }
+            }
+            // A domain is a list of strings and the translation admits only
+            // a string literal into one, so on any other column every
+            // literal would fall outside it and every predicate would
+            // answer empty — a pushdown switched off (or, for a boolean
+            // column, a spelling-dependent one) with nothing saying so.
+            // The column exists: undeclared ones were refused above.
+            if let Some(field) = table.fields.iter().find(|f| f.name == filter.column)
+                && field.field_type != FieldType::Utf8
+            {
+                return Err(format!(
+                    "{id}: filter on '{}' declares `values` on a column of type {}; a value \
+                     domain is a list of strings and only a utf8 column can carry one",
+                    filter.column,
+                    field.field_type.label()
+                ));
+            }
         }
         // Epoch renderings floor sub-second precision, which only ever
         // WIDENS a lower bound; under any other operator the floored
@@ -345,7 +414,7 @@ fn validate_table(table: &SourcePackTable) -> Result<(), String> {
     // rejected below even though the scan-time claimed-inputs guard makes
     // them safe (the loser stays local): which predicate pushes would
     // depend on query order, and that ambiguity is an authoring mistake.
-    let mut filter_inputs = std::collections::HashSet::new();
+    let mut filter_inputs = HashSet::new();
     for filter in table.filters {
         if !filter_inputs.insert(filter.input_field) {
             return Err(format!(
@@ -468,40 +537,15 @@ fn validate_table(table: &SourcePackTable) -> Result<(), String> {
 }
 
 fn convert_column(table_id: &str, doc: ColumnDoc) -> Result<FieldMapping, String> {
-    let field_type = match (doc.column_type, doc.key) {
-        (ColumnType::Utf8ListFromObjectKey, Some(key)) => {
-            FieldType::Utf8ListFromObjectKey(leak_str(key))
-        }
-        (ColumnType::Utf8ListFromObjectKey, None) => {
-            return Err(format!(
-                "{table_id}: column '{}' has type utf8_list_from_object_key and needs `key`",
-                doc.name
-            ));
-        }
-        (other, Some(_)) => {
-            return Err(format!(
-                "{table_id}: column '{}' declares `key`, which only \
-                 utf8_list_from_object_key accepts (got {other:?})",
-                doc.name
-            ));
-        }
-        (ColumnType::Boolean, None) => FieldType::Boolean,
-        (ColumnType::Int64, None) => FieldType::Int64,
-        (ColumnType::Uint64, None) => FieldType::UInt64,
-        (ColumnType::Float64, None) => FieldType::Float64,
-        (ColumnType::Utf8, None) => FieldType::Utf8,
-        (ColumnType::TimestampMsUtc, None) => FieldType::TimestampMillisUtc,
-        (ColumnType::TimestampSUtc, None) => FieldType::TimestampSecondsUtc,
-        (ColumnType::TimestampMsStringUtc, None) => FieldType::TimestampMillisStringUtc,
-        (ColumnType::TimestampSStringUtc, None) => FieldType::TimestampSecondsStringUtc,
-        (ColumnType::Utf8List, None) => FieldType::Utf8List,
-        (ColumnType::Json, None) => FieldType::Json,
-    };
+    // The grammar and its checks are the shared `ColumnDoc`'s (a webhook
+    // route parses the same type); the pack only pins the spec's strings
+    // into the `'static` mapping the engine keeps for the process lifetime.
+    let spec = doc.into_spec(table_id)?;
     Ok(FieldMapping {
-        name: leak_str(doc.name),
-        path: leak_str(doc.path),
-        field_type,
-        nullable: doc.nullable,
+        name: leak_str(spec.name),
+        path: leak_str(spec.path),
+        field_type: spec.field_type,
+        nullable: spec.nullable,
     })
 }
 
@@ -524,6 +568,7 @@ fn convert_filter(doc: FilterDoc) -> FilterMapping {
             FormatDoc::EpochSeconds => ValueFormat::EpochSeconds,
             FormatDoc::EpochSecondsString => ValueFormat::EpochSecondsString,
         },
+        values: leak_str_slice(doc.values),
     }
 }
 
@@ -566,6 +611,10 @@ enum KindTag {
 struct TableDoc {
     action: String,
     row_path: String,
+    /// Response shape. Omitted means `array`, so every pack written before
+    /// object rows existed keeps its exact behaviour.
+    #[serde(default)]
+    row_shape: RowShapeDoc,
     #[serde(default)]
     fingerprint: Option<String>,
     pagination: PaginationDoc,
@@ -578,6 +627,23 @@ struct TableDoc {
     columns: Vec<ColumnDoc>,
     #[serde(default)]
     filters: Vec<FilterDoc>,
+}
+
+#[derive(Deserialize, Default, Clone, Copy)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+enum RowShapeDoc {
+    #[default]
+    Array,
+    Object,
+}
+
+impl From<RowShapeDoc> for RowShape {
+    fn from(doc: RowShapeDoc) -> Self {
+        match doc {
+            RowShapeDoc::Array => Self::Array,
+            RowShapeDoc::Object => Self::Object,
+        }
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -719,6 +785,14 @@ impl PaginationDoc {
                     page_size_param: page_size_input.map(leak_str),
                     page_size,
                     has_more_path: has_more_path.map(leak_str),
+                    // Every YAML-declared pack keeps the behaviour it has
+                    // today. `AbsentCursor::IsDrift` is a MEASUREMENT — that
+                    // the action sends its cursor key on every page and
+                    // spells the end as null — and no pack asset carries
+                    // that measurement yet, so there is no YAML key to read
+                    // it from. One goes in when a provider's terminal page
+                    // has actually been observed, not before.
+                    absent_cursor: AbsentCursor::EndsTheScan,
                 },
                 continuation.map(|doc| CursorContinuation {
                     action_id: doc.action.map_or(table_action, leak_str),
@@ -748,47 +822,6 @@ impl PaginationDoc {
             ),
         }
     }
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ColumnDoc {
-    name: String,
-    path: String,
-    #[serde(rename = "type")]
-    column_type: ColumnType,
-    /// Object key to pluck; only valid with `utf8_list_from_object_key`.
-    #[serde(default)]
-    key: Option<String>,
-    nullable: bool,
-}
-
-#[derive(Debug, Deserialize, Clone, Copy)]
-enum ColumnType {
-    #[serde(rename = "boolean")]
-    Boolean,
-    #[serde(rename = "int64")]
-    Int64,
-    #[serde(rename = "uint64")]
-    Uint64,
-    #[serde(rename = "float64")]
-    Float64,
-    #[serde(rename = "utf8")]
-    Utf8,
-    #[serde(rename = "timestamp_ms_utc")]
-    TimestampMsUtc,
-    #[serde(rename = "timestamp_s_utc")]
-    TimestampSUtc,
-    #[serde(rename = "timestamp_ms_string_utc")]
-    TimestampMsStringUtc,
-    #[serde(rename = "timestamp_s_string_utc")]
-    TimestampSStringUtc,
-    #[serde(rename = "utf8_list")]
-    Utf8List,
-    #[serde(rename = "utf8_list_from_object_key")]
-    Utf8ListFromObjectKey,
-    #[serde(rename = "json")]
-    Json,
 }
 
 /// Untagged so the YAML scalar's own type selects the variant; order puts
@@ -874,6 +907,10 @@ struct FilterDoc {
     fidelity: FidelityDoc,
     #[serde(default)]
     format: FormatDoc,
+    /// The literals an `eq` mapping may forward; absent means any. See
+    /// [`FilterMapping::values`] for why a closed provider enum needs it.
+    #[serde(default)]
+    values: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -913,10 +950,9 @@ enum FormatDoc {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sources::providers::open_connector::source_pack::SourcePackRegistry;
 
     /// Every registered asset parses AND passes the same structural
-    /// checks binding performs. Driven off `SourcePackRegistry::builtins()`
+    /// checks binding performs. Driven off `crate::sources::providers::open_connector::builtin_pack_registry()`
     /// rather than a hand-listed roster: the roster construct had already
     /// drifted for a full milestone (`discord.yaml` shipped in 5.6
     /// unlisted), and whatever registration sees, this test now sees —
@@ -924,8 +960,8 @@ mod tests {
     /// registry name-list test's pin, not this one's.
     #[test]
     fn builtin_assets_parse_and_validate() {
-        let registry =
-            SourcePackRegistry::builtins().expect("every embedded asset parses and validates");
+        let registry = crate::sources::providers::open_connector::builtin_pack_registry()
+            .expect("every embedded asset parses and validates");
         for pack in registry.packs() {
             // parse_pack rejects an empty `tables` today; this stays as
             // the second layer should that rejection ever move.
@@ -990,6 +1026,120 @@ tables:
         )
         .unwrap_err();
         assert!(err.contains("total_page_path"), "{err}");
+    }
+
+    #[test]
+    fn row_shape_defaults_to_array_for_every_existing_pack() {
+        // The zero-behaviour-change invariant: a pack that says nothing
+        // about shape must load exactly as it did before object rows.
+        let pack = parse_pack(
+            r#"
+kind: pack
+pack: demo
+version: 1
+tables:
+  items:
+    action: demo.list
+    row_path: "$.items"
+    pagination: { strategy: single_page }
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }
+"#,
+        )
+        .expect("a pack without row_shape still parses");
+        assert_eq!(pack.tables[0].row_shape, RowShape::Array);
+    }
+
+    #[test]
+    fn object_row_shape_parses_with_root_path_and_single_page() {
+        let pack = parse_pack(
+            r#"
+kind: pack
+pack: demo
+version: 1
+tables:
+  document_content:
+    action: demo.get_document_content
+    row_path: "$"
+    row_shape: object
+    pagination: { strategy: single_page }
+    columns:
+      - { name: content, path: content, type: utf8, nullable: true }
+"#,
+        )
+        .expect("object rows at the root with single_page are valid");
+        assert_eq!(pack.tables[0].row_shape, RowShape::Object);
+        assert_eq!(pack.tables[0].row_path, "$");
+    }
+
+    #[test]
+    fn object_row_shape_requires_single_page() {
+        // An object row IS the whole response: a second page could only
+        // re-fetch the same row.
+        let err = parse_pack(
+            r#"
+kind: pack
+pack: demo
+version: 1
+tables:
+  document_content:
+    action: demo.get_document_content
+    row_path: "$"
+    row_shape: object
+    pagination:
+      strategy: cursor
+      cursor_input: pageToken
+      next_cursor_path: "$.pageToken"
+      page_size_input: pageSize
+      page_size: 100
+    columns:
+      - { name: content, path: content, type: utf8, nullable: true }
+"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("single_page"), "{err}");
+    }
+
+    #[test]
+    fn object_row_shape_rejects_a_non_root_path() {
+        let err = parse_pack(
+            r#"
+kind: pack
+pack: demo
+version: 1
+tables:
+  document_content:
+    action: demo.get_document_content
+    row_path: "$.document"
+    row_shape: object
+    pagination: { strategy: single_page }
+    columns:
+      - { name: content, path: content, type: utf8, nullable: true }
+"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("'$'"), "{err}");
+    }
+
+    #[test]
+    fn array_row_shape_still_rejects_the_root_path() {
+        // The array contract is unchanged: `$` remains invalid there.
+        let err = parse_pack(
+            r#"
+kind: pack
+pack: demo
+version: 1
+tables:
+  items:
+    action: demo.list
+    row_path: "$"
+    pagination: { strategy: single_page }
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }
+"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("row path"), "{err}");
     }
 
     #[test]
@@ -1142,6 +1292,77 @@ tables:
             "      - { column: created, op: gt_eq, input: since, fidelity: inexact, format: epoch_seconds_string }",
         ))
         .expect("lower-bound inexact epoch mapping is legal");
+    }
+
+    #[test]
+    fn a_values_domain_parses_on_eq_and_is_refused_where_it_means_nothing() {
+        let base = |filter: &str| {
+            format!(
+                r#"
+kind: pack
+pack: demo
+version: 1
+tables:
+  items:
+    action: demo.list
+    row_path: "$.items"
+    pagination: {{ strategy: page_number, page_input: page, page_size_input: perPage, page_size: 10 }}
+    columns:
+      - {{ name: state, path: state, type: utf8, nullable: false }}
+      - {{ name: created, path: created, type: timestamp_ms_utc, nullable: true }}
+      - {{ name: done, path: done, type: boolean, nullable: true }}
+      - {{ name: count, path: count, type: int64, nullable: true }}
+    filters:
+{filter}
+"#
+            )
+        };
+        // The github shape round-trips, in declaration order.
+        let pack = parse_pack(&base(
+            "      - { column: state, op: eq, input: state, fidelity: inexact, values: [open, closed] }",
+        ))
+        .expect("an eq domain is legal");
+        let filter = &pack.tables[0].filters[0];
+        assert_eq!(filter.values, &["open", "closed"]);
+        // Omitted means unconstrained — the shape every other pack has.
+        let pack = parse_pack(&base(
+            "      - { column: state, op: eq, input: state, fidelity: inexact }",
+        ))
+        .expect("no domain is legal");
+        assert!(pack.tables[0].filters[0].values.is_empty());
+
+        for (filter, expected) in [
+            // A range has no finite domain to list.
+            (
+                "      - { column: created, op: gt_eq, input: since, fidelity: inexact, format: rfc3339, values: [x] }",
+                "only an eq mapping",
+            ),
+            // A list that says nothing is a slip, not a declaration.
+            (
+                "      - { column: state, op: eq, input: state, fidelity: inexact, values: [open, open] }",
+                "twice",
+            ),
+            (
+                "      - { column: state, op: eq, input: state, fidelity: inexact, values: [open, ''] }",
+                "empty string",
+            ),
+            // A domain is a list of strings; on any other column every
+            // literal would be outside it.
+            (
+                "      - { column: done, op: eq, input: done, fidelity: inexact, values: [yes] }",
+                "column of type boolean",
+            ),
+            (
+                "      - { column: count, op: eq, input: count, fidelity: inexact, values: ['1'] }",
+                "column of type integer",
+            ),
+        ] {
+            let err = parse_pack(&base(filter)).expect_err(expected);
+            assert!(
+                err.contains(expected) && err.contains("demo.items"),
+                "want {expected:?} naming the table in: {err}"
+            );
+        }
     }
 
     #[test]

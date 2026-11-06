@@ -4,7 +4,7 @@
 //! responses (and transport failures) into a uniform `ApiError`.
 
 use crate::config::ClientConfig;
-use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
+use crate::identity::{ClientIdentity, Surface};
 use reqwest::header::{AUTHORIZATION, HeaderName, HeaderValue};
 use reqwest::{Client, RequestBuilder, Response, StatusCode};
 use serde_json::Value;
@@ -12,16 +12,10 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-/// Characters percent-encoded by [`encode_component`]: everything except
-/// ASCII alphanumerics and the RFC 3986 "unreserved" marks (`-`, `.`, `_`,
-/// `~`). Deliberately conservative — over-encoding is always valid, while
-/// missing a reserved character (`/`, `?`, `#`, `%`, space, …) mis-routes
-/// the request.
-const URL_COMPONENT: &AsciiSet = &NON_ALPHANUMERIC
-    .remove(b'-')
-    .remove(b'.')
-    .remove(b'_')
-    .remove(b'~');
+// The pipeline-name → URL path encoding is part of the tool→REST translation
+// contract shared with the server's /mcp binding; the CLI re-exports it so
+// command modules keep importing from crate::client.
+pub use skardi_mcp_core::encode_component;
 
 /// [`WORKSPACE_HEADER`] lowercased, for `HeaderName::from_static` — which
 /// panics on any uppercase byte, and is the only constructor that cannot fail
@@ -56,13 +50,6 @@ fn retry_after_seconds(response: &Response) -> Option<u64> {
         .trim()
         .parse()
         .ok()
-}
-
-/// Percent-encode one URL path segment or query value (user-supplied
-/// pipeline/job names, run ids) so characters like `/`, `?`, `#`, `%`, and
-/// spaces cannot alter the request route.
-pub fn encode_component(raw: &str) -> String {
-    utf8_percent_encode(raw, URL_COMPONENT).to_string()
 }
 
 /// A thin HTTP client for a single skardi-server instance.
@@ -156,10 +143,23 @@ impl ApiClient {
     /// `/` from the server URL so `path` (which starts with `/`) can be
     /// appended directly without producing a double slash.
     pub fn new(cfg: &ClientConfig) -> anyhow::Result<ApiClient> {
+        Self::with_identity(cfg, ClientIdentity::from_env(Surface::Cli))
+    }
+
+    /// As [`Self::new`], presenting `identity` on every request — the
+    /// User-Agent, and `DNT: 1` when the caller opted out (`crate::identity`).
+    /// `skardi mcp` builds its client through here with [`Surface::Mcp`].
+    pub fn with_identity(
+        cfg: &ClientConfig,
+        identity: ClientIdentity,
+    ) -> anyhow::Result<ApiClient> {
         // The server address is explicit (flag/env/config file), so route
         // to it directly rather than honoring system HTTP_PROXY/HTTPS_PROXY
         // env vars intended for general web browsing.
-        let http = Client::builder().no_proxy().build()?;
+        let http = Client::builder()
+            .no_proxy()
+            .default_headers(identity.headers())
+            .build()?;
         let base_url = cfg.server.trim_end_matches('/').to_string();
 
         // Built here, not per request: `HeaderValue` conversion is the only
@@ -398,7 +398,9 @@ fn is_local_host(host: &str) -> bool {
 mod tests {
     use super::{ApiClient, ApiError};
     use crate::config::ClientConfig;
+    use crate::identity::{ClientIdentity, Surface};
     use serde_json::json;
+    use std::env::consts::{ARCH, OS};
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -407,6 +409,69 @@ mod tests {
             server: server.to_string(),
             token: token.map(|t| t.to_string()),
             context: None,
+        }
+    }
+
+    /// What reached the server on the wire: the `user-agent` and `dnt` of the
+    /// one request `identity`'s client made.
+    async fn sent_by(identity: ClientIdentity) -> (String, Option<String>) {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/health"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&server)
+            .await;
+        ApiClient::with_identity(&config(&server.uri(), None), identity)
+            .unwrap()
+            .get("/health")
+            .await
+            .unwrap();
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let header_of = |name: &str| {
+            requests[0]
+                .headers
+                .get(name)
+                .map(|v| v.to_str().unwrap().to_string())
+        };
+        (header_of("user-agent").unwrap(), header_of("dnt"))
+    }
+
+    /// The CLI names itself, its version and its platform on every request,
+    /// and the MCP bridge marks itself — the two shapes skardi-cloud's parser
+    /// reads (`client_activity::parse_user_agent`).
+    #[tokio::test]
+    async fn every_request_carries_the_cli_identity() {
+        let version = env!("CARGO_PKG_VERSION");
+        let platform = format!("({OS}; {ARCH})");
+        let (ua, dnt) = sent_by(ClientIdentity {
+            surface: Surface::Cli,
+            do_not_track: false,
+        })
+        .await;
+        assert_eq!(ua, format!("skardi-cli/{version} {platform}"));
+        assert_eq!(dnt, None, "no opt-out is sent unless asked for");
+
+        let (ua, _) = sent_by(ClientIdentity {
+            surface: Surface::Mcp,
+            do_not_track: false,
+        })
+        .await;
+        assert_eq!(ua, format!("skardi-cli/{version} mcp {platform}"));
+    }
+
+    /// `DO_NOT_TRACK` sends `DNT: 1` and a User-Agent with no version and no
+    /// platform, from either surface.
+    #[tokio::test]
+    async fn do_not_track_sends_dnt_and_the_bare_product() {
+        for surface in [Surface::Cli, Surface::Mcp] {
+            let (ua, dnt) = sent_by(ClientIdentity {
+                surface,
+                do_not_track: true,
+            })
+            .await;
+            assert_eq!(ua, "skardi-cli", "{surface:?}");
+            assert_eq!(dnt.as_deref(), Some("1"), "{surface:?}");
         }
     }
 
@@ -584,22 +649,6 @@ mod tests {
     fn base_url_strips_trailing_slash() {
         let client = ApiClient::new(&config("http://h:1/", None)).unwrap();
         assert_eq!(client.base_url, "http://h:1");
-    }
-
-    #[test]
-    fn encode_component_escapes_reserved_and_keeps_unreserved() {
-        use super::encode_component;
-
-        assert_eq!(encode_component("a/b"), "a%2Fb");
-        assert_eq!(encode_component("a b?c#d%e"), "a%20b%3Fc%23d%25e");
-        assert_eq!(encode_component("a&b=c"), "a%26b%3Dc");
-        // Unreserved characters pass through untouched.
-        assert_eq!(
-            encode_component("daily-report_v2.1~x"),
-            "daily-report_v2.1~x"
-        );
-        // Non-ASCII is UTF-8 percent-encoded.
-        assert_eq!(encode_component("café"), "caf%C3%A9");
     }
 
     #[test]

@@ -13,6 +13,7 @@ use crate::config::{self, Context, ContextMode, ContextsFile};
 use anyhow::{Context as _, Result, bail};
 use clap::Subcommand;
 use std::collections::BTreeMap;
+use std::io::{BufRead, BufReader, IsTerminal, Read, stdin};
 use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
@@ -53,7 +54,10 @@ pub enum ConfigCmd {
         #[arg(long, value_name = "TOKEN", conflicts_with = "token_stdin")]
         token: Option<String>,
 
-        /// read the token from stdin (the first line), keeping it off argv
+        /// read the token from a PIPE or a file on stdin, keeping it off argv
+        /// and out of shell history. Refused when stdin is a terminal, because
+        /// a token typed there is echoed: pipe it instead
+        /// (`pbpaste | skardi config set-context …`, or `… < token.txt`)
         #[arg(long)]
         token_stdin: bool,
 
@@ -122,13 +126,72 @@ pub fn run(cmd: ConfigCmd, flag_context: Option<String>) -> Result<()> {
 /// The `docker login --password-stdin` / `gh auth login --with-token` shape.
 /// A trailing newline from `echo` is stripped; an empty read is an error
 /// rather than a context written with an empty credential.
+/// Read the token from a pipe or a file on stdin.
+///
+/// # Why a terminal is refused rather than read
+///
+/// This option exists so a credential stays out of `argv` and out of shell
+/// history. Read from a terminal it defeats its own purpose in the most
+/// visible way possible: the terminal echoes what is typed or pasted, so the
+/// token lands in the scrollback — and from there into a screenshot, a
+/// bug report, or a shared session. Two PATs were exposed exactly that way
+/// before this refusal existed, and both had to be revoked.
+///
+/// Suppressing the echo would be the other answer, and a better one if it
+/// could be relied on: it needs platform terminal handling, and a failure to
+/// restore the terminal's state leaves the user's shell with echo off, which
+/// is a worse outcome than a clear refusal. Refusing needs no dependency and
+/// no restore path, and the message names the two forms that are safe — which
+/// is guidance the previous behaviour never gave.
+///
+/// A terminal was also where the SECOND defect showed: `read_to_string` waits
+/// for EOF, so an interactive user pressed Enter and the CLI hung until
+/// Ctrl-D, while the help text said "the first line". A pipe or a file reaches
+/// EOF on its own, so the read below is unsurprising for every input this now
+/// accepts.
 fn read_token_from_stdin() -> Result<String> {
-    use std::io::Read as _;
-    let mut buffer = String::new();
-    std::io::stdin()
-        .read_to_string(&mut buffer)
+    let handle = stdin();
+    // The two arguments are split from the reading so every branch below is
+    // reachable in a unit test: the terminal refusal would otherwise need a
+    // pty to exercise, which is why it had no coverage to break.
+    token_from_stdin(handle.is_terminal(), handle.lock())
+}
+
+/// Read the token from `reader`, refusing a terminal.
+///
+/// # One line, not to EOF
+///
+/// `read_line`, not `read_to_string`, and that is the whole of the second fix.
+/// Refusing a terminal removed the hang an interactive user hit, but the same
+/// hang survived for input this function ACCEPTS: a FIFO, or a credential
+/// helper that writes the token and stays alive, is not a terminal, so
+/// `is_terminal` is false and `read_to_string` waits for an EOF that is not
+/// coming — with the documented first line already complete. Measured: a
+/// `mkfifo` whose writer sleeps after one line left the CLI running
+/// indefinitely.
+///
+/// Stopping at the first newline also bounds the buffer. `read_to_string` on a
+/// pipe nobody closes grows without limit, and a credential path is a poor
+/// place to accept unbounded input.
+///
+/// A file with no trailing newline still works: `read_line` returns what it
+/// has at EOF, and `Ok(0)` is the empty case the guard below already covered.
+fn token_from_stdin(is_terminal: bool, reader: impl Read) -> Result<String> {
+    if is_terminal {
+        bail!(
+            "--token-stdin reads a pipe or a file, not a terminal: a token typed here would be \
+             echoed into your scrollback, which is what this option exists to avoid. Pipe it \
+             instead:\n\
+             \x20 pbpaste | skardi config set-context … --token-stdin\n\
+             \x20 skardi config set-context … --token-stdin < token.txt"
+        );
+    }
+
+    let mut line = String::new();
+    BufReader::new(reader)
+        .read_line(&mut line)
         .context("read token from stdin")?;
-    let token = buffer.lines().next().unwrap_or("").trim().to_string();
+    let token = line.trim().to_string();
     if token.is_empty() {
         bail!("--token-stdin was given but stdin held no token");
     }
@@ -366,6 +429,23 @@ fn render_view(path: &Path, show_tokens: bool) -> Result<String> {
             config::describe_parse_error(&err)
         ),
     };
+    // The `control` token is redacted whatever was asked (agent onboarding
+    // §2.1.1): `--show-tokens` is how a person copies their query token, and
+    // an agent told to "show me the config" must not come away holding the
+    // one credential that reaches the control plane. The `token` it shows
+    // instead is the pair's data-plane half, the `mcp_token`.
+    //
+    // By name as well as by field: a key this binary does not model — a
+    // hand-typed `Control-Token:`, or a newer CLI's control credential — is
+    // preserved in `extra`, and `--show-tokens` skips the general credential
+    // sweep below, so it would otherwise print in full.
+    for context in &mut file.contexts {
+        if let Some(token) = &context.control_token {
+            context.control_token = Some(redact(token));
+        }
+        redact_control_extras(&mut context.extra);
+    }
+    redact_control_extras(&mut file.extra);
     if !show_tokens {
         for context in &mut file.contexts {
             if let Some(token) = &context.token {
@@ -404,6 +484,26 @@ fn redact_sensitive_extras(extra: &mut BTreeMap<String, serde_yaml::Value>) {
     }
 }
 
+/// Redact any unmodeled key that names a CONTROL credential, whatever was
+/// asked: `control` together with `token`, `secret` or `credential`, matched
+/// without case and with `-` and `_` ignored — so `Control-Token`,
+/// `control_token` and `controlSecret` all count.
+fn redact_control_extras(extra: &mut BTreeMap<String, serde_yaml::Value>) {
+    const CREDENTIAL: [&str; 3] = ["token", "secret", "credential"];
+    for (key, value) in extra.iter_mut() {
+        let normalized: String = key
+            .chars()
+            .filter(|c| !matches!(c, '-' | '_'))
+            .collect::<String>()
+            .to_ascii_lowercase();
+        if normalized.contains("control")
+            && CREDENTIAL.iter().any(|needle| normalized.contains(needle))
+        {
+            *value = serde_yaml::Value::String("(redacted)".to_string());
+        }
+    }
+}
+
 /// Replace a token entirely. No prefix survives, deliberately.
 ///
 /// An earlier version kept the first twelve characters so a reader could tell
@@ -429,6 +529,93 @@ fn render_names(names: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
+    // Aliased: `Result` at module scope is anyhow's, and shadowing it
+    // here would change what every other test in this module returns.
+    use std::io::{Cursor, Result as IoResult, empty};
+
+    /// A terminal is refused, and the message names both safe forms.
+    ///
+    /// The refusal is the fix for a real leak: read from a terminal, the token
+    /// is echoed into the scrollback, which is exactly what `--token-stdin`
+    /// exists to prevent. Two PATs were exposed that way.
+    #[test]
+    fn token_stdin_refuses_a_terminal_and_teaches_the_safe_forms() {
+        let err = token_from_stdin(true, empty()).expect_err("a terminal must be refused");
+        let msg = format!("{err}");
+        assert!(msg.contains("not a terminal"), "{msg}");
+        // Guidance, not just a refusal — a user told "no" and nothing else has
+        // no way to proceed.
+        assert!(msg.contains("pbpaste |"), "{msg}");
+        assert!(msg.contains("< token.txt"), "{msg}");
+    }
+
+    /// A pipe or a file is read to EOF and yields its first line.
+    ///
+    /// The second defect lived here: `read_to_string` waits for EOF, so an
+    /// interactive user pressed Enter and the CLI hung — while the help said
+    /// "the first line". Non-terminal input reaches EOF on its own, so the
+    /// read is only surprising for the input that is now refused.
+    /// Reading stops at the first newline, so input that never reaches EOF
+    /// cannot hang — the defect the terminal refusal did NOT cover.
+    ///
+    /// A `Cursor` cannot show this: it always reaches EOF, so `read_to_string`
+    /// passes against one. This reader hands back the first line and then
+    /// PANICS if asked for more, which is a deterministic stand-in for a FIFO
+    /// or a credential helper that keeps its end of the pipe open — measured
+    /// to hang the CLI indefinitely before this fix.
+    struct PanicAfterFirstLine(Option<&'static [u8]>);
+
+    impl Read for PanicAfterFirstLine {
+        fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
+            match self.0.take() {
+                Some(line) => {
+                    buf[..line.len()].copy_from_slice(line);
+                    Ok(line.len())
+                }
+                None => panic!("read past the first line — this would block on a live pipe"),
+            }
+        }
+    }
+
+    #[test]
+    fn token_stdin_stops_at_the_first_newline_and_never_waits_for_eof() {
+        let reader = PanicAfterFirstLine(Some(b"skardi_pat_abc\n"));
+        assert_eq!(
+            token_from_stdin(false, reader).expect("the first line is enough"),
+            "skardi_pat_abc"
+        );
+    }
+
+    /// Every shape a token arrives in from a pipe or a file.
+    ///
+    /// `no_trailing_newline` is the case that constrains the `read_line`
+    /// change: it returns what it has at EOF, so a file written without a
+    /// final newline must still yield its token.
+    #[rstest]
+    #[case::padded("  skardi_pat_abc  \n")]
+    #[case::no_trailing_newline("skardi_pat_abc")]
+    #[case::crlf("skardi_pat_abc\r\n")]
+    #[case::second_line_ignored("skardi_pat_abc\nsomething else\n")]
+    fn token_stdin_yields_the_token(#[case] raw: &str) {
+        let input = Cursor::new(raw.as_bytes().to_vec());
+        assert_eq!(
+            token_from_stdin(false, input).expect("read"),
+            "skardi_pat_abc"
+        );
+    }
+
+    /// Empty input stays an error rather than an empty token in the config —
+    /// the guard that predates this change, now covered.
+    #[rstest]
+    #[case::eof_immediately("")]
+    #[case::bare_newline("\n")]
+    #[case::whitespace_only("   \n")]
+    fn token_stdin_refuses_empty_input_rather_than_storing_it(#[case] raw: &str) {
+        let input = Cursor::new(raw.as_bytes().to_vec());
+        let err = token_from_stdin(false, input).expect_err("empty input must be refused");
+        assert!(format!("{err}").contains("held no token"), "{err}");
+    }
     use crate::config::{ContextsFile, LegacySpec};
     use tempfile::TempDir;
 
@@ -621,6 +808,79 @@ mod tests {
         let err = use_context(&path, "any").unwrap_err();
         // The "(none)" arm — a listing with nothing to list.
         assert!(err.to_string().contains("Available: (none)"), "{err}");
+    }
+
+    /// `--show-tokens` prints the query token (the pair's mcp_token) and
+    /// NEVER the control token (agent onboarding §2.1.1).
+    #[test]
+    fn show_tokens_shows_the_mcp_token_and_redacts_the_control_token() {
+        let (_dir, path) = temp();
+        write(
+            &path,
+            "contexts:\n\
+             \x20 - name: acme/prod\n    mode: cloud\n    server: https://gw\n    workspace: acme-prod\n\
+             \x20   token: skardi_pat_mcp_value\n\
+             \x20   control-token: skardi_pat_control_value\n\
+             \x20   control-token-expires-at: 2026-10-31T12:00:00Z\n\
+             \x20   pair-id: pair-1\n",
+        );
+        for show_tokens in [false, true] {
+            let body = render_view(&path, show_tokens).unwrap();
+            assert!(!body.contains("skardi_pat_control_value"), "{body}");
+            assert!(body.contains("control-token: (redacted)"), "{body}");
+            // Not a credential: when it stops working, and which login it is.
+            assert!(body.contains("2026-10-31T12:00:00Z"), "{body}");
+            assert!(body.contains("pair-1"), "{body}");
+            assert_eq!(body.contains("skardi_pat_mcp_value"), show_tokens, "{body}");
+        }
+    }
+
+    /// Codex on #311: a control credential under a key the model does not
+    /// know lands in `extra`, which `--show-tokens` used to print in full.
+    /// It is redacted in either mode now, while the ordinary query token and
+    /// an unrelated extra still show with `--show-tokens`.
+    #[rstest]
+    #[case::case_typo("Control-Token")]
+    #[case::snake("control_token")]
+    #[case::camel("controlSecret")]
+    #[case::credential("CONTROL_CREDENTIAL")]
+    fn show_tokens_never_prints_a_control_credential_under_any_spelling(#[case] key: &str) {
+        let (_dir, path) = temp();
+        write(
+            &path,
+            &format!(
+                "{key}: top_level_control_value\n\
+                 contexts:\n\
+                 \x20 - name: acme/prod\n    mode: cloud\n    server: https://gw\n    workspace: acme-prod\n\
+                 \x20   token: skardi_pat_mcp_value\n\
+                 \x20   {key}: skardi_pat_control_value\n\
+                 \x20   refresh-token: an_ordinary_extra\n"
+            ),
+        );
+        for show_tokens in [false, true] {
+            let body = render_view(&path, show_tokens).unwrap();
+            assert!(!body.contains("skardi_pat_control_value"), "{body}");
+            assert!(!body.contains("top_level_control_value"), "{body}");
+            assert!(body.contains(&format!("{key}: (redacted)")), "{body}");
+            assert_eq!(body.contains("skardi_pat_mcp_value"), show_tokens, "{body}");
+            assert_eq!(body.contains("an_ordinary_extra"), show_tokens, "{body}");
+        }
+    }
+
+    /// Only a control CREDENTIAL: a key that merely mentions control, or a
+    /// credential that is not a control one, is left to the usual rule.
+    #[rstest]
+    #[case::not_a_credential("control-plane", true)]
+    #[case::not_control("api-token", true)]
+    #[case::control_token("x-control-token", false)]
+    fn the_control_rule_needs_both_words(#[case] key: &str, #[case] shown: bool) {
+        let mut extra = BTreeMap::new();
+        extra.insert(key.to_string(), serde_yaml::Value::String("v".to_string()));
+        redact_control_extras(&mut extra);
+        assert_eq!(
+            extra[key] == serde_yaml::Value::String("v".to_string()),
+            shown
+        );
     }
 
     #[test]

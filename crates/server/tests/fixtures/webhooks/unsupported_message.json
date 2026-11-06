@@ -1,0 +1,49 @@
+{
+  "object": "whatsapp_business_account",
+  "entry": [
+    {
+      "id": "102290129340398",
+      "changes": [
+        {
+          "value": {
+            "messaging_product": "whatsapp",
+            "metadata": {
+              "display_phone_number": "15550783881",
+              "phone_number_id": "106540352242922"
+            },
+            "contacts": [
+              {
+                "profile": {
+                  "name": "Sheena Nelson"
+                },
+                "wa_id": "16505551234"
+              }
+            ],
+            "messages": [
+              {
+                "from": "16505551234",
+                "id": "wamid.HBgLMTY1MDM4Nzk0MzkVAgASGBQzQUFERjg0NDEzNDdFODU3MUMxMAA=",
+                "timestamp": "1750090702",
+                "errors": [
+                  {
+                    "code": 131051,
+                    "title": "Message type unknown",
+                    "message": "Message type unknown",
+                    "error_data": {
+                      "details": "Message type is currently not supported."
+                    }
+                  }
+                ],
+                "type": "unsupported",
+                "unsupported": {
+                  "type": "edit"
+                }
+              }
+            ]
+          },
+          "field": "messages"
+        }
+      ]
+    }
+  ]
+}

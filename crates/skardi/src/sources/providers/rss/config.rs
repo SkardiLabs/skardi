@@ -173,6 +173,21 @@ pub struct RssConfig {
     /// `User-Agent` header sent with every feed request.
     #[serde(default = "default_user_agent")]
     pub user_agent: String,
+
+    /// Address ranges the fetcher must never connect to, on the initial URL
+    /// and on every redirect hop. Empty (the default) installs no policy at
+    /// all — OSS stays `AllowAll`, and system proxy variables keep being
+    /// honored. Non-empty, registration installs a CIDR deny policy
+    /// (`egress::DenyCidrs`; unlinked, the module is private) through the
+    /// same seam `register_rss_tables_with_policy` exposes, which also turns
+    /// proxies off for this source so the check sees the real destination.
+    ///
+    /// The mechanism only: OSS ships no list. Which ranges to refuse
+    /// (loopback, RFC 1918, link-local, CGNAT, unique-local …) is the
+    /// operator's decision — Skardi Cloud writes its own into the ctx it
+    /// renders. See `docs/superpowers/specs/2026-08-03-rss-cloud-egress-design.md`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny_cidrs: Vec<ipnet::IpNet>,
 }
 
 /// One RSS/Atom/JSON-Feed subscription in an inline `feeds:` list.
@@ -388,6 +403,7 @@ pub(crate) fn inline_config(feeds: Vec<FeedSubscription>) -> RssConfig {
         scan_timeout_seconds: default_scan_timeout_seconds(),
         max_response_bytes: default_max_response_bytes(),
         user_agent: default_user_agent(),
+        deny_cidrs: Vec::new(),
     }
 }
 
@@ -643,6 +659,42 @@ feeds:
         )
         .unwrap_err();
         assert!(err.to_string().contains("bogus"), "{err}");
+    }
+
+    #[test]
+    fn deny_cidrs_defaults_to_empty_and_is_omitted_when_serialized() {
+        // Empty is the OSS default — no policy at all — and a config written
+        // back out must not grow a key the operator never set.
+        let config: RssConfig =
+            serde_yaml::from_str("feeds:\n  - url: https://a.example/f.xml\n").unwrap();
+        assert!(config.deny_cidrs.is_empty());
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        assert!(!yaml.contains("deny_cidrs"), "{yaml}");
+    }
+
+    #[test]
+    fn deny_cidrs_parse_v4_and_v6_ranges() {
+        let yaml = "feeds:\n  - url: https://a.example/f.xml\ndeny_cidrs:\n  - 127.0.0.0/8\n  - 169.254.0.0/16\n  - '::1/128'\n  - 'fc00::/7'\n";
+        let config: RssConfig = serde_yaml::from_str(yaml).unwrap();
+        config.validate().unwrap();
+        let written: Vec<String> = config.deny_cidrs.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            written,
+            vec!["127.0.0.0/8", "169.254.0.0/16", "::1/128", "fc00::/7"]
+        );
+    }
+
+    #[test]
+    fn a_malformed_deny_cidr_fails_at_load() {
+        // A range that does not parse must fail loudly, not be dropped: a
+        // dropped entry is a hole in the operator's policy that looks like
+        // success. A bare address is not a range either — `/32` is spelled out.
+        for bad in ["10.0.0.0/33", "not-a-cidr", "10.0.0.1"] {
+            let yaml =
+                format!("feeds:\n  - url: https://a.example/f.xml\ndeny_cidrs:\n  - '{bad}'\n");
+            let err = serde_yaml::from_str::<RssConfig>(&yaml).unwrap_err();
+            assert!(err.to_string().contains("deny_cidrs"), "{bad}: {err}");
+        }
     }
 
     #[test]

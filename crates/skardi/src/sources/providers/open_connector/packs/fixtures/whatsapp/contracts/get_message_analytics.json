@@ -1,0 +1,58 @@
+{
+  "type": "object",
+  "properties": {
+    "granularity": {
+      "type": "string",
+      "description": "Width of each data point as returned by Meta."
+    },
+    "phone_numbers": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "Business phone numbers the data covers."
+    },
+    "country_codes": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "Two-letter country codes the data covers."
+    },
+    "data_points": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "start": {
+            "type": "integer",
+            "description": "Start of the data point window as a UNIX timestamp in seconds."
+          },
+          "end": {
+            "type": "integer",
+            "description": "End of the data point window as a UNIX timestamp in seconds."
+          },
+          "sent": {
+            "type": "integer",
+            "description": "Messages sent in the window."
+          },
+          "delivered": {
+            "type": "integer",
+            "description": "Messages delivered in the window."
+          }
+        },
+        "additionalProperties": true,
+        "description": "Message counts for one window."
+      },
+      "description": "One entry per window."
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "granularity",
+    "data_points"
+  ],
+  "description": "Action output."
+}

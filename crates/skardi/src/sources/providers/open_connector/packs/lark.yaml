@@ -1,0 +1,303 @@
+# Lark source pack. Lark is the international edition of Feishu, and its
+# Open Connector actions, tables, columns, and wire shape are declared
+# IDENTICAL to packs/feishu.yaml (`lark.*` instead of `feishu.*`) —
+# mirrored here rather than live-verified against a real Lark gateway.
+#
+# ⚠️ UNVERIFIED AGAINST A LIVE LARK GATEWAY: every claim below (gateway
+# v1.3.3, the 2026-08-04 / 2026-09-01 reconciliation dates, page-size
+# caps, has_more semantics) is carried over from the feishu pack's own
+# live verification, on the assumption that Lark's `lark.*` actions are
+# wire-identical to Feishu's `feishu.*` actions. That assumption has not
+# been independently confirmed against a live Lark/Open Connector
+# gateway. Re-run the feishu.rs-equivalent live pass against Lark before
+# relying on these specifics in production, and update this header (and
+# lark.rs's module docs) with the real findings once that happens.
+#
+# Wire contract is Open Connector's HYBRID shape: every list executor
+# rebuilds the pagination ENVELOPE (camelCase `$.items` / `$.pageToken` /
+# `$.hasMore`, with `page_token` absent-or-empty normalized to a null
+# `pageToken` at end-of-collection) while passing the Lark API's item
+# objects through RAW — snake_case keys, timestamps as epoch DIGIT
+# STRINGS (millis for im and tasks, seconds for wiki), the reason the
+# timestamp_*_string_utc column types exist. Inputs are camelCase strict
+# (`pageSize` / `pageToken` / `chatId`; `additionalProperties: false`).
+# Design rationale lives in the module docs of packs/feishu.rs (and is
+# mirrored in packs/lark.rs).
+#
+# COLUMN STATUS: item schemas are declared LOOSE by the gateway (empty
+# properties + additionalProperties), so every column below rides
+# passthrough and none is protected by the fingerprint gate — real rows
+# are the only column truth. tasks / wiki_spaces / wiki_nodes are
+# reconciled (on feishu) against a live workspace (2026-08-04): tasks
+# carry status/completed_at (no `completed` boolean), wiki spaces answer
+# the final page with a NON-empty pageToken and hasMore:false (the reason
+# has_more_path exists). chats, chat_members, and messages are
+# live-verified too (on feishu): chats gained chat_mode/chat_status from
+# the pass; messages' real page_size cap is 50 (99992402 above it) and
+# reading them under the user identity requires the im:message:readonly
+# (or im:message / im:message.history:readonly) scope — the get_as_user
+# scopes the gateway declares are NOT honored for this path (99991679).
+# document_blocks is live-verified 2026-09-01 over two cursor pages; its
+# real page_size cap is 500 (99992402 at 501), and its block-type payload
+# remains under a dynamic `page` / `text` / `heading1` / ... key.
+# `message_position` (a digit string on every row) is deliberately
+# unmapped: it appears in no public Feishu/Lark doc we could pin
+# semantics to.
+kind: pack
+pack: lark
+version: 1
+
+tables:
+  chats:
+    action: lark.list_chats
+    row_path: "$.items"
+    fingerprint: ae92a20605dc6b38d1c350df84bbe2989a2284450a17fcf6a7b398b958a9882d
+    pagination:
+      strategy: cursor
+      cursor_input: pageToken
+      next_cursor_path: "$.pageToken"
+      page_size_input: pageSize
+      page_size: 100
+      has_more_path: "$.hasMore"
+    # ByCreateTimeAsc is the STABLE ordering. The API default
+    # (ByActiveTimeDesc) reshuffles rows whenever a chat receives a
+    # message mid-scan, which can skip or duplicate chats across cursor
+    # pages — creation order is immutable.
+    fixed_inputs:
+      sortType: ByCreateTimeAsc
+    columns:
+      - { name: id, path: chat_id, type: utf8, nullable: false }
+      - { name: name, path: name, type: utf8, nullable: true }
+      - { name: description, path: description, type: utf8, nullable: true }
+      - { name: owner_id, path: owner_id, type: utf8, nullable: true }
+      - { name: owner_id_type, path: owner_id_type, type: utf8, nullable: true }
+      - { name: external, path: external, type: boolean, nullable: true }
+      - { name: tenant_key, path: tenant_key, type: utf8, nullable: true }
+      - { name: avatar, path: avatar, type: utf8, nullable: true }
+      - { name: chat_mode, path: chat_mode, type: utf8, nullable: true }
+      - { name: chat_status, path: chat_status, type: utf8, nullable: true }
+
+  messages:
+    action: lark.list_messages
+    row_path: "$.items"
+    fingerprint: ae92a20605dc6b38d1c350df84bbe2989a2284450a17fcf6a7b398b958a9882d
+    pagination:
+      strategy: cursor
+      cursor_input: pageToken
+      next_cursor_path: "$.pageToken"
+      page_size_input: pageSize
+      # 50, NOT the schema's declared max of 100: Feishu's im/v1/messages
+      # caps page_size at 50 and hard-fails larger values (99992402,
+      # live-verified 2026-08-04) — the gateway's declared maximum is
+      # wrong on the wire.
+      page_size: 50
+      has_more_path: "$.hasMore"
+    # containerIdType is pinned to `chat`: this table IS chat history
+    # (thread listing is a different action, list_thread_messages).
+    # ByCreateTimeAsc for the same cursor-stability reason as chats —
+    # and it makes the startTime lower-bound pushdown coherent with the
+    # scan direction.
+    fixed_inputs:
+      containerIdType: chat
+      sortType: ByCreateTimeAsc
+    resources:
+      required: [containerId]
+    filters:
+      # Lower bound only: startTime is inclusive epoch seconds (a digit
+      # STRING in the strict schema — the reason epoch_seconds_string
+      # exists). Flooring widens the fetch; Inexact re-filtering trims.
+      # endTime is deliberately unmapped: it is EXCLUSIVE and flooring an
+      # upper bound would drop rows.
+      - { column: create_time, op: gt_eq, input: startTime, fidelity: inexact, format: epoch_seconds_string }
+    columns:
+      - { name: id, path: message_id, type: utf8, nullable: false }
+      - { name: chat_id, path: chat_id, type: utf8, nullable: true }
+      - { name: msg_type, path: msg_type, type: utf8, nullable: true }
+      - { name: create_time, path: create_time, type: timestamp_ms_string_utc, nullable: true }
+      - { name: update_time, path: update_time, type: timestamp_ms_string_utc, nullable: true }
+      - { name: deleted, path: deleted, type: boolean, nullable: true }
+      - { name: updated, path: updated, type: boolean, nullable: true }
+      - { name: root_id, path: root_id, type: utf8, nullable: true }
+      - { name: parent_id, path: parent_id, type: utf8, nullable: true }
+      - { name: thread_id, path: thread_id, type: utf8, nullable: true }
+      # sender carries id/id_type/sender_type/tenant_key — a small stable
+      # object, kept opaque; mentions is an array of user references.
+      - { name: sender, path: sender, type: json, nullable: true }
+      # body.content is Feishu's message payload: itself a JSON-encoded
+      # string whose inner schema varies BY msg_type — opaque by design,
+      # searchable as text.
+      - { name: content, path: body.content, type: utf8, nullable: true }
+      - { name: mentions, path: mentions, type: json, nullable: true }
+      # DOC-DERIVED: no captured row carries upper_message_id (it appears
+      # only on merge-forwarded messages) — under this pack's loose-schema
+      # doctrine that means zero evidence trail; kept because the Feishu
+      # message resource documents it, typed utf8 like every other id.
+      - { name: upper_message_id, path: upper_message_id, type: utf8, nullable: true }
+
+  # One row per DOCUMENT, not per block: the whole docx as plain text.
+  #
+  # `document_blocks` below is the structural view, and it deliberately
+  # exposes no text — a block's payload lives under a key named BY its
+  # block_type (`page`, `text`, `heading1`, ...), which a fixed relational
+  # mapping cannot address. That makes it useless as a corpus on its own,
+  # so this table exists beside it: Feishu's raw-content endpoint returns
+  # the assembled text of every block in one call, which is exactly the
+  # shape an OKF document row wants.
+  #
+  # This is the pack format's first `row_shape: object` table. The action
+  # answers with the row itself (`{documentId, content}`) rather than a
+  # list, so `row_path: "$"` names the envelope and the loader refuses any
+  # pagination beside it — there is no second page of a document's text.
+  # Live-captured 2026-09-03 through the pinned build against a real
+  # document; the fixture is that capture with the id replaced.
+  document_content:
+    action: lark.get_document_content
+    row_path: "$"
+    row_shape: object
+    fingerprint: 08734aacc5852526417d49b121b8dc171cca52d961432cca342bb16b23cc8b1c
+    pagination:
+      strategy: single_page
+    resources:
+      required: [documentId]
+    columns:
+      - { name: document_id, path: documentId, type: utf8, nullable: false }
+      # Never null: the action substitutes an empty string for a document
+      # with no text, so an empty corpus row is a real empty document
+      # rather than a fetch that half-failed.
+      - { name: content, path: content, type: utf8, nullable: false }
+
+  document_blocks:
+    action: lark.list_document_blocks
+    row_path: "$.items"
+    fingerprint: 01197fece20db6e4dc097595b5d8b28cd42380aa1c6c625cd4a2377a112883aa
+    pagination:
+      strategy: cursor
+      cursor_input: pageToken
+      next_cursor_path: "$.pageToken"
+      page_size_input: pageSize
+      # Live-verified 2026-09-01: 500 succeeds and 501 hard-fails with
+      # Feishu 99992402 (`the max value is 500`).
+      page_size: 500
+      has_more_path: "$.hasMore"
+    resources:
+      required: [documentId]
+    columns:
+      # The block-type payload (`page`, `text`, `heading1`, ...) lives
+      # under a key selected BY block_type. A fixed relational mapping
+      # cannot address that dynamic key; the live fixtures retain it for
+      # contract evidence while this table exposes the stable row fields.
+      - { name: block_id, path: block_id, type: utf8, nullable: false }
+      - { name: block_type, path: block_type, type: int64, nullable: true }
+      - { name: parent_id, path: parent_id, type: utf8, nullable: true }
+
+  chat_members:
+    action: lark.list_chat_members
+    row_path: "$.items"
+    fingerprint: ae92a20605dc6b38d1c350df84bbe2989a2284450a17fcf6a7b398b958a9882d
+    pagination:
+      strategy: cursor
+      cursor_input: pageToken
+      next_cursor_path: "$.pageToken"
+      page_size_input: pageSize
+      page_size: 100
+      has_more_path: "$.hasMore"
+    resources:
+      required: [chatId]
+    columns:
+      - { name: member_id, path: member_id, type: utf8, nullable: false }
+      - { name: member_id_type, path: member_id_type, type: utf8, nullable: true }
+      - { name: name, path: name, type: utf8, nullable: true }
+      - { name: tenant_key, path: tenant_key, type: utf8, nullable: true }
+
+  tasks:
+    action: lark.list_tasks
+    row_path: "$.items"
+    fingerprint: 32c84c3fbbb16e2b6b1721646a52c01eef37064530310b623101f8672841af1f
+    pagination:
+      strategy: cursor
+      cursor_input: pageToken
+      next_cursor_path: "$.pageToken"
+      page_size_input: pageSize
+      page_size: 100
+      has_more_path: "$.hasMore"
+    # `my_tasks` is the ONLY value Feishu accepts (1470400 for
+    # assigned/created/followed — field-verified), pinned explicitly so
+    # the table's population is declared, not inherited. Omitting the
+    # action's `completed` input returns tasks in BOTH states — the
+    # state=all default. The input is deliberately unmapped as a filter:
+    # real rows carry NO `completed` boolean (live-verified 2026-08-04 —
+    # completion is `status: todo|done` plus `completed_at`), and a
+    # string-enum column cannot render into a boolean input without a
+    # value transform the engine deliberately lacks.
+    fixed_inputs:
+      type: my_tasks
+    columns:
+      - { name: guid, path: guid, type: utf8, nullable: false }
+      - { name: summary, path: summary, type: utf8, nullable: true }
+      - { name: description, path: description, type: utf8, nullable: true }
+      - { name: status, path: status, type: utf8, nullable: true }
+      - { name: created_at, path: created_at, type: timestamp_ms_string_utc, nullable: true }
+      - { name: updated_at, path: updated_at, type: timestamp_ms_string_utc, nullable: true }
+      # Feishu spells "not completed" as the digit string "0", which
+      # decodes to 1970-01-01T00:00:00Z — filter on `status = 'done'`
+      # rather than on this column's epoch-zero sentinel.
+      - { name: completed_at, path: completed_at, type: timestamp_ms_string_utc, nullable: true }
+      # DOC-DERIVED shape: the live pass saw `due` on 2 of 9 rows, but no
+      # row with it survived the redacted fixture subset — the column has
+      # no fixture evidence; kept opaque json per the documented resource.
+      - { name: due, path: due, type: json, nullable: true }
+      - { name: members, path: members, type: json, nullable: true }
+      - { name: url, path: url, type: utf8, nullable: true }
+
+  wiki_spaces:
+    action: lark.list_wiki_spaces
+    row_path: "$.items"
+    fingerprint: 3e409151958df3889afbd4461debb32f96f4d6336fb79bc79b09bf336fdeda97
+    pagination:
+      strategy: cursor
+      cursor_input: pageToken
+      next_cursor_path: "$.pageToken"
+      page_size_input: pageSize
+      page_size: 50
+      has_more_path: "$.hasMore"
+    columns:
+      - { name: space_id, path: space_id, type: utf8, nullable: false }
+      - { name: name, path: name, type: utf8, nullable: true }
+      - { name: description, path: description, type: utf8, nullable: true }
+      - { name: space_type, path: space_type, type: utf8, nullable: true }
+      - { name: visibility, path: visibility, type: utf8, nullable: true }
+      - { name: open_sharing, path: open_sharing, type: utf8, nullable: true }
+
+  wiki_nodes:
+    action: lark.list_wiki_nodes
+    row_path: "$.items"
+    fingerprint: 3e409151958df3889afbd4461debb32f96f4d6336fb79bc79b09bf336fdeda97
+    pagination:
+      strategy: cursor
+      cursor_input: pageToken
+      next_cursor_path: "$.pageToken"
+      page_size_input: pageSize
+      page_size: 50
+      has_more_path: "$.hasMore"
+    # One level per scan: the action lists the children of ONE parent
+    # (space root when parentNodeToken is omitted) — same shape as
+    # Notion's block_children. Full-tree traversal is a client-side
+    # recursion, documented in the pack doc.
+    resources:
+      required: [spaceId]
+      optional: [parentNodeToken]
+    columns:
+      - { name: node_token, path: node_token, type: utf8, nullable: false }
+      - { name: obj_token, path: obj_token, type: utf8, nullable: true }
+      - { name: obj_type, path: obj_type, type: utf8, nullable: true }
+      - { name: title, path: title, type: utf8, nullable: true }
+      - { name: parent_node_token, path: parent_node_token, type: utf8, nullable: true }
+      - { name: node_type, path: node_type, type: utf8, nullable: true }
+      - { name: origin_node_token, path: origin_node_token, type: utf8, nullable: true }
+      - { name: has_child, path: has_child, type: boolean, nullable: true }
+      - { name: obj_create_time, path: obj_create_time, type: timestamp_s_string_utc, nullable: true }
+      - { name: obj_edit_time, path: obj_edit_time, type: timestamp_s_string_utc, nullable: true }
+      - { name: node_create_time, path: node_create_time, type: timestamp_s_string_utc, nullable: true }
+      - { name: owner, path: owner, type: utf8, nullable: true }
+      - { name: creator, path: creator, type: utf8, nullable: true }
+      - { name: url, path: url, type: utf8, nullable: true }

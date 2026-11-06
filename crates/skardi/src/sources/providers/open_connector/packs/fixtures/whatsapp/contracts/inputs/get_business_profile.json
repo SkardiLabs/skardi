@@ -1,0 +1,20 @@
+{
+  "type": "object",
+  "properties": {
+    "phone_number_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Meta phone number ID for the WhatsApp Business number used by this action."
+    },
+    "fields": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Comma-separated list of fields to retrieve."
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "phone_number_id"
+  ],
+  "description": "Input for reading a WhatsApp business profile."
+}

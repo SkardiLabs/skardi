@@ -1,7 +1,8 @@
 # Feishu Source Pack
 
 The built-in `feishu` source pack exposes a Feishu user's own workspace —
-chats and their messages and members, tasks, and wiki spaces/nodes — as
+chats and their messages and members, tasks, wiki spaces/nodes, and a
+docx document's text and block structure — as
 stable SQL tables through an
 [Open Connector gateway](open-connector.md). Feishu credentials are an
 OAuth **user_access_token** obtained through the gateway's OAuth flow
@@ -18,15 +19,21 @@ epoch **digit strings** (milliseconds for im, seconds for wiki), which is
 what the `timestamp_ms_string_utc` / `timestamp_s_string_utc` column
 types decode. Reconciled against a live gateway (v1.3.3).
 
-> **Live-verified (2026-08-04):** all six tables are reconciled against
-> a real workspace end to end — registration through live discovery,
-> real scans (86 messages over two real cursor pages, zero duplicate
-> ids; `create_time >=` pushdown narrowing a live scan; wiki's
-> non-empty final token terminating cleanly), and every mapped column
-> non-NULL on real rows. The gateway declares every feishu items schema
-> loose (no declared properties), so no column is protected by the
-> fingerprint gate — real rows are the column truth, and the bundled
-> fixtures are redacted live captures.
+> **Live-verified:** all eight tables are reconciled against a real
+> workspace end to end — registration through live discovery, real scans
+> (86 messages over two real cursor pages and four document blocks over
+> two more, zero duplicate ids; `create_time >=` pushdown narrowing a
+> live scan; wiki's non-empty final token terminating cleanly), and every
+> mapped column non-NULL on real rows. Six tables on 2026-08-04,
+> `document_blocks` on 2026-09-01, `document_content` on 2026-09-03.
+> The gateway declares the **seven list** actions' items schemas loose
+> (no declared properties), so none of their columns is protected by the
+> fingerprint gate — real rows are the column truth. `document_content`
+> is the exception: `get_document_content` declares `documentId` and
+> `content` under `additionalProperties: false`, so its two columns sit
+> inside the gate and an upstream rename fails registration instead of
+> surfacing as a null column mid-query. The bundled fixtures are
+> redacted live captures.
 
 ## Binding
 
@@ -42,8 +49,9 @@ spec:
         runtime_token_env: OPEN_CONNECTOR_TOKEN
         bindings:
           # The three tables that need NO resource — a first ctx can only
-          # cover these; the other three each require an id you get by
-          # querying chats / wiki_spaces first, then coming back.
+          # cover these; the other five each require an id you get by
+          # querying chats / wiki_spaces / wiki_nodes first, then coming
+          # back.
           - name: team               # schema name in SQL
             source_pack: feishu
             tables: [chats, tasks, wiki_spaces]
@@ -65,6 +73,16 @@ spec:
             resource:
               spaceId: "7034502641455497244" # space_id from wiki_spaces
             tables: [wiki_nodes]
+          # The two document tables share ONE resource key, so unlike the
+          # others they can live in a single binding — one binding per
+          # document, not per table.
+          - name: onboarding_doc
+            source_pack: feishu
+            resource:
+              # `obj_token` of a wiki_nodes row whose obj_type is `docx`,
+              # or the id in the document's own URL.
+              documentId: doxcnAbCdEfGhIjKlMnOpQr
+            tables: [document_content, document_blocks]
 ```
 
 ```sql
@@ -75,6 +93,9 @@ FROM saas.standup.messages
 WHERE create_time >= TIMESTAMP '2026-07-01T00:00:00Z'
   AND msg_type = 'text'
 ORDER BY create_time;
+
+-- One document's text as a single row — the corpus shape.
+SELECT document_id, content FROM saas.onboarding_doc.document_content;
 
 -- The same definition, ad hoc, without a binding:
 SELECT member_id, name
@@ -89,9 +110,14 @@ FROM open_connector_query('saas', 'feishu.chat_members',
 | `chats` | `feishu.list_chats` | — | cursor, 100/page | — |
 | `messages` | `feishu.list_messages` | `containerId` (required) | cursor, 50/page | `create_time >=` → `startTime` (inexact) |
 | `chat_members` | `feishu.list_chat_members` | `chatId` (required) | cursor, 100/page | — |
+| `document_content` | `feishu.get_document_content` | `documentId` (required) | single page (one row per document) | — |
+| `document_blocks` | `feishu.list_document_blocks` | `documentId` (required) | cursor, 500/page | — |
 | `tasks` | `feishu.list_tasks` | — | cursor, 100/page | — |
 | `wiki_spaces` | `feishu.list_wiki_spaces` | — | cursor, 50/page | — |
 | `wiki_nodes` | `feishu.list_wiki_nodes` | `spaceId` (required), `parentNodeToken` (optional) | cursor, 50/page | — |
+
+Neither document table pushes a time filter: neither action declares a
+timestamp input, and the block rows carry no timestamp column at all.
 
 Design notes:
 
@@ -113,6 +139,25 @@ Design notes:
   real rows carry no `completed` boolean (completion on the wire is
   `status: todo|done` plus `completed_at`), so filter on `status`
   locally.
+- **`document_content` is the corpus table, `document_blocks` the
+  structural one.** Feishu's raw-content endpoint returns the whole
+  document's assembled plain text in one call, which is exactly the shape
+  a document row wants — so `document_content` is one row per document
+  (`document_id`, `content`) rather than one row per block. It is the
+  pack's only `row_shape: object` table: the action answers with the row
+  itself instead of a list, so the row path is the envelope and the loader
+  refuses any pagination beside `single_page` — there is no second page of
+  a document's text. `content` is never NULL; the action substitutes an
+  empty string, so an empty row is a genuinely empty document rather than
+  a half-failed fetch.
+- **`document_blocks` deliberately exposes no text.** It carries the
+  stable identity fields — `block_id`, `block_type` (an integer),
+  `parent_id` — and nothing else, because a block's payload lives under a
+  key named *by* its block type (`page`, `text`, `heading1`, …), which a
+  fixed relational mapping cannot address. Use it to reconstruct document
+  structure and `document_content` to read the words. Its real page-size
+  cap is **500**: live-verified 2026-09-01, where 501 hard-fails with
+  Feishu 99992402 (`the max value is 500`).
 - **`wiki_nodes` lists ONE level**: the children of `parentNodeToken`,
   or the space root when omitted. Walking a whole space is client-side
   recursion over `has_child` / `node_token`.
@@ -127,7 +172,7 @@ The gateway's feishu provider uses the OAuth authorization-code flow
 creates. Rows are the authorizing user's view — a chat the user left or
 a wiki space they cannot read is simply absent, not an error.
 
-**Gateway version is a floor, not a fact**: the six actions this pack
+**Gateway version is a floor, not a fact**: the eight actions this pack
 needs were added to Open Connector after older mid-2025 builds (which
 expose only docs/bitable feishu actions); a too-old gateway fails
 registration with `action 'feishu.list_chats' was not found`, which
@@ -139,7 +184,7 @@ curl -s -H "Authorization: Bearer $OPEN_CONNECTOR_TOKEN" \
   "$GATEWAY/v1/actions?service=feishu&limit=500" \
   | python3 -c "import json,sys; d=json.load(sys.stdin); \
     ids=[i['id'] for i in d['data']['items']]; print(len(ids)); \
-    print([n for n in ['feishu.list_chats','feishu.list_messages','feishu.list_chat_members','feishu.list_tasks','feishu.list_wiki_spaces','feishu.list_wiki_nodes'] if n not in ids])"
+    print([n for n in ['feishu.list_chats','feishu.list_messages','feishu.list_chat_members','feishu.get_document_content','feishu.list_document_blocks','feishu.list_tasks','feishu.list_wiki_spaces','feishu.list_wiki_nodes'] if n not in ids])"
 # expect: a few hundred actions, then an empty list []
 ```
 
@@ -156,10 +201,20 @@ Feishu console gates independently of each other:
 - Feishu's `im/v1/messages` caps `page_size` at **50** on the wire
   (99992402 above it) despite the gateway schema declaring 100 — the
   pack requests 50.
+- The document tables need the docx read scope —
+  **`docx:document:readonly`** (or the read-write `docx:document`). That
+  NAME is from Feishu's documentation; unlike the page-size caps below it
+  was not measured against the live gateway, so confirm it against your own
+  app's enabled scopes before relying on the snippet — a wrong scope name
+  fails at authorization, not at scan time. The authorizing user must also
+  be able to open the document. A document the
+  user cannot read is an error from Feishu, not an empty table.
+  `docx/v1/documents/:id/blocks` caps `page_size` at **500** the same way
+  (99992402 at 501, live-verified 2026-09-01); the pack requests 500.
 - Upstream gateway caveat: its authorization URL requests the union of
   ALL feishu actions' scopes with no narrowing surface — measured at
   164 scopes on the live authorize URL, including destructive write
-  scopes, to read six tables — which Feishu rejects (20027) unless the
+  scopes, to read eight tables — which Feishu rejects (20027) unless the
   app enables every one. Until upstream grows a config-level override
   ([#267](https://github.com/oomol-lab/open-connector/issues/267)),
   narrow `feishuOAuthScopes` in the gateway's
@@ -174,6 +229,7 @@ Feishu console gates independently of each other:
     "im:message.group_msg:get_as_user",
     "im:message.p2p_msg:get_as_user",
     "im:message.reactions:read",
+    "docx:document:readonly",             // document_content, document_blocks
     "task:task:read",                     // tasks
     "wiki:space:retrieve",                // wiki_spaces
     "wiki:node:retrieve",                 // wiki_nodes
@@ -185,7 +241,8 @@ Feishu console gates independently of each other:
   ```json
   {"scopes":{"tenant":[],"user":["offline_access","im:chat:read","im:chat.members:read",
   "im:message:readonly","im:message.group_msg:get_as_user","im:message.p2p_msg:get_as_user",
-  "im:message.reactions:read","task:task:read","wiki:space:retrieve","wiki:node:retrieve"]}}
+  "im:message.reactions:read","docx:document:readonly","task:task:read",
+  "wiki:space:retrieve","wiki:node:retrieve"]}}
   ```
 
 - Zero-trust corporate VPNs (aTrust / EasyConnect class) that map

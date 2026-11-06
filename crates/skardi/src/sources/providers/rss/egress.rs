@@ -2,14 +2,17 @@
 //!
 //! Feed URLs are agent-authored, i.e. attacker-influenceable, so *where* a
 //! fetch may connect is a policy decision. Skardi OSS does not make that
-//! decision: it ships only [`AllowAll`], and the fetcher reaches any address
+//! decision: its default is [`AllowAll`], and the fetcher reaches any address
 //! the host can route to (including link-local `169.254.169.254` and RFC 1918
 //! targets). An operator — or Skardi Cloud — supplies a real [`EgressPolicy`]
-//! through the fetcher's constructor to restrict egress; the reserved-range
-//! taxonomy that would refuse loopback/link-local/private/CGNAT/unique-local
-//! targets is Cloud policy, specified in the RSS Cloud egress design doc
-//! (`docs/superpowers/specs/2026-08-03-rss-cloud-egress-design.md`, added
-//! later in this stack), not shipped here.
+//! through the fetcher's constructor to restrict egress, either by embedding
+//! (`register_rss_tables_with_policy`) or, for a stock `skardi-server`, by
+//! listing ranges in the ctx's `rss.deny_cidrs`, which installs [`DenyCidrs`].
+//! That is a mechanism without a list: the reserved-range taxonomy that would
+//! refuse loopback/link-local/private/CGNAT/unique-local targets is Cloud
+//! policy, specified in the RSS Cloud egress design doc
+//! (`docs/superpowers/specs/2026-08-03-rss-cloud-egress-design.md`), and not
+//! shipped here.
 //!
 //! The seam is enforced at the DNS-resolver layer ([`PolicyDns`]) so an
 //! injected policy holds against DNS rebinding: reqwest only ever connects to
@@ -26,6 +29,7 @@ use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
+use ipnet::IpNet;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 
 /// Why a target was refused. A policy names the reason (e.g. `"link-local"`);
@@ -60,6 +64,113 @@ pub struct AllowAll;
 impl EgressPolicy for AllowAll {
     fn check_ip(&self, _ip: IpAddr) -> Result<(), EgressReason> {
         Ok(())
+    }
+}
+
+/// Refuses every address inside any of a fixed list of CIDR ranges — the
+/// policy `RssConfig::deny_cidrs` installs. A mechanism with no opinion: OSS
+/// ships no list, and an empty one refuses nothing (registration never builds
+/// this from an empty list, so the `None`/proxy-honoring default survives).
+///
+/// The reason names the matched range as written in config (normalized to its
+/// network address), so `feeds.last_error` reads e.g. `egress blocked: host
+/// 'evil.example' resolves to deny_cidrs 10.0.0.0/8 address 10.0.0.1`.
+///
+/// # Examples
+///
+/// ```
+/// use std::net::IpAddr;
+///
+/// use skardi::sources::providers::rss::{DenyCidrs, EgressPolicy, IpNet};
+///
+/// let ranges = ["127.0.0.0/8", "169.254.0.0/16"]
+///     .into_iter()
+///     .map(|range| range.parse::<IpNet>().unwrap());
+/// let policy = DenyCidrs::new(ranges);
+///
+/// // Refused, and the reason names the range that matched.
+/// let metadata: IpAddr = "169.254.169.254".parse().unwrap();
+/// assert_eq!(
+///     policy.check_ip(metadata).unwrap_err(),
+///     "deny_cidrs 169.254.0.0/16"
+/// );
+///
+/// // Outside every listed range, so it is allowed.
+/// let public: IpAddr = "93.184.216.34".parse().unwrap();
+/// assert!(policy.check_ip(public).is_ok());
+/// ```
+#[derive(Debug)]
+pub struct DenyCidrs {
+    nets: Vec<IpNet>,
+}
+
+impl DenyCidrs {
+    /// Builds a policy that refuses every address inside `nets`.
+    ///
+    /// Each range is normalized to its network address, so a range written
+    /// with host bits set is stored — and named in the refusal reason — as
+    /// the operator's intent rather than as typed: `10.0.0.1/8` becomes
+    /// `10.0.0.0/8`.
+    ///
+    /// An empty iterator builds a policy that refuses nothing. Registration
+    /// never does so from an empty `deny_cidrs`: it leaves the injected
+    /// policy exactly as given, which is how the `AllowAll` default and the
+    /// system proxy variables it honors survive untouched.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::net::IpAddr;
+    ///
+    /// use skardi::sources::providers::rss::{DenyCidrs, EgressPolicy, IpNet};
+    ///
+    /// // Host bits are normalized away, in the policy and in the reason.
+    /// let policy = DenyCidrs::new(["10.0.0.1/8".parse::<IpNet>().unwrap()]);
+    /// let private: IpAddr = "10.1.2.3".parse().unwrap();
+    /// assert_eq!(policy.check_ip(private).unwrap_err(), "deny_cidrs 10.0.0.0/8");
+    ///
+    /// // An empty list refuses nothing.
+    /// let empty = DenyCidrs::new(Vec::<IpNet>::new());
+    /// assert!(empty.check_ip("10.1.2.3".parse().unwrap()).is_ok());
+    /// ```
+    pub fn new(nets: impl IntoIterator<Item = IpNet>) -> Self {
+        Self {
+            nets: nets.into_iter().map(|net| net.trunc()).collect(),
+        }
+    }
+}
+
+impl EgressPolicy for DenyCidrs {
+    fn check_ip(&self, ip: IpAddr) -> Result<(), EgressReason> {
+        // Both call sites already canonicalize; doing it again here keeps the
+        // policy correct for a direct caller too. A V4 is also matched in its
+        // IPv4-mapped v6 spelling, so a range written as `::ffff:10.0.0.0/104`
+        // refuses `10.0.0.1` the way `10.0.0.0/8` does.
+        let ip = ip.to_canonical();
+        let mapped = match ip {
+            IpAddr::V4(v4) => Some(IpAddr::V6(v4.to_ipv6_mapped())),
+            IpAddr::V6(_) => None,
+        };
+        match self
+            .nets
+            .iter()
+            .find(|net| net.contains(&ip) || mapped.is_some_and(|m| net.contains(&m)))
+        {
+            Some(net) => Err(format!("deny_cidrs {net}").into()),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Every policy must allow an address for it to pass; the first refusal wins.
+/// What registration installs when a caller injects a policy *and* the config
+/// carries `deny_cidrs`: neither silently overrides the other.
+#[derive(Debug)]
+pub(crate) struct AllOf(pub(crate) Vec<Arc<dyn EgressPolicy>>);
+
+impl EgressPolicy for AllOf {
+    fn check_ip(&self, ip: IpAddr) -> Result<(), EgressReason> {
+        self.0.iter().try_for_each(|policy| policy.check_ip(ip))
     }
 }
 
@@ -214,6 +325,73 @@ mod tests {
         let policy = DenyV4("10.0.0.1".parse().unwrap());
         let addrs: Vec<SocketAddr> = vec!["[::ffff:10.0.0.1]:80".parse().unwrap()];
         assert!(check_addrs(&policy, "evil.example", addrs).is_err());
+    }
+
+    fn deny(cidrs: &[&str]) -> DenyCidrs {
+        DenyCidrs::new(cidrs.iter().map(|c| c.parse::<IpNet>().unwrap()))
+    }
+
+    #[test]
+    fn deny_cidrs_refuses_inside_and_names_the_range() {
+        let policy = deny(&["127.0.0.0/8", "10.0.0.0/8", "169.254.0.0/16", "fc00::/7"]);
+        for (ip, range) in [
+            ("127.0.0.1", "127.0.0.0/8"),
+            ("10.0.0.1", "10.0.0.0/8"),
+            ("169.254.169.254", "169.254.0.0/16"),
+            ("fd12::1", "fc00::/7"),
+        ] {
+            let reason = policy.check_ip(ip.parse().unwrap()).unwrap_err();
+            assert_eq!(reason, format!("deny_cidrs {range}"), "{ip}");
+        }
+        for ip in ["1.1.1.1", "11.0.0.1", "::1", "2606:4700::1111"] {
+            policy
+                .check_ip(ip.parse().unwrap())
+                .unwrap_or_else(|r| panic!("{ip} is outside every range, refused: {r}"));
+        }
+    }
+
+    #[test]
+    fn deny_cidrs_matches_ipv4_mapped_ipv6_as_ipv4() {
+        // A V4 range refuses the mapped-v6 spelling even when called directly
+        // (no canonicalizing call site in front of it)...
+        let policy = deny(&["10.0.0.0/8"]);
+        assert!(policy.check_ip("::ffff:10.0.0.1".parse().unwrap()).is_err());
+        // ...and a range written in mapped-v6 form refuses the plain V4.
+        let policy = deny(&["::ffff:10.0.0.0/104"]);
+        assert!(policy.check_ip("10.0.0.1".parse().unwrap()).is_err());
+        assert!(policy.check_ip("11.0.0.1".parse().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn deny_cidrs_reports_a_range_with_host_bits_by_its_network() {
+        let policy = deny(&["10.1.2.3/8"]);
+        let reason = policy.check_ip("10.9.9.9".parse().unwrap()).unwrap_err();
+        assert_eq!(reason, "deny_cidrs 10.0.0.0/8");
+    }
+
+    #[test]
+    fn empty_deny_cidrs_refuses_nothing() {
+        let policy = deny(&[]);
+        for ip in ["127.0.0.1", "169.254.169.254", "10.0.0.1", "::1"] {
+            assert!(policy.check_ip(ip.parse().unwrap()).is_ok(), "{ip}");
+        }
+    }
+
+    #[test]
+    fn all_of_needs_every_policy_to_allow() {
+        let policy = AllOf(vec![
+            Arc::new(deny(&["10.0.0.0/8"])),
+            Arc::new(DenyV4("1.1.1.1".parse().unwrap())),
+        ]);
+        assert_eq!(
+            policy.check_ip("10.0.0.1".parse().unwrap()).unwrap_err(),
+            "deny_cidrs 10.0.0.0/8"
+        );
+        assert_eq!(
+            policy.check_ip("1.1.1.1".parse().unwrap()).unwrap_err(),
+            "test-denied"
+        );
+        assert!(policy.check_ip("8.8.8.8".parse().unwrap()).is_ok());
     }
 
     #[test]

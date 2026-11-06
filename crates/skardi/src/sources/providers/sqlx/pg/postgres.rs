@@ -1,11 +1,13 @@
+use super::dialect::GovernedPostgresDialect;
 use crate::sources::DataSourceType;
 use crate::sources::hierarchy::{
-    HierarchyLevel, SourceLabel, build_catalog, parse_allowed_schemas, retry_with_timeout,
+    CONNECT_TIMEOUT, HierarchyLevel, SourceLabel, build_catalog, parse_allowed_schemas,
+    retry_with_timeout_budget,
 };
 use crate::sources::providers::sqlx::pg::knn_table_function::{PgKnnEntry, fetch_table_columns};
-use crate::sources::providers::{DatasetEntry, DatasetRegistry};
+use crate::sources::providers::{CountSafeTable, DatasetEntry, DatasetRegistry};
 use anyhow::{Context, Result};
-use arrow::array::{RecordBatch, UInt64Array};
+use arrow::array::{ListArray, RecordBatch, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::Session;
@@ -13,7 +15,7 @@ use datafusion::common::Constraints;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::logical_expr::{Expr, dml::InsertOp};
+use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, dml::InsertOp};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
@@ -23,18 +25,20 @@ use datafusion::physical_plan::{
 use datafusion::prelude::SessionContext;
 use datafusion::sql::TableReference;
 use datafusion::sql::unparser::Unparser;
-use datafusion::sql::unparser::dialect::PostgreSqlDialect;
 use datafusion_table_providers::postgres::DynPostgresConnectionPool;
 use datafusion_table_providers::sql::arrow_sql_gen::statement::InsertBuilder;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
 use datafusion_table_providers::sql::sql_provider_datafusion::SqlTable;
 use futures::{StreamExt, stream};
 use secrecy::SecretString;
-use sqlx::PgPool;
+use sqlx::{PgPool, postgres::PgPoolOptions};
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
+use std::num::NonZeroU32;
 use std::sync::Arc;
+use std::time::Duration;
+use url::{Url, form_urlencoded};
 
 /// Register PostgreSQL tables or a whole database (catalog) into a DataFusion [`SessionContext`].
 ///
@@ -56,8 +60,15 @@ use std::sync::Arc;
 /// * `table` - Table name (required in table mode)
 /// * `schema` - Schema name (default: "public")
 /// * `allowed_schemas` - Comma-separated schema allow-list (catalog mode only)
+/// * `governed_array_key_budget` - Measured array-overlap/unnest crossover (optional)
 /// * `user_env` - Environment variable name for username (optional)
 /// * `pass_env` - Environment variable name for password (optional)
+///
+/// PostgreSQL URL query parameters can also set `connection_pool_size` (read
+/// maximum), `write_connection_pool_size` (write/introspection maximum), and
+/// `connection_init_timeout_seconds` (per-attempt construction/introspection
+/// budget). Each is a positive integer. Unset options preserve the pool defaults
+/// and the five-second initialization budget.
 pub async fn register_postgres_tables(
     session_ctx: &mut SessionContext,
     name: &str,
@@ -102,17 +113,21 @@ pub async fn register_postgres_tables(
 
 /// Create both connection pools needed for a Postgres source.
 ///
-/// Returns `(read_pool, sqlx_pool)`. The `label` identifies the source (kind + mode + name)
-/// in retry tracing and error context. Each pool's construction is wrapped in
-/// [`retry_with_timeout`] for parity with the MySQL path.
+/// Returns the read pool, write/introspection pool and per-attempt initialization
+/// budget. A pooler may queue initialization behind an active transaction, so its
+/// explicit budget must cover both client construction and later introspection.
 async fn init_postgres_pools(
     connection_string: &str,
     options: Option<&HashMap<String, String>>,
     label: SourceLabel<'_>,
-) -> Result<(Arc<PostgresConnectionPool>, PgPool)> {
-    let pool_params = parse_connection_params(connection_string, options)?;
+) -> Result<(Arc<PostgresConnectionPool>, PgPool, Option<Duration>)> {
+    let settings = PostgresPoolSettings::parse(connection_string)?;
+    let init_timeout = settings.init_timeout.unwrap_or(CONNECT_TIMEOUT);
+    let mut pool_params = parse_connection_params(connection_string, options)?;
+    pool_params.remove("write_connection_pool_size");
+    pool_params.remove("connection_init_timeout_seconds");
     let read_pool = Arc::new(
-        retry_with_timeout(label, "read pool creation", || async {
+        retry_with_timeout_budget(label, "read pool creation", init_timeout, || async {
             PostgresConnectionPool::new(pool_params.clone())
                 .await
                 .map_err(|e| anyhow::anyhow!(e))
@@ -129,15 +144,18 @@ async fn init_postgres_pools(
     // Always build the sqlx pool: needed for schema introspection (handles pgvector and other
     // custom types), and reused for writes and KNN registry population when applicable.
     let sqlx_url = build_sqlx_connection_url(connection_string, options)?;
-    let sqlx_pool = retry_with_timeout(label, "sqlx pool creation", || async {
-        PgPool::connect(&sqlx_url)
-            .await
-            .map_err(|e| anyhow::anyhow!(e))
-    })
-    .await
-    .with_context(|| format!("Failed to create sqlx PgPool for '{}'", label.name))?;
+    let sqlx_pool =
+        retry_with_timeout_budget(label, "sqlx pool creation", init_timeout, || async {
+            settings
+                .sqlx_options()
+                .connect(&sqlx_url)
+                .await
+                .map_err(|e| anyhow::anyhow!(e))
+        })
+        .await
+        .with_context(|| format!("Failed to create sqlx PgPool for '{}'", label.name))?;
 
-    Ok((read_pool, sqlx_pool))
+    Ok((read_pool, sqlx_pool, settings.init_timeout))
 }
 
 /// Build a [`TableProvider`] for one table and optionally register it in the KNN registry.
@@ -152,18 +170,42 @@ async fn build_and_register_table(
     read_write: bool,
     pg_knn_registry: Option<&DatasetRegistry>,
     knn_key: &str,
+    init_timeout: Option<Duration>,
+    array_key_budget: Option<usize>,
 ) -> Result<Arc<dyn TableProvider>> {
     let table_reference = TableReference::partial(schema, table_name);
-    let table_provider =
-        build_postgres_table_provider(read_pool, table_reference, read_write, sqlx_pool).await?;
-
-    if let Some(registry) = pg_knn_registry {
-        register_table_in_knn_registry(sqlx_pool, registry, knn_key, schema, table_name)
+    let label = SourceLabel::new(DataSourceType::Postgres, HierarchyLevel::Table, knn_key);
+    let build = || async {
+        let table_provider = build_postgres_table_provider(
+            read_pool,
+            table_reference.clone(),
+            read_write,
+            sqlx_pool,
+            array_key_budget,
+        )
+        .await?;
+        if let Some(registry) = pg_knn_registry {
+            register_table_in_knn_registry(
+                sqlx_pool,
+                registry,
+                knn_key,
+                schema,
+                table_name,
+                array_key_budget,
+            )
             .await
             .with_context(|| format!("Failed to register '{}' in pg_knn registry", knn_key))?;
+        }
+        Ok(table_provider)
+    };
+    match init_timeout {
+        Some(budget) => {
+            retry_with_timeout_budget(label, "table introspection", budget, build).await
+        }
+        // Preserve the existing table-registration behavior for consumers that
+        // have not opted into an initialization budget.
+        None => build().await,
     }
-
-    Ok(table_provider)
 }
 
 /// Register one logical table (`options.table`) under `name` in the default catalog.
@@ -191,7 +233,8 @@ async fn register_single_postgres_table(
     })?;
 
     let label = SourceLabel::new(DataSourceType::Postgres, HierarchyLevel::Table, name);
-    let (read_pool, sqlx_pool) = init_postgres_pools(connection_string, options, label).await?;
+    let (read_pool, sqlx_pool, init_timeout) =
+        init_postgres_pools(connection_string, options, label).await?;
 
     let table_provider = build_and_register_table(
         &read_pool,
@@ -201,6 +244,8 @@ async fn register_single_postgres_table(
         read_write,
         pg_knn_registry,
         name,
+        init_timeout,
+        array_key_budget(options)?,
     )
     .await?;
 
@@ -240,12 +285,16 @@ async fn register_postgres_catalog(
         HierarchyLevel::Catalog,
         catalog_name,
     );
-    let (read_pool, sqlx_pool) = init_postgres_pools(connection_string, options, label).await?;
+    let (read_pool, sqlx_pool, init_timeout) =
+        init_postgres_pools(connection_string, options, label).await?;
 
     let allowed_schemas = parse_allowed_schemas(options);
-    let schema_tables = retry_with_timeout(label, "information_schema introspection", || async {
-        list_postgres_tables_in_catalog(&sqlx_pool, allowed_schemas.as_deref()).await
-    })
+    let schema_tables = retry_with_timeout_budget(
+        label,
+        "information_schema introspection",
+        init_timeout.unwrap_or(CONNECT_TIMEOUT),
+        || async { list_postgres_tables_in_catalog(&sqlx_pool, allowed_schemas.as_deref()).await },
+    )
     .await
     .with_context(|| {
         format!(
@@ -262,6 +311,7 @@ async fn register_postgres_catalog(
     }
 
     let table_count = schema_tables.len();
+    let array_key_budget = array_key_budget(options)?;
     let catalog_name_owned = catalog_name.to_string();
     let knn_registry = pg_knn_registry.map(Arc::clone);
 
@@ -284,6 +334,8 @@ async fn register_postgres_catalog(
                     read_write,
                     knn_registry.as_ref(),
                     &knn_key,
+                    init_timeout,
+                    array_key_budget,
                 )
                 .await
             }
@@ -311,6 +363,7 @@ async fn build_postgres_table_provider(
     table_reference: TableReference,
     read_write: bool,
     sqlx_pool: &PgPool,
+    array_key_budget: Option<usize>,
 ) -> Result<Arc<dyn TableProvider>> {
     let schema_name = table_reference
         .schema()
@@ -351,10 +404,19 @@ async fn build_postgres_table_provider(
 
     let dyn_pool: Arc<DynPostgresConnectionPool> =
         Arc::clone(read_pool) as Arc<DynPostgresConnectionPool>;
-    let read_provider: Arc<dyn TableProvider> = Arc::new(
-        SqlTable::new_with_schema("postgres", &dyn_pool, schema, table_reference.clone())
-            .with_dialect(Arc::new(PostgreSqlDialect {})),
-    );
+    // `SqlTable` unparses an EMPTY projection — what DataFusion asks for on an
+    // ungrouped `count(*)` — as `SELECT 1`, and reports a one-column Int64
+    // schema for it while the logical scan has no columns at all. The plan
+    // then fails to execute with `(physical) 1 vs (logical) 0`. Wrapping here,
+    // rather than inside `SqlxPostgresTableProvider`, covers BOTH
+    // registrations: the read-only one returns this provider directly, and the
+    // read-write one delegates its `scan` to it.
+    let read_provider: Arc<dyn TableProvider> = Arc::new(CountSafeTable {
+        inner: Arc::new(
+            SqlTable::new_with_schema("postgres", &dyn_pool, schema, table_reference.clone())
+                .with_dialect(Arc::new(GovernedPostgresDialect::new(array_key_budget))),
+        ),
+    });
 
     if !read_write {
         return Ok(read_provider);
@@ -390,6 +452,7 @@ async fn register_table_in_knn_registry(
     entry_name: &str,
     schema_name: &str,
     table_name: &str,
+    governed_array_key_budget: Option<usize>,
 ) -> Result<()> {
     let columns = fetch_table_columns(pool, schema_name, table_name)
         .await
@@ -410,6 +473,7 @@ async fn register_table_in_knn_registry(
         pool: Arc::new(pool.clone()),
         qualified_table,
         columns,
+        governed_array_key_budget,
     };
 
     registry
@@ -494,6 +558,64 @@ impl TableProvider for SqlxPostgresTableProvider {
         self.read_provider.constraints()
     }
 
+    /// Report what the read provider can express, but never `Exact`.
+    ///
+    /// **Why forward at all.** `TableProvider`'s default answers
+    /// `Unsupported` for every filter, so a wrapper that forwards `scan`
+    /// but not this one is handed an EMPTY filter slice: DataFusion keeps a
+    /// `Filter` node above the scan and evaluates every predicate locally,
+    /// after dragging the whole table across the wire. Reads through this
+    /// provider pushed down NOTHING — not `WHERE id = 1`, nothing — while
+    /// the same source registered read-only (a bare `SqlTable`, which does
+    /// implement this) pushed down normally. Same source, same SQL,
+    /// different plan, decided only by whether writes were enabled.
+    ///
+    /// **Why the verdict is clamped to `Inexact`.** This provider also
+    /// implements [`TableProvider::delete_from`] and
+    /// [`TableProvider::update`], and DataFusion builds their `WHERE` from
+    /// the filters it hands those methods. An `Exact` verdict tells the
+    /// optimizer the scan applies the predicate itself, so `PushDownFilter`
+    /// REMOVES the `Filter` node — and the DML methods are then invoked
+    /// with an empty filter list. Measured, on the CI fixtures:
+    ///
+    /// ```text
+    /// UPDATE users SET email = '…' WHERE name = 'Alice Smith'
+    ///   -- reaches Postgres as:
+    /// UPDATE public.users SET "email" = '…'
+    /// ```
+    ///
+    /// Every row, silently. `DELETE` degrades the same way. `Inexact` keeps
+    /// the `Filter` node in the plan, so the DML planner still has the
+    /// predicate to hand over, while the scan still receives the filters and
+    /// still renders them into the SQL it sends — the pushdown is real, it
+    /// is merely also re-checked locally, which costs a redundant pass over
+    /// rows Postgres has already narrowed.
+    ///
+    /// This matches the rule the DynamoDB and MongoDB providers already
+    /// follow for the same reason. It is a house rule for any provider that
+    /// serves DML through these methods, not a Postgres quirk.
+    ///
+    /// **Known limitation.** Because the `Filter` node survives, a predicate
+    /// that CANNOT be evaluated locally still fails here: the Postgres FTS
+    /// scalars (`to_tsvector`, `websearch_to_tsquery`) are registered to
+    /// error rather than return NULL, so a full-text query against a
+    /// read-write registration errors even with this fix. Full-text search
+    /// needs a read-only registration, which is what a serving engine uses.
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
+        Ok(self
+            .read_provider
+            .supports_filters_pushdown(filters)?
+            .into_iter()
+            .map(|verdict| match verdict {
+                TableProviderFilterPushDown::Exact => TableProviderFilterPushDown::Inexact,
+                other => other,
+            })
+            .collect())
+    }
+
     async fn scan(
         &self,
         state: &dyn Session,
@@ -547,7 +669,8 @@ impl TableProvider for SqlxPostgresTableProvider {
             ));
         }
 
-        let unparser = Unparser::new(&PostgreSqlDialect {});
+        let dialect = GovernedPostgresDialect::default();
+        let unparser = Unparser::new(&dialect);
         let set_clause = assignments
             .iter()
             .map(|(col, expr)| {
@@ -586,7 +709,7 @@ struct SqlxPostgresInsertExec {
     op: InsertOp,
     /// Output schema: single `count` column
     output_schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl SqlxPostgresInsertExec {
@@ -615,7 +738,7 @@ impl SqlxPostgresInsertExec {
             input,
             op,
             output_schema,
-            properties,
+            properties: Arc::new(properties),
         }
     }
 }
@@ -645,7 +768,7 @@ impl ExecutionPlan for SqlxPostgresInsertExec {
         Arc::clone(&self.output_schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -722,15 +845,7 @@ impl ExecutionPlan for SqlxPostgresInsertExec {
                     let filtered_batch = filter_batch_columns(&batch, &auto_gen_cols)?;
                     let num_rows = filtered_batch.num_rows() as u64;
 
-                    // Build INSERT SQL using InsertBuilder from datafusion-table-providers
-                    let batches = vec![filtered_batch];
-                    let insert_sql = InsertBuilder::new(&table_ref, &batches)
-                        .build_postgres(None)
-                        .map_err(|e| {
-                            DataFusionError::Execution(format!(
-                                "Failed to build INSERT statement: {e}"
-                            ))
-                        })?;
+                    let insert_sql = build_insert_sql(&table_ref, &filtered_batch)?;
 
                     // Execute via sqlx within the transaction
                     sqlx::query(&insert_sql)
@@ -758,6 +873,33 @@ impl ExecutionPlan for SqlxPostgresInsertExec {
             stream::once(future),
         )))
     }
+}
+
+/// The upstream primitive-list builder replaces NULL children with their
+/// storage values, while its reader cannot decode them. Refuse that unsupported
+/// input before building SQL instead of silently inserting a zero.
+fn build_insert_sql(table: &TableReference, batch: &RecordBatch) -> DataFusionResult<String> {
+    for (index, column) in batch.columns().iter().enumerate() {
+        if !matches!(column.data_type(), DataType::List(child) if child.data_type() == &DataType::Int64)
+        {
+            continue;
+        }
+        let lists = column.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
+            DataFusionError::Internal("bigint list column has no ListArray".into())
+        })?;
+        // Iterate logical list rows: slices may retain unrelated NULL children
+        // outside their offsets, and an outer NULL is a supported SQL NULL.
+        if lists.iter().flatten().any(|values| values.null_count() > 0) {
+            return Err(DataFusionError::NotImplemented(format!(
+                "PostgreSQL bigint[] INSERT does not support NULL elements (column {})",
+                batch.schema().field(index).name()
+            )));
+        }
+    }
+    let batches = vec![batch.clone()];
+    InsertBuilder::new(table, &batches)
+        .build_postgres(None)
+        .map_err(|e| DataFusionError::Execution(format!("Failed to build INSERT statement: {e}")))
 }
 
 /// Project out auto-generated columns from a RecordBatch.
@@ -789,7 +931,7 @@ struct SqlxPostgresDmlExec {
     sqlx_pool: PgPool,
     sql: String,
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl SqlxPostgresDmlExec {
@@ -809,7 +951,7 @@ impl SqlxPostgresDmlExec {
             sqlx_pool,
             sql,
             schema,
-            properties,
+            properties: Arc::new(properties),
         }
     }
 }
@@ -839,7 +981,7 @@ impl ExecutionPlan for SqlxPostgresDmlExec {
         Arc::clone(&self.schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -888,7 +1030,8 @@ fn build_where_clause(filters: &[Expr]) -> DataFusionResult<String> {
     if filters.is_empty() {
         return Ok(String::new());
     }
-    let unparser = Unparser::new(&PostgreSqlDialect {});
+    let dialect = GovernedPostgresDialect::default();
+    let unparser = Unparser::new(&dialect);
     let parts = filters
         .iter()
         .map(|e| {
@@ -900,6 +1043,18 @@ fn build_where_clause(filters: &[Expr]) -> DataFusionResult<String> {
     Ok(format!(" WHERE {}", parts.join(" AND ")))
 }
 
+/// No guessed crossover: callers opt in with their measured GIN key budget.
+fn array_key_budget(options: Option<&HashMap<String, String>>) -> Result<Option<usize>> {
+    options
+        .and_then(|options| options.get("governed_array_key_budget"))
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .context("PostgreSQL governed_array_key_budget must be a non-negative integer")
+        })
+        .transpose()
+}
+
 /// Quotes a PostgreSQL identifier with double quotes, escaping embedded double-quotes.
 fn quote_pg_ident(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
@@ -907,13 +1062,59 @@ fn quote_pg_ident(s: &str) -> String {
 
 // ─── Connection helpers ─────────────────────────────────────────────────────
 
+const ENGINE_POOL_PARAMETERS: &[&str] = &[
+    "connection_pool_size",
+    "write_connection_pool_size",
+    "connection_init_timeout_seconds",
+];
+
+#[derive(Debug, Default)]
+struct PostgresPoolSettings {
+    write_max: Option<NonZeroU32>,
+    init_timeout: Option<Duration>,
+}
+
+impl PostgresPoolSettings {
+    fn parse(connection_string: &str) -> Result<Self> {
+        let url = Url::parse(connection_string).context("Invalid PostgreSQL connection string")?;
+        let mut settings = Self::default();
+        for (key, value) in url.query_pairs() {
+            if !ENGINE_POOL_PARAMETERS.contains(&key.as_ref()) {
+                continue;
+            }
+            // Refuse zero before bb8/sqlx builders can panic or create a pool
+            // that cannot ever serve a request. Do not include values or DSNs
+            // in option validation errors: they may carry credentials.
+            let value = value
+                .parse::<NonZeroU32>()
+                .with_context(|| format!("PostgreSQL option '{key}' must be a positive integer"))?;
+            match key.as_ref() {
+                "write_connection_pool_size" => settings.write_max = Some(value),
+                "connection_init_timeout_seconds" => {
+                    settings.init_timeout = Some(Duration::from_secs(u64::from(value.get())));
+                }
+                _ => {}
+            }
+        }
+        Ok(settings)
+    }
+
+    fn sqlx_options(&self) -> PgPoolOptions {
+        let options = PgPoolOptions::new();
+        match self.write_max {
+            Some(maximum) => options.max_connections(maximum.get()),
+            None => options,
+        }
+    }
+}
+
 /// Build a sqlx-compatible connection URL from the same parameters used by the
 /// existing provider. Credentials come from environment variables only.
 fn build_sqlx_connection_url(
     connection_string: &str,
     options: Option<&HashMap<String, String>>,
 ) -> Result<String> {
-    let url = url::Url::parse(connection_string)
+    let url = Url::parse(connection_string)
         .with_context(|| format!("Invalid PostgreSQL connection string: {connection_string}"))?;
 
     let host = url.host_str().unwrap_or("localhost");
@@ -955,10 +1156,17 @@ fn build_sqlx_connection_url(
     }
     result.push_str(&format!("{host}:{port}/{db}"));
 
-    // Forward query parameters (sslmode, etc.)
-    if let Some(query) = url.query() {
+    // Engine controls are not PostgreSQL connection options. Keep them out of
+    // sqlx rather than relying on its handling of unknown URL parameters.
+    let query = form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(
+            url.query_pairs()
+                .filter(|(key, _)| !ENGINE_POOL_PARAMETERS.contains(&key.as_ref())),
+        )
+        .finish();
+    if !query.is_empty() {
         result.push('?');
-        result.push_str(query);
+        result.push_str(&query);
     }
 
     Ok(result)
@@ -970,7 +1178,7 @@ fn parse_connection_params(
     connection_string: &str,
     options: Option<&HashMap<String, String>>,
 ) -> Result<HashMap<String, SecretString>> {
-    let url = url::Url::parse(connection_string).with_context(|| {
+    let url = Url::parse(connection_string).with_context(|| {
         format!(
             "Invalid PostgreSQL connection string: {}",
             connection_string
@@ -1064,12 +1272,23 @@ async fn detect_auto_generated_columns(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{
-        BooleanArray, Float64Array, Int16Array, Int32Array, Int64Array, StringArray,
+    use crate::sources::providers::sqlx::pg::{
+        fts_exec::PgFtsExec, knn_exec::PgKnnExec, register_pg_fts_udfs, register_pg_fts_udtf,
+        register_pg_knn_udtf,
     };
+    use arrow::array::{
+        Array, BooleanArray, Float64Array, Int16Array, Int32Array, Int64Array, ListArray,
+        StringArray,
+    };
+    use arrow::datatypes::Int64Type;
     use datafusion::common::Column;
-    use datafusion::logical_expr::Operator;
+    use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::logical_expr::{Operator, TableProviderFilterPushDown};
+    use datafusion::physical_plan::empty::EmptyExec;
+    use datafusion::physical_plan::{collect, displayable};
     use secrecy::ExposeSecret;
+    use sqlx::postgres::PgPoolOptions;
+    use std::sync::{Mutex, RwLock};
 
     // ─── build_sqlx_connection_url tests ────────────────────────────────
 
@@ -1081,10 +1300,35 @@ mod tests {
 
     #[test]
     fn test_build_sqlx_connection_url_with_query_params() {
-        let url =
-            build_sqlx_connection_url("postgresql://localhost:5432/mydb?sslmode=require", None)
-                .unwrap();
+        let url = build_sqlx_connection_url(
+            "postgresql://localhost:5432/mydb?sslmode=require&connection_pool_size=2&write_connection_pool_size=2&connection_init_timeout_seconds=30",
+            None,
+        )
+        .unwrap();
         assert_eq!(url, "postgres://localhost:5432/mydb?sslmode=require");
+    }
+
+    #[test]
+    fn postgres_pool_controls_preserve_defaults_and_refuse_invalid_budgets() {
+        let defaults = PostgresPoolSettings::parse("postgres://localhost/db").unwrap();
+        assert_eq!(defaults.sqlx_options().get_max_connections(), 10);
+        assert_eq!(defaults.sqlx_options().get_min_connections(), 0);
+        assert_eq!(defaults.init_timeout, None);
+        let configured = PostgresPoolSettings::parse(
+            "postgres://localhost/db?connection_pool_size=2&write_connection_pool_size=2&connection_init_timeout_seconds=30",
+        )
+        .unwrap();
+        assert_eq!(configured.sqlx_options().get_max_connections(), 2);
+        assert_eq!(configured.init_timeout, Some(Duration::from_secs(30)));
+        for key in ENGINE_POOL_PARAMETERS {
+            for invalid in ["0", "-1", "not-an-integer", "4294967296"] {
+                let dsn = format!("postgres://localhost/db?{key}={invalid}");
+                assert!(
+                    PostgresPoolSettings::parse(&dsn).is_err(),
+                    "invalid {key} must fail before opening a database connection"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1800,6 +2044,27 @@ mod tests {
         .unwrap_or_else(|e| panic!("register {} failed: {}", table, e));
     }
 
+    /// The same table registered READ-ONLY — a bare `SqlTable`, with no
+    /// read-write wrapper and so no `Inexact` clamp.
+    async fn register_ci_table_read_only(ctx: &mut SessionContext, table: &str) {
+        let mut options = HashMap::new();
+        options.insert("table".to_string(), table.to_string());
+        options.insert("schema".to_string(), "public".to_string());
+        options.insert("user_env".to_string(), "PG_USER".to_string());
+        options.insert("pass_env".to_string(), "PG_PASSWORD".to_string());
+        register_postgres_tables(
+            ctx,
+            table,
+            "postgresql://127.0.0.1:5432/mydb?sslmode=disable",
+            Some(&options),
+            false,
+            None,
+            HierarchyLevel::Table,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("register {} read-only failed: {}", table, e));
+    }
+
     async fn query_all(ctx: &SessionContext, sql: &str) -> Vec<RecordBatch> {
         let df = ctx.sql(sql).await.expect("parse sql");
         df.collect().await.expect("collect results")
@@ -1807,6 +2072,272 @@ mod tests {
 
     fn total_rows(batches: &[RecordBatch]) -> usize {
         batches.iter().map(|b| b.num_rows()).sum()
+    }
+
+    fn search_sql(plan: &dyn ExecutionPlan) -> Option<String> {
+        if let Some(exec) = plan.as_any().downcast_ref::<PgKnnExec>() {
+            return Some(exec.build_query());
+        }
+        if let Some(exec) = plan.as_any().downcast_ref::<PgFtsExec>() {
+            return Some(exec.build_query());
+        }
+        plan.children()
+            .into_iter()
+            .find_map(|child| search_sql(child.as_ref()))
+    }
+
+    // Covers the real schema/insert/scan path: string snapshots alone cannot
+    // detect a List child-name mismatch or SQL that PostgreSQL rejects.
+    #[tokio::test]
+    async fn bigint_arrays_round_trip_and_membership_pushdown_preserves_nulls() {
+        let (Ok(user), Ok(password)) = (std::env::var("PG_USER"), std::env::var("PG_PASSWORD"))
+        else {
+            return;
+        };
+        let pool = PgPool::connect(&format!(
+            "postgres://{user}:{password}@127.0.0.1:5432/mydb?sslmode=disable"
+        ))
+        .await
+        .expect("CI PostgreSQL service");
+        sqlx::raw_sql(
+            "CREATE EXTENSION IF NOT EXISTS vector;
+             DROP TABLE IF EXISTS public.acl_array_probe;
+             CREATE TABLE public.acl_array_probe (
+               id BIGINT, readers BIGINT[], other TEXT[],
+               body TEXT DEFAULT 'fixture', embedding vector(2) DEFAULT '[0,0]'
+             );
+             INSERT INTO public.acl_array_probe (id, readers, other) VALUES
+               (1, '{10,20}', '{a}'), (2, '{30}', '{b}'), (3, '{}', '{}'),
+               (4, NULL, NULL), (NULL, '{20,NULL}', NULL);",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed membership fixture");
+
+        let columns = fetch_table_columns(&pool, "public", "acl_array_probe")
+            .await
+            .unwrap();
+        assert_eq!(
+            columns[1].1,
+            DataType::List(Arc::new(Field::new("item", DataType::Int64, true)))
+        );
+        assert_eq!(
+            columns[2].1,
+            DataType::Utf8,
+            "other arrays keep their existing mapping"
+        );
+        // Only the mapping is under test for other array types; their existing
+        // Utf8 fallback is not a new array decoder for table/search scans.
+        sqlx::query("ALTER TABLE public.acl_array_probe DROP COLUMN other")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        for budget in [None, Some(1)] {
+            let mut options = HashMap::from([
+                ("table".to_string(), "acl_array_probe".to_string()),
+                ("user_env".to_string(), "PG_USER".to_string()),
+                ("pass_env".to_string(), "PG_PASSWORD".to_string()),
+            ]);
+            if let Some(budget) = budget {
+                options.insert("governed_array_key_budget".to_string(), budget.to_string());
+            }
+            let mut ctx = SessionContext::new();
+            let registry = Arc::new(RwLock::new(HashMap::new()));
+            register_postgres_tables(
+                &mut ctx,
+                "probe",
+                "postgresql://127.0.0.1:5432/mydb?sslmode=disable",
+                Some(&options),
+                false,
+                Some(&registry),
+                HierarchyLevel::Table,
+            )
+            .await
+            .unwrap();
+            register_pg_knn_udtf(&ctx, Arc::clone(&registry));
+            register_pg_fts_udtf(&ctx, registry);
+
+            for source in [
+                "probe",
+                "pg_fts('probe', 'body', 'fixture', 20)",
+                "pg_knn('probe', 'embedding', [0.0,0.0], '<->', 20)",
+            ] {
+                for (predicate, expected) in [
+                    ("array_has_any(readers, [10,20])", vec![Some(1), None]),
+                    (
+                        "NOT array_has_any(readers, [10,20])",
+                        vec![Some(2), Some(3)],
+                    ),
+                    ("array_has_any(readers, [10,20]) IS NULL", vec![Some(4)]),
+                    ("array_has_any(readers, [])", vec![]),
+                ] {
+                    let frame = ctx
+                        .sql(&format!(
+                            "SELECT id FROM {source} WHERE {predicate} ORDER BY id NULLS LAST"
+                        ))
+                        .await
+                        .unwrap();
+                    let plan = frame.create_physical_plan().await.unwrap();
+                    let rendered = search_sql(plan.as_ref())
+                        .unwrap_or_else(|| format!("{}", displayable(plan.as_ref()).indent(false)));
+                    if predicate == "array_has_any(readers, [10,20])" {
+                        assert!(
+                            rendered.contains(if budget.is_some() { "EXISTS" } else { "&&" }),
+                            "native SQL missing: {rendered}"
+                        );
+                    }
+                    let batches = query_all(
+                        &ctx,
+                        &format!(
+                            "SELECT id FROM {source} WHERE {predicate} ORDER BY id NULLS LAST"
+                        ),
+                    )
+                    .await;
+                    let values = batches
+                        .iter()
+                        .flat_map(|batch| {
+                            batch
+                                .column(0)
+                                .as_any()
+                                .downcast_ref::<Int64Array>()
+                                .unwrap()
+                                .iter()
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        values, expected,
+                        "source={source}, predicate={predicate}, budget={budget:?}"
+                    );
+                }
+            }
+        }
+
+        let mut ctx = SessionContext::new();
+        let mut options = HashMap::from([
+            ("table".to_string(), "acl_array_probe".to_string()),
+            ("user_env".to_string(), "PG_USER".to_string()),
+            ("pass_env".to_string(), "PG_PASSWORD".to_string()),
+        ]);
+        options.insert("governed_array_key_budget".to_string(), "1".to_string());
+        register_postgres_tables(
+            &mut ctx,
+            "probe",
+            "postgresql://127.0.0.1:5432/mydb?sslmode=disable",
+            Some(&options),
+            true,
+            None,
+            HierarchyLevel::Table,
+        )
+        .await
+        .unwrap();
+        query_all(
+            &ctx,
+            "INSERT INTO probe (id, readers) VALUES
+             (5, [10, 9223372036854775807]), (6, []), (7, NULL)",
+        )
+        .await;
+        let batches = query_all(&ctx, "SELECT readers FROM probe WHERE id = 5").await;
+        let list = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert_eq!(
+            list.data_type(),
+            &DataType::List(Arc::new(Field::new("item", DataType::Int64, true)))
+        );
+        assert_eq!(
+            list.value(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some(10), Some(i64::MAX)]
+        );
+        let empty_and_null = query_all(
+            &ctx,
+            "SELECT readers FROM probe WHERE id IN (6,7) ORDER BY id",
+        )
+        .await;
+        let arrays = empty_and_null[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert!(!arrays.is_null(0));
+        assert_eq!(arrays.value_length(0), 0);
+        assert!(arrays.is_null(1));
+        let row = sqlx::query("SELECT readers FROM public.acl_array_probe WHERE id = 5")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "readers",
+            columns[1].1.clone(),
+            true,
+        )]));
+        assert_eq!(
+            super::super::utils::rows_to_batch(&[row], &schema)
+                .unwrap()
+                .column(0)
+                .to_data(),
+            list.to_data()
+        );
+        // The first batch is a slice whose backing child array has a NULL
+        // outside its offsets. It is valid and is inserted before the second
+        // batch fails; the whole existing INSERT transaction must roll back.
+        let lists = ListArray::from_iter_primitive::<Int64Type, _, _>([
+            Some(vec![Some(10), None]),
+            Some(vec![Some(8)]),
+        ]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("readers", lists.data_type().clone(), true),
+        ]));
+        let good = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![8])),
+                Arc::new(lists.slice(1, 1)),
+            ],
+        )
+        .unwrap();
+        let bad = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![9])),
+                Arc::new(lists.slice(0, 1)),
+            ],
+        )
+        .unwrap();
+        let table = TableReference::partial("public", "acl_array_probe");
+        assert!(build_insert_sql(&table, &good).is_ok());
+        let input = MemorySourceConfig::try_new_exec(&[vec![good, bad]], schema, None).unwrap();
+        let writer =
+            SqlxPostgresInsertExec::new(pool.clone(), table, vec![], input, InsertOp::Append);
+        let error = collect(Arc::new(writer), ctx.task_ctx()).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("bigint[] INSERT does not support NULL elements"),
+            "{error}"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM public.acl_array_probe WHERE id IN (8,9)"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0,
+            "a rejected NULL child must not leave either batch committed"
+        );
+        sqlx::query("DROP TABLE public.acl_array_probe")
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 
     // ─── Scan tests (integration) ───────────────────────────────────────
@@ -1864,6 +2395,64 @@ mod tests {
 
         let batches = query_all(&ctx, "SELECT id FROM users LIMIT 2").await;
         assert_eq!(total_rows(&batches), 2);
+    }
+
+    /// An ungrouped `count(*)` is the one query shape that asks the scan for
+    /// no columns at all, and it used to be the one shape a Postgres source
+    /// could not answer. The assertion is against `count(id)` rather than a
+    /// literal, because `id` is `NOT NULL` in the fixture, so the two must
+    /// agree whatever the fixture's size — and `count(id)` is exactly the
+    /// workaround users were told to write instead.
+    #[tokio::test]
+    #[ignore]
+    async fn count_star_matches_count_of_a_not_null_column() {
+        let mut ctx = SessionContext::new();
+        register_ci_table(&mut ctx, "users").await;
+
+        let star = query_all(&ctx, "SELECT count(*) FROM users").await;
+        let column = query_all(&ctx, "SELECT count(id) FROM users").await;
+        assert_eq!(scalar_count(&star), scalar_count(&column));
+        assert!(
+            scalar_count(&star) >= 3,
+            "the fixture seeds at least 3 rows"
+        );
+    }
+
+    /// The same query against a read-only registration, which returns the
+    /// read provider directly instead of going through
+    /// [`SqlxPostgresTableProvider`]. Both paths have to be covered, and
+    /// they are covered by the same wrapper only because it sits on the read
+    /// provider itself.
+    #[tokio::test]
+    #[ignore]
+    async fn count_star_works_against_a_read_only_registration() {
+        let mut ctx = SessionContext::new();
+        register_ci_table_read_only(&mut ctx, "users").await;
+
+        let star = query_all(&ctx, "SELECT count(*) FROM users").await;
+        let column = query_all(&ctx, "SELECT count(id) FROM users").await;
+        assert_eq!(scalar_count(&star), scalar_count(&column));
+    }
+
+    /// A `count(*)` narrowed by a predicate still has an empty projection,
+    /// and the filter has to survive the wrapper's detour through one column.
+    #[tokio::test]
+    #[ignore]
+    async fn count_star_still_honours_a_filter() {
+        let mut ctx = SessionContext::new();
+        register_ci_table(&mut ctx, "users").await;
+
+        let filtered = query_all(&ctx, "SELECT count(*) FROM users WHERE id = 1").await;
+        assert_eq!(scalar_count(&filtered), 1);
+    }
+
+    fn scalar_count(batches: &[RecordBatch]) -> i64 {
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("count() is Int64")
+            .value(0)
     }
 
     // ─── Insert test (integration) ──────────────────────────────────────
@@ -2207,6 +2796,63 @@ mod tests {
         assert!(total_rows(&batches) >= 3);
     }
 
+    /// The other half of the documented contract: the predicate the guide
+    /// tells users to write DOES work against a read-only source. Without
+    /// this, the guidance "use a read-only registration" would be advice
+    /// nothing verifies.
+    #[tokio::test]
+    #[ignore]
+    async fn raw_fts_predicate_works_against_a_read_only_registration() {
+        let mut ctx = SessionContext::new();
+        register_ci_table_read_only(&mut ctx, "articles").await;
+        register_pg_fts_udfs(&ctx);
+
+        let batches = query_all(
+            &ctx,
+            "SELECT id, title FROM articles \
+             WHERE to_tsvector('english', body) @@ \
+                   websearch_to_tsquery('english', 'database')",
+        )
+        .await;
+        // The seeded corpus has exactly one article about databases.
+        assert_eq!(total_rows(&batches), 1);
+    }
+
+    /// The documented limitation of `docs/postgres/README.md`'s raw-SQL FTS
+    /// section, pinned against a real database.
+    ///
+    /// A read-write registration reports its filters `Inexact` (see
+    /// `supports_filters_pushdown`), which keeps a LOCAL copy of the
+    /// predicate in the plan. For an ordinary column that is a redundant
+    /// re-check; for the FTS scalars it is fatal, because the local copy
+    /// invokes them and they refuse to run. The guide tells users raw FTS
+    /// needs a read-only source — this is the test that keeps that true.
+    #[tokio::test]
+    #[ignore]
+    async fn raw_fts_predicate_fails_against_a_read_write_registration() {
+        let mut ctx = SessionContext::new();
+        register_ci_table(&mut ctx, "articles").await;
+        register_pg_fts_udfs(&ctx);
+
+        let err = ctx
+            .sql(
+                "SELECT id, title FROM articles \
+                 WHERE to_tsvector('english', body) @@ \
+                       websearch_to_tsquery('english', 'database')",
+            )
+            .await
+            .expect("the statement PLANS — only execution fails")
+            .collect()
+            .await
+            .expect_err("a read-write registration cannot execute this predicate");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("this query was not pushed down"),
+            "the refusal must name the cause: {message}"
+        );
+    }
+
     #[tokio::test]
     #[ignore]
     async fn test_cross_table_join() {
@@ -2335,5 +2981,172 @@ mod tests {
         assert!(field_names.contains(&"user_id"));
         assert!(field_names.contains(&"user_name"));
         assert!(field_names.contains(&"total_orders"));
+    }
+
+    // ─── read-write filter pushdown ─────────────────────────────────────
+
+    /// A stand-in for `SqlTable`, reporting a fixed verdict so the WRAPPER's
+    /// handling is what is under test rather than the inner provider's logic.
+    #[derive(Debug)]
+    struct PushdownProbe {
+        verdict: TableProviderFilterPushDown,
+        /// Filters the last `scan` was handed, so a test can assert the
+        /// CONSEQUENCE of the forwarding and not merely the verdict.
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl PushdownProbe {
+        fn new(verdict: TableProviderFilterPushDown) -> Self {
+            Self {
+                verdict,
+                seen: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl TableProvider for PushdownProbe {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn schema(&self) -> SchemaRef {
+            Arc::new(Schema::new(vec![Field::new("body", DataType::Utf8, true)]))
+        }
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+        fn supports_filters_pushdown(
+            &self,
+            filters: &[&Expr],
+        ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
+            Ok(vec![self.verdict.clone(); filters.len()])
+        }
+        async fn scan(
+            &self,
+            _state: &dyn Session,
+            _projection: Option<&Vec<usize>>,
+            filters: &[Expr],
+            _limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            *self.seen.lock().unwrap() = filters.iter().map(|f| f.to_string()).collect();
+            Ok(Arc::new(EmptyExec::new(self.schema())))
+        }
+    }
+
+    /// Lazy: constructing a pool performs no I/O, and these tests never
+    /// reach a write path.
+    fn rw_provider_over(probe: Arc<PushdownProbe>) -> SqlxPostgresTableProvider {
+        SqlxPostgresTableProvider {
+            read_provider: probe,
+            sqlx_pool: PgPoolOptions::new()
+                .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+                .expect("lazy pool"),
+            table_reference: TableReference::bare("docs"),
+            auto_generated_columns: Vec::new(),
+        }
+    }
+
+    /// The wrapper reports what the read provider can express — **except**
+    /// that `Exact` is clamped to `Inexact`, because this provider also
+    /// serves UPDATE and DELETE through `TableProvider` and an `Exact`
+    /// verdict strips the `Filter` node those methods build their `WHERE`
+    /// from. See `supports_filters_pushdown`'s doc for the measured
+    /// full-table `UPDATE` that results.
+    #[rstest::rstest]
+    #[case::exact_is_clamped_so_dml_keeps_its_predicate(
+        TableProviderFilterPushDown::Exact,
+        TableProviderFilterPushDown::Inexact
+    )]
+    #[case::inexact_passes_through(
+        TableProviderFilterPushDown::Inexact,
+        TableProviderFilterPushDown::Inexact
+    )]
+    #[case::unsupported_passes_through(
+        TableProviderFilterPushDown::Unsupported,
+        TableProviderFilterPushDown::Unsupported
+    )]
+    #[tokio::test]
+    async fn read_write_wrapper_reports(
+        #[case] read_provider_says: TableProviderFilterPushDown,
+        #[case] wrapper_reports: TableProviderFilterPushDown,
+    ) {
+        let filter = Expr::Column(Column::from_name("body"));
+        let provider = rw_provider_over(Arc::new(PushdownProbe::new(read_provider_says)));
+        assert_eq!(
+            provider.supports_filters_pushdown(&[&filter]).unwrap(),
+            vec![wrapper_reports]
+        );
+    }
+
+    /// The arity contract: one verdict per filter, in order.
+    #[tokio::test]
+    async fn read_write_wrapper_answers_once_per_filter() {
+        let a = Expr::Column(Column::from_name("body"));
+        let b = Expr::Column(Column::from_name("path"));
+        let provider = rw_provider_over(Arc::new(PushdownProbe::new(
+            TableProviderFilterPushDown::Exact,
+        )));
+        assert_eq!(
+            provider.supports_filters_pushdown(&[&a, &b]).unwrap().len(),
+            2
+        );
+    }
+
+    /// The point of forwarding: a predicate must REACH the read provider's
+    /// `scan`, so it lands in the SQL actually sent. Checking the verdict
+    /// alone only tests the accessor; an empty slice here is what made
+    /// read-write registrations pull whole tables.
+    #[tokio::test]
+    async fn a_predicate_reaches_the_read_providers_scan_in_read_write_mode() {
+        let probe = Arc::new(PushdownProbe::new(TableProviderFilterPushDown::Exact));
+        let seen = Arc::clone(&probe.seen);
+        let ctx = SessionContext::new();
+        ctx.register_table("docs", Arc::new(rw_provider_over(probe)))
+            .expect("register");
+        ctx.sql("SELECT body FROM docs WHERE body = 'needle'")
+            .await
+            .expect("plans")
+            .collect()
+            .await
+            .expect("executes");
+        let seen = seen.lock().unwrap().clone();
+        assert!(
+            seen.iter().any(|f| f.contains("needle")),
+            "the predicate must reach the read provider's scan; an empty \
+             slice means DataFusion is filtering locally: {seen:?}"
+        );
+    }
+
+    /// The regression guard for the bug this clamp exists to prevent.
+    ///
+    /// DataFusion derives a DML statement's `WHERE` from the filters it
+    /// hands `delete_from` / `update`, and it only has them to hand over
+    /// while the `Filter` node is still in the plan. An `Exact` verdict
+    /// removes that node, and the measured result was
+    /// `UPDATE public.users SET "email" = '…'` — every row — from a
+    /// statement written `WHERE name = 'Alice Smith'`.
+    ///
+    /// Asserting on the physical plan keeps this honest without a database:
+    /// the live proof is the `#[ignore]`d Postgres suite above, which CI
+    /// runs and which failed on all ten write tests when this was `Exact`.
+    #[tokio::test]
+    async fn the_filter_node_survives_so_update_and_delete_keep_their_where() {
+        let probe = Arc::new(PushdownProbe::new(TableProviderFilterPushDown::Exact));
+        let ctx = SessionContext::new();
+        ctx.register_table("docs", Arc::new(rw_provider_over(probe)))
+            .expect("register");
+        let plan = ctx
+            .sql("SELECT body FROM docs WHERE body = 'needle'")
+            .await
+            .expect("plans")
+            .create_physical_plan()
+            .await
+            .expect("physical plan");
+        let rendered = format!("{}", displayable(plan.as_ref()).indent(false));
+        assert!(
+            rendered.contains("FilterExec"),
+            "the Filter node must survive, or UPDATE/DELETE lose their \
+             WHERE and rewrite the whole table:\n{rendered}"
+        );
     }
 }

@@ -27,16 +27,21 @@ use futures::StreamExt;
 use object_store::path::Path as OsPath;
 #[cfg(feature = "documents")]
 use object_store::{Attribute, Attributes, PutOptions, PutPayload};
-use object_store::{ObjectMeta, ObjectStore};
+use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt};
 
 /// A parsed source/target location: either a local path or an S3 object.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Loc {
     Local(PathBuf),
-    /// `key` never has a leading `/`.
+    /// `key` is the object's exact store [`OsPath`]: for a listed object it is
+    /// the `ObjectMeta.location` the listing returned, carried as-is. It is never
+    /// rebuilt from a name or string, because `OsPath::from` / `OsPath::child`
+    /// percent-encode (non-ASCII bytes, `%`, `#`, ...) and would then address a
+    /// different key than the one that was written (NoSuchKey on raw keys,
+    /// `%25`-double-encoding on already-encoded ones). Never has a leading `/`.
     S3 {
         bucket: String,
-        key: String,
+        key: OsPath,
     },
 }
 
@@ -54,7 +59,7 @@ impl Loc {
             }
             return Ok(Loc::S3 {
                 bucket: bucket.to_string(),
-                key: key.to_string(),
+                key: raw_object_path(key),
             });
         }
         if let Some(path) = uri.strip_prefix("file://") {
@@ -62,6 +67,20 @@ impl Loc {
         }
         Ok(Loc::Local(PathBuf::from(uri)))
     }
+}
+
+/// The store path for a raw object key taken from a URI: the key verbatim, with
+/// no percent-encoding, so `s3://b/docs/团体.pdf` addresses the object whose S3
+/// key is literally `docs/团体.pdf` (as listed, and as written by a raw writer).
+/// ASCII keys without special characters are byte-identical either way.
+///
+/// Only a key `OsPath::parse` rejects (an empty, `.` or `..` segment, or an ASCII
+/// control character) falls back to the old lossy `OsPath::from`, which drops
+/// empty segments and escapes the rest. Such a key is not a valid listed
+/// location either (the S3 client parses listed keys with `OsPath::parse`), so
+/// the fallback only keeps a malformed configured prefix behaving as before.
+fn raw_object_path(key: &str) -> OsPath {
+    OsPath::parse(key).unwrap_or_else(|_| OsPath::from(key))
 }
 
 /// How [`BlobStore::list`] walks a prefix.
@@ -249,7 +268,7 @@ impl BlobStore {
             },
             (BlobStore::Remote(store), Loc::S3 { key, .. }) => {
                 let res = store
-                    .get(&OsPath::from(key.as_str()))
+                    .get(key)
                     .await
                     .with_context(|| format!("s3 get {key}"))?;
                 // The listing's size is a snapshot; this one comes with the
@@ -258,7 +277,7 @@ impl BlobStore {
                 if let Some(max) = opts.max_bytes {
                     if res.meta.size > max {
                         return Err(SizeCapExceeded {
-                            target: key.clone(),
+                            target: key.to_string(),
                             max_bytes: max,
                         }
                         .into());
@@ -280,7 +299,7 @@ impl BlobStore {
                     if let Some(max) = opts.max_bytes {
                         if buf.len() as u64 + chunk.len() as u64 > max {
                             return Err(SizeCapExceeded {
-                                target: key.clone(),
+                                target: key.to_string(),
                                 max_bytes: max,
                             }
                             .into());
@@ -309,7 +328,7 @@ impl BlobStore {
             }
             (BlobStore::Remote(store), Loc::S3 { key, .. }) => {
                 let mut attributes = Attributes::new();
-                if let Some(ct) = content_type_for_key(key) {
+                if let Some(ct) = content_type_for_key(key.as_ref()) {
                     attributes.insert(Attribute::ContentType, ct.into());
                 }
                 let opts = PutOptions {
@@ -317,11 +336,7 @@ impl BlobStore {
                     ..Default::default()
                 };
                 store
-                    .put_opts(
-                        &OsPath::from(key.as_str()),
-                        PutPayload::from(bytes.to_vec()),
-                        opts,
-                    )
+                    .put_opts(key, PutPayload::from(bytes.to_vec()), opts)
                     .await
                     .with_context(|| format!("s3 put {key}"))?;
                 Ok(())
@@ -625,18 +640,18 @@ fn read_local_no_follow(_root: &Path, path: &Path, _max_bytes: Option<u64>) -> R
 async fn list_remote(
     store: &Arc<dyn ObjectStore>,
     bucket: &str,
-    prefix_key: &str,
+    prefix_key: &OsPath,
     recursive: bool,
 ) -> Result<Vec<BlobEntry>> {
-    let norm = normalize_prefix(prefix_key);
-    let os_prefix = (!norm.is_empty()).then(|| OsPath::from(norm.as_str()));
+    let norm = normalize_prefix(prefix_key.as_ref());
+    let os_prefix = (!norm.is_empty()).then(|| prefix_key.clone());
 
     let mut out: Vec<BlobEntry> = Vec::new();
     if recursive {
         let mut stream = store.list(os_prefix.as_ref());
         while let Some(meta) = stream.next().await {
             let meta = meta.context("s3 list")?;
-            push_remote_entry(&mut out, bucket, &norm, &meta, false);
+            push_remote_entry(&mut out, bucket, &norm, meta, false);
         }
     } else {
         let res = store
@@ -644,7 +659,7 @@ async fn list_remote(
             .await
             .context("s3 list_with_delimiter")?;
         for meta in res.objects {
-            push_remote_entry(&mut out, bucket, &norm, &meta, true);
+            push_remote_entry(&mut out, bucket, &norm, meta, true);
         }
     }
     out.sort_by(|a, b| a.rel_key.cmp(&b.rel_key));
@@ -654,11 +669,14 @@ async fn list_remote(
 /// Append one S3 object to the accumulator, stripping `norm` to the rel key.
 /// Skips the zero-length "folder marker" (rel == "") and, when `single_level`,
 /// any nested key that slipped through.
+///
+/// The listed `ObjectMeta.location` becomes the [`Loc`] key as-is, so the later
+/// `get` fetches exactly the object the listing returned.
 fn push_remote_entry(
     out: &mut Vec<BlobEntry>,
     bucket: &str,
     norm: &str,
-    meta: &ObjectMeta,
+    meta: ObjectMeta,
     single_level: bool,
 ) {
     let full_key: &str = meta.location.as_ref();
@@ -673,7 +691,7 @@ fn push_remote_entry(
     out.push(BlobEntry {
         loc: Loc::S3 {
             bucket: bucket.to_string(),
-            key: full_key.to_string(),
+            key: meta.location,
         },
         rel_key,
         size: meta.size,
@@ -700,7 +718,7 @@ mod tests {
             Loc::parse("s3://my-bucket/corpus/a.pdf").unwrap(),
             Loc::S3 {
                 bucket: "my-bucket".to_string(),
-                key: "corpus/a.pdf".to_string(),
+                key: OsPath::parse("corpus/a.pdf").unwrap(),
             }
         );
     }
@@ -711,14 +729,14 @@ mod tests {
             Loc::parse("s3://my-bucket").unwrap(),
             Loc::S3 {
                 bucket: "my-bucket".to_string(),
-                key: String::new(),
+                key: OsPath::ROOT,
             }
         );
         assert_eq!(
             Loc::parse("s3://my-bucket/").unwrap(),
             Loc::S3 {
                 bucket: "my-bucket".to_string(),
-                key: String::new(),
+                key: OsPath::ROOT,
             }
         );
     }
@@ -868,7 +886,7 @@ mod tests {
         // Loc carries the full key.
         assert!(matches!(
             &listed[0].loc,
-            Loc::S3 { bucket, key } if bucket == "bk" && key == "corpus/a.pdf"
+            Loc::S3 { bucket, key } if bucket == "bk" && key.as_ref() == "corpus/a.pdf"
         ));
 
         // Non-recursive drops the nested entry.
@@ -915,6 +933,44 @@ mod tests {
                 b"\x89PNGcrop"
             );
         }
+    }
+
+    /// A ref URI carrying a hostile name must write and read the object whose
+    /// key is that string verbatim — the same key a listing of the bucket
+    /// returns — not a percent-encoded or normalised variant of it. Gated on
+    /// `documents`: it is the only writer, and it owns the fixture names.
+    #[cfg(feature = "documents")]
+    #[tokio::test]
+    async fn remote_uri_keys_address_the_raw_object_key() {
+        use super::super::documents::HOSTILE_OBJECT_NAMES;
+
+        let mem = Arc::new(object_store::memory::InMemory::new());
+        let blob = BlobStore::Remote(mem.clone());
+        for name in HOSTILE_OBJECT_NAMES {
+            let key = format!("extracted/{name}_page_1.png");
+            let uri = format!("s3://bk/{key}");
+            let loc = Loc::parse(&uri).unwrap();
+            blob.put(&loc, name.as_bytes()).await.unwrap();
+            let raw = OsPath::parse(&key)
+                .unwrap_or_else(|e| panic!("Path::parse rejects fixture name {name:?}: {e}"));
+            mem.head(&raw)
+                .await
+                .unwrap_or_else(|e| panic!("{uri:?} not stored at raw key {key:?}: {e}"));
+            assert_eq!(
+                blob.get(&loc, ReadOptions::follow()).await.unwrap(),
+                name.as_bytes()
+            );
+        }
+        // NFC and NFD stay two objects.
+        assert_eq!(mem.list(None).count().await, HOSTILE_OBJECT_NAMES.len());
+        // ASCII keys are unchanged by the raw parse.
+        assert_eq!(
+            Loc::parse("s3://bk/corpus/a.pdf").unwrap(),
+            Loc::S3 {
+                bucket: "bk".into(),
+                key: OsPath::from("corpus/a.pdf"),
+            }
+        );
     }
 
     #[test]

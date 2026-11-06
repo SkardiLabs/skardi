@@ -10,7 +10,7 @@ tables:
   conversations:
     action: slack.list_conversations
     row_path: "$.conversations"
-    fingerprint: 2d4e5cee7cf87f146ab7848849f97a559ba44ff09350295e0dc50b75abf0ef84
+    fingerprint: 780f342067b2c4798b004f1ab8cd7e8eaf1c744f07054b1fff3f03c480d45d2f
     pagination:
       strategy: cursor
       page_size_input: limit
@@ -30,10 +30,90 @@ tables:
       - { name: topic, path: topic, type: utf8, nullable: true }
       - { name: purpose, path: purpose, type: utf8, nullable: true }
 
+  messages:
+    # The governed content table: one conversation's history, bound by
+    # `channelId` (the same key skardi-cloud's registry binds — the strings
+    # are one contract). Cursor pagination exists because our vendored build
+    # added it: the upstream action dropped Slack's cursor on the floor, and
+    # single_page's premise check refuses a boolean hasMore. Fingerprint
+    # pinned from OUR build b2b33e57 (skardi/slack-acl in open-connector),
+    # not an oomol-lab release.
+    action: slack.get_channel_messages
+    row_path: "$.messages"
+    fingerprint: 7517225db41711140265f8cced59029ab52a7e8ec646582dba9d828dbc61b6c4
+    pagination:
+      strategy: cursor
+      page_size_input: limit
+      cursor_input: cursor
+      next_cursor_path: "$.nextCursor"
+      # The AUTHORITATIVE end-of-collection signal, and declaring it is not
+      # belt-and-braces. The committed contract says `hasMore` is "whether
+      # more messages are available beyond this page" and `nextCursor` is
+      # "the cursor for the next page, or an empty string when this is the
+      # last page" — so `hasMore: true` with an empty cursor is a state the
+      # response is allowed to express, and reading the empty cursor as
+      # end-of-collection caches a silently truncated channel history.
+      # `paginate` consults this FIRST, and a missing cursor while it is true
+      # becomes a hard error rather than a quiet stop.
+      #
+      # ONLY this table. `list_conversations`, `list_users` and `list_files`
+      # do not declare `hasMore` in their committed contracts, and a pack
+      # that names a signal the response lacks fails the scan outright
+      # (`PaginationHasMoreInvalid { found: "absent" }`) — declaring it
+      # there "for symmetry" would break three working tables.
+      has_more_path: "$.hasMore"
+      page_size: 999
+    resources:
+      required: [channelId]
+    fixed_inputs:
+      # Load-bearing, not a default. Slack's `oldest` is EXCLUSIVE unless
+      # this is set, and the `sent_at` filter below floors its literal to a
+      # whole second — so a message sitting exactly on that second would be
+      # dropped by the provider, and Inexact re-filtering cannot recover a
+      # row that never arrived. Slack ignores the flag when neither bound
+      # is sent, so it costs nothing on an unfiltered scan.
+      inclusive: true
+    columns:
+      # `ts` is the message's identity (unique per conversation, and the
+      # handle `conversations.replies` and permalinks take), so it stays the
+      # raw string. `sent_at` reads the SAME field as a time, because a
+      # pushdown needs a Timestamp-typed column and Arrow milliseconds
+      # cannot hold Slack's microseconds — splitting them keeps identity
+      # exact and makes the truncation visible in the schema.
+      - { name: ts, path: ts, type: utf8, nullable: false }
+      - { name: sent_at, path: ts, type: timestamp_s_frac_string_utc, nullable: false }
+      - { name: type, path: type, type: utf8, nullable: true }
+      - { name: subtype, path: subtype, type: utf8, nullable: true }
+      - { name: user_id, path: userId, type: utf8, nullable: true }
+      - { name: bot_id, path: botId, type: utf8, nullable: true }
+      - { name: app_id, path: appId, type: utf8, nullable: true }
+      - { name: username, path: username, type: utf8, nullable: true }
+      - { name: team_id, path: teamId, type: utf8, nullable: true }
+      - { name: client_msg_id, path: clientMsgId, type: utf8, nullable: true }
+      - { name: text, path: text, type: utf8, nullable: true }
+      - { name: edited_ts, path: editedTs, type: utf8, nullable: true }
+      - { name: thread_ts, path: threadTs, type: utf8, nullable: true }
+      - { name: parent_user_id, path: parentUserId, type: utf8, nullable: true }
+      - { name: reply_count, path: replyCount, type: uint64, nullable: true }
+      - { name: reply_users_count, path: replyUsersCount, type: uint64, nullable: true }
+      - { name: latest_reply, path: latestReply, type: utf8, nullable: true }
+      - { name: is_locked, path: isLocked, type: boolean, nullable: true }
+    filters:
+      # The whole point of the table's incremental story: `sent_at >= X`
+      # becomes Slack's `oldest`, so a scheduled run fetches the delta
+      # instead of the channel's entire history. Inexact and gt_eq are both
+      # forced by the epoch-seconds rendering (see ValueFormat) — the
+      # floored literal widens the fetch by up to a second and DataFusion
+      # trims it back. The STRING spelling because the action types
+      # `oldest` as a Slack `ts` string under a strict
+      # `additionalProperties: false` schema: a bare JSON number is a 400,
+      # not a coercion.
+      - { column: sent_at, op: gt_eq, input: oldest, format: epoch_seconds_string, fidelity: inexact }
+
   users:
     action: slack.list_users
     row_path: "$.users"
-    fingerprint: 77f3f0f41d30b9095875b1c02d5f93f31b948f4a666fdfc820192348e5e1b18f
+    fingerprint: fe44b3c7fe1e3de1cfdee0b2c7face77036a83c779937ffd4c6ff404bd508cf6
     pagination:
       strategy: cursor
       page_size_input: limit

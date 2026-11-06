@@ -9,6 +9,30 @@ becomes available.
 
 ## Install
 
+Pre-built binaries for Linux (x86_64, aarch64), macOS (Apple Silicon) and
+Windows (x86_64) are attached to every
+[release](https://github.com/SkardiLabs/skardi/releases).
+
+macOS and Linux:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/SkardiLabs/skardi/main/install.sh | bash
+```
+
+Windows (PowerShell). This puts `skardi.exe` in
+`%LOCALAPPDATA%\Programs\skardi\bin`, adds that directory to your user
+`PATH`, and, like `install.sh`, offers to set up Claude Code, Codex and
+Cursor (see [MCP Binding](mcp.md#set-up-agents-with-installsh)):
+
+```powershell
+irm https://raw.githubusercontent.com/SkardiLabs/skardi/main/install.ps1 | iex
+```
+
+On Windows the config file is `%USERPROFILE%\.skardi\config.yaml`. Wherever
+these docs say `~/.skardi`, read that path instead.
+
+### From source
+
 From the repo root:
 
 ```bash
@@ -51,6 +75,12 @@ contexts:
     workspace: acme-prod       # required in cloud mode, sent per request
     token: skardi_pat_…
 ```
+
+On Windows the file is `%USERPROFILE%\.skardi\config.yaml`. Set
+`SKARDI_CONFIG_DIR` to keep it somewhere else: the CLI then reads and writes
+`$SKARDI_CONFIG_DIR/config.yaml` in place of `~/.skardi/config.yaml`. That is
+also how to give a sandbox or a test its own config on Windows, where the
+home directory cannot be redirected through `HOME`.
 
 Which context a command uses: `--context NAME` > `$SKARDI_CONTEXT` >
 `current-context` > the only context, if the file defines exactly one. With
@@ -120,6 +150,14 @@ skardi config delete-context acme/prod
 skardi config view
 ```
 
+`--show-tokens` prints every token **except a `control-token`**, which is
+always `(redacted)` — as is any key that names a control credential however
+it is spelled (`Control-Token`, `control_token`, `controlSecret`: `control`
+with `token`, `secret` or `credential`, case and `-`/`_` ignored): it is the
+one credential that reaches skardi-cloud's control surface, and nothing the
+CLI prints carries it (see
+[Connecting data sources from an agent](#connecting-data-sources-from-an-agent--integrations-handoff-documents)).
+
 The file is written atomically and `0600`, since it holds credentials; a
 looser existing file is reported and rewritten tighter. Keys this CLI does
 not recognize are preserved, so a newer CLI's fields survive an older one's
@@ -162,35 +200,175 @@ headers before forwarding upstream.
 workspace and writes a context for each, so nothing is copied by hand:
 
 ```bash
-# Sign in; a lone workspace is used automatically, several prompt
-skardi login --control-plane https://global.skardi.ai \
-  --client-id <your-deployment's-oauth-client-id>
+# The default: the console signs you in and approves the token
+skardi login --control-plane https://skardi-console.example.com
 
-# With both pinned in the environment, the flags go away
-export SKARDI_CONTROL_PLANE_URL=https://global.skardi.ai
-export SKARDI_OAUTH_CLIENT_ID=<client-id>
-skardi login
-
-# Non-interactive selection
-skardi login --workspace acme-prod
-skardi login --all-workspaces
-
-# Print the sign-in URL instead of opening a browser
+# Print the approval URL instead of opening a browser — works over SSH
 skardi login --no-browser
 
 # Shorter-lived credential (default: 90d; `12h` also works)
 skardi login --expires 30d
 ```
 
-Two inputs have no built-in default, and both fail by name rather than
-guessing: the **control plane** (`--control-plane` >
-`$SKARDI_CONTROL_PLANE_URL` > `control-plane:` in the config file) and the
-**OAuth client id** (`--client-id` > `$SKARDI_OAUTH_CLIENT_ID`). The client id
-is per deployment — it is the same value the deployment gives its console — so
-there is nothing correct to hardcode. Once a `login` succeeds, the control
-plane is recorded in the config file and later runs need no flag for it.
+There are **two ways in**, and which one runs depends on whether you name a
+credential for the CLI itself:
 
-What it does, in order:
+| You pass | What happens |
+|---|---|
+| nothing | **Console-brokered** (the default). The CLI opens a page on the console; the console signs you in with whatever it accepts — email or Google — and you approve the workspaces it may reach, each at a role cap |
+| `--client-id <ID>` | **Direct OAuth**. The CLI talks to the identity provider itself and mints per workspace, which is what `--workspace` and `--all-workspaces` need |
+| `--identity dev:<id>` | Dev auth, loopback control planes only |
+
+The console-brokered path is the default because the alternative needs a
+Google **Desktop** OAuth client provisioned per deployment before anyone can
+log in at all. Here the CLI speaks to no identity provider, learns nothing
+about which one you used, and needs no client id.
+
+The URL resolves as `--control-plane` > `$SKARDI_CONTROL_PLANE_URL` > the
+config file > **`https://console.skardi.ai`**, the hosted console. So against
+skardi-cloud a bare `skardi login` works with nothing configured. For the
+brokered path the URL is the **console's** — the same address you open in a
+browser — because that is what serves the approval page. Once a `login`
+succeeds it is recorded and later runs need no flag.
+
+When the default is what chose the URL, the CLI says so on stderr before the
+browser opens — `signing in through https://console.skardi.ai (the built-in
+default; …)` — naming the three ways to point it elsewhere. That line is the
+guard against the one real risk of a default: someone on a development
+cluster who forgot to configure theirs and would otherwise sign in to
+production without noticing.
+
+**The direct-OAuth path has no default** and fails by name instead. It calls
+skardi-global's API directly (`/v1/me/...`), which the hosted deployment
+does not expose — global answers only behind the console — so there is no
+hosted address to build in.
+
+**The two paths record it under different keys**, and that matters if you mix
+them:
+
+| Path | File key |
+|---|---|
+| console-brokered | `console:` |
+| direct OAuth, and `logout --revoke` | `control-plane:` |
+
+They are different services. `ControlPlane` calls bare `/v1/me/...`; a console
+serves that API under `/api/global/v1/...` and only to a browser holding a
+session. One key for both meant a brokered login left the console's URL where
+the direct flows look, so a later `logout --revoke` cleared the local
+credential and then sent `DELETE /v1/me/tokens/{id}` at the console, which
+answered with its 404 page. Kept apart, a direct flow with nothing recorded
+of its own says so and names `control-plane:`.
+
+The direct-OAuth path additionally needs the **OAuth client id**
+(`--client-id` > `$SKARDI_OAUTH_CLIENT_ID`), which is per deployment, so
+there is nothing correct to hardcode.
+
+### The console-brokered flow, in order
+
+```
+$ skardi login --control-plane https://skardi-console.example.com
+opening https://skardi-console.example.com/cli-login?request_id=7f3a9c…
+waiting for approval in the browser (the request expires at 2026-09-09T12:05:00Z)
+  confirmation code: 7f3a9c
+wrote context 'acme/my-workspace' (current)
+```
+
+1. Opens a login request on the console and prints the URL, the deadline, and
+   a **confirmation code**.
+2. Opens your browser at that URL (`--no-browser` just prints it).
+3. The console signs you in if you are not already, on its own `/login`.
+4. You pick **one** workspace and retype the confirmation code. The code is
+   required, not decorative: the console's *Waiting for approval* list under
+   Agent access shows the same six characters and no request id, so an
+   approver has to be looking at the terminal that started the login. Without
+   it, someone could open a request, never visit it, and collect a token
+   belonging to whoever approved it from that list.
+5. The CLI polls until you approve, then receives a token scoped to that one
+   workspace at your role there, verifies it against the gateway, and writes
+   the context.
+
+The request expires in five minutes. If nobody approves it, the CLI says so
+and writes nothing.
+
+### For an agent: `--control`, and signing up on the way
+
+```bash
+# A new person: the approval page creates their account and workspace first
+skardi login --setup personal --name "Alice" --control --no-verify
+
+# Someone who already has an account
+skardi login --control
+```
+
+`--control` asks the approver for a **token pair** instead of one token. The
+approval page shows it as its own tick ("may connect data sources"), offered
+only to an admin of the workspace. Approved, the context holds:
+
+| Key | What |
+|---|---|
+| `token`, `token-id`, `token-expires-at` | the **MCP token**, which has no control-plane reach and lives 90 days: every `query`, the documents upload, and what `mcp register` writes. The same key every older CLI reads, so nothing else changes |
+| `control-token`, `control-token-expires-at` | the **control token**, accepted only by the gateway's `/control/v1`, for **24 hours**: what the `integrations`, `handoff` and `documents` commands send. **No command prints it**, `--json` and `config view --show-tokens` included |
+| `pair-id` | which login the pair came from |
+| `mcp-url` | the workspace's MCP server, as the control plane named it — unless `--server` or `$SKARDI_GATEWAY_URL` sent this context's queries to a different origin, in which case it is that gateway's `/mcp`, and `login` says it set the control plane's aside. The token is only ever registered against the gateway it queries |
+
+When the approval comes back **without** `control` — the box was unticked,
+or your role is not admin — the context is still written, so queries work,
+and `login` exits **6** saying so: re-run `skardi login --control` and tick
+the box, or ask an admin to connect sources.
+
+An approval that carries only **part** of a pair (a control token with no
+`pair_id`, or the reverse — a console and control plane on different
+versions) is not read as "without control": a control token may have been
+minted that nothing would hold. The login fails (exit `1`), writes nothing,
+and names the ids it was given and the `/account/agent-access` page where
+that login is revoked. It never prints the token.
+
+`--setup personal|team` and `--name` (and optionally `--industry`) prefill
+the approval page's signup form for a person who has no account yet, so the
+same browser pass creates the workspace. Someone with an account, or someone
+joining by invitation, leaves them out.
+
+A re-login replaces the previous pair: the CLI sends the context's `pair-id`
+as `replaces_pair_id`, and the control plane revokes that pair when you
+approve — the only way a browser login's credentials are revoked from the
+command line, since the CLI holds only tokens and no token may revoke one.
+`--keep-old-token` skips it.
+
+A pair context overwritten by a login through `--client-id` or `--identity`
+is revoked by its query token's id, and the control plane revokes a pair's
+two tokens together. Either way the replaced `pair-id` is named in the
+output: if the revoke failed, or `--keep-old-token` kept it, `login` warns
+that its control token stays live and names
+`/account/agent-access?pair=<id>` on the console, where it is revoked.
+
+These flags exist only on the console-brokered path, and a control plane
+older than them refuses the request (`invalid_body`); the CLI says the
+server is too old for the flag rather than opening a login without it.
+
+Two consequences of the token arriving already-minted, both of which the CLI
+reports rather than hides:
+
+- **The browser chooses the workspaces, and you get a context for each.** Tick
+  one or more on the consent screen, each at a role cap. The approval mints
+  ONE token reaching all of them, and the CLI writes a `<org>/<workspace>`
+  context per approved workspace, every one holding that token and verified
+  through its own workspace. `current-context` is the first one you ticked;
+  `skardi config use-context` switches.
+- **`--workspace` and `--all-workspaces` are refused on this path**, since the
+  browser chooses. The error names both flows that *can* select from the
+  terminal: `--client-id`, and `--identity dev:<id>` against a loopback
+  control plane. `--context <NAME>` names one context, so it works only when
+  you approve one workspace.
+- **Nothing can be revoked from here.** The credential is a workspace token,
+  which authenticates to the gateway and not to the control plane — so where
+  the direct-OAuth path revokes, this one prints the token id and tells you to
+  revoke it in the console. That applies to a token this run had to abandon
+  (a failed verify) and to a credential a re-login replaced. `logout --revoke`
+  is the same story: it re-authenticates, so after a brokered login it needs
+  `--client-id` or `--identity` and otherwise reports the live token ids
+  rather than pretending to revoke them.
+
+### The direct-OAuth flow (`--client-id`), in order
 
 1. Resolves the control plane, as above. With none of the three sources, it
    stops and says so rather than guessing a host. A plain-`http://`
@@ -221,17 +399,24 @@ What it does, in order:
 ### `--no-browser` and remote shells
 
 `--no-browser` prints the URL instead of launching a browser, for a host that
-has none or none the CLI can start. It does **not** on its own make `login`
-work over SSH: the redirect goes to `127.0.0.1:<port>` on the machine running
-`skardi`, so opening that URL on your laptop sends the callback to your
-laptop's port, where nothing is listening.
+has none or none the CLI can start. What happens next depends on which flow
+you are in, and the difference is the whole reason to prefer the default.
 
-To sign in against a remote host, the browser must reach that host's loopback
-port. Either run a browser there, or forward the port the printed URL names —
-it is fresh per run, so with OpenSSH add the forward mid-session (`~C` then
+**Console-brokered (default): this works over SSH.** The CLI polls the console
+for the result, so there is no local listener and nothing has to come back to
+the machine running `skardi`. Run it on a server, open the printed URL on your
+laptop, type the confirmation code, and the server's `skardi` picks the token
+up on its next poll. That is the headless capability the device-code grant
+would have provided, without a device-code endpoint.
+
+**Direct OAuth (`--client-id`): this does not.** The redirect goes to
+`127.0.0.1:<port>` on the machine running `skardi`, so opening that URL on
+your laptop sends the callback to your laptop's port, where nothing is
+listening. The browser has to reach the remote host's loopback port: either
+run a browser there, or forward the port the printed URL names — it is fresh
+per run, so with OpenSSH add the forward mid-session (`~C` then
 `-L <port>:127.0.0.1:<port>`), or use `ssh -L` on a connection opened after
-the URL is shown. A headless flow needing no local listener is the device-code
-grant, which is deliberately out of scope for this milestone.
+the URL is shown.
 
 For a loopback control plane (a local or compose stack), `--identity` skips the
 browser entirely — see [Working against a local stack](#working-against-a-local-stack).
@@ -241,7 +426,7 @@ The gateway URL comes from `--server` > `$SKARDI_GATEWAY_URL` > the control
 fall back to `http://127.0.0.1:8080`: a context pointing at a local port
 would fail later and further from the cause.
 
-Minting is a **saga**. Each token commits independently at the control plane,
+On the direct-OAuth path, minting is a **saga**. Each token commits independently at the control plane,
 so if a later mint fails — or the config write fails — every token this run
 created is revoked before the original failure is reported, and no context is
 written. If a rollback cannot complete, the surviving token ids are printed
@@ -250,7 +435,9 @@ than a loud failure.
 
 Running `login` again over an existing context replaces it and revokes the
 token it replaced. `--keep-old-token` retains the old one — for an agent
-that is mid-task — and says so.
+that is mid-task — and says so. On the console-brokered path the replaced
+token is **reported rather than revoked**, with its id, for the reason given
+above.
 
 If your identity belongs to more than one organization, minting is not
 available in v1: `login` prints the organizations and the way round it
@@ -275,6 +462,12 @@ itself, so `--revoke` signs in again to call the control plane. The context
 itself (server, workspace, mode) is kept either way, so a later `login`
 refills it; removing the context entirely is `skardi config delete-context`.
 
+After a browser login the output also names the console's
+`/account/agent-access` page, where the login is revoked under your own
+session — with `?pair=<pair-id>` for a `--control` login, which revokes both
+tokens of the pair. `logout` clears the control token with the query token
+and keeps the `pair-id`, so the next `login` replaces (revokes) that pair.
+
 `logout` only touches **cloud** contexts — the ones `login` can mint again. A
 server-mode context's token was configured by hand and nothing can restore it,
 so clearing it is refused, with a pointer at `config delete-context` (or
@@ -289,12 +482,20 @@ recorded id at all, and `--revoke` names it rather than skipping it quietly.
 
 ### What a cloud context cannot do
 
-A skardi-cloud gateway serves `query` and `schema`. `run`, `pipeline`, `job`,
-and `health` are engine-local surfaces it does not mount, so they fail
-immediately, naming the context, with no request issued:
+A cloud context will **attempt** `query`, `schema`, `run` and `pipeline`.
+`query` and `schema` are the gateway's long-standing routes. `run` and
+`pipeline` are no longer refused client-side, because the cloud side is
+growing routes for them — but that is not a promise that the gateway you are
+pointed at mounts them: whether it does depends on its version, and one that
+predates the routes answers the request with an error of its own instead of
+being stopped here. `job` and `health` are engine-local surfaces no gateway
+mounts, so they fail immediately, naming the context, with no request issued.
+`mcp` is refused too, and not because of which routes a gateway mounts — it
+serves its own `/mcp` with its own tool catalog, so the stdio bridge would be
+a redundant surface there rather than a missing one:
 
 ```
-error: 'job' is not available in a cloud context (acme/acme-prod). Available: query, schema.
+error: 'job' is not available in a cloud context (acme/acme-prod). Available: query, schema, run, pipeline.
 ```
 
 Two credential failures are reported in the context's own terms rather than
@@ -319,6 +520,41 @@ needs `--i-know-this-is-dev-auth`, so the decision is visible in the command
 that made it. Every run prints a warning naming what it authenticated
 against.
 
+## What the CLI sends about itself — and `DO_NOT_TRACK`
+
+Every request the CLI makes to Skardi carries a `User-Agent` naming the CLI, its
+version, and the operating system and processor type it was built for:
+
+```
+User-Agent: skardi-cli/0.9.1 (macos; aarch64)
+User-Agent: skardi-cli/0.9.1 mcp (linux; x86_64)    # from `skardi mcp`
+```
+
+That is all of it. The OS and architecture are compile-time constants, nothing
+on the machine is probed, and nothing about you is included. The header goes
+only where the CLI already sends requests: the server or gateway you point it
+at, and the control plane `login` and `logout --revoke` talk to. The identity
+provider a `--client-id` login signs in through (Google, by default) gets
+neither this header nor `DNT`. The CLI makes no request of its own to report
+it, and against a local skardi-server it never leaves your machine.
+
+skardi-cloud uses it to count which clients people use, and which versions and
+platforms are in use. It records, per day, the client kind, version, platform
+and a network prefix (never your full IP address). See the
+[privacy policy](https://www.skardi.ai/privacy).
+
+**To opt out, set `DO_NOT_TRACK`:**
+
+```bash
+export DO_NOT_TRACK=1
+```
+
+The CLI then sends `DNT: 1` and a `User-Agent` of just `skardi-cli`, with no
+version or platform, and skardi-cloud records nothing about the client. `1`,
+`true` and `yes` opt out; unset, empty, `0` and `false` do not. The opt-out
+covers the client details only: skardi-cloud still records that your account
+was active on a given day, which it needs in order to run the service.
+
 ## Ad-hoc SQL — `query`
 
 `skardi query` sends one SQL statement to `POST /query` on the server and
@@ -337,9 +573,11 @@ skardi query -e "SELECT * FROM events" --max-rows 50
 # Render as an ASCII table instead of JSON
 skardi query -e "SELECT * FROM products LIMIT 10" --table
 
-# Record why this query ran, and which session it belongs to
+# Record why this query ran, which session it belongs to, and the larger
+# task it serves
 skardi query -e "SELECT count(*) FROM orders WHERE status = 'paid'" \
-  --purpose "weekly paid-order count" --session-id sess-2026-08-27
+  --purpose "weekly paid-order count" --session-id sess-2026-08-27 \
+  --task "September revenue review"
 ```
 
 Default output is the response's `data` array, pretty-printed JSON, on
@@ -363,20 +601,34 @@ piping:
 note: results truncated; pass a higher --max-rows to see the rest
 ```
 
-### Recording intent — `--purpose` / `--session-id`
+### Recording intent — `--purpose` / `--session-id` / `--task`
 
-The two flags travel together as the request body's `ai_context` object,
+These flags travel together as the request body's `ai_context` object,
 which the server records in its query audit ledger when it was started with
-`--query-audit-db`. `--purpose` says why the query ran; `--session-id`
+`--query-audit-db`. `--purpose` says why *this* query ran; `--session-id`
 groups it with the rest of one agent session, so a later reader can tell a
 repeated question from a one-off. Without them the ledger still records the
 SQL, but nothing about intent — the column that makes "we have answered this
 before" answerable stays empty.
 
-Either flag requires the other: the server rejects an `ai_context` carrying
-only one of the pair, so the CLI refuses it at parse time rather than
-spending a round trip on a 400. Values are checked client-side before any
-request (non-empty, `--purpose` ≤ 2000 characters, `--session-id` ≤ 200).
+`--task` names the larger piece of work a run of queries belongs to, repeated
+verbatim on every query that serves it. Where `--purpose` describes one
+statement, `--task` is the one fact a day of queries cannot be reassembled
+into afterwards: it is what lets the daily brief describe *what was being
+done* rather than list the lookups it took. It is optional and requires
+`--purpose`.
+
+`--purpose` and `--session-id` each require the other, and `--task` requires
+`--purpose`: the server takes `ai_context` whole or not at all, so a partial
+object has nothing valid to travel in. The CLI refuses these combinations at
+parse time rather than spending a round trip on a 400. Values are checked
+client-side before any request: `--purpose` non-empty and ≤ 2000 characters,
+`--session-id` non-empty and ≤ 200, and the serialized `ai_context` ≤ 4096
+bytes in total. `--task` has no length cap of its own — the server treats it
+as a free-form key bounded only by that whole-object size, so capping it here
+would reject a task the REST and MCP entrypoints accept. The object-size check
+is what catches a purpose and task that are each legal but together overflow
+what the server accepts.
 
 Unlike `run --session-id`, which travels as an HTTP header and is therefore
 held to header-safe characters, these values ride inside JSON — any
@@ -493,6 +745,42 @@ safe to retry.
 
 ## MCP — `skardi mcp`
 
+### Registering a skardi-cloud workspace — `skardi mcp register`
+
+```bash
+skardi mcp register claude-code   # runs `claude mcp add-json --scope user skardi …`
+skardi mcp register --print       # the same server, for any other client
+```
+
+Adds the current cloud context's MCP server to an agent: the `mcp-url` the
+login recorded, with the context's `token` as the bearer — the pair's MCP
+token after `login --control`, and the only token after a login without it.
+**Never the control token.** For Claude Code it replaces any earlier `skardi`
+entry with the new one at user scope and prints only `registered`, so the
+token does not pass through the agent's transcript. `--print` shows the
+JSON (`type: http`, the URL, `Authorization` and `Skardi-Workspace`
+headers) for a person to add to another client by hand. A re-login re-runs it.
+
+The replacement never leaves you with less than you had. The new entry is
+added first, as `skardi-pending`; only once Claude Code has accepted it are
+the old `skardi` entries (local and user scope) removed and the new one put
+in their place, and the staged copy dropped. Every step is checked, and any
+failure is an error naming what it left — a refused add changes nothing, a
+removal that fails keeps the old entry in charge, a final add that fails
+leaves the new server working as `skardi-pending` — so `registered` means all
+of it held. What `claude` prints is never passed through, and a failure's
+message has the token scrubbed from it.
+
+The command uses what the selected context holds, so it takes `--context`
+and refuses `--server` and `--token`, which it could not honour: to register
+a different token, `skardi login` again.
+
+A context with no `mcp-url` means the control plane named none at login,
+because it has no gateway URL set (`SKARDI_GLOBAL_GATEWAY_URL`); the error
+says so.
+
+### The stdio bridge — `skardi mcp`
+
 Serves the Model Context Protocol over stdio, bridging an MCP host (Claude
 Desktop, Cursor, …) to a running skardi-server: pipelines become MCP tools,
 plus built-in `query` and `list_data_sources` tools. The host spawns the
@@ -521,7 +809,136 @@ startup, so `2` is rare here). Once the MCP session is up, REST failures —
 unreachable server included — are reported in-band as tool errors, and the
 process exits `0` when the host closes stdin.
 
+The bridge stays refused on a cloud context: the gateway serves `/mcp`
+itself, and `skardi mcp register` is how an agent reaches it.
+
+## Connecting data sources from an agent — `integrations`, `handoff`, `documents`
+
+After `skardi login --control`, a coding agent can connect a skardi-cloud
+workspace's data sources **without ever being handed a secret**: wherever a
+person has to consent at a provider or type a token, the CLI opens a
+*handoff* — a console page only that person can open — and waits for them.
+Everything else is the console wizard's own calls, over the gateway's
+`/control/v1`, with the 24-hour control token.
+
+| Command | What it does |
+|---|---|
+| `skardi integrations list` | the workspace's state, what this org may install, what is connected |
+| `skardi integrations connect <saas> --target new\|<alias>` | opens a handoff for one provider and prints its page link |
+| `skardi handoff wait <id> [--timeout 30m]` | waits until the person is done, then prints the connection alias and version |
+| `skardi integrations permissions <alias> --connection-version <id>` | one verdict per capability, and whether the install may proceed |
+| `skardi integrations candidates <alias> --connection-version <id> [--content-type <t>] [--parent <id>] [--cursor <c>]` | one page of the picker |
+| `skardi integrations install <alias> --connection-version <id> --scope <json> [--request-id <id>] [--timeout 10m]` | adds to what the connection syncs, then waits for the install |
+| `skardi integrations cancel <handoff>` | when the person declines: drops what that handoff staged, never anything else |
+| `skardi integrations status [<source>] [--detail]` | a source's phase, health, runs and items; with none, every source |
+| `skardi integrations sync <source>` | asks for one run now |
+| `skardi documents add <file>` | uploads a local file into a **personal** workspace and starts its run |
+
+Separate runs share nothing, so the connection version is always an
+argument: name the one `handoff wait` printed.
+
+**Every command prints the next one.** Without `--json`, a sentence and a
+`next:` line; with `--json`, exactly one object on stdout:
+
+```text
+{"ok": true,  "result": {…}, "next": "skardi handoff wait 4b9f…"}
+{"ok": false, "error": {"code": "…", "message": "…"}, "next": "<recovery command, or null>"}
+```
+
+A success may also carry `"warning": {"code": "…", "message": "…"}` when
+something went wrong beside it (today, only `install`; see below); the key
+is absent otherwise, and the same warning is a `warning:` line on stderr.
+
+`result` is the control plane's own response (for `install`, the final
+operation) and `error` its own refusal, copied through. The sequence —
+`list` → `connect` → `handoff wait` → `permissions` → `candidates` →
+`install` → `status` → `sync` — lives in those hints, so an agent that
+follows `next` follows it. A hint carries `--json` and `--context` when the
+run that printed it did.
+
+**`--scope`** is a JSON object of content type to rules, in the install
+API's `content-types-v1` shape, **positive rules only**: an install from an
+agent only adds. Copy each `coordinate` verbatim from a `candidates` row;
+`null` means everything the credential reaches.
+
+```bash
+# GitHub, two repositories
+--scope '{"issues":[{"kind":"leaf","coordinate":{"owner":"acme","repo":"api"}},
+                    {"kind":"leaf","coordinate":{"owner":"acme","repo":"web"}}],
+          "pull_requests":[]}'
+# Notion, a page and everything under it
+--scope '{"pages":[{"kind":"subtree","coordinate":{"page_id":"…"}}]}'
+# Everything
+--scope '{"issues":null,"pull_requests":null}'
+```
+
+An `exclude` rule is refused locally: narrowing is the person's, on the
+source's Manage page in the console.
+
+**`handoff wait`** polls every 2 seconds, growing by half up to 10, for up to
+30 minutes (`--timeout`). It tells four endings apart by the error code:
+`still_open` at the deadline, and `expired`, `denied` or `abandoned` when the
+handoff ended without a connection. A completed handoff should be installed
+within the hour, or the staged connection is reclaimed.
+
+**`--timeout` bounds the whole command**, on `handoff wait` and `install`
+alike: a request to a gateway that stalls, and a `429`'s `Retry-After`, are
+cut off at the deadline too, so `--timeout 5s` returns in about five seconds
+— `still_open` for a wait, `install_pending` for an install.
+
+**`install` can always be resumed.** Every install carries a request id, its
+idempotency key, generated before the submit. Whenever the outcome is
+uncertain — the submit timed out, lost its connection or met a 5xx (any
+exit `5`), or the operation was still running at the deadline — the error
+carries that `request_id` and its `next` is the same install with
+`--request-id <id>`, which the control plane answers with the existing
+operation rather than installing twice. A refusal (exit `3`) names no replay:
+nothing was installed.
+
+**An install that only failed to link its installer landed.** When the
+person signed in is not the admin who set the connection up, the control
+plane installs the scope and the sources sync, but the operation still
+settles `failed` with a `link_` code — `link_actor_is_not_the_installer`,
+`link_installer_no_longer_a_member` and the like — because it could not
+link that person to the connection as its installer. `install` reports
+that as the success it is: exit `0`, `next` naming `integrations status`,
+and the code as `warning`. It does so only for a `link_` failure at the
+identity-proof step (the operation's `last_step` is `activated`); any other
+`failed` operation, `install_incomplete` included, is exit `3` with the
+failure as its error code.
+
+**`documents add`** declares the file (its name, type, sha256 and length)
+with the control token, uploads the bytes to the gateway's data plane with
+the MCP token, retries once while the workspace's engine picks up the new
+source, and asks for the first run. The file is read **once**, before
+anything is declared, and those bytes are what is hashed and sent — so
+editing it afterwards cannot make the upload disagree with its declaration.
+A file that changes *while* it is read is refused (`file_changed`) before
+anything is created, and one over 1 GiB, the largest any plan accepts, is
+refused from its size alone (`file_too_large`). A team workspace refuses it
+(`team_upload_not_agent_callable`): there, every member would read the file,
+so it is uploaded in the console.
+
+These commands have their own exit codes, which the `skardi-onboard` skill
+branches on:
+
+| Code | Meaning |
+|---|---|
+| `0` | done — for `install`, also when the only failure was linking the installer (a `warning` says which) |
+| `2` | usage error (a bad flag, a malformed `--scope`) |
+| `3` | refused by the server: any 4xx not below |
+| `4` | a handoff ended without a result: `expired`, `denied`, `abandoned`, or `still_open` at the deadline |
+| `5` | the control plane could not be reached, or answered 5xx |
+| `6` | no usable control token: none was granted, or it expired — run `skardi login --control` |
+
+A `429 rate_limited` is retried after its `Retry-After` (twice) before it is
+reported.
+
 ## Exit codes
+
+The agent commands above, and `login --control`'s `6`, have
+[their own table](#connecting-data-sources-from-an-agent--integrations-handoff-documents).
+Everything else:
 
 | Code | Meaning |
 |---|---|

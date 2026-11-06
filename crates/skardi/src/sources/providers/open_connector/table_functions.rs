@@ -55,6 +55,7 @@ use super::json_to_arrow::RowConverter;
 use super::pagination::PaginationStrategy;
 use super::raw_schema::derive_raw_columns;
 use super::row_path::RowPath;
+use super::source_pack::RowShape;
 use super::source_pack::SourcePackRegistry;
 use super::table::OpenConnectorTableProvider;
 use crate::sources::providers::udtf_args::strict_string_arg;
@@ -116,7 +117,7 @@ pub fn register_open_connector_udtfs(
     ctx: &SessionContext,
     gateways: OpenConnectorGateways,
 ) -> Result<(), OpenConnectorError> {
-    let packs = SourcePackRegistry::builtins()?;
+    let packs = super::builtin_pack_registry()?;
     ctx.register_udtf(
         "open_connector_query",
         Arc::new(OpenConnectorQueryFunction::new(
@@ -140,7 +141,7 @@ pub struct OpenConnectorQueryFunction {
 
 impl OpenConnectorQueryFunction {
     /// Build the function over the shared gateway map and a validated
-    /// pack registry (see [`SourcePackRegistry::builtins`]).
+    /// pack registry (see [`builtin_pack_registry`](super::builtin_pack_registry)).
     pub fn new(gateways: OpenConnectorGateways, packs: SourcePackRegistry) -> Self {
         Self { gateways, packs }
     }
@@ -243,6 +244,25 @@ impl TableFunctionImpl for OpenConnectorQueryFunction {
                     .check_continuation_inputs(meta.input_schema())
                     .map_err(plan_error)?;
             }
+            // The domain gate decides for itself which actions receive the
+            // pushed inputs (the table's own, and a full-input continuation
+            // to another), so this entry point offers every discovered
+            // action and cannot skip one. A query plans this on every call,
+            // so an enum the pack leaves undeclared is a debug line here and
+            // a warning on the once-per-process registration path.
+            for finding in table
+                .check_filter_values(action_id, meta.input_schema())
+                .map_err(plan_error)?
+            {
+                tracing::debug!(
+                    table = table.id,
+                    action = %finding.action_id,
+                    column = finding.column,
+                    input = finding.input_field,
+                    accepted = ?finding.accepted,
+                    "Open Connector action types a pushed filter input as an enum the pack does not declare"
+                );
+            }
         }
 
         let provider = OpenConnectorTableProvider::new(
@@ -329,6 +349,15 @@ impl TableFunctionImpl for OpenConnectorScanFunction {
             "action inputs",
         )?;
 
+        // Raw actions stay array-only; see
+        // `OpenConnectorError::ObjectRowsUnsupportedForRawAction` for why the
+        // object shape is a pack-declared contract rather than something a
+        // caller can request ad hoc.
+        if row_path == "$" {
+            return Err(plan_error(
+                OpenConnectorError::ObjectRowsUnsupportedForRawAction,
+            ));
+        }
         let row_path = RowPath::parse(&row_path).map_err(plan_error)?;
         // Deterministic row type or planning error — derived purely from the
         // in-memory discovered output schema.
@@ -352,6 +381,9 @@ impl TableFunctionImpl for OpenConnectorScanFunction {
                 error_path: None,
                 fixed_inputs: &[],
                 source_pack_version: 0,
+                // Raw actions are array-only; see
+                // `ObjectRowsUnsupportedForRawAction`.
+                row_shape: RowShape::Array,
                 // Raw scans declare no pagination contract at all, so
                 // there is no listing to continue.
                 continuation: None,
@@ -1053,6 +1085,27 @@ raw_action_allowlist:
             r#"SELECT * FROM open_connector_scan('saas', 'mock.list_items',
                                                  '{"workspace":"demo"}', '$.items')"#,
             "is classified as mutating",
+        )
+        .await;
+        assert!(execute_requests(&gateway).is_empty(), "rejected pre-HTTP");
+    }
+
+    #[tokio::test]
+    async fn scan_udtf_rejects_the_object_root_path_before_http() {
+        // Object rows are a pack-declared contract. A caller asking for one
+        // ad hoc must be told so at planning time, by the targeted error —
+        // not fall through to `RowPath::parse`'s generic "no segments", and
+        // not reach the gateway.
+        let gateway =
+            MockGateway::start(|req| gateway_handler(req, 5, Some(true), ITEMS_OUTPUT_SCHEMA))
+                .await;
+        let config = parse_config(ALLOWLIST_CONFIG, "SKARDI_TEST_OC_UDTF_SCAN_OBJECT_ROOT", 0);
+        let ctx = setup(&gateway, &config, "SKARDI_TEST_OC_UDTF_SCAN_OBJECT_ROOT").await;
+        expect_plan_error(
+            &ctx,
+            r#"SELECT * FROM open_connector_scan('saas', 'mock.list_items',
+                                                 '{"workspace":"demo"}', '$')"#,
+            "do not support object rows",
         )
         .await;
         assert!(execute_requests(&gateway).is_empty(), "rejected pre-HTTP");

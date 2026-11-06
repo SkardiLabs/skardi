@@ -399,7 +399,7 @@ impl TableProvider for DynamoTableProvider {
             projection_expr,
             count_only,
             limit,
-            properties,
+            properties: Arc::new(properties),
         }))
     }
 
@@ -422,7 +422,7 @@ impl TableProvider for DynamoTableProvider {
             client: self.client.clone(),
             table_name: self.table_name.clone(),
             schema: self.schema.clone(),
-            properties: count_plan_properties(),
+            properties: Arc::new(count_plan_properties()),
             partition_key: self.partition_key.clone(),
             upsert,
         }))
@@ -1394,7 +1394,7 @@ struct DynamoScanExec {
     projection_expr: Option<(String, HashMap<String, String>)>,
     count_only: bool,
     limit: Option<usize>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl DisplayAs for DynamoScanExec {
@@ -1410,7 +1410,7 @@ impl ExecutionPlan for DynamoScanExec {
     fn as_any(&self) -> &dyn Any {
         self
     }
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -1503,7 +1503,7 @@ struct DynamoInsertExec {
     schema: SchemaRef,
     /// Properties of this node's own output (`{ count }`), distinct from
     /// `input`'s schema — `execute` streams a count, not the inserted rows.
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     partition_key: String,
     /// True for INSERT OVERWRITE/REPLACE (upsert via `BatchWriteItem`); false
     /// for plain INSERT (Append), which uses a conditional `PutItem` so a
@@ -1589,7 +1589,7 @@ impl ExecutionPlan for DynamoInsertExec {
     fn as_any(&self) -> &dyn Any {
         self
     }
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -1682,7 +1682,7 @@ struct DynamoDmlExec {
     handle: DynamoHandle,
     op: DynamoDmlOp,
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl DynamoDmlExec {
@@ -1691,7 +1691,7 @@ impl DynamoDmlExec {
             handle,
             op,
             schema: count_schema(),
-            properties: count_plan_properties(),
+            properties: Arc::new(count_plan_properties()),
         }
     }
 }
@@ -1715,7 +1715,7 @@ impl ExecutionPlan for DynamoDmlExec {
     fn as_any(&self) -> &dyn Any {
         self
     }
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {

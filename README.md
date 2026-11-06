@@ -72,7 +72,7 @@ spec:
 ```
 
 ```bash
-# from a source checkout — Docker once --query-audit-db ships in a tagged release
+# from a source checkout; the v0.6.0 Docker image takes the same flags (Docker & cloud, under More)
 git clone https://github.com/SkardiLabs/skardi.git && cd skardi
 cargo run --release --bin skardi-server -- \
   --ctx ctx.yaml --query-audit-db ./audit.db --port 8080
@@ -80,20 +80,22 @@ cargo run --release --bin skardi-server -- \
 
 **2 — Your agent explores freely, declaring intent.** Any SQL over any
 registered source, federated in one statement. `ai_context` is how the agent
-says *why* — `purpose` and `session_id` are recorded, never executed.
+says *why* — `purpose` (this query), `session_id` (this run), and optional
+`task` (the larger work a run of queries serves) are recorded, never executed.
 
 ```bash
 curl -X POST localhost:8080/query -H 'Content-Type: application/json' -d @- <<'JSON'
 { "sql": "SELECT plan, COUNT(*) AS cancels FROM warehouse.public.subs WHERE cancelled_at > now() - interval '7 days' GROUP BY plan",
-  "ai_context": { "purpose": "weekly churn check, by plan", "session_id": "sess-1a2b" } }
+  "ai_context": { "purpose": "weekly churn check, by plan", "session_id": "sess-1a2b", "task": "Q3 retention review" } }
 JSON
 ```
 
 **3 — Promote what recurs.** &nbsp;`in flight` — the
 [`skardi-query-log`](https://github.com/SkardiLabs/skardi-skills/pull/25) skill
 reads the ledger, writes the pipeline, reloads the server, health-checks it, and
-rolls back if the install fails. Held until `--query-audit-db` lands in a tagged
-release; today you can read the ledger yourself with plain SQL — it is a SQLite
+rolls back if the install fails. The server flag it relies on,
+`--query-audit-db`, ships in v0.6.0; the skill itself is still in review, and
+until it lands you can read the ledger yourself with plain SQL — it is a SQLite
 file indexed on `(session_id, created_at)`.
 
 ```yaml
@@ -110,8 +112,9 @@ spec:
 ```
 
 **4 — The agent has a new tool.** One definition, every binding — shell, REST,
-and MCP — so the same promoted pipeline works in Claude Code, Cursor, your own
-loop, or any HTTP host, with no wrapper code to maintain.
+and MCP over both transports (local stdio and remote streamable HTTP) — so the
+same promoted pipeline works in Claude Code, Cursor, your own loop, claude.ai,
+or any HTTP host, with no wrapper code to maintain.
 
 ```bash
 # shell verb — any agent with a Bash tool, no MCP config
@@ -119,10 +122,18 @@ skardi run weekly-churn -p window='7 days'
 # same pipeline, served as REST
 curl -X POST localhost:8080/weekly-churn/execute \
   -H 'Content-Type: application/json' -d '{"window": "7 days"}'
-# same pipeline as an MCP tool — hosts without a shell (Claude Desktop, …)
-# from a source checkout until `skardi mcp` ships in a tagged release
+# same pipeline as an MCP tool — hosts that spawn a local process (Claude Desktop, …)
+# (v0.6.0 or later)
 skardi mcp
+# … and as remote MCP — hosts that only take a URL (claude.ai, hosted agents):
+# the server above already serves http://localhost:8080/mcp. With auth enabled
+# every request carries a Bearer token; a public hostname is declared with
+# --mcp-allowed-host api.example.com (loopback is always allowed).
 ```
+
+Both MCP bindings — the local `skardi mcp` bridge and the server's `/mcp`
+endpoint — project the same tool surface; [docs/mcp.md](docs/mcp.md) covers
+host setup, auth, the host allowlist, and reverse proxies for both.
 
 Promoting queries into pipelines is only the simplest form of **Act**. The same ledger supports
 acting on *intentions*: when every weekday morning ends with the same GitHub +
@@ -168,22 +179,51 @@ scratch.
 
 ## Install
 
-Two skills. [`auto-context`](https://github.com/SkardiLabs/skardi-skills/tree/main/auto-context)
+**One line** installs the CLI, then offers to set up the Claude Code, Codex
+and Cursor it finds on your machine: the skills below in each agent's skills
+directory, and Skardi's MCP server in each agent's config (Skardi Cloud by
+URL, with sign-in in the browser; or a local `skardi-server` through
+`skardi mcp`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/SkardiLabs/skardi/main/install.sh | bash
+```
+
+Run it as yourself, not with `sudo`. Add `--agents-only` to update the skills
+or set up an agent you installed later, and `--help` for the rest. The
+sections below are the same steps by hand.
+
+**On Windows**, one line in PowerShell does the same: it installs `skardi.exe`,
+adds it to your user `PATH` with no admin rights needed, then offers to set up
+the Claude Code, Codex and Cursor it finds:
+
+```powershell
+irm https://raw.githubusercontent.com/SkardiLabs/skardi/main/install.ps1 | iex
+```
+
+To pass `-AgentsOnly` or another option, run it as a script block:
+`& ([scriptblock]::Create((irm https://raw.githubusercontent.com/SkardiLabs/skardi/main/install.ps1))) -AgentsOnly`.
+
+Four skills. [`auto-context`](https://github.com/SkardiLabs/skardi-skills/tree/main/skills/auto-context)
 turns a folder of documents — or a datastore you already run — into governed,
 searchable context served over HTTP by `skardi-server`: hybrid search (vector +
 FTS + RRF), defaulting to a local SQLite file the skill creates and owns, or
 pointed at Postgres + pgvector, MongoDB, or Lance.
-[`retrieval`](https://github.com/SkardiLabs/skardi-skills/tree/main/retrieval)
+[`retrieval`](https://github.com/SkardiLabs/skardi-skills/tree/main/skills/retrieval)
 teaches the agent to answer questions from a `skardi-server` you already run.
+[`graph-source`](https://github.com/SkardiLabs/skardi-skills/tree/main/skills/graph-source)
+connects a property graph and queries it through SQL, and
+[`graph-rag`](https://github.com/SkardiLabs/skardi-skills/tree/main/skills/graph-rag)
+answers questions whose evidence is in graph relationships.
 
-Both run on every [Agent Skills](https://agentskills.io/) host below. They
+All four run on every [Agent Skills](https://agentskills.io/) host below. They
 differ only in where the skill directory goes.
 
 **Claude Code** installs from the marketplace:
 
 ```text
 /plugin marketplace add SkardiLabs/skardi-skills
-/plugin install auto-context@skardi-skills
+/plugin install skardi@skardi-skills
 ```
 
 Every other host installs from a checkout:
@@ -197,8 +237,10 @@ git clone https://github.com/SkardiLabs/skardi-skills.git && cd skardi-skills
 
 ```bash
 mkdir -p ~/.agents/skills
-cp -r auto-context/skills/auto-context ~/.agents/skills/auto-context
-cp -r retrieval/skills/retrieval ~/.agents/skills/retrieval
+cp -r skills/auto-context ~/.agents/skills/auto-context
+cp -r skills/retrieval ~/.agents/skills/retrieval
+cp -r skills/graph-source ~/.agents/skills/graph-source
+cp -r skills/graph-rag ~/.agents/skills/graph-rag
 ```
 
 **[OpenClaw](https://docs.openclaw.ai/cli/skills)** installs through its own CLI
@@ -206,8 +248,8 @@ instead of copying, and **[Hermes](https://hermes-agent.nousresearch.com/docs/us
 reads `~/.hermes/skills/`:
 
 ```bash
-openclaw skills install ./auto-context/skills/auto-context   # add --global for every workspace
-mkdir -p ~/.hermes/skills && cp -r auto-context/skills/auto-context ~/.hermes/skills/auto-context
+openclaw skills install ./skills/auto-context   # add --global for every workspace
+mkdir -p ~/.hermes/skills && cp -r skills/auto-context ~/.hermes/skills/auto-context
 ```
 
 Per-host native directories, project-scoped installs and the Hermes
@@ -222,13 +264,51 @@ curl -fSL "https://github.com/SkardiLabs/skardi/releases/latest/download/skardi-
 sudo mv skardi /usr/local/bin/
 ```
 
+Against **skardi-cloud**, one command signs the CLI in — the console
+authenticates you in a browser and you approve one workspace, so there is no
+OAuth client to provision per deployment:
+
+```bash
+skardi login
+```
+
+That goes to the hosted console, `https://console.skardi.ai`. A self-hosted
+deployment names its own with `--control-plane https://your-console.example.com`
+(or `$SKARDI_CONTROL_PLANE_URL`, or `console:` in `~/.skardi/config.yaml`).
+
+It writes a workspace-scoped token into `~/.skardi/config.yaml`. `--no-browser`
+prints the approval URL instead of opening one, which is how a headless or
+SSH'd host logs in: nothing has to come back to the machine running `skardi`.
+See [docs/cli.md](docs/cli.md#signing-in-to-skardi-cloud--login--logout) for the
+other way in (`--client-id`, which selects workspaces from the terminal) and
+for what a cloud context can and cannot do.
+
+A coding agent can also connect your data sources for you: `skardi login
+--control` asks you to approve a 24-hour control token beside the query
+token, after which `skardi integrations …` connects a provider through a page
+only you can open — the agent is never handed a secret — and every command
+prints the next one. `skardi mcp register claude-code` adds the workspace's
+MCP server to Claude Code. See
+[docs/cli.md](docs/cli.md#connecting-data-sources-from-an-agent--integrations-handoff-documents).
+
 **Server** — a Docker image, or a source build (no pre-built binary yet):
 
 ```bash
 git clone https://github.com/SkardiLabs/skardi.git && cd skardi
-cargo build --release -p skardi-server     # add --features rag for embedding + chunk UDFs
-cargo install --locked --path crates/cli   # the CLI, from the same checkout
+cargo build --release -p skardi-server --features candle,chunking   # local embeddings + chunk(); pure Rust
+cargo install --locked --path crates/cli                            # the CLI, from the same checkout
 ```
+
+That gives the retrieval skills what they need — `chunk()` plus a local
+embedding UDF — and builds with cargo alone. (`chunking` is already a default
+server feature; naming it keeps the line correct against older tags.)
+
+**`--features rag` widens that to all four embedding backends, and one of them
+— `gguf` — compiles llama.cpp through `cmake`, so that build needs `cmake` and a
+C++ toolchain on the machine.** Reach for `rag` when you want `gguf`, `onnx` or
+`remote_embed`; otherwise the line above is the cheaper build. Or skip building
+altogether and run a published server image that ships the embedding backends
+(see **Docker & cloud** under More).
 
 ---
 
@@ -246,8 +326,13 @@ agents; deploy it next to your data, behind your usual auth.
 - **Semantic overlay** — plain-English descriptions of tables and columns served
   on `GET /data_source`, so the agent reads what data *means* before querying
   instead of guessing from a schema dump. [docs/semantics.md](docs/semantics.md)
-- **Offline jobs** — async batch writes with atomic commit, crash recovery and a
-  run ledger you can list and inspect. [docs/jobs.md](docs/jobs.md)
+- **Offline jobs** — async batch writes (append, or upsert into Lance on merge
+  keys) with atomic commit, crash recovery and a run ledger you can list and
+  inspect. [docs/jobs.md](docs/jobs.md)
+- **Webhooks** — a `kind: webhook` YAML becomes a public route that verifies a
+  provider's push deliveries (WhatsApp Cloud API today) and appends them to a
+  table, with the same column grammar as a source pack; a job then dedups them
+  into Lance. [docs/webhooks.md](docs/webhooks.md)
 - **Retrieval built in** — KNN, FTS and hybrid RRF in SQL; `candle()` embeddings,
   `chunk()`, `onnx_predict()` and `llm_extract()` as UDFs, so content and vector
   land on the same row atomically. [docs/embeddings/](docs/embeddings/)
@@ -256,7 +341,7 @@ agents; deploy it next to your data, behind your usual auth.
 
 | Type | CRUD | Catalog | Notes | Docs |
 |------|------|---------|-------|------|
-| PostgreSQL | Full | Yes | pgvector KNN, FTS | [docs](docs/postgres/) |
+| PostgreSQL | Full | Yes | pgvector KNN, FTS (`pg_fts`, plus `tsvector` predicates pushed down from raw SQL), one-dimensional `bigint[]` read/write (non-NULL elements) and membership filters, configurable read/write pools and initialization budgets | [docs](docs/postgres/) |
 | MySQL | Full | Yes | Table or catalog registration | [docs](docs/mysql/) |
 | SQLite | Full | Yes | sqlite-vec KNN, FTS | [docs](docs/sqlite/) |
 | MongoDB | Full | No | Collections with point lookups | [docs](docs/mongo/) |
@@ -264,13 +349,13 @@ agents; deploy it next to your data, behind your usual auth.
 | DynamoDB | Full | Yes | Scan + filter pushdown | [docs](docs/dynamodb/) |
 | SeekDB | Full | Yes | MySQL-wire CRUD, FULLTEXT, HNSW | [docs](docs/seekdb/) |
 | ClickHouse | Read | Yes | Columnar OLAP, filter/limit pushdown | [docs](docs/clickhouse/) |
-| Lance | Read + job-write | No | KNN, BM25 FTS; job destination | [docs](docs/lance/) |
+| Lance | Read + job-write | No | KNN, BM25 FTS; job destination, local or in S3 | [docs](docs/lance/), [S3](docs/S3_USAGE.md#lance-datasets-in-s3-and-s3-compatible-stores) |
 | Apache Iceberg | Read | No | Schema evolution, partition pruning | [docs](docs/iceberg/) |
 | InfluxDB 3 | Read | No | Time series over Arrow Flight SQL | [docs](docs/influxdb/) |
 | S3 / GCS / Azure | Read | No | CSV, Parquet, Lance in object stores | [docs](docs/S3_USAGE.md) |
 | CSV / Parquet | Read | No | Local or remote files | [docs](docs/server.md) |
-| SaaS via Open Connector | Read | Yes | GitHub, Slack, Notion, Feishu, Gmail, Discord, Outlook, OneDrive, Google Drive, Dropbox packs as stable SQL tables; pushdown + TTL cache | [docs](docs/open-connector.md) |
-| Documents | Read | No | PDF/Office/ODF/image → per-page Markdown, tables, images | [docs](docs/documents.md) |
+| SaaS via Open Connector | Read | Yes | GitHub, Slack, Notion, Feishu, Lark, Gmail, Discord, Outlook, OneDrive, Google Drive, Dropbox, WhatsApp packs as stable SQL tables; Slack channel history and Feishu/Lark document text as content tables, with time-window pushdown for incremental scans; pushdown + TTL cache | [docs](docs/open-connector.md) |
+| Documents | Read | No | PDF/Office/ODF/image → per-page Markdown, tables, images; Markdown and plain text read directly, one row per heading or paragraph run; optional empty-text rows | [docs](docs/documents.md) |
 | RSS / Atom | Read | Yes | Feeds as `feeds` + `items`; per-feed TTL cache, fault isolation, un-sandboxed fetch egress | [docs](docs/rss.md) |
 | Obsidian | Read | Yes | Vault as `notes`/`links`/`tags`; frontmatter JSON, resolved link graph, tags (feature `obsidian`) | [docs](docs/obsidian.md) |
 | Graph (Apache AGE) | Read | Yes | Read-only openCypher over Postgres; YAML views as catalog tables, `cypher_query` UDTF | [docs](docs/graph.md) |
@@ -305,13 +390,24 @@ infrastructure layer. See [docs/rss.md](docs/rss.md).
 docker run --rm -p 8080:8080 \
   -v /path/to/ctx.yaml:/config/ctx.yaml \
   -v /path/to/pipelines:/config/pipelines \
-  ghcr.io/skardilabs/skardi/skardi-server:latest \
+  ghcr.io/skardilabs/skardi/skardi-server-lite:latest \
   --ctx /config/ctx.yaml --pipeline /config/pipelines --port 8080
 ```
 
-Use the `skardi-server-rag` tag for the embedding + chunk UDFs, or build locally
-with `docker build -t skardi .` (`--build-arg FEATURES=rag`). The fastest cloud
-path is the [Sealos](https://sealos.io/products/app-store/skardi/) template.
+Two images are published per release: `skardi-server-lite` (default build —
+chunking only) and `skardi-server-full` (every stable feature: RAG/embedding,
+LLM extraction, documents, RSS). For anything in between, build locally with
+`docker build -t skardi --build-arg FEATURES=<flags> .` (e.g. `FEATURES=rag`).
+The fastest cloud path is the
+[Sealos](https://sealos.io/products/app-store/skardi/) template.
+
+The full image's `documents` support is **PDF-only**: it ships PDFium, but not
+the LibreOffice/ImageMagick converters that Office/ODF/image inputs need, and
+OCR is HTTP-only (`ocr_server_url`) in every build. For a non-PDF corpus,
+derive an image that installs those tools —
+`FROM ghcr.io/skardilabs/skardi/skardi-server-full:latest` plus
+`apt-get install -y libreoffice imagemagick`. See
+[docs/documents.md](docs/documents.md).
 
 </details>
 
@@ -327,7 +423,7 @@ Source-specific demos are linked from the table above.
 
 Reference: [server](docs/server.md) (ad-hoc queries, `ai_context`, the audit
 ledger) · [CLI](docs/cli.md) · [pipelines](docs/pipelines.md) ·
-[jobs](docs/jobs.md) · [semantics](docs/semantics.md) ·
+[jobs](docs/jobs.md) · [webhooks](docs/webhooks.md) · [semantics](docs/semantics.md) ·
 [federated queries](docs/federated-queries.md) ·
 [embeddings](docs/embeddings/) · [chunking](docs/chunk.md) ·
 [ONNX](docs/onnx_predict.md) · [LLM extraction](docs/llm_extract.md) ·

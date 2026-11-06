@@ -57,6 +57,16 @@ pub fn session_id_from_headers(headers: &HeaderMap) -> Result<Option<String>, St
     let s = value
         .to_str()
         .map_err(|_| format!("{SESSION_ID_HEADER} must contain only visible ASCII characters"))?;
+    validate_session_id(s)?;
+    Ok(Some(s.to_string()))
+}
+
+/// Validate one session-id VALUE against the rules above, independent of the
+/// header plumbing. Public so the server's `/mcp` handler can vet a
+/// caller-minted `Mcp-Session-Id` against the same predicate before
+/// forwarding it as `x-skardi-session-id` (falling back to a minted UUID on
+/// mismatch — losing that call's session grouping, not the call).
+pub fn validate_session_id(s: &str) -> Result<(), String> {
     if !s.chars().all(|c| c.is_ascii_graphic() && c != ',') {
         return Err(format!(
             "{SESSION_ID_HEADER} must contain only visible ASCII characters, \
@@ -72,5 +82,20 @@ pub fn session_id_from_headers(headers: &HeaderMap) -> Result<Option<String>, St
             "{SESSION_ID_HEADER} must be at most {MAX_SESSION_ID_CHARS} characters"
         ));
     }
-    Ok(Some(s.to_string()))
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_session_id_matches_the_header_rules() {
+        assert!(validate_session_id("sess-1").is_ok());
+        assert!(validate_session_id("").is_err());
+        assert!(validate_session_id("has space").is_err());
+        assert!(validate_session_id("a,b").is_err());
+        assert!(validate_session_id(&"x".repeat(MAX_SESSION_ID_CHARS + 1)).is_err());
+        assert!(validate_session_id(&"x".repeat(MAX_SESSION_ID_CHARS)).is_ok());
+    }
 }

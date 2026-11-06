@@ -23,6 +23,7 @@ use arrow::datatypes::Schema;
 use chrono::Utc;
 use datafusion::prelude::SessionContext;
 use serde_json::Value;
+use skardi_source_pack::OpenConnectorError;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{
     Arc, Mutex,
@@ -36,7 +37,7 @@ use super::definition::{Destination, DestinationMode, JobDefinition};
 use super::destination::{
     CancellableStream, JobDestination, JobDestinationKind, LanceDestination, SqlDmlDestination,
 };
-use super::store::{JobRun, JobRunStatus, JobStore};
+use super::store::{JobProviderFailure, JobRun, JobRunStatus, JobStore};
 use crate::pipeline::pipeline::Pipeline;
 use crate::sources::DataSourceType;
 
@@ -86,6 +87,11 @@ pub enum JobSubmitError {
         source_type: DataSourceType,
     },
 
+    /// An `upsert` the destination cannot honour: a SQL destination, which
+    /// has no MERGE to drive, or a merge key the query does not output.
+    #[error("Destination '{table}' cannot take this upsert: {reason}")]
+    UnsupportedWriteMode { table: String, reason: String },
+
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
@@ -103,6 +109,7 @@ impl JobSubmitError {
             Self::SqlPlanFailure { .. } => "sql_plan_failure",
             Self::DestinationResolutionFailed { .. } => "destination_resolution_failed",
             Self::NonTransactionalDestination { .. } => "non_transactional_destination",
+            Self::UnsupportedWriteMode { .. } => "unsupported_write_mode",
             Self::Internal(_) => "internal_error",
         }
     }
@@ -252,6 +259,7 @@ impl JobExecutor {
 
         self.preflight(destination.as_ref(), &job.destination, &query_schema)
             .await?;
+        check_upsert(destination.as_ref(), &job.destination, &query_schema)?;
 
         // Persist the pending row.
         let run_id = Uuid::new_v4().simple().to_string();
@@ -268,6 +276,7 @@ impl JobExecutor {
             rows_written: None,
             snapshot_id: None,
             error: None,
+            provider_failure: None,
             // Written in the same INSERT that creates the run: the reverse
             // pointer is durable the moment the run exists, so it survives
             // the submitter failing to record its own forward pointer.
@@ -339,7 +348,11 @@ impl JobExecutor {
                         table: dest.table.clone(),
                     }
                 })?;
-                Ok(Arc::new(LanceDestination::new(path)) as Arc<dyn JobDestination>)
+                Ok(Arc::new(
+                    LanceDestination::new(path)
+                        .with_merge_keys(dest.merge_keys.clone())
+                        .with_repeated_keys(dest.repeated_keys),
+                ) as Arc<dyn JobDestination>)
             }
             Some(DataSourceType::Postgres)
             | Some(DataSourceType::Mysql)
@@ -482,6 +495,42 @@ fn sorted_json(params: &HashMap<String, Value>) -> String {
     serde_json::to_string(&sorted).unwrap_or_else(|_| "{}".to_string())
 }
 
+/// The submit-time half of the upsert contract (the load-time half is
+/// [`Destination::validate`]): only a lake destination merges, and every
+/// merge key has to be a column the query produces. Caught here, a bad key
+/// is a 400 at submit rather than a failed run after the source was read.
+fn check_upsert(
+    destination: &dyn JobDestination,
+    config: &Destination,
+    query_schema: &Schema,
+) -> Result<(), JobSubmitError> {
+    if config.mode != DestinationMode::Upsert {
+        return Ok(());
+    }
+    if destination.kind() != JobDestinationKind::Lake {
+        return Err(JobSubmitError::UnsupportedWriteMode {
+            table: config.table.clone(),
+            reason: "`mode: upsert` is supported for Lance destinations only".to_string(),
+        });
+    }
+    let missing: Vec<&str> = config
+        .merge_keys
+        .iter()
+        .filter(|key| query_schema.field_with_name(key).is_err())
+        .map(String::as_str)
+        .collect();
+    if !missing.is_empty() {
+        return Err(JobSubmitError::UnsupportedWriteMode {
+            table: config.table.clone(),
+            reason: format!(
+                "merge key(s) {} are not columns of the query output",
+                missing.join(", ")
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Order-insensitive schema diff: every column in `produced` must have a
 /// same-named field in `expected` with the same Arrow DataType, and every
 /// non-nullable column in `expected` must exist in `produced` (otherwise
@@ -558,6 +607,7 @@ async fn run_job_task(
             None,
             None,
             None,
+            None,
         )
         .await
     {
@@ -614,6 +664,7 @@ async fn run_job_task(
                     Some(w.rows_written),
                     w.snapshot_id,
                     Some("cancelled after commit".to_string()),
+                    None,
                 )
                 .await
             {
@@ -629,6 +680,7 @@ async fn run_job_task(
                     Some(finished),
                     Some(w.rows_written),
                     w.snapshot_id,
+                    None,
                     None,
                 )
                 .await
@@ -651,6 +703,11 @@ async fn run_job_task(
                     None,
                     None,
                     Some(format!("{err:#}")),
+                    if status == JobRunStatus::Failed {
+                        provider_failure(&err)
+                    } else {
+                        None
+                    },
                 )
                 .await
             {
@@ -664,12 +721,253 @@ async fn run_job_task(
     flags.remove(&run_id);
 }
 
+fn provider_failure(error: &anyhow::Error) -> Option<JobProviderFailure> {
+    error.chain().find_map(|cause| {
+        let OpenConnectorError::ActionExecutionFailed {
+            error_code, data, ..
+        } = cause.downcast_ref::<OpenConnectorError>()?
+        else {
+            return None;
+        };
+        if error_code.as_deref() != Some("quota_exhausted") {
+            return None;
+        }
+        let retry_after_ms = data
+            .as_ref()
+            .and_then(|data| data.0.get("details"))
+            .and_then(|details| {
+                details
+                    .get("retryAfterSeconds")
+                    .and_then(Value::as_u64)
+                    .or_else(|| details.get("details")?.get("retryAfterSeconds")?.as_u64())
+            })
+            .and_then(|seconds| seconds.checked_mul(1000))
+            .and_then(|millis| u32::try_from(millis).ok());
+        Some(JobProviderFailure {
+            code: "quota_exhausted".to_string(),
+            retry_after_ms,
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    use super::super::store::SqliteJobStore;
     use super::*;
+    use crate::sources::hierarchy::HierarchyLevel;
+    use crate::sources::providers::open_connector::{
+        OpenConnectorConfig, register_open_connector_tables,
+    };
     use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use arrow::record_batch::RecordBatch;
+    use rstest::rstest;
+    use skardi_source_pack::testing::{MockGateway, MockResponse, discovery_ok};
+
+    fn upsert_on(table: &str, keys: &[&str]) -> Destination {
+        Destination {
+            table: table.to_string(),
+            mode: DestinationMode::Upsert,
+            create_if_missing: true,
+            merge_keys: keys.iter().map(|k| k.to_string()).collect(),
+            repeated_keys: Default::default(),
+        }
+    }
+
+    fn id_name_schema() -> ArrowSchema {
+        ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ])
+    }
+
+    #[rstest]
+    #[case::direct(false)]
+    #[case::wrapped(true)]
+    #[tokio::test]
+    async fn quota_from_an_oc_scan_survives_a_lance_job_and_ledger_reopen(#[case] wrapped: bool) {
+        let details =
+            serde_json::json!({"retryAfterSeconds": 2678400, "payload": "must-not-escape"});
+        let details = if wrapped {
+            serde_json::json!({"details": details})
+        } else {
+            details
+        };
+        let quota_refusal = serde_json::json!({
+            "success": false,
+            "message": "Upstream refused the request",
+            "errorCode": "quota_exhausted",
+            "data": {"status": 429, "details": details},
+            "meta": {}
+        })
+        .to_string();
+        let gateway = MockGateway::start(move |request| {
+            match (request.method.as_str(), request.path.as_str()) {
+                ("GET", "/v1/health") => MockResponse::ok("{}"),
+                ("GET", "/v1/actions/mock.list_items") => {
+                    MockResponse::ok(&discovery_ok("{}", "{}", true, None))
+                }
+                ("POST", "/v1/actions/mock.list_items") => {
+                    MockResponse::new(429, quota_refusal.clone())
+                        .with_header("retry-after", "2678400")
+                }
+                _ => MockResponse::new(404, "{}"),
+            }
+        })
+        .await;
+        let token_env = if wrapped {
+            "SKARDI_TEST_JOB_QUOTA_WRAPPED_TOKEN"
+        } else {
+            "SKARDI_TEST_JOB_QUOTA_DIRECT_TOKEN"
+        };
+        unsafe {
+            std::env::set_var(token_env, "test-token");
+        }
+        let config: OpenConnectorConfig = serde_yaml::from_str(&format!(
+            r#"
+runtime_token_env: {token_env}
+bindings:
+  - name: ws
+    source_pack: mock
+    resource: {{workspace: demo}}
+    tables: [items]
+"#
+        ))
+        .unwrap();
+        let mut context = SessionContext::new();
+        let registered = register_open_connector_tables(
+            &mut context,
+            "saas",
+            &gateway.url,
+            Some(&config),
+            false,
+            HierarchyLevel::Catalog,
+            None,
+        )
+        .await;
+        unsafe {
+            std::env::remove_var(token_env);
+        }
+        registered.unwrap();
+        let context = Arc::new(context);
+        let directory = tempfile::TempDir::new().unwrap();
+        let job_path = directory.path().join("quota.yaml");
+        std::fs::write(
+            &job_path,
+            r#"
+kind: job
+metadata:
+  name: quota
+  version: "1.0.0"
+spec:
+  query: SELECT name FROM saas.ws.items
+  destination:
+    table: corpus
+    mode: append
+    create_if_missing: true
+"#,
+        )
+        .unwrap();
+        let job = JobDefinition::load_from_file(&job_path, Arc::clone(&context))
+            .await
+            .unwrap()
+            .unwrap();
+        let ledger_path = directory.path().join("jobs.db");
+        let store = Arc::new(SqliteJobStore::open(&ledger_path).await.unwrap());
+        let executor = JobExecutor::new(
+            HashMap::from([("quota".to_string(), job)]),
+            store,
+            context,
+            HashMap::from([("corpus".to_string(), DataSourceType::Lance)]),
+            HashMap::from([(
+                "corpus".to_string(),
+                directory
+                    .path()
+                    .join("corpus.lance")
+                    .to_string_lossy()
+                    .into_owned(),
+            )]),
+        );
+        let run_id = executor
+            .submit("quota", HashMap::new(), None)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if executor
+                    .store()
+                    .get_run(&run_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status
+                    .is_terminal()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("job finishes");
+        let reopened = SqliteJobStore::open(&ledger_path).await.unwrap();
+        let run = reopened.get_run(&run_id).await.unwrap().unwrap();
+        assert_eq!(run.status, JobRunStatus::Failed, "{run:?}");
+        assert_eq!(
+            serde_json::to_value(&run).unwrap()["provider_failure"],
+            serde_json::json!({
+                "code": "quota_exhausted", "retry_after_ms": 2_678_400_000u32
+            })
+        );
+        assert_eq!(
+            gateway
+                .requests()
+                .iter()
+                .filter(|request| request.method == "POST")
+                .count(),
+            1,
+            "quota rejection must not use the default three attempts"
+        );
+    }
+
+    #[test]
+    fn check_upsert_accepts_a_lake_destination_whose_keys_are_output_columns() {
+        let lake = LanceDestination::new("unused.lance");
+        check_upsert(&lake, &upsert_on("lake", &["id"]), &id_name_schema())
+            .expect("a Lance destination keyed on an output column merges");
+    }
+
+    #[test]
+    fn check_upsert_refuses_a_sql_destination() {
+        let db = SqlDmlDestination::new(Arc::new(SessionContext::new()), "pg.public.t");
+        let err = check_upsert(&db, &upsert_on("pg.public.t", &["id"]), &id_name_schema())
+            .expect_err("SQL destinations have no MERGE");
+        assert_eq!(err.category(), "unsupported_write_mode");
+        assert!(err.to_string().contains("Lance destinations only"), "{err}");
+    }
+
+    #[test]
+    fn check_upsert_names_every_key_the_query_does_not_output() {
+        let lake = LanceDestination::new("unused.lance");
+        let err = check_upsert(
+            &lake,
+            &upsert_on("lake", &["id", "path", "source_id"]),
+            &id_name_schema(),
+        )
+        .expect_err("keys must be output columns");
+        assert!(err.to_string().contains("path, source_id"), "{err}");
+    }
+
+    #[test]
+    fn check_upsert_ignores_append() {
+        let db = SqlDmlDestination::new(Arc::new(SessionContext::new()), "pg.public.t");
+        let append = Destination {
+            mode: DestinationMode::Append,
+            merge_keys: Vec::new(),
+            ..upsert_on("pg.public.t", &[])
+        };
+        check_upsert(&db, &append, &id_name_schema()).expect("append is not an upsert");
+    }
 
     #[test]
     fn substitute_sql_params_replaces_string_and_number() {

@@ -22,6 +22,9 @@
 # them under the user identity requires the im:message:readonly (or
 # im:message / im:message.history:readonly) scope — the get_as_user
 # scopes the gateway declares are NOT honored for this path (99991679).
+# document_blocks is live-verified 2026-09-01 over two cursor pages; its
+# real page_size cap is 500 (99992402 at 501), and its block-type payload
+# remains under a dynamic `page` / `text` / `heading1` / ... key.
 # `message_position` (a digit string on every row) is deliberately
 # unmapped: it appears in no public Feishu doc we could pin semantics
 # to.
@@ -33,7 +36,7 @@ tables:
   chats:
     action: feishu.list_chats
     row_path: "$.items"
-    fingerprint: 51dcd0f7fe1efb4437ee71cf62e9991b535e5d0bc71a3b9998a96b090b4e6cd3
+    fingerprint: ae92a20605dc6b38d1c350df84bbe2989a2284450a17fcf6a7b398b958a9882d
     pagination:
       strategy: cursor
       cursor_input: pageToken
@@ -62,7 +65,7 @@ tables:
   messages:
     action: feishu.list_messages
     row_path: "$.items"
-    fingerprint: 51dcd0f7fe1efb4437ee71cf62e9991b535e5d0bc71a3b9998a96b090b4e6cd3
+    fingerprint: ae92a20605dc6b38d1c350df84bbe2989a2284450a17fcf6a7b398b958a9882d
     pagination:
       strategy: cursor
       cursor_input: pageToken
@@ -116,10 +119,66 @@ tables:
       # message resource documents it, typed utf8 like every other id.
       - { name: upper_message_id, path: upper_message_id, type: utf8, nullable: true }
 
+  # One row per DOCUMENT, not per block: the whole docx as plain text.
+  #
+  # `document_blocks` below is the structural view, and it deliberately
+  # exposes no text — a block's payload lives under a key named BY its
+  # block_type (`page`, `text`, `heading1`, ...), which a fixed relational
+  # mapping cannot address. That makes it useless as a corpus on its own,
+  # so this table exists beside it: Feishu's raw-content endpoint returns
+  # the assembled text of every block in one call, which is exactly the
+  # shape an OKF document row wants.
+  #
+  # This is the pack format's first `row_shape: object` table. The action
+  # answers with the row itself (`{documentId, content}`) rather than a
+  # list, so `row_path: "$"` names the envelope and the loader refuses any
+  # pagination beside it — there is no second page of a document's text.
+  # Live-captured 2026-09-03 through the pinned build against a real
+  # document; the fixture is that capture with the id replaced.
+  document_content:
+    action: feishu.get_document_content
+    row_path: "$"
+    row_shape: object
+    fingerprint: 08734aacc5852526417d49b121b8dc171cca52d961432cca342bb16b23cc8b1c
+    pagination:
+      strategy: single_page
+    resources:
+      required: [documentId]
+    columns:
+      - { name: document_id, path: documentId, type: utf8, nullable: false }
+      # Never null: the action substitutes an empty string for a document
+      # with no text, so an empty corpus row is a real empty document
+      # rather than a fetch that half-failed.
+      - { name: content, path: content, type: utf8, nullable: false }
+
+  document_blocks:
+    action: feishu.list_document_blocks
+    row_path: "$.items"
+    fingerprint: 01197fece20db6e4dc097595b5d8b28cd42380aa1c6c625cd4a2377a112883aa
+    pagination:
+      strategy: cursor
+      cursor_input: pageToken
+      next_cursor_path: "$.pageToken"
+      page_size_input: pageSize
+      # Live-verified 2026-09-01: 500 succeeds and 501 hard-fails with
+      # Feishu 99992402 (`the max value is 500`).
+      page_size: 500
+      has_more_path: "$.hasMore"
+    resources:
+      required: [documentId]
+    columns:
+      # The block-type payload (`page`, `text`, `heading1`, ...) lives
+      # under a key selected BY block_type. A fixed relational mapping
+      # cannot address that dynamic key; the live fixtures retain it for
+      # contract evidence while this table exposes the stable row fields.
+      - { name: block_id, path: block_id, type: utf8, nullable: false }
+      - { name: block_type, path: block_type, type: int64, nullable: true }
+      - { name: parent_id, path: parent_id, type: utf8, nullable: true }
+
   chat_members:
     action: feishu.list_chat_members
     row_path: "$.items"
-    fingerprint: 51dcd0f7fe1efb4437ee71cf62e9991b535e5d0bc71a3b9998a96b090b4e6cd3
+    fingerprint: ae92a20605dc6b38d1c350df84bbe2989a2284450a17fcf6a7b398b958a9882d
     pagination:
       strategy: cursor
       cursor_input: pageToken
@@ -138,7 +197,7 @@ tables:
   tasks:
     action: feishu.list_tasks
     row_path: "$.items"
-    fingerprint: f8d062dc87c010a03a76e6b1b0bc252f2de8b7004365042422de3f89b13f6382
+    fingerprint: 32c84c3fbbb16e2b6b1721646a52c01eef37064530310b623101f8672841af1f
     pagination:
       strategy: cursor
       cursor_input: pageToken
@@ -178,7 +237,7 @@ tables:
   wiki_spaces:
     action: feishu.list_wiki_spaces
     row_path: "$.items"
-    fingerprint: e6b2676fbe15e20f408f30c5d2f4aafee1cd628c434f699f1520f780fc940a6a
+    fingerprint: 3e409151958df3889afbd4461debb32f96f4d6336fb79bc79b09bf336fdeda97
     pagination:
       strategy: cursor
       cursor_input: pageToken
@@ -197,7 +256,7 @@ tables:
   wiki_nodes:
     action: feishu.list_wiki_nodes
     row_path: "$.items"
-    fingerprint: e6b2676fbe15e20f408f30c5d2f4aafee1cd628c434f699f1520f780fc940a6a
+    fingerprint: 3e409151958df3889afbd4461debb32f96f4d6336fb79bc79b09bf336fdeda97
     pagination:
       strategy: cursor
       cursor_input: pageToken

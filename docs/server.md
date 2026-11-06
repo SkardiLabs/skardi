@@ -25,6 +25,7 @@ cargo run --bin skardi-server -- \
   --jobs <job-file-or-directory> \
   --jobs-db <path-to-jobs.db> \
   --semantics <semantics-file-or-directory> \
+  --webhooks <webhook-file-or-directory> \
   --port 8080
 ```
 
@@ -35,6 +36,7 @@ cargo run --bin skardi-server -- \
 | `--jobs` | Job YAML file or directory. When omitted, every `/jobs/*` endpoint returns `503` with `error_type: jobs_disabled`. |
 | `--jobs-db` | SQLite run ledger for jobs. Default: `~/.skardi/jobs.db` (parent dirs created on first use). |
 | `--semantics` | `kind: semantics` YAML file or directory. Attaches NL descriptions to tables / columns on `GET /data_source`. **Auto-discovered** from `<ctx_dir>/semantics/` or `<ctx_dir>/semantics.yaml` when omitted. See [semantics.md](semantics.md). |
+| `--webhooks` | `kind: webhook` YAML file or directory. Each file becomes a public `GET|POST /webhooks/<name>` route that verifies a provider's deliveries and appends them to a table. When omitted, every `/webhooks/*` route returns `404`. See [webhooks.md](webhooks.md). |
 | `--port` | Port to listen on. Default: `8080`. |
 
 On startup the server:
@@ -46,7 +48,11 @@ On startup the server:
    orphan runs — any row left in `pending` or `running` by a previous
    crash is rewritten to `failed` with the message `"server restarted
    before run completed"`.
-4. Binds the HTTP listener.
+4. Loads webhook files, resolves their secrets from the environment, and
+   preflights every destination table (it must exist, on a read-write
+   transactional source, with exactly the route's columns in order);
+   any mismatch is a startup error.
+5. Binds the HTTP listener.
 
 ---
 
@@ -108,12 +114,14 @@ and updates automatically when pipelines, jobs, or semantics reload.
 | `/pipeline/:name` | GET | Metadata for one pipeline. |
 | `/health/:name` | GET | Per-pipeline health check (includes upstream data-source status). |
 | `/:name/execute` | POST | Execute a pipeline by name. Body is the JSON param map. See [pipelines.md](pipelines.md). |
-| `/query` | POST | Execute one ad-hoc SQL statement. Body: `{ "sql": "...", "max_rows": 1000, "ai_context": { "purpose": "...", "session_id": "..." } }`. See [§ Ad-hoc queries](#ad-hoc-queries). |
+| `/query` | POST | Execute one ad-hoc SQL statement. Body: `{ "sql": "...", "max_rows": 1000, "ai_context": { "purpose": "...", "session_id": "...", "task": "..." } }`. See [§ Ad-hoc queries](#ad-hoc-queries). |
 | `/jobs` | GET | List all registered jobs with destinations. |
 | `/jobs/:name/run` | POST | Submit a new job run. Body is the JSON param map. See [jobs.md](jobs.md). |
 | `/jobs/runs` | GET | List recent runs; supports `?job=<name>&limit=N`. |
 | `/jobs/runs/:run_id` | GET | Current state of one run. |
 | `/jobs/runs/:run_id/cancel` | POST | Flag a run for cancellation. |
+| `/webhooks/:name` | GET | Provider subscription handshake (Meta's `hub.challenge`). Public; authenticated by the verify token. See [webhooks.md](webhooks.md). |
+| `/webhooks/:name` | POST | One provider delivery, verified by its signature and appended to the route's tables. Public; `200` means committed. |
 
 Request / response bodies for pipeline execution are documented in
 [pipelines.md § Response format](pipelines.md#response-format); job run
@@ -136,8 +144,13 @@ Request fields:
   be a JSON object carrying two required non-empty strings — `purpose`
   (≤ 2000 chars, why the query runs) and `session_id` (≤ 200 chars, groups
   queries from one agent session) — plus any free-form keys of the caller's
-  choosing. The whole object must serialize to ≤ 4096 bytes. Recorded for
-  observability; never executed. Any violation → `400
+  choosing. One such key is conventional: `task` (a string, why a *run* of
+  queries is happening — the larger piece of work a `purpose` serves, repeated
+  verbatim across it), which the daily brief reads. The server does not require
+  or specially validate `task`; it is subject only to the whole-object rules.
+  That object must serialize to ≤ 4096 bytes — reachable with a full `purpose`
+  and `task` together, so a caller setting both should budget for it. Recorded
+  for observability; never executed. Any violation → `400
   parameter_validation_error`. Omitting the field is valid; sending
   `"ai_context": null` is *not* — an explicit null is a present-but-malformed
   value and is rejected like any other non-object.
@@ -573,5 +586,6 @@ on that source, from pipelines and jobs alike.
 
 - **[Pipelines](pipelines.md)** — YAML shape, parameters, invocation, and response format for the online-serving side.
 - **[Jobs](jobs.md)** — YAML shape, destinations, run ledger, and cancellation for the offline-batch side.
+- **[Webhooks](webhooks.md)** — provider push deliveries (WhatsApp today) verified and appended to a table you can query.
 - **[Semantics](semantics.md)** — natural-language descriptions on tables and columns; the agent-facing catalog overlay.
 - **[CLI](cli.md)** — `skardi run`, aliases, federated SQL from the shell.
