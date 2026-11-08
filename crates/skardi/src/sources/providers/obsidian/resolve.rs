@@ -70,9 +70,15 @@ pub struct Resolved {
 pub struct Index {
     by_path: HashMap<String, String>,
     by_name: HashMap<String, Vec<String>>,
-    /// Multi-segment tails of every path, for the suffix rule in
+    /// Multi-segment tails of every path, verbatim, for the suffix rule in
     /// [`Index::resolve_wikilink`].
     by_suffix: HashMap<String, Vec<String>>,
+    /// The same tails for `.md` files with the extension dropped, kept apart
+    /// from [`Index::by_suffix`] so a note and an extensionless file of the
+    /// same name are two candidates under two keys rather than one
+    /// `ambiguous` under one. Searched second, exactly as [`Index::lookup_exact`]
+    /// tries the path before the path plus `.md`.
+    by_suffix_stem: HashMap<String, Vec<String>>,
 }
 
 impl Index {
@@ -96,18 +102,28 @@ impl Index {
                 .entry(name.to_lowercase())
                 .or_default()
                 .push(path.to_string());
-            for suffix in path_suffixes(path) {
+            for (suffix, stem) in path_suffixes(path) {
                 index
                     .by_suffix
                     .entry(suffix)
                     .or_default()
                     .push(path.to_string());
+                if let Some(stem) = stem {
+                    index
+                        .by_suffix_stem
+                        .entry(stem)
+                        .or_default()
+                        .push(path.to_string());
+                }
             }
         }
         for candidates in index.by_name.values_mut() {
             candidates.sort();
         }
         for candidates in index.by_suffix.values_mut() {
+            candidates.sort();
+        }
+        for candidates in index.by_suffix_stem.values_mut() {
             candidates.sort();
         }
         index
@@ -149,6 +165,11 @@ impl Index {
     fn resolve_wikilink(&self, from_path: &str, target: &str) -> (Option<String>, Resolution) {
         if target.starts_with("./") || target.starts_with("../") {
             return self.exact_or_missing(normalize(folder_of(from_path), target));
+        }
+        // A leading `/` names the vault root explicitly, so it is a path and
+        // only a path: no suffix fallback, same as a Markdown link's `/`.
+        if let Some(rooted) = target.strip_prefix('/') {
+            return self.exact_or_missing(normalize("", rooted));
         }
         if target.contains('/') {
             let Some(candidate) = normalize("", target) else {
@@ -220,8 +241,17 @@ impl Index {
     /// listed path (`Projects/Notes` -> `Work/Projects/Notes.md`). Only
     /// reached once the root-relative path missed.
     fn lookup_suffix(&self, candidate: &str) -> (Option<String>, Resolution) {
-        let key = strip_md(candidate).unwrap_or(candidate).to_lowercase();
-        match self.by_suffix.get(&key).map(Vec::as_slice) {
+        let lower = candidate.to_lowercase();
+        // The tail as written wins outright: a vault holding both `Sub/Notes`
+        // and `Sub/Notes.md` has one answer for `[[Sub/Notes]]`, not an
+        // `ambiguous` born of the index conflating the two.
+        match self.by_suffix.get(&lower).map(Vec::as_slice) {
+            Some([only]) => return (Some(only.clone()), Resolution::Name),
+            Some([_, _, ..]) => return (None, Resolution::Ambiguous),
+            Some([]) | None => {}
+        }
+        let stem = strip_md(&lower).unwrap_or(&lower);
+        match self.by_suffix_stem.get(stem).map(Vec::as_slice) {
             Some([only]) => (Some(only.clone()), Resolution::Name),
             Some([_, _, ..]) => (None, Resolution::Ambiguous),
             Some([]) | None => (None, Resolution::Missing),
@@ -239,22 +269,22 @@ impl Index {
     }
 }
 
-/// Every multi-segment tail of `path`, lowercased, with and without the `.md`
-/// extension — the keys a path-ish wikilink can match by suffix.
+/// Every multi-segment tail of `path`, lowercased, as `(verbatim, stem)` — the
+/// keys a path-ish wikilink can match by suffix. `stem` is the tail with a
+/// `.md` extension dropped, and `None` for anything else, so the two keys never
+/// share a map.
 ///
 /// The one-segment tail is deliberately absent: a bare name is `by_name`'s job,
 /// under different rules (stem only, and it is what Obsidian's "Shortest path"
 /// setting writes). Size is linear in the number of path segments in the vault,
 /// which is why this is built once per scan rather than scanned per link.
-fn path_suffixes(path: &str) -> Vec<String> {
+fn path_suffixes(path: &str) -> Vec<(String, Option<String>)> {
     let segments: Vec<&str> = path.split('/').collect();
     let mut out = Vec::new();
     for start in (0..segments.len().saturating_sub(1)).rev() {
         let lower = segments[start..].join("/").to_lowercase();
-        if let Some(stem) = strip_md(&lower) {
-            out.push(stem.to_string());
-        }
-        out.push(lower);
+        let stem = strip_md(&lower).map(str::to_string);
+        out.push((lower, stem));
     }
     out
 }
@@ -457,6 +487,27 @@ mod tests {
         // Two tails, no winner.
         let twice = Index::build(&["A/Projects/Notes.md", "B/Projects/Notes.md"]);
         assert_eq!(at(&twice, "Projects/Notes"), (None, Resolution::Ambiguous));
+
+        // A leading `/` names the vault root and nothing else: a path that is
+        // not there is `missing`, never a suffix hit elsewhere.
+        assert_eq!(at(&nested, "/Projects/Notes"), (None, Resolution::Missing));
+        assert_eq!(
+            at(&nested, "/Work/Projects/Notes"),
+            ok("Work/Projects/Notes.md", Resolution::Exact)
+        );
+
+        // A note and an extensionless file sharing a tail are two keys, not one
+        // `ambiguous` key: the tail as written decides, and `.md` is optional
+        // only when nothing matched verbatim.
+        let both_kinds = Index::build(&["A/Sub/Notes.md", "A/Sub/Notes"]);
+        assert_eq!(
+            at(&both_kinds, "Sub/Notes"),
+            ok("A/Sub/Notes", Resolution::Name)
+        );
+        assert_eq!(
+            at(&both_kinds, "Sub/Notes.md"),
+            ok("A/Sub/Notes.md", Resolution::Name)
+        );
     }
 
     #[test]

@@ -157,6 +157,24 @@ pub fn parse_note(
     }
 }
 
+/// The mtime to record for a note. Almost always the listing's; for a local
+/// file the listing could not stat, one more `stat` after a successful read —
+/// the file is plainly there, so the listing's failure was a race (a note
+/// deleted and recreated mid-scan), and `notes.modified_at` is not nullable, so
+/// the alternative is recording the epoch as if it were the truth. Blocking,
+/// like the rest of the scan.
+fn modified_for(entry: &BlobEntry) -> DateTime<Utc> {
+    if let Some(modified) = entry.modified {
+        return modified;
+    }
+    if let Loc::Local(path) = &entry.loc {
+        if let Ok(modified) = std::fs::metadata(path).and_then(|meta| meta.modified()) {
+            return DateTime::<Utc>::from(modified);
+        }
+    }
+    DateTime::<Utc>::from(std::time::UNIX_EPOCH)
+}
+
 fn link_row(from_path: &str, raw: &RawLink, source: Source, index: &Index) -> LinkRow {
     let resolved = index.resolve(from_path, raw);
     LinkRow {
@@ -251,6 +269,13 @@ impl VaultScan {
         let started = Instant::now();
         let handle = Handle::current();
 
+        // Before the listing, and again before the first read: a `LIST` over a
+        // large bucket is itself slow, and the reads used to start regardless.
+        // Inside one `list` call there is nothing to check — it is a single
+        // `BlobStore` call — so a cancellation lands at worst one listing late.
+        if cancel.is_cancelled() {
+            anyhow::bail!("obsidian: scan of {root} cancelled before listing");
+        }
         let entries = handle
             .block_on(store.list(
                 prefix,
@@ -275,10 +300,12 @@ impl VaultScan {
             if !is_markdown(&entry.rel_key) {
                 continue;
             }
-            if entry.size > opts.max_file_bytes {
+            // An unknown size (the listing could not stat it) is not "small":
+            // it is unknown, so the read's own cap decides instead.
+            if let Some(size) = entry.size.filter(|size| *size > opts.max_file_bytes) {
                 tracing::warn!(
                     path = %entry.rel_key,
-                    size = entry.size,
+                    size,
                     max_file_bytes = opts.max_file_bytes,
                     "obsidian: skipping note over max_file_bytes"
                 );
@@ -286,6 +313,13 @@ impl VaultScan {
                 continue;
             }
             targets.push(entry);
+        }
+
+        if cancel.is_cancelled() {
+            anyhow::bail!(
+                "obsidian: scan of {root} cancelled after listing, before reading {} notes",
+                targets.len()
+            );
         }
 
         let mut notes = Vec::with_capacity(targets.len());
@@ -350,10 +384,15 @@ impl VaultScan {
                     }
                 };
                 let text = String::from_utf8_lossy(&bytes);
+                // The bytes just read, not the listing's snapshot: a note that
+                // grew or shrank since the listing reports what was parsed, and
+                // one the listing could not stat reports a real size instead of
+                // a 0 nobody can tell from an empty file.
+                let size = bytes.len() as u64;
                 notes.push(parse_note(
                     &entry.rel_key,
-                    entry.size,
-                    entry.modified,
+                    size,
+                    modified_for(entry),
                     &text,
                     &index,
                 ));
@@ -1122,6 +1161,36 @@ mod tests {
         .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("cancelled"), "{msg}");
+    }
+
+    /// A listing that could not stat a file carries `None`, not a fabricated
+    /// zero: the mtime is taken from the file itself once the read proved it is
+    /// there, so a note deleted and recreated mid-scan is not recorded at the
+    /// epoch. `notes.modified_at` is not nullable, so there is no third option.
+    #[test]
+    fn an_unstat_able_entry_takes_its_mtime_from_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, b"body\n").unwrap();
+        let on_disk = DateTime::<Utc>::from(std::fs::metadata(&path).unwrap().modified().unwrap());
+
+        let unknown = BlobEntry {
+            loc: Loc::Local(path),
+            rel_key: "note.md".to_string(),
+            size: None,
+            modified: None,
+        };
+        assert_eq!(modified_for(&unknown), on_disk);
+
+        // A listed mtime is used as is; nothing is stat-ed twice.
+        let known = BlobEntry {
+            modified: Some(DateTime::<Utc>::from(std::time::UNIX_EPOCH)),
+            ..unknown
+        };
+        assert_eq!(
+            modified_for(&known),
+            DateTime::<Utc>::from(std::time::UNIX_EPOCH)
+        );
     }
 
     /// What the `ExecutionPlan`'s stream owns: the guard cancels on drop, so a

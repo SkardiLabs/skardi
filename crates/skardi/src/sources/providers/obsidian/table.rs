@@ -335,15 +335,22 @@ fn columns(
         .collect()
 }
 
-/// Rows per emitted batch.
+/// Rows per emitted batch, and the Utf8 bytes those rows may carry.
 ///
-/// Not a tuning knob: `notes.body` is a `Utf8` column, whose offsets are `i32`,
-/// so a single batch holding more than 2 GiB of note text overflows inside
-/// Arrow — a panic in the middle of a scan rather than an error a caller can
-/// see. A vault that big is rare but entirely legal (`max_file_bytes` caps one
-/// note, not the vault), and chunking costs nothing: the row order across
-/// batches is the order within one, so [`declared_ordering`] still holds.
+/// Neither is a tuning knob. `notes.body` is a `Utf8` column, whose offsets are
+/// `i32`, so a batch holding more than 2 GiB of text overflows inside Arrow — a
+/// panic mid-scan rather than an error a caller can see. The row cap alone does
+/// not prevent that: `max_file_bytes` caps one note at 16 MiB by default, so
+/// 8192 consecutive notes averaging more than 256 KiB still cross 2 GiB. The
+/// byte budget is what actually bounds the column; the row cap keeps batches a
+/// size DataFusion's operators like when the rows are small.
+///
+/// 256 MiB leaves an order of magnitude of headroom under the 2 GiB limit, so a
+/// row that overshoots its own budget (a single 16 MiB note) cannot get near it.
+/// Either way the row order across batches is the order within one, so
+/// [`declared_ordering`] still holds.
 const MAX_BATCH_ROWS: usize = 8 * 1024;
+const MAX_BATCH_BYTES: usize = 256 * 1024 * 1024;
 
 /// Project + limit the parsed notes into batches of `kind`, in row order. An
 /// empty projection (`count(*)`) still carries the row count, and an empty
@@ -355,12 +362,39 @@ pub(crate) fn build_batches(
     projection: &[usize],
     limit: Option<usize>,
 ) -> datafusion::common::Result<Vec<RecordBatch>> {
+    build_batches_bounded(
+        kind,
+        notes,
+        projected_schema,
+        projection,
+        limit,
+        MAX_BATCH_ROWS,
+        MAX_BATCH_BYTES,
+    )
+}
+
+/// [`build_batches`] with the caps spelled out, so a test can cross the byte
+/// budget without allocating 256 MiB of fixture.
+fn build_batches_bounded(
+    kind: TableKind,
+    notes: &[ParsedNote],
+    projected_schema: &SchemaRef,
+    projection: &[usize],
+    limit: Option<usize>,
+    max_rows: usize,
+    max_bytes: usize,
+) -> datafusion::common::Result<Vec<RecordBatch>> {
     match kind {
         TableKind::Notes => {
             let rows = truncate(notes, limit);
-            chunked(rows, projected_schema, |chunk| {
-                columns(projection, |i| notes_column(i, chunk))
-            })
+            chunked(
+                rows,
+                projected_schema,
+                max_rows,
+                max_bytes,
+                note_bytes,
+                |chunk| columns(projection, |i| notes_column(i, chunk)),
+            )
         }
         TableKind::Links => {
             let all: Vec<(&str, &LinkRow)> = notes
@@ -368,9 +402,14 @@ pub(crate) fn build_batches(
                 .flat_map(|n| n.links.iter().map(move |l| (n.path.as_str(), l)))
                 .collect();
             let rows = truncate(&all, limit);
-            chunked(rows, projected_schema, |chunk| {
-                columns(projection, |i| links_column(i, chunk))
-            })
+            chunked(
+                rows,
+                projected_schema,
+                max_rows,
+                max_bytes,
+                link_bytes,
+                |chunk| columns(projection, |i| links_column(i, chunk)),
+            )
         }
         TableKind::Tags => {
             let all: Vec<(&str, &TagRow)> = notes
@@ -378,27 +417,91 @@ pub(crate) fn build_batches(
                 .flat_map(|n| n.tags.iter().map(move |t| (n.path.as_str(), t)))
                 .collect();
             let rows = truncate(&all, limit);
-            chunked(rows, projected_schema, |chunk| {
-                columns(projection, |i| tags_column(i, chunk))
-            })
+            chunked(
+                rows,
+                projected_schema,
+                max_rows,
+                max_bytes,
+                tag_bytes,
+                |chunk| columns(projection, |i| tags_column(i, chunk)),
+            )
         }
     }
 }
 
-/// `rows` in `MAX_BATCH_ROWS`-sized batches, built by `arrays_for`. No rows
-/// still means one batch: the consumer needs the schema, and `count(*)` over an
-/// empty vault must see a zero-row batch rather than nothing at all.
+/// The Utf8 bytes one row contributes — what the i32 offsets actually count.
+/// Measured on every string column of the table, projection or no projection:
+/// a projection only ever drops columns, so this is an upper bound on what the
+/// built batch holds, and the budget stays independent of the query.
+fn note_bytes(n: &ParsedNote) -> usize {
+    n.path.len()
+        + n.name.len()
+        + n.folder.len()
+        + n.body.len()
+        + opt_len(n.frontmatter_json.as_deref())
+        + opt_len(n.frontmatter_error.as_deref())
+        + n.aliases
+            .as_ref()
+            .map_or(0, |aliases| aliases.iter().map(String::len).sum::<usize>())
+}
+
+fn link_bytes((from_path, link): &(&str, &LinkRow)) -> usize {
+    from_path.len()
+        + opt_len(link.to_path.as_deref())
+        + link.target.len()
+        + opt_len(link.display_text.as_deref())
+        + opt_len(link.heading.as_deref())
+        + opt_len(link.block_id.as_deref())
+}
+
+fn tag_bytes((path, tag): &(&str, &TagRow)) -> usize {
+    path.len() + tag.tag.len()
+}
+
+fn opt_len(value: Option<&str>) -> usize {
+    value.map_or(0, str::len)
+}
+
+/// `rows` split into batches at whichever cap comes first — `max_rows` rows or
+/// `max_bytes` of Utf8 — and built by `arrays_for`. A row whose own bytes
+/// exceed the budget still gets a batch (it cannot be split), so every batch
+/// holds at least one row. No rows still means one batch: the consumer needs
+/// the schema, and `count(*)` over an empty vault must see a zero-row batch
+/// rather than nothing at all.
 fn chunked<T>(
     rows: &[T],
     projected_schema: &SchemaRef,
+    max_rows: usize,
+    max_bytes: usize,
+    bytes_of: impl Fn(&T) -> usize,
     mut arrays_for: impl FnMut(&[T]) -> datafusion::common::Result<Vec<ArrayRef>>,
 ) -> datafusion::common::Result<Vec<RecordBatch>> {
     if rows.is_empty() {
         return Ok(vec![batch(projected_schema, arrays_for(rows)?, 0)?]);
     }
-    rows.chunks(MAX_BATCH_ROWS)
-        .map(|chunk| batch(projected_schema, arrays_for(chunk)?, chunk.len()))
-        .collect()
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut bytes = 0usize;
+    for (i, row) in rows.iter().enumerate() {
+        let row_bytes = bytes_of(row);
+        let started_here = i == start;
+        if i - start == max_rows || (!started_here && bytes + row_bytes > max_bytes) {
+            out.push(batch(
+                projected_schema,
+                arrays_for(&rows[start..i])?,
+                i - start,
+            )?);
+            start = i;
+            bytes = 0;
+        }
+        bytes += row_bytes;
+    }
+    out.push(batch(
+        projected_schema,
+        arrays_for(&rows[start..])?,
+        rows.len() - start,
+    )?);
+    Ok(out)
 }
 
 fn batch(
@@ -736,6 +839,63 @@ mod tests {
         let first_path = |b: &RecordBatch| b.column(0).as_string::<i32>().value(0).to_string();
         assert_eq!(first_path(&batches[0]), "000000.md");
         assert_eq!(first_path(&batches[1]), format!("{MAX_BATCH_ROWS:06}.md"));
+    }
+
+    /// The byte budget, not just the row count. `max_file_bytes` caps one note
+    /// at 16 MiB by default, so 8192 consecutive big ones cross the 2 GiB the
+    /// `Utf8` offsets can address while never reaching the row cap. Three
+    /// 400 KiB notes under a 1 MiB budget split 2 + 1.
+    #[test]
+    fn a_batch_ends_at_the_byte_budget_before_the_row_cap() {
+        let index = Index::build::<&str>(&[]);
+        let body = "x".repeat(400 * 1024);
+        let notes: Vec<ParsedNote> = (0..3)
+            .map(|i| {
+                parse_note(
+                    &format!("{i}.md"),
+                    body.len() as u64,
+                    epoch(),
+                    &body,
+                    &index,
+                )
+            })
+            .collect();
+        let schema = TableKind::Notes.schema();
+        let all: Vec<usize> = (0..schema.fields().len()).collect();
+        let rows_of = |batches: &[RecordBatch]| -> Vec<usize> {
+            batches.iter().map(|b| b.num_rows()).collect()
+        };
+
+        let batches = build_batches_bounded(
+            TableKind::Notes,
+            &notes,
+            &schema,
+            &all,
+            None,
+            MAX_BATCH_ROWS,
+            1024 * 1024,
+        )
+        .unwrap();
+        assert_eq!(rows_of(&batches), vec![2, 1]);
+        assert_eq!(
+            batches[0].column(3).as_string::<i32>().value(0).len(),
+            body.len(),
+            "bodies survive the split intact"
+        );
+
+        // A row bigger than the whole budget still gets a batch of its own:
+        // one row cannot be split, and an empty batch would help nobody.
+        let batches = build_batches_bounded(
+            TableKind::Notes,
+            &notes,
+            &schema,
+            &all,
+            None,
+            MAX_BATCH_ROWS,
+            1024,
+        )
+        .unwrap();
+        assert_eq!(rows_of(&batches), vec![1, 1, 1]);
     }
 
     /// An empty vault is still a batch: the consumer needs the schema, and

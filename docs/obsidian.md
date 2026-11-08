@@ -124,8 +124,9 @@ Skardi mirrors Obsidian's rules, not a general file resolver:
 | `[[Name]]`, `[[Name#H]]`, `[[Name\|t]]` | exactly one note named `Name` anywhere → that note | `name` |
 | same, several notes share `Name` | none picked | `ambiguous` |
 | `[[Folder/Name]]` | root-relative exact path (`.md` optional) | `exact` |
-| same, nothing at that path | exactly one note whose path *ends* with `Folder/Name` → that note | `name` |
+| same, nothing at that path | exactly one note whose path *ends* with `Folder/Name` → that note; the tail as written wins over one that needs `.md` added | `name` |
 | same, several notes end with it | none picked | `ambiguous` |
+| `[[/Folder/Name]]` | root-relative only — a leading `/` names the vault root, so no suffix fallback | `exact` / `missing` |
 | `[[./X]]`, `[[../X]]` | relative to the linking note's folder | `exact` / `missing` |
 | `[[Note.md]]`, `[[Note v2.1]]` | tries a root-level exact path first, then falls back to the name rule | `exact` or `name` |
 | `[text](Note.md)`, `[text](../Note.md)` | relative to the linking note (Markdown semantics), then name fallback | `exact` / `name` / `missing` |

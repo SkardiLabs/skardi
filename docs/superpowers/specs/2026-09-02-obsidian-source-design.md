@@ -295,7 +295,8 @@ The base a path is resolved against depends on the syntax. **Wikilinks** (`[[…
 | `exact` (self) | target is empty (`[[#Heading]]`) | `to_path = from_path` |
 | `exact` (relative) | target starts with `./` or `../` | resolve against the note's folder and normalize; `.md` appended if the result has no extension; must exist, else `missing` |
 | `exact` (vault path) | target contains `/` or has a file extension | match the relative path from the vault root, `.md` optional for notes |
-| `name` (path suffix) | target contains `/` and matched nothing from the root | exactly one file whose path *ends* with the target (at a segment boundary, `.md` optional) → that file; Obsidian resolves `[[Projects/Notes]]` to `Work/Projects/Notes.md` |
+| `exact` (explicit root) | target starts with `/` | the path from the vault root and nothing else — no suffix fallback, as for a Markdown link's leading `/` |
+| `name` (path suffix) | target contains `/`, does not start with `/`, and matched nothing from the root | exactly one file whose path *ends* with the target → that file; the tail as written is tried before the tail plus `.md`, so a note and an extensionless file of the same name stay two candidates. Obsidian resolves `[[Projects/Notes]]` to `Work/Projects/Notes.md` |
 | `name` | exactly one file has that name | that file |
 | `ambiguous` | more than one file has that name, or more than one path ends with the target | `to_path = NULL` |
 | `missing` | nothing matched | `to_path = NULL` |
@@ -447,9 +448,22 @@ covered by a test:
   aborted, so `ObsidianScanExec`'s stream holds a `Cancel` guard that flips a
   flag on drop; the scan checks it between notes. Without it a dropped stream
   left the whole vault being read, and billed, for nobody.
-- **Rows are emitted in `MAX_BATCH_ROWS` (8192) chunks.** `notes.body` is a
-  `Utf8` column, so one batch holding more than 2 GiB of note text overflows
-  its i32 offsets and panics inside Arrow instead of returning an error.
+- **Rows are emitted in chunks of `MAX_BATCH_ROWS` (8192) rows or
+  `MAX_BATCH_BYTES` (256 MiB) of Utf8, whichever comes first.** `notes.body` is
+  a `Utf8` column, so one batch holding more than 2 GiB of note text overflows
+  its i32 offsets and panics inside Arrow instead of returning an error. The row
+  cap alone does not bound that: `max_file_bytes` caps one note at 16 MiB, so
+  8192 notes averaging more than 256 KiB still cross 2 GiB. A row larger than
+  the budget still gets its own batch — one row cannot be split.
+- **`notes.size_bytes` is the size of the bytes actually read**, not the
+  listing's snapshot, so a note that changed between the two reports what was
+  parsed. A local file the listing could not stat is stat-ed once more after a
+  successful read rather than recorded as size 0 at the epoch; `BlobEntry`
+  carries `Option` for both, so "unknown" is never confused with "empty".
+- **Cancellation is checked before the listing and before the first read**, as
+  well as between notes. A `LIST` over a large bucket is itself slow; inside one
+  `BlobStore::list` call there is nothing to check, so a cancellation lands at
+  worst one listing late.
 - **Frontmatter tags** follow the body grammar's digit rule (`2026` dropped,
   `y2026` kept) and lose exactly one leading `#`.
 - **Declared output ordering.** `ObsidianScanExec` declares `notes` by

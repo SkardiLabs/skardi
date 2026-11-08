@@ -181,11 +181,16 @@ pub struct BlobEntry {
     /// Relative to the listed prefix, `/`-separated on every backend so
     /// `doc_id`/`path` columns are stable across local and S3.
     pub rel_key: String,
-    /// `fs::metadata().len()` locally; `ObjectMeta::size` on S3.
-    pub size: u64,
-    /// Filesystem mtime locally (UNIX epoch if the platform reports none);
-    /// `ObjectMeta::last_modified` on S3.
-    pub modified: DateTime<Utc>,
+    /// `fs::metadata().len()` locally; `ObjectMeta::size` on S3. `None` when
+    /// the local `stat` failed: the entry is still listed (so the read reports
+    /// the failure rather than it vanishing), and callers are told the size is
+    /// unknown instead of being handed a fabricated `0` they cannot tell from a
+    /// genuinely empty file.
+    pub size: Option<u64>,
+    /// Filesystem mtime locally; `ObjectMeta::last_modified` on S3. `None` when
+    /// the `stat` failed or the platform reports no mtime — same reason as
+    /// [`BlobEntry::size`].
+    pub modified: Option<DateTime<Utc>>,
 }
 
 /// Normalize an S3 prefix key so it is empty or ends with exactly one `/`.
@@ -429,8 +434,9 @@ fn list_local(root: &Path, opts: ListOptions) -> Result<Vec<BlobEntry>> {
             // and mtime, so the read decides its fate: dropping it here would
             // make it vanish from the listing instead of counting as the fetch
             // failure it is, quietly shrinking `documents`' failure count and
-            // hiding a note from obsidian's wholesale-failure guard. `size = 0`
-            // also means no size policy can skip it before that read.
+            // hiding a note from obsidian's wholesale-failure guard. An
+            // unknown size is `None`, not `0`: no size policy can skip it
+            // before that read, and nobody records `0` as if it were a fact.
             let meta = match std::fs::metadata(&path) {
                 Ok(m) => Some(m),
                 Err(e) => {
@@ -441,8 +447,7 @@ fn list_local(root: &Path, opts: ListOptions) -> Result<Vec<BlobEntry>> {
             let modified = meta
                 .as_ref()
                 .and_then(|m| m.modified().ok())
-                .map(DateTime::<Utc>::from)
-                .unwrap_or_else(|| DateTime::<Utc>::from(std::time::UNIX_EPOCH));
+                .map(DateTime::<Utc>::from);
             // Joined from the path's components rather than `to_string_lossy`
             // with the OS separator replaced: on unix a `\` is a legal
             // character in a file name, and replacing it would forge a
@@ -456,7 +461,7 @@ fn list_local(root: &Path, opts: ListOptions) -> Result<Vec<BlobEntry>> {
                 rel_key.push_str(&component.as_os_str().to_string_lossy());
             }
             out.push(BlobEntry {
-                size: meta.as_ref().map(|m| m.len()).unwrap_or(0),
+                size: meta.as_ref().map(|m| m.len()),
                 modified,
                 loc: Loc::Local(path),
                 rel_key,
@@ -701,8 +706,8 @@ fn push_remote_entry(
             key: meta.location,
         },
         rel_key,
-        size: meta.size,
-        modified: meta.last_modified,
+        size: Some(meta.size),
+        modified: Some(meta.last_modified),
     });
 }
 
@@ -1006,10 +1011,10 @@ mod tests {
             .unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].rel_key, "a.md");
-        assert_eq!(listed[0].size, 5);
+        assert_eq!(listed[0].size, Some(5));
         assert_eq!(
             listed[0].modified,
-            DateTime::<Utc>::from(meta.modified().unwrap())
+            Some(DateTime::<Utc>::from(meta.modified().unwrap()))
         );
     }
 
@@ -1063,7 +1068,8 @@ mod tests {
         let rels: Vec<&str> = listed.iter().map(|e| e.rel_key.as_str()).collect();
         assert_eq!(rels, vec!["dangling.md", "real.md"]);
         let dangling = &listed[0];
-        assert_eq!(dangling.size, 0, "unknown size, not a skipped entry");
+        assert_eq!(dangling.size, None, "unknown size, not a fabricated 0");
+        assert_eq!(dangling.modified, None);
 
         // And the read is where it fails, naming the path.
         let err = BlobStore::Local
@@ -1366,7 +1372,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].size, 5);
-        assert!(listed[0].modified > DateTime::<Utc>::from(std::time::UNIX_EPOCH));
+        assert_eq!(listed[0].size, Some(5));
+        assert!(listed[0].modified.unwrap() > DateTime::<Utc>::from(std::time::UNIX_EPOCH));
     }
 }
