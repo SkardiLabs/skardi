@@ -36,6 +36,9 @@ documents = ["skardi/documents"]
 # `data_sources[]` parses without it; this flag is what makes a `type: rss`
 # source register instead of failing with a build-capability error.
 rss = ["skardi/rss"]
+# Obsidian vault as a read-only catalog (notes/links/tags). Mirrors
+# skardi/obsidian; pulls in pulldown-cmark, glob, object_store.
+obsidian = ["skardi/obsidian"]
 
 [dependencies]
 better-auth = { workspace = true }

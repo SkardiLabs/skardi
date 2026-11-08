@@ -1,0 +1,2 @@
+# Deleted
+[[Home]] #trash
