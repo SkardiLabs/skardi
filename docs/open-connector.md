@@ -58,8 +58,8 @@ gateway **runtime token**.
 > and [Zoom](open-connector-zoom.md) (AI Companion meeting summaries as
 > the meeting-minutes contract's `meetings`, `meeting_notes` and
 > `meeting_action_items` — the first pack to use the loader's `derive:`
-> block; pins captured from a local gateway built from the Open Connector
-> branch, live pass against a real Zoom account pending per the pack doc).
+> block; pins captured from a local gateway built from Open Connector
+> main, live pass against a real Zoom account pending per the pack doc).
 > Further provider packs (Google Calendar, Jira, …) ship one pack per
 > release per the
 > [design spec](superpowers/specs/2026-07-11-open-connector-integration-design.md);

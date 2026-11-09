@@ -13,15 +13,15 @@
 //! (design §0.3, D13, D14).
 //!
 //! **The wire contract is Open Connector's, not Zoom's REST API's.** The
-//! zoom executors (SkardiLabs/open-connector#21, branch
-//! `claude/zoom-meeting-summaries`, ab02d6da) REBUILD rows: camelCase keys
+//! zoom executors (SkardiLabs/open-connector#21, merged to main as
+//! dc3cc1c3) REBUILD rows: camelCase keys
 //! (`meetingUuid`, `summaryContent`), Zoom's `next_page_token` re-emitted
 //! as a top-level `nextPageToken` that is `null` on the last page (Zoom
 //! sends `""`), the summary nested under `summary` beside an `available`
 //! flag. Inputs are camelCase strict (`additionalProperties: false`): a
 //! wrong key (`page_size`, `meeting_uuid`) is a hard 400, and every input
 //! set this pack generates reached the credential wall against a local
-//! gateway built from that branch on 2026-11-09 (`pageSize`+`from`+`to`,
+//! gateway built from that main on 2026-11-09 (`pageSize`+`from`+`to`,
 //! the same plus `nextPageToken`, `meetingUuid` alone), which is where the
 //! contracts under `fixtures/zoom/contracts/` were captured.
 //!
@@ -104,16 +104,21 @@
 //!   identity is one namespace per source); `text` is the string;
 //!   `owner_name`, `owner_email`, `owner_id`, `due`, `done` are NULL — no
 //!   extraction from the text, ever (D13/D14).
-//! - **Zoom's `403 2305` is zero rows, not a failure.** The account setting
-//!   "Only share meeting summaries by email", or a summary in Trash, makes
-//!   Zoom answer 403 with code 2305; the action turns THAT one into a
-//!   successful envelope `{available: false, unavailableReason:
-//!   "shared_by_email_only", summary: null}` (open-connector#21). The
-//!   tables `skip_when_null: summary`, so such a meeting has no note and
-//!   no items; the engine's object-row rule — a null root fails loudly —
-//!   is untouched because the root is still an object. Every other 403
-//!   stays a gateway failure envelope (`authorization_failed`) and fails
-//!   the scan with its code and the action named.
+//! - **Zoom's `403 2305` is zero rows, not a failure.** Zoom answers 403
+//!   with code 2305 for three causes it does not tell apart by code —
+//!   summary access restricted to IP ranges, the account setting "Only
+//!   share meeting summaries by email", or a summary in Trash — and the
+//!   action turns THAT one into a successful envelope `{available: false,
+//!   unavailableReason: "not_accessible", unavailableMessage: <Zoom's own
+//!   wording>, summary: null}` (open-connector#21 as merged; the value was
+//!   `shared_by_email_only` on the PR's first revision, renamed because the
+//!   code does not say which cause). The tables `skip_when_null: summary`,
+//!   so such a meeting has no note and no items while its `meetings` row
+//!   from the listing still stands; the engine's object-row rule — a null
+//!   root fails loudly — is untouched because the root is still an object.
+//!   Every other 403 stays a gateway failure envelope
+//!   (`authorization_failed`) and fails the scan with its code and the
+//!   action named.
 //! - **Timestamps are UTC RFC 3339 to the second** (`2026-11-02T09:00:00Z`),
 //!   read as `timestamp_ms_utc` (Arrow `Timestamp(ms, UTC)`).
 //! - **Nullability follows the contract exactly**: `provider` and each
@@ -557,7 +562,7 @@ mod tests {
         // The fingerprint gate hashes OUTPUT schemas only; both actions are
         // `additionalProperties: false`, so an undeclared key is a 400 on
         // every scan. Both sides here are committed artifacts (gateway
-        // built from open-connector#21 at ab02d6da): this locks the
+        // built from open-connector main dc3cc1c3): this locks the
         // declarations against the captured input halves and catches
         // drift on re-capture, as gmail's twin does.
         for (short, contract) in [
@@ -1027,8 +1032,8 @@ bindings:
     #[tokio::test]
     async fn an_unavailable_summary_scans_as_zero_rows_not_a_failure() {
         // The 403 2305 shape end to end: the action's successful envelope
-        // with `summary: null` is an empty result on both tables, after
-        // one request each.
+        // (`unavailableReason: not_accessible`, `summary: null`) is an
+        // empty result on both tables, after one request each.
         let unavailable = include_str!("fixtures/zoom/summary_unavailable.json");
         let gateway = MockGateway::start(move |req| {
             if req.method == "GET" && req.path == "/v1/health" {

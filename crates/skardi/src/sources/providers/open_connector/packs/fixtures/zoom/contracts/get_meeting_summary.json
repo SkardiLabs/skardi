@@ -10,15 +10,15 @@
         {
           "type": "string",
           "enum": [
-            "shared_by_email_only"
+            "not_accessible"
           ],
-          "description": "Why the summary is not available: shared_by_email_only means Zoom answered 403 code 2305, because the account shares summaries by email only or the summary is in Trash."
+          "description": "Zoom answered 403 code 2305: the account restricts summary access to IP ranges or shares summaries by email only, or the summary is in Trash; unavailableMessage carries Zoom's own wording."
         },
         {
           "type": "null"
         }
       ],
-      "description": "Why the summary is not available: shared_by_email_only means Zoom answered 403 code 2305, because the account shares summaries by email only or the summary is in Trash."
+      "description": "Zoom answered 403 code 2305: the account restricts summary access to IP ranges or shares summaries by email only, or the summary is in Trash; unavailableMessage carries Zoom's own wording."
     },
     "unavailableMessage": {
       "anyOf": [

@@ -1,8 +1,8 @@
 # Zoom source pack: AI Companion meeting summaries in the meeting-minutes
 # contract shape (`meetings`, `meeting_notes`, `meeting_action_items`) that
 # every meeting pack writes. Wire contract reconciled against a local Open
-# Connector gateway built from SkardiLabs/open-connector#21 (branch
-# `claude/zoom-meeting-summaries`, ab02d6da, 2026-11-09): the zoom
+# Connector gateway built from SkardiLabs/open-connector main dc3cc1c3
+# (PR #21 merged, 2026-11-09): the zoom
 # executors REBUILD rows (camelCase keys, `next_page_token` re-emitted as a
 # top-level `nextPageToken` that is `null` on the last page, the summary
 # nested under `summary` beside an `available` flag). Inputs are camelCase
@@ -83,7 +83,7 @@ tables:
     action: zoom.get_meeting_summary
     row_path: "$"
     row_shape: object
-    fingerprint: ec6f8fc60a0708f3c849e85b7203c067ef7af9f59f46f68ff567cbaaf532a770
+    fingerprint: 4de8c3a55c08d8daa0546efbce03a3e3a64b9ff39c32c0730c13345edec91f14
     pagination:
       strategy: single_page
     # The meeting instance UUID. One can start with `/` or contain `//`;
@@ -92,11 +92,14 @@ tables:
     resources:
       required: [meetingUuid]
     derive:
-      # Zoom's 403 code 2305 — the account shares summaries by email only,
-      # or the summary is in Trash — comes back from the action as a
-      # SUCCESSFUL envelope with `available: false` and `summary: null`.
-      # That is zero rows, not an error and not a row of NULLs. Any other
-      # 403 stays a gateway failure envelope and fails the scan.
+      # Zoom's 403 code 2305 — summary access restricted to IP ranges,
+      # summaries shared by email only, or the summary in Trash; Zoom does
+      # not tell them apart by code — comes back from the action as a
+      # SUCCESSFUL envelope with `available: false`, `unavailableReason:
+      # not_accessible` and `summary: null`. That is zero rows (the meeting
+      # row from the listing still stands), not an error and not a row of
+      # NULLs. Any other 403 stays a gateway failure envelope and fails the
+      # scan.
       skip_when_null: summary
       constants:
         provider: zoom
@@ -131,7 +134,7 @@ tables:
     action: zoom.get_meeting_summary
     row_path: "$"
     row_shape: object
-    fingerprint: ec6f8fc60a0708f3c849e85b7203c067ef7af9f59f46f68ff567cbaaf532a770
+    fingerprint: 4de8c3a55c08d8daa0546efbce03a3e3a64b9ff39c32c0730c13345edec91f14
     pagination:
       strategy: single_page
     resources:

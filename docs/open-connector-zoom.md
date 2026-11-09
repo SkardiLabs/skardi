@@ -24,7 +24,7 @@ page, and nest the summary under `summary` beside an `available` flag.
 Inputs are camelCase strict (`additionalProperties: false`; a wrong key is
 a hard 400). Everything below is reconciled against a local gateway built
 from [SkardiLabs/open-connector#21](https://github.com/SkardiLabs/open-connector/pull/21)
-(branch `claude/zoom-meeting-summaries`, commit `ab02d6da`, 2026-11-09),
+(merged to Open Connector main as `dc3cc1c3`, 2026-11-09),
 where every input set the pack generates passed the strict schemas.
 **Live verification against a real Zoom account has not been done yet**;
 the verification section at the end says exactly what has and has not been
@@ -120,10 +120,14 @@ One row per summary, the one Zoom keeps per meeting instance
 - The legacy `summaryOverview` / `summaryDetails` are not columns: Zoom
   marks them deprecated and the Markdown holds them.
 - **A summary Zoom will not return is zero rows, not an error.** Zoom's
-  `403` code `2305` (the account shares summaries by email only, or the
-  summary is in Trash) comes back from the action as a successful answer
-  with `available: false` and `summary: null`; the pack skips it. Any other
-  `401`/`403` is the gateway's `authorization_failed` and fails the scan.
+  `403` code `2305` covers three causes it does not tell apart by code —
+  summary access restricted to IP ranges, summaries shared by email only,
+  or the summary in Trash — and comes back from the action as a successful
+  answer with `available: false`, `unavailableReason: not_accessible`
+  (Zoom's own wording in `unavailableMessage`) and `summary: null`; the
+  pack skips it, so the meeting has no note and no items while its
+  `meetings` row still stands. Any other `401`/`403` is the gateway's
+  `authorization_failed` and fails the scan.
 - A meeting UUID can start with `/` or contain `//`; the pack passes it
   verbatim and the action encodes it into Zoom's path (twice, as Zoom
   requires).
@@ -187,8 +191,9 @@ declares no `derive:` and loads exactly as before.
 
 ## Verification
 
-What has been observed, against a local gateway built from
-open-connector#21 at `ab02d6da` (2026-11-09), without Zoom credentials:
+What has been observed, against a local gateway built from Open
+Connector main `dc3cc1c3` (open-connector#21 merged, 2026-11-09), without
+Zoom credentials:
 
 - Discovery of both actions; their output and input schemas captured under
   `fixtures/zoom/contracts/` and pinned by fingerprint.
