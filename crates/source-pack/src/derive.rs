@@ -19,7 +19,8 @@
 //!   not return (`available: false`, `summary: null`) is zero rows, not a
 //!   failed scan and not a row of NULLs.
 //!
-//! A [`RowDerivation`] declares those four, and nothing else: no
+//! A [`RowDerivation`](crate::derive::RowDerivation) declares those four,
+//! and nothing else: no
 //! expressions, no lookups, no reading of prose. It rewrites rows as JSON
 //! and hands them to the SAME converter every other table uses, so a
 //! derived column has the same typing, nullability and error identity as a
