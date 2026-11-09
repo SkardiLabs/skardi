@@ -1,0 +1,6 @@
+{
+  "available": false,
+  "unavailableReason": "shared_by_email_only",
+  "unavailableMessage": "The meeting summary can only be shared by email.",
+  "summary": null
+}

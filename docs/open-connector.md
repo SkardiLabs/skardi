@@ -49,12 +49,17 @@ gateway **runtime token**.
 > [Dropbox](open-connector-dropbox.md) (files, shared links, file
 > search — split-action cursor continuation; live-verified against a real
 > account, all five pins captured from a live gateway),
-> and [WhatsApp](open-connector-whatsapp.md) (phone numbers, business
+> [WhatsApp](open-connector-whatsapp.md) (phone numbers, business
 > profile, message templates, and the message / pricing / template
 > analytics fields — the account side of a WABA; messages themselves are
 > delivered only by webhook and belong to the
 > [`kind: webhook` receiver](webhooks.md); pins captured from a live
-> gateway, live pass against a real WABA pending per the pack doc).
+> gateway, live pass against a real WABA pending per the pack doc),
+> and [Zoom](open-connector-zoom.md) (AI Companion meeting summaries as
+> the meeting-minutes contract's `meetings`, `meeting_notes` and
+> `meeting_action_items` — the first pack to use the loader's `derive:`
+> block; pins captured from a local gateway built from the Open Connector
+> branch, live pass against a real Zoom account pending per the pack doc).
 > Further provider packs (Google Calendar, Jira, …) ship one pack per
 > release per the
 > [design spec](superpowers/specs/2026-07-11-open-connector-integration-design.md);

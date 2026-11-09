@@ -1,0 +1,388 @@
+{
+  "type": "object",
+  "properties": {
+    "available": {
+      "type": "boolean",
+      "description": "Whether Zoom returned the summary through the API."
+    },
+    "unavailableReason": {
+      "anyOf": [
+        {
+          "type": "string",
+          "enum": [
+            "shared_by_email_only"
+          ],
+          "description": "Why the summary is not available: shared_by_email_only means Zoom answered 403 code 2305, because the account shares summaries by email only or the summary is in Trash."
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Why the summary is not available: shared_by_email_only means Zoom answered 403 code 2305, because the account shares summaries by email only or the summary is in Trash."
+    },
+    "unavailableMessage": {
+      "anyOf": [
+        {
+          "type": "string",
+          "description": "Zoom's own message when the summary is not available."
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Zoom's own message when the summary is not available."
+    },
+    "summary": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "meetingUuid": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "description": "The meeting instance UUID. Pass it to get_meeting_summary; it differs for every occurrence."
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The meeting instance UUID. Pass it to get_meeting_summary; it differs for every occurrence."
+            },
+            "meetingId": {
+              "anyOf": [
+                {
+                  "anyOf": [
+                    {
+                      "type": "integer",
+                      "description": "The numeric Zoom meeting ID."
+                    },
+                    {
+                      "type": "string",
+                      "description": "The string Zoom meeting ID."
+                    }
+                  ],
+                  "description": "The numeric Zoom meeting ID, shared by every occurrence of a recurring meeting."
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The numeric Zoom meeting ID, shared by every occurrence of a recurring meeting."
+            },
+            "meetingHostId": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "description": "The Zoom user ID of the meeting host."
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The Zoom user ID of the meeting host."
+            },
+            "meetingHostEmail": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "description": "The email address of the meeting host."
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The email address of the meeting host."
+            },
+            "meetingTopic": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "description": "The meeting topic."
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The meeting topic."
+            },
+            "meetingStartTime": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "description": "The time the meeting started."
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The time the meeting started."
+            },
+            "meetingEndTime": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "description": "The time the meeting ended."
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The time the meeting ended."
+            },
+            "summaryStartTime": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "description": "The start of the meeting span the summary covers."
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The start of the meeting span the summary covers."
+            },
+            "summaryEndTime": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "description": "The end of the meeting span the summary covers."
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The end of the meeting span the summary covers."
+            },
+            "summaryCreatedTime": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "description": "The time Zoom created the summary."
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The time Zoom created the summary."
+            },
+            "summaryLastModifiedTime": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "description": "The time the summary was last edited."
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The time the summary was last edited."
+            },
+            "summaryLastModifiedUserId": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "description": "The Zoom user ID of the last editor of the summary."
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The Zoom user ID of the last editor of the summary."
+            },
+            "summaryLastModifiedUserEmail": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "description": "The email address of the last editor of the summary."
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The email address of the last editor of the summary."
+            },
+            "summaryTitle": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "description": "The summary title."
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The summary title."
+            },
+            "summaryContent": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "description": "The full summary in Markdown, Zoom's unified summary field."
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The full summary in Markdown, Zoom's unified summary field."
+            },
+            "summaryDocUrl": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "description": "The URL of the summary document in Zoom Docs, when Zoom returns one."
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The URL of the summary document in Zoom Docs, when Zoom returns one."
+            },
+            "summaryOverview": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "description": "The legacy overview paragraph. Zoom marks it deprecated."
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The legacy overview paragraph. Zoom marks it deprecated."
+            },
+            "summaryDetails": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "label": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "description": "The section label."
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "description": "The section label."
+                  },
+                  "summary": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "description": "The section text."
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "description": "The section text."
+                  }
+                },
+                "additionalProperties": false,
+                "description": "One labelled section of a legacy Zoom summary."
+              },
+              "description": "Labelled sections of the legacy summary."
+            },
+            "nextSteps": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "description": "A next step."
+              },
+              "description": "Legacy next-step strings Zoom extracted from the meeting."
+            },
+            "editedSummary": {
+              "anyOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "summaryOverview": {
+                      "anyOf": [
+                        {
+                          "type": "string",
+                          "description": "The edited overview paragraph."
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "description": "The edited overview paragraph."
+                    },
+                    "summaryDetails": {
+                      "anyOf": [
+                        {
+                          "type": "string",
+                          "description": "The edited details as text."
+                        },
+                        {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "label": {
+                                "anyOf": [
+                                  {
+                                    "type": "string",
+                                    "description": "The section label."
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ],
+                                "description": "The section label."
+                              },
+                              "summary": {
+                                "anyOf": [
+                                  {
+                                    "type": "string",
+                                    "description": "The section text."
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ],
+                                "description": "The section text."
+                              }
+                            },
+                            "additionalProperties": false,
+                            "description": "One labelled section of a legacy Zoom summary."
+                          },
+                          "description": "Labelled sections of the legacy summary."
+                        }
+                      ],
+                      "description": "The edited details, as text or as labelled sections."
+                    },
+                    "nextSteps": {
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "description": "A next step."
+                      },
+                      "description": "Legacy next-step strings Zoom extracted from the meeting."
+                    }
+                  },
+                  "additionalProperties": false,
+                  "description": "The user-edited version of the legacy fields, when someone edited the summary."
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The user-edited version of the legacy fields, when someone edited the summary."
+            }
+          },
+          "additionalProperties": false,
+          "description": "The content and metadata of one Zoom AI Companion meeting summary."
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The content and metadata of one Zoom AI Companion meeting summary."
+    }
+  },
+  "additionalProperties": false,
+  "description": "The response returned when fetching one Zoom meeting summary."
+}

@@ -391,8 +391,11 @@ impl ScanState {
         }
         let page = self.scan.page();
         let envelope = self.scan.fetch_page().await?;
+        // Pagination advances on the RAW page below; the converter reads
+        // the derived rows (the same rows, for a table that derives none).
         let rows = self.scan.rows(&envelope)?;
-        let batch = self.converter.convert(rows, page)?;
+        let derived = self.scan.derive_rows(rows)?;
+        let batch = self.converter.convert(&derived, page)?;
         // Conversion is synchronous, so it cannot be preempted by Tokio; do
         // not emit its result if it consumed the remaining scan budget.
         if Instant::now() >= self.scan.deadline() {
@@ -594,6 +597,7 @@ mod tests {
                 expected_fingerprint: "unused-in-exec",
                 cursor_only: true,
             }),
+            derive: None,
         }))
     }
 
@@ -630,6 +634,7 @@ mod tests {
             error_path: None,
             expected_fingerprint: None,
             continuation: None,
+            derive: None,
         }))
     }
 

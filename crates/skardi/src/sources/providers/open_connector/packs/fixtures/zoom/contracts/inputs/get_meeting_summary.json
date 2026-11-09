@@ -1,0 +1,12 @@
+{
+  "type": "object",
+  "properties": {
+    "meetingUuid": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The meeting instance UUID returned by list_user_meeting_summaries."
+    }
+  },
+  "additionalProperties": false,
+  "description": "The input payload for fetching one Zoom meeting summary."
+}
