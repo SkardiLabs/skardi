@@ -167,6 +167,11 @@ consumers:
   always wins over a wire key of the same name.
 - `explode` — one row per element of the first non-empty array among the
   listed paths; the element lands under `into`, its position under `index`.
+  Explode consumes its paths: a derived row carries the element and the
+  row's other keys (`summary.meetingUuid` beside `summary.nextSteps`), but
+  none of the listed arrays, so an array of `n` elements is never copied
+  onto each of its own `n` rows. A column or a `format` placeholder that
+  reads a listed path is refused when the pack loads.
 - `format` — a key rendered from a template over the row
   (`"{summary.meetingUuid}#{position}"`); a missing part makes the whole
   value NULL, so a non-null identity fails loudly.

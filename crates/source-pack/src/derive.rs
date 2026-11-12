@@ -51,8 +51,18 @@ use crate::source_pack::FixedValue;
 /// array is passed over, and a path present with any other shape fails the
 /// scan with its kind. When no path supplies elements the source row
 /// yields zero rows. Each element lands under `into` on a copy of the
-/// source row (whose own keys stay reachable), and its 0-based position
-/// under `index` when one is named.
+/// source row, and its 0-based position under `index` when one is named.
+///
+/// **Explode consumes its paths.** The copy each element lands on is the
+/// source row WITHOUT the value at any of `paths` — the array that was
+/// chosen and every fallback beside it — so a derived row never carries
+/// the array it came from. Everything else stays reachable, siblings under
+/// the same parent included (`summary.meetingUuid` beside
+/// `summary.nextSteps`). Copying the array onto each of its own `n` rows
+/// would cost `n²` elements before the converter or a row bound could
+/// refuse the page; a column or a `format` placeholder therefore cannot
+/// read an exploded path (the loader refuses one that tries) and reads the
+/// element through `into` instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Explode {
     /// Row-relative dotted paths, tried in order.
@@ -174,18 +184,24 @@ impl RowDerivation {
                     }
                     match elements {
                         None => Vec::new(),
-                        Some(items) => items
-                            .iter()
-                            .enumerate()
-                            .map(|(position, item)| {
-                                let mut row = source.clone();
-                                row.insert(explode.into.to_string(), item.clone());
-                                if let Some(index) = explode.index {
-                                    row.insert(index.to_string(), Value::from(position as u64));
-                                }
-                                row
-                            })
-                            .collect(),
+                        Some(items) => {
+                            // Built once per source row and never holding
+                            // the arrays: cloning `source` per element
+                            // would copy the n-element array n times.
+                            let base = clone_without(source, explode.paths);
+                            items
+                                .iter()
+                                .enumerate()
+                                .map(|(position, item)| {
+                                    let mut row = base.clone();
+                                    row.insert(explode.into.to_string(), item.clone());
+                                    if let Some(index) = explode.index {
+                                        row.insert(index.to_string(), Value::from(position as u64));
+                                    }
+                                    row
+                                })
+                                .collect()
+                        }
                     }
                 }
             };
@@ -203,6 +219,37 @@ impl RowDerivation {
         }
         Ok(out)
     }
+}
+
+/// Clone `row` leaving out the value at each row-relative dotted path in
+/// `paths`, without ever copying what is left out. A path is followed only
+/// through object parents; one that does not resolve removes nothing, and
+/// every key no path names — siblings of a removed key included — is
+/// cloned as it is.
+fn clone_without(row: &Map<String, Value>, paths: &[&str]) -> Map<String, Value> {
+    let mut out = Map::with_capacity(row.len());
+    for (key, value) in row {
+        let mut removed = false;
+        let mut below: Vec<&str> = Vec::new();
+        for path in paths {
+            match path.split_once('.') {
+                None => removed |= *path == key.as_str(),
+                Some((head, rest)) if head == key.as_str() => below.push(rest),
+                Some(_) => {}
+            }
+        }
+        if removed {
+            continue;
+        }
+        let kept = match value {
+            Value::Object(child) if !below.is_empty() => {
+                Value::Object(clone_without(child, &below))
+            }
+            other => other.clone(),
+        };
+        out.insert(key.clone(), kept);
+    }
+    out
 }
 
 /// Walk a row-relative dotted path. `Ok(None)` when a key is absent or a
@@ -389,6 +436,106 @@ mod tests {
         // The parent's keys stay reachable on every derived row.
         assert_eq!(out[1]["summary"]["meetingUuid"], "uuid-1");
         assert_eq!(derivation.written_keys(), vec!["text", "position"]);
+    }
+
+    #[test]
+    fn an_exploded_row_carries_none_of_the_listed_arrays_and_keeps_their_siblings() {
+        let derivation = RowDerivation {
+            explode: Some(Explode {
+                paths: &["summary.editedSummary.nextSteps", "summary.nextSteps"],
+                into: "text",
+                index: Some("position"),
+            }),
+            format: &[("item_id", "{summary.meetingUuid}#{position}")],
+            ..RowDerivation::default()
+        };
+        // Both lists non-empty: the edited one is chosen, and the legacy
+        // fallback is the same hazard, so neither may ride on a derived row.
+        let edited = json!({"nextSteps": ["Edited one", "Edited two"], "summaryTitle": "Edited"});
+        let rows = vec![summary_answer(json!(["Legacy step"]), edited)];
+        let out = derivation.apply("t", &rows, 1).unwrap();
+        assert_eq!(out.len(), 2);
+        for (position, row) in out.iter().enumerate() {
+            let summary = row["summary"].as_object().expect("summary stays an object");
+            assert!(
+                !summary.contains_key("nextSteps"),
+                "the fallback array is consumed"
+            );
+            let edited = summary["editedSummary"]
+                .as_object()
+                .expect("the edited summary stays an object");
+            assert!(
+                !edited.contains_key("nextSteps"),
+                "the chosen array is consumed"
+            );
+            // Siblings under each parent, and the keys above them, stay.
+            assert_eq!(edited["summaryTitle"], "Edited");
+            assert_eq!(summary["meetingUuid"], "uuid-1");
+            assert_eq!(summary["meetingId"], 81234567890u64);
+            assert_eq!(row["available"], true);
+            // ...which is what `format` and the columns read.
+            assert_eq!(row["item_id"], format!("uuid-1#{position}"));
+        }
+        assert_eq!(out[0]["text"], "Edited one");
+        assert_eq!(out[1]["text"], "Edited two");
+        // The source rows are borrowed, never rewritten.
+        assert_eq!(rows[0]["summary"]["nextSteps"], json!(["Legacy step"]));
+
+        // A top-level exploded path is consumed the same way.
+        let top_level = RowDerivation {
+            explode: Some(Explode {
+                paths: &["steps"],
+                into: "text",
+                index: None,
+            }),
+            ..RowDerivation::default()
+        };
+        let out = top_level
+            .apply("t", &[json!({"id": "a", "steps": ["one", "two"]})], 1)
+            .unwrap();
+        assert_eq!(
+            out,
+            vec![
+                json!({"id": "a", "text": "one"}),
+                json!({"id": "a", "text": "two"})
+            ]
+        );
+    }
+
+    #[test]
+    fn a_large_array_explodes_into_rows_that_do_not_grow_with_it() {
+        // Linear, pinned without a clock: 10 000 elements make 10 000 rows,
+        // and no row carries the array, so every row's serialized size is a
+        // small constant instead of growing with the element count (which
+        // is what made the whole page quadratic).
+        const ELEMENTS: usize = 10_000;
+        let steps: Vec<Value> = (0..ELEMENTS)
+            .map(|step| Value::String(format!("step {step}")))
+            .collect();
+        let derivation = RowDerivation {
+            explode: Some(Explode {
+                paths: &["summary.editedSummary.nextSteps", "summary.nextSteps"],
+                into: "text",
+                index: Some("position"),
+            }),
+            ..RowDerivation::default()
+        };
+        let rows = vec![summary_answer(Value::Array(steps), NULL)];
+        let out = derivation.apply("t", &rows, 1).unwrap();
+        assert_eq!(out.len(), ELEMENTS);
+        for (position, row) in out.iter().enumerate() {
+            assert!(
+                row["summary"].get("nextSteps").is_none(),
+                "row {position} carries the source array"
+            );
+            assert_eq!(row["position"], position as u64);
+            let size = row.to_string().len();
+            assert!(
+                size < 256,
+                "row {position} serializes to {size} bytes; it grew with the array"
+            );
+        }
+        assert_eq!(out[ELEMENTS - 1]["text"], format!("step {}", ELEMENTS - 1));
     }
 
     #[test]

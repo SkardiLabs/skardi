@@ -235,6 +235,14 @@ fn check_derived_key(id: &str, what: &str, key: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether the row-relative path `read` names `path` itself or a key below
+/// it (`summary.steps.0` below `summary.steps`; `summary.stepsTaken` is a
+/// sibling, not below).
+fn reads_at_or_below(read: &str, path: &str) -> bool {
+    read.strip_prefix(path)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+}
+
 /// The `derive:` block's own invariants. Serde guarantees its shape; these
 /// are the ways a derivation could be declared and do nothing, or do
 /// something other than what its author read.
@@ -287,6 +295,38 @@ fn validate_derive(table: &SourcePackTable) -> Result<(), String> {
             .map_err(|reason| format!("{id}: derive format '{key}' template {reason}"))?;
         for path in placeholders {
             check_row_relative_path(id, &format!("derive format '{key}' placeholder"), path)?;
+        }
+    }
+    // Explode consumes its paths: a derived row carries the element under
+    // `into`, never the arrays it came from (see `Explode`). A column or a
+    // template reading at or below an exploded path would read nothing on
+    // every row, silently NULL on a nullable column, so it is refused here.
+    if let Some(explode) = &derive.explode {
+        for path in explode.paths {
+            if let Some(field) = table
+                .fields
+                .iter()
+                .find(|field| reads_at_or_below(field.path, path))
+            {
+                return Err(format!(
+                    "{id}: column '{}' reads '{}', which derive explode consumes; a derived row \
+                     carries the element under '{}', not the array",
+                    field.name, field.path, explode.into
+                ));
+            }
+            for (key, template) in derive.format {
+                let placeholders = template_placeholders(template).unwrap_or_default();
+                if let Some(read) = placeholders
+                    .iter()
+                    .find(|read| reads_at_or_below(read, path))
+                {
+                    return Err(format!(
+                        "{id}: derive format '{key}' reads '{read}', which derive explode \
+                         consumes; a derived row carries the element under '{}', not the array",
+                        explode.into
+                    ));
+                }
+            }
         }
     }
     // One key, one writer: a key two steps write would be whichever ran
@@ -797,6 +837,10 @@ struct TableDoc {
 /// The `derive:` block as written in YAML. Every part optional, every key
 /// strict: a misspelt step must fail the asset, not silently leave a
 /// contract column unwritten.
+///
+/// `explode` consumes its `paths`: a derived row carries each element under
+/// `into` and none of the listed arrays, so no column path and no `format`
+/// placeholder may read at or below one (`validate_derive` refuses it).
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DeriveDoc {
@@ -2101,6 +2145,20 @@ tables:
             (
                 "    derive: { constants: { unread: zoom } }",
                 "writes 'unread', which no column path and no format template reads",
+            ),
+            // Explode consumes its paths, the chosen array and every
+            // fallback: nothing may read one afterwards.
+            (
+                "    derive: { explode: { paths: [summary.id], into: text } }",
+                "column 'id' reads 'summary.id', which derive explode consumes",
+            ),
+            (
+                "    derive: { explode: { paths: [steps, summary], into: text } }",
+                "column 'id' reads 'summary.id', which derive explode consumes",
+            ),
+            (
+                "    derive: { explode: { paths: [summary.steps], into: text }, format: { provider: \"{summary.steps}\" } }",
+                "derive format 'provider' reads 'summary.steps', which derive explode consumes",
             ),
             (
                 "    derive: { format: { provider: \"{summary.id\" } }",
