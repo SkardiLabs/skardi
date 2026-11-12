@@ -830,6 +830,15 @@ bindings:
         tables: &str,
         resource: &str,
     ) -> (MockGateway, SessionContext) {
+        let config = zoom_config(token_env, tables, resource);
+        setup_with_config(gateway, token_env, &config).await
+    }
+
+    async fn setup_with_config(
+        gateway: MockGateway,
+        token_env: &'static str,
+        config: &OpenConnectorConfig,
+    ) -> (MockGateway, SessionContext) {
         let _token = EnvVarGuard::set(token_env, "test-token");
         let gateways = OpenConnectorGateways::default();
         let mut ctx = SessionContext::new();
@@ -837,7 +846,7 @@ bindings:
             &mut ctx,
             "saas",
             &gateway.url,
-            Some(&zoom_config(token_env, tables, resource)),
+            Some(config),
             false,
             HierarchyLevel::Catalog,
             Some(&gateways),
@@ -1069,6 +1078,65 @@ bindings:
         assert_eq!(
             execute_inputs(&gateway, "zoom.get_meeting_summary").len(),
             2
+        );
+    }
+
+    #[tokio::test]
+    async fn summary_tables_sharing_one_cache_never_replay_each_others_rows() {
+        // With the scan cache on, the two summary tables are the same
+        // action, pack version, resource and row shape, and under this
+        // narrow projection the same emitted schema (`provider` and
+        // `meeting_id` are non-null utf8 on both). Only the table differs —
+        // and so do the rows: one note, one row per next step.
+        let summary = include_str!("fixtures/zoom/summary.json");
+        let gateway = MockGateway::start(move |req| {
+            if req.method == "GET" && req.path == "/v1/health" {
+                return MockResponse::ok("{}");
+            }
+            if req.method == "GET" && req.path.starts_with("/v1/actions/") {
+                return zoom_discovery(&req.path);
+            }
+            if req.method == "POST" && req.path == "/v1/actions/zoom.get_meeting_summary" {
+                return MockResponse::ok(&envelope_ok(summary));
+            }
+            MockResponse::new(404, "{}")
+        })
+        .await;
+        let token_env = "SKARDI_TEST_OC_ZOOM_SHARED_CACHE";
+        let mut config = zoom_config(
+            token_env,
+            "meeting_notes, meeting_action_items",
+            &format!(r#"{{ meetingUuid: "{UUID}" }}"#),
+        );
+        config.cache_ttl_seconds = 60;
+        let (gateway, ctx) = setup_with_config(gateway, token_env, &config).await;
+
+        let row_count =
+            |batches: &[RecordBatch]| batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+        let notes_sql = "SELECT provider, meeting_id FROM saas.minutes.meeting_notes";
+        let items_sql = "SELECT provider, meeting_id FROM saas.minutes.meeting_action_items";
+
+        let notes = collect(&ctx, notes_sql).await;
+        assert_eq!(row_count(&notes), 1, "one summary is one note");
+        let items = collect(&ctx, items_sql).await;
+        assert_eq!(
+            row_count(&items),
+            2,
+            "one row per next step, never a replay of the cached note batch"
+        );
+        assert_eq!(column_values(&items, "meeting_id"), vec![UUID, UUID]);
+        assert_eq!(column_values(&items, "provider"), vec!["zoom", "zoom"]);
+
+        // The reverse direction, and proof the cache is on: each table's
+        // repeat is served from its OWN entry, with no third request.
+        let notes_again = collect(&ctx, notes_sql).await;
+        assert_eq!(row_count(&notes_again), 1);
+        let items_again = collect(&ctx, items_sql).await;
+        assert_eq!(row_count(&items_again), 2);
+        assert_eq!(
+            execute_inputs(&gateway, "zoom.get_meeting_summary").len(),
+            2,
+            "each table fetched once; the repeats were cache hits under their own keys"
         );
     }
 

@@ -275,10 +275,18 @@ impl ScanState {
         // functionally determined by (action_id, source_pack_version), both
         // already keyed. If fixed inputs ever become binding-configurable or
         // vary within a pack version, they must join the key.
+        //
+        // `table_id` IS in the key: two tables of one pack can read the
+        // same action's answer into different rows (a `derive` block that
+        // explodes an array on one and not the other), and no other key
+        // part tells them apart. The derivation itself is absent for the
+        // same reason `fixed_inputs` is — it is functionally determined by
+        // (table_id, source_pack_version).
         let cache_key = scan_cache_key(&ScanKeyParts {
             gateway: &exec.gateway,
             connection_alias: exec.connection_alias.as_deref(),
             action_id: &exec.target.action_id,
+            table_id: &exec.target.table_id,
             source_pack_version: exec.target.source_pack_version,
             resource: &exec.resource,
             filter_inputs: &exec.filter_inputs,
