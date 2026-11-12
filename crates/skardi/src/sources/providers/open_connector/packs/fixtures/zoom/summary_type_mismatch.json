@@ -1,0 +1,27 @@
+{
+  "available": true,
+  "unavailableReason": null,
+  "unavailableMessage": null,
+  "summary": {
+    "meetingUuid": "Zm9vYmFyMTIzNDU2Nzg5MA==",
+    "meetingId": 81234567890,
+    "meetingHostId": "AbCdEfGhIjKlMnOpQrStUv",
+    "meetingHostEmail": "host@example.com",
+    "meetingTopic": "Weekly sync",
+    "meetingStartTime": "2026-11-02T09:00:00Z",
+    "meetingEndTime": "2026-11-02T09:45:00Z",
+    "summaryStartTime": "2026-11-02T09:01:00Z",
+    "summaryEndTime": "2026-11-02T09:44:00Z",
+    "summaryCreatedTime": "2026-11-02T09:46:00Z",
+    "summaryLastModifiedTime": "2026-11-02T10:00:00Z",
+    "summaryLastModifiedUserId": null,
+    "summaryLastModifiedUserEmail": null,
+    "summaryTitle": "Weekly sync summary",
+    "summaryContent": 42,
+    "summaryDocUrl": null,
+    "summaryOverview": null,
+    "summaryDetails": [],
+    "nextSteps": [],
+    "editedSummary": null
+  }
+}

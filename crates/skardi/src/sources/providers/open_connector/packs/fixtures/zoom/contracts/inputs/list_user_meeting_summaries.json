@@ -1,0 +1,42 @@
+{
+  "type": "object",
+  "properties": {
+    "userId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The Zoom user ID or email address. Use me when the credential can act on the current app user.",
+      "default": "me"
+    },
+    "from": {
+      "type": "string",
+      "description": "A UTC date-time in Zoom's yyyy-MM-ddTHH:mm:ssZ form, such as 2026-11-01T00:00:00Z.",
+      "format": "date-time"
+    },
+    "to": {
+      "type": "string",
+      "description": "A UTC date-time in Zoom's yyyy-MM-ddTHH:mm:ssZ form, such as 2026-11-01T00:00:00Z.",
+      "format": "date-time"
+    },
+    "timeFilterField": {
+      "type": "string",
+      "enum": [
+        "summary_start_time",
+        "summary_created_time"
+      ],
+      "description": "Which summary time from and to filter on. Zoom defaults to summary_start_time."
+    },
+    "pageSize": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 300,
+      "description": "The number of summaries per page. Zoom defaults to 30."
+    },
+    "nextPageToken": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The next_page_token value returned by Zoom for the next page of results."
+    }
+  },
+  "additionalProperties": false,
+  "description": "The input payload for listing Zoom meeting summaries."
+}

@@ -693,6 +693,25 @@ pub enum OpenConnectorError {
         found: String,
     },
 
+    /// A table's declared row derivation (`derive:` in the pack asset — see
+    /// `skardi_source_pack::derive`) met a row it cannot rewrite: an array
+    /// path holding a non-array, a template placeholder over an object, a
+    /// parent of the wrong shape. `step` names which of the four steps,
+    /// `found` the JSON *kind* only — never the value.
+    #[error(
+        "Open Connector row derivation ({step}) failed for table '{table}' at path '{path}', \
+         page {page}, row {row}: expected {expected}, found {found}"
+    )]
+    RowDerivationFailed {
+        table: String,
+        step: String,
+        path: String,
+        page: usize,
+        row: usize,
+        expected: String,
+        found: String,
+    },
+
     /// An embedded source-pack asset failed to parse or validate. A build
     /// defect (assets ship inside the binary), surfaced as a registration /
     /// UDTF-setup diagnostic instead of a panic.

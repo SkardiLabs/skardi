@@ -1,0 +1,175 @@
+# Zoom source pack: AI Companion meeting summaries in the meeting-minutes
+# contract shape (`meetings`, `meeting_notes`, `meeting_action_items`) that
+# every meeting pack writes. Wire contract reconciled against a local Open
+# Connector gateway built from SkardiLabs/open-connector main dc3cc1c3
+# (PR #21 merged, 2026-11-09): the zoom
+# executors REBUILD rows (camelCase keys, `next_page_token` re-emitted as a
+# top-level `nextPageToken` that is `null` on the last page, the summary
+# nested under `summary` beside an `available` flag). Inputs are camelCase
+# strict (`additionalProperties: false`; a wrong key is a hard 400, checked
+# live without credentials). Design rationale — every wire decision and
+# its why — lives in the module doc of packs/zoom.rs.
+#
+# Column names are the shared contract's (skardi-cloud
+# `skardi-source-contract/src/meetings.rs`), not Zoom's: one shape serves
+# four tools. A column Zoom has no field for is written as an explicit
+# NULL by `derive.constants`, so it exists on every row and nothing reads
+# it from a wire key Zoom might one day grow.
+kind: pack
+pack: zoom
+version: 1
+
+tables:
+  # One row per meeting the connecting user's AI Companion summarised,
+  # from the listing (`GET /users/me/meeting_summaries`), which carries
+  # ids, topic, host and times but never content.
+  meetings:
+    action: zoom.list_user_meeting_summaries
+    row_path: "$.summaries"
+    fingerprint: 14a83880ecb8ef8666f6260cc89b437bab9195f9f545ec68da51759a16c022be
+    pagination:
+      strategy: cursor
+      cursor_input: nextPageToken
+      next_cursor_path: "$.nextPageToken"
+      page_size_input: pageSize
+      # Zoom's own default. The token a page hands back expires fifteen
+      # minutes after it is issued, so a walk must finish inside that;
+      # the cloud list work walks a window inside one work, and this pack
+      # only declares the cursor.
+      page_size: 30
+    # The listing's time window, Zoom's `from`/`to` in UTC
+    # `yyyy-MM-ddTHH:mm:ssZ`, passed through verbatim. Resources, not
+    # pushed filters: the loader refuses a filter input that is also a
+    # resource, and a window is a pair the cloud list work sets per work.
+    # `userId` is deliberately not declared: the pack reads the connecting
+    # user's own summaries (`me`, the action's default). `timeFilterField`
+    # is not declared either (Zoom's default, `summary_start_time`).
+    resources:
+      optional: [from, to]
+    derive:
+      constants:
+        provider: zoom
+        # Zoom has no attendee field on a summary, no link to the meeting
+        # and no calendar event (design §3.3): NULL on every Zoom row.
+        attendee_emails: null
+        attendee_ids: null
+        url: null
+        calendar_event_id: null
+      format:
+        # The numeric meeting id a recurring meeting keeps across its
+        # occurrences; the UUID is per occurrence. The wire spells it as
+        # an integer or a string, the contract column is text.
+        series_id: "{meetingId}"
+    columns:
+      - { name: provider, path: provider, type: utf8, nullable: false }
+      - { name: meeting_id, path: meetingUuid, type: utf8, nullable: false }
+      - { name: series_id, path: series_id, type: utf8, nullable: true }
+      - { name: title, path: meetingTopic, type: utf8, nullable: true }
+      # UTC RFC 3339 to the second (`2026-11-02T09:00:00Z`).
+      - { name: started_at, path: meetingStartTime, type: timestamp_ms_utc, nullable: true }
+      - { name: ended_at, path: meetingEndTime, type: timestamp_ms_utc, nullable: true }
+      - { name: organizer_email, path: meetingHostEmail, type: utf8, nullable: true }
+      - { name: organizer_id, path: meetingHostId, type: utf8, nullable: true }
+      - { name: attendee_emails, path: attendee_emails, type: utf8_list, nullable: true }
+      - { name: attendee_ids, path: attendee_ids, type: utf8_list, nullable: true }
+      - { name: url, path: url, type: utf8, nullable: true }
+      - { name: calendar_event_id, path: calendar_event_id, type: utf8, nullable: true }
+
+  # One summary per meeting (`GET /meetings/{uuid}/meeting_summary`), as a
+  # note of kind `summary` written by Zoom's AI Companion. The response is
+  # the row (`row_shape: object`), one binding per meeting UUID; the cloud
+  # fetches it per listed meeting.
+  meeting_notes:
+    action: zoom.get_meeting_summary
+    row_path: "$"
+    row_shape: object
+    fingerprint: 4de8c3a55c08d8daa0546efbce03a3e3a64b9ff39c32c0730c13345edec91f14
+    pagination:
+      strategy: single_page
+    # The meeting instance UUID. One can start with `/` or contain `//`;
+    # encoding it into the request path (twice, as Zoom requires) is the
+    # action's job, the pack passes it verbatim.
+    resources:
+      required: [meetingUuid]
+    derive:
+      # Zoom's 403 code 2305 — summary access restricted to IP ranges,
+      # summaries shared by email only, or the summary in Trash; Zoom does
+      # not tell them apart by code — comes back from the action as a
+      # SUCCESSFUL envelope with `available: false`, `unavailableReason:
+      # not_accessible` and `summary: null`. That is zero rows (the meeting
+      # row from the listing still stands), not an error and not a row of
+      # NULLs. Any other 403 stays a gateway failure envelope and fails the
+      # scan.
+      skip_when_null: summary
+      constants:
+        provider: zoom
+        kind: summary
+        producer: zoom_ai_companion
+        # The summary is text in `body`; there is no document to point at.
+        document_path: null
+    columns:
+      - { name: provider, path: provider, type: utf8, nullable: false }
+      - { name: meeting_id, path: summary.meetingUuid, type: utf8, nullable: false }
+      # The meeting's start, copied onto the note so the storage cap evicts
+      # the oldest meetings' notes first.
+      - { name: meeting_started_at, path: summary.meetingStartTime, type: timestamp_ms_utc, nullable: true }
+      # Zoom keeps one summary per meeting instance, so the meeting UUID is
+      # the note's id too.
+      - { name: note_id, path: summary.meetingUuid, type: utf8, nullable: false }
+      - { name: kind, path: kind, type: utf8, nullable: true }
+      - { name: producer, path: producer, type: utf8, nullable: true }
+      - { name: title, path: summary.summaryTitle, type: utf8, nullable: true }
+      # `summary_content`, Zoom's unified Markdown field — the current
+      # summary. The legacy `summary_overview` / `summary_details` are not
+      # columns: Zoom marks them deprecated and the Markdown holds them.
+      - { name: body, path: summary.summaryContent, type: utf8, nullable: true }
+      - { name: document_path, path: document_path, type: utf8, nullable: true }
+      - { name: url, path: summary.summaryDocUrl, type: utf8, nullable: true }
+
+  # One row per next step Zoom returned AS AN ITEM — the `nextSteps[]`
+  # strings of the same summary response. Never split out of the Markdown
+  # body (design D14): when Zoom stops returning the array, this table is
+  # empty and the note still stands.
+  meeting_action_items:
+    action: zoom.get_meeting_summary
+    row_path: "$"
+    row_shape: object
+    fingerprint: 4de8c3a55c08d8daa0546efbce03a3e3a64b9ff39c32c0730c13345edec91f14
+    pagination:
+      strategy: single_page
+    resources:
+      required: [meetingUuid]
+    derive:
+      skip_when_null: summary
+      explode:
+        # The user-edited list when someone edited the summary and left a
+        # non-empty list; otherwise Zoom's legacy list. Both absent or
+        # empty: zero rows.
+        paths: [summary.editedSummary.nextSteps, summary.nextSteps]
+        into: text
+        index: position
+      constants:
+        provider: zoom
+        # A next step is one string. No owner, due date or status is ever
+        # read out of it (design D13/D14).
+        owner_name: null
+        owner_email: null
+        owner_id: null
+        due: null
+        done: null
+      format:
+        # `<note_id>#<position>`, never a bare position: the identity is
+        # one namespace per source, and a bare `0` would make every
+        # meeting's first item overwrite the last.
+        item_id: "{summary.meetingUuid}#{position}"
+    columns:
+      - { name: provider, path: provider, type: utf8, nullable: false }
+      - { name: meeting_id, path: summary.meetingUuid, type: utf8, nullable: false }
+      - { name: note_id, path: summary.meetingUuid, type: utf8, nullable: true }
+      - { name: item_id, path: item_id, type: utf8, nullable: false }
+      - { name: text, path: text, type: utf8, nullable: true }
+      - { name: owner_name, path: owner_name, type: utf8, nullable: true }
+      - { name: owner_email, path: owner_email, type: utf8, nullable: true }
+      - { name: owner_id, path: owner_id, type: utf8, nullable: true }
+      - { name: due, path: due, type: timestamp_ms_utc, nullable: true }
+      - { name: done, path: done, type: boolean, nullable: true }

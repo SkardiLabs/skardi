@@ -46,6 +46,7 @@ pub mod exec;
 pub mod filters;
 pub mod json_to_arrow;
 pub mod packs;
+pub use skardi_source_pack::derive;
 pub use skardi_source_pack::pagination;
 pub use skardi_source_pack::raw_schema;
 pub use skardi_source_pack::row_path;

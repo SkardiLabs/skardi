@@ -28,6 +28,7 @@
 //! [`OpenConnectorError::ProviderReportedError`] — already lived in this
 //! crate before the walk did.
 
+use std::borrow::Cow;
 use std::slice;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -35,6 +36,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Map, Value};
 
 use crate::client::OpenConnectorClient;
+use crate::derive::RowDerivation;
 use crate::error::OpenConnectorError;
 use crate::pagination::{CursorContinuation, PagePosition, Pagination, PaginationStrategy};
 use crate::row_path::RowPath;
@@ -100,6 +102,11 @@ pub struct ScanTarget {
     /// it: this is the per-table response contract, exactly like `pagination`
     /// and `error_path`. Raw scans are always [`RowShape::Array`].
     pub row_shape: RowShape,
+    /// The table's row derivation (see [`RowDerivation`]), applied by
+    /// [`ActionScan::derive_rows`] after a page's rows are extracted and
+    /// before a consumer converts them. `None` for raw scans and for every
+    /// table that declares none.
+    pub derive: Option<RowDerivation>,
 }
 
 impl ScanTarget {
@@ -114,6 +121,7 @@ impl ScanTarget {
             source_pack_version,
             continuation: table.continuation.map(ScanContinuation::from),
             row_shape: table.row_shape,
+            derive: table.derive,
         }
     }
 }
@@ -396,6 +404,29 @@ impl ActionScan {
         }
     }
 
+    /// The rows a consumer converts: the extracted rows rewritten by the
+    /// table's [`RowDerivation`], or the extracted rows themselves when the
+    /// table declares none. Borrowed in the common case, owned only when a
+    /// derivation rewrote them.
+    ///
+    /// Takes the rows [`Self::rows`] returned rather than re-extracting
+    /// them, and deliberately does NOT replace that method: pagination
+    /// advances on the RAW page ([`Self::advance`]), so an explode that
+    /// yields nothing from a non-empty page cannot read as an empty page.
+    pub fn derive_rows<'a>(
+        &self,
+        rows: &'a [Value],
+    ) -> Result<Cow<'a, [Value]>, OpenConnectorError> {
+        match &self.target.derive {
+            Some(derivation) if !derivation.is_empty() => Ok(Cow::Owned(derivation.apply(
+                &self.target.table_id,
+                rows,
+                self.pagination.page(),
+            )?)),
+            _ => Ok(Cow::Borrowed(rows)),
+        }
+    }
+
     /// Advance past the page just handled; `false` when the scan is complete.
     ///
     /// Separate from [`Self::fetch_page`] because a consumer may decide, after
@@ -426,7 +457,7 @@ impl ActionScan {
         loop {
             let envelope = self.fetch_page().await?;
             let rows = self.rows(&envelope)?;
-            all.extend(rows.iter().cloned());
+            all.extend(self.derive_rows(rows)?.iter().cloned());
             if !self.advance(&envelope, rows)? {
                 return Ok(all);
             }
@@ -459,6 +490,7 @@ mod tests {
             source_pack_version: 1,
             continuation: None,
             row_shape: RowShape::Array,
+            derive: None,
         }
     }
 
