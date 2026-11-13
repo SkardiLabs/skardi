@@ -310,6 +310,74 @@ async fn without_a_cloud_context_status_is_off_and_the_rest_ask_for_login() {
     assert_eq!(parsed["next"], "skardi login");
 }
 
+/// `--server` reaches the context's gateway another way (a port-forward when
+/// the configured address is not reachable from here), so `copy --to` sends
+/// every call there too — here `--to` names the source's own workspace, which
+/// finds the source's context, whose configured server answers nothing.
+#[tokio::test]
+async fn copy_to_dials_the_server_flag_not_the_configured_one() {
+    let server = MockServer::start().await;
+    let home = TempDir::new().unwrap();
+    seed(home.path(), "http://127.0.0.1:9");
+    Mock::given(method("GET"))
+        .and(path("/memory/label%3Ax"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "anchor": "label:x",
+            "memories": [fixture("recall_response.json")["memories"][0].clone()],
+            "consent": "task",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/memory"))
+        .and(header("skardi-workspace", "acme-eng"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"memories": [], "total": 0, "workspace_used": 37, "workspace_cap": 2000}),
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut saved = fixture("save_response.json");
+    saved["anchor"] = json!("label:x-copy");
+    saved["version"] = json!(1);
+    Mock::given(method("PUT"))
+        .and(path("/memory/label%3Ax-copy"))
+        .and(header("authorization", format!("Bearer {TOKEN}").as_str()))
+        .and(header("skardi-workspace", "acme-eng"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&saved))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let uri = server.uri();
+    let output = run(
+        home.path(),
+        &[
+            "--server",
+            &uri,
+            "memory",
+            "copy",
+            "label:x",
+            "--to",
+            "acme-eng",
+            "--as",
+            "label:x-copy",
+            "--json",
+        ],
+        None,
+    )
+    .await;
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert_eq!(envelope(&output)["result"]["to"], saved);
+    assert_token_not_printed(&output);
+}
+
 /// Usage errors are the agent table's 2, as the envelope under `--json`,
 /// whether clap or the command finds them.
 #[tokio::test]

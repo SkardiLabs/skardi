@@ -112,7 +112,13 @@ const MEMORY_CODES: [&str; 10] = [
 pub struct Target {
     /// The context it came from, for messages.
     pub context: String,
+    /// Where calls are sent: the context's server, or `--server`.
     pub gateway: String,
+    /// The server the context itself names in the config file. It differs
+    /// from `gateway` when `--server` overrode it — a port-forward to the
+    /// same gateway, say — and `copy --to` uses it to tell which target
+    /// contexts the override applies to.
+    pub home_gateway: String,
     pub workspace: String,
     pub token: String,
 }
@@ -122,6 +128,7 @@ impl fmt::Debug for Target {
         f.debug_struct("Target")
             .field("context", &self.context)
             .field("gateway", &self.gateway)
+            .field("home_gateway", &self.home_gateway)
             .field("workspace", &self.workspace)
             .field("token", &"(redacted)")
             .finish()
@@ -134,9 +141,11 @@ impl Target {
     ///
     /// Memory lives in a skardi-cloud workspace, so a server context is exit
     /// 6 naming `skardi login`, as is a context with no data-plane token or
-    /// one whose token has expired by its own stamp.
+    /// one whose token has expired by its own stamp. `file` is the config
+    /// file resolution read, for the server the context names there.
     pub fn from_resolved(
         resolved: Result<ClientConfig, ConfigError>,
+        file: Option<&ContextsFile>,
         workspace: Option<&str>,
         now: DateTime<Utc>,
     ) -> Result<Target, AgentError> {
@@ -145,9 +154,20 @@ impl Target {
         let Some(selected) = resolved.cloud_context() else {
             return Err(not_a_cloud_context());
         };
+        // A cloud context refuses `$SKARDI_SERVER_URL` unless `--server` is
+        // given too, so a gateway that differs from the file's is `--server`.
+        let home_gateway = file
+            .map(|f| f.effective_contexts())
+            .unwrap_or_default()
+            .into_iter()
+            .find(|c| c.name == selected.name)
+            .and_then(|c| c.server)
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| resolved.server.clone());
         let target = Target {
             context: selected.name.clone(),
             gateway: resolved.server.clone(),
+            home_gateway,
             workspace: workspace
                 .map(str::trim)
                 .filter(|w| !w.is_empty())
@@ -194,6 +214,11 @@ impl Target {
     /// cloud context whose workspace has that slug (the one on this gateway
     /// first), or else that workspace through this target's own gateway and
     /// token, for a token that reaches several workspaces.
+    ///
+    /// An explicit `--server` carries over to a target context on the same
+    /// server as this one: it is the same gateway reached another way (a
+    /// port-forward, a tunnel), and the configured address may not be
+    /// reachable from here. A context on another server keeps its own.
     pub fn copy_target(
         &self,
         to: &str,
@@ -213,11 +238,20 @@ impl Target {
             .into_iter()
             .filter(|c| c.mode == ContextMode::Cloud)
             .collect();
-        let gateway_of = |c: &Context| {
+        let same_server = |a: &str, b: &str| a.trim_end_matches('/') == b.trim_end_matches('/');
+        let configured = |c: &Context| {
             c.server
                 .clone()
                 .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| self.gateway.clone())
+                .unwrap_or_else(|| self.home_gateway.clone())
+        };
+        let gateway_of = |c: &Context| {
+            let server = configured(c);
+            if same_server(&server, &self.home_gateway) {
+                self.gateway.clone()
+            } else {
+                server
+            }
         };
         let by_name = contexts.iter().find(|c| c.name == to);
         let by_workspace = || {
@@ -225,7 +259,7 @@ impl Target {
                 .iter()
                 .filter(|c| c.workspace.as_deref() == Some(to))
                 .collect();
-            matching.sort_by_key(|c| gateway_of(c) != self.gateway);
+            matching.sort_by_key(|c| !same_server(&configured(c), &self.home_gateway));
             matching.into_iter().next()
         };
         let Some(context) = by_name.or_else(by_workspace) else {
@@ -237,6 +271,7 @@ impl Target {
         let target = Target {
             context: context.name.clone(),
             gateway: gateway_of(context),
+            home_gateway: configured(context),
             workspace: context.workspace.clone().unwrap_or_default(),
             token: context.token.clone().unwrap_or_default(),
         };
@@ -1544,6 +1579,8 @@ mod tests {
     const TEAM: &str = "acme-team";
     const TOKEN: &str = "skardi_pat_mcp_token";
     const SESSION: &str = "9f2c1d7e-session";
+    /// A `--server` standing in for the context's own gateway.
+    const FORWARD: &str = "http://127.0.0.1:18431";
     const ANCHOR: &str = "url:github.com/SkardiLabs/skardi-cloud/issues/1400";
     const ANCHOR_PATH: &str =
         "/memory/url%3Agithub.com%2FSkardiLabs%2Fskardi-cloud%2Fissues%2F1400";
@@ -1567,6 +1604,7 @@ mod tests {
         Target {
             context: "acme/eng".to_string(),
             gateway: server.uri(),
+            home_gateway: server.uri(),
             workspace: workspace.to_string(),
             token: TOKEN.to_string(),
         }
@@ -2728,8 +2766,8 @@ mod tests {
         #[case] mode: ContextMode,
         #[case] code: &str,
     ) {
-        let err =
-            Target::from_resolved(Ok(resolved(token, expires, mode)), None, now()).unwrap_err();
+        let err = Target::from_resolved(Ok(resolved(token, expires, mode)), None, None, now())
+            .unwrap_err();
         assert_eq!((err.exit, err.code()), (EXIT_NO_CONTROL, code));
         assert_eq!(err.next.as_deref(), Some(LOGIN));
     }
@@ -2742,6 +2780,7 @@ mod tests {
                 Some("2026-11-14T00:00:00Z"),
                 ContextMode::Cloud,
             )),
+            None,
             Some("acme-team"),
             now(),
         )
@@ -2781,6 +2820,7 @@ mod tests {
     ) {
         let source = Target::from_resolved(
             Ok(resolved(Some(TOKEN), None, ContextMode::Cloud)),
+            Some(&contexts()),
             None,
             now(),
         )
@@ -2789,6 +2829,32 @@ mod tests {
         assert_eq!(
             (t.gateway.as_str(), t.workspace.as_str(), t.token.as_str()),
             (gateway, workspace, token)
+        );
+    }
+
+    /// `--server` (a port-forward to the context's own gateway, say) carries
+    /// over to every target on that same gateway — including the slug of the
+    /// source's own workspace, which finds the source's context — while a
+    /// context on another server keeps its own.
+    #[rstest]
+    #[case::own_workspace_slug(WS, FORWARD, WS)]
+    #[case::context_on_the_same_server("acme/team", FORWARD, TEAM)]
+    #[case::slug_on_the_same_server(TEAM, FORWARD, TEAM)]
+    #[case::unknown_slug("acme-ops", FORWARD, "acme-ops")]
+    #[case::context_on_another_server("other/team", "https://other.example", TEAM)]
+    fn copy_to_keeps_an_explicit_server_for_the_same_gateway(
+        #[case] to: &str,
+        #[case] gateway: &str,
+        #[case] workspace: &str,
+    ) {
+        let mut overridden = resolved(Some(TOKEN), None, ContextMode::Cloud);
+        overridden.server = FORWARD.to_string();
+        let source = Target::from_resolved(Ok(overridden), Some(&contexts()), None, now()).unwrap();
+        assert_eq!(source.home_gateway, "https://gw.example");
+        let t = source.copy_target(to, Some(&contexts()), now()).unwrap();
+        assert_eq!(
+            (t.gateway.as_str(), t.workspace.as_str()),
+            (gateway, workspace)
         );
     }
 

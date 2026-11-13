@@ -1016,7 +1016,9 @@ server and the save runs the secret scan as usual. The copy keeps every
 entry's `at`, `source` and `cites`, is private on arrival, and leaves the
 original unchanged. `--to` names a context (its token and gateway are used)
 or a workspace slug (a context for that workspace if there is one, else this
-context's token). If you already have a memory at the target, `copy` refuses
+context's token). An explicit `--server` — a port-forward to the context's
+gateway, say — is used for every target context on that same gateway; a
+context on another server keeps its own. If you already have a memory at the target, `copy` refuses
 (`memory_exists`) unless `--replace`, which saves over it as its next
 version. `copy <anchor> --as <right anchor>` followed by `rm <anchor>` is how
 a record saved under the wrong anchor is corrected.

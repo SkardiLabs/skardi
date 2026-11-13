@@ -499,7 +499,7 @@ pub async fn execute_memory(
         cmd,
         ..
     } = args;
-    let target = Target::from_resolved(resolved, workspace.as_deref(), now);
+    let target = Target::from_resolved(resolved, file, workspace.as_deref(), now);
     // A hook runs status on every session start, in every directory: a
     // context that has no memory is an answer for it, not a failure.
     if let MemoryCmd::Status { .. } = &cmd
