@@ -20,11 +20,12 @@
 //! choosing from them ([`from_facts`]) is pure, so the rules are tested
 //! without a repository or a network.
 
-use serde_json::Value;
+use serde_json::{Value, from_str};
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command;
+use tokio::time::timeout;
 
 /// A branch name that never names a task.
 const TRUNKS: [&str; 6] = ["main", "master", "develop", "development", "trunk", "HEAD"];
@@ -227,7 +228,7 @@ async fn gh_pull_request(dir: &Path) -> Option<PullRequest> {
 
 /// `gh pr view --json url,closingIssuesReferences`, read.
 pub fn parse_gh_pr(text: &str) -> Option<PullRequest> {
-    let value: Value = serde_json::from_str(text).ok()?;
+    let value: Value = from_str(text).ok()?;
     let url = value.get("url")?.as_str()?.to_string();
     let closes = value
         .get("closingIssuesReferences")
@@ -246,15 +247,12 @@ pub fn parse_gh_pr(text: &str) -> Option<PullRequest> {
 /// Run `command`, returning its trimmed stdout when it exits 0 within
 /// `timeout`. Its stderr is discarded: a hook's output is the agent's
 /// context, and `git`'s "not a git repository" is noise there.
-async fn run(mut command: Command, timeout: Duration) -> Option<String> {
+async fn run(mut command: Command, limit: Duration) -> Option<String> {
     command
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true);
-    let output = tokio::time::timeout(timeout, command.output())
-        .await
-        .ok()?
-        .ok()?;
+    let output = timeout(limit, command.output()).await.ok()?.ok()?;
     if !output.status.success() {
         return None;
     }
@@ -439,6 +437,21 @@ mod tests {
             from_facts(&facts).anchor.map(|(a, _)| a).as_deref(),
             Some("url:github.com/SkardiLabs/skardi-cloud/issues/1400")
         );
+
+        // A branch whose name holds no issue number asks `gh` for its pull
+        // request. A remote that is not GitHub's has none (and a machine
+        // with no `gh` has no answer either), so no anchor applies.
+        git(&["checkout", "-q", "-b", "audit-export"]);
+        git(&[
+            "remote",
+            "set-url",
+            "origin",
+            "https://git.example.invalid/acme/api.git",
+        ]);
+        let facts = gather(dir.path()).await;
+        assert_eq!(facts.branch.as_deref(), Some("audit-export"));
+        assert_eq!(facts.pull_request, None);
+        assert_eq!(from_facts(&facts).anchor, None);
 
         // Not a repository: no facts, no anchor, no error.
         let empty = tempfile::TempDir::new().unwrap();

@@ -231,8 +231,11 @@ impl Invocation {
         // A hint that is not a skardi command (`skardi login --control` is,
         // so it qualifies) is left alone; every hint here is one today.
         let mut out = next.to_string();
+        // A hint that already names its context (a `copy --to` target's) is
+        // about that one, not this run's.
         if let Some(context) = &self.context
             && next.starts_with("skardi ")
+            && !next.contains(" --context ")
         {
             out.push_str(" --context ");
             out.push_str(&shell_quote(context));

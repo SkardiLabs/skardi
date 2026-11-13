@@ -13,6 +13,7 @@ use crate::agent::{AgentContext, AgentError, EXIT_NO_CONTROL, Invocation, LOGIN_
 use crate::config::{self, ClientConfig, ConfigError, ContextsFile};
 use chrono::{DateTime, Utc};
 use clap::{Args, Subcommand, ValueEnum};
+use std::env;
 use std::path::PathBuf;
 
 /// `--json` on every agent command: one object on stdout, §2.4.2's shape.
@@ -509,6 +510,9 @@ pub async fn execute_memory(
         return Ok(memory::status_off(err.code(), err.message(), None));
     }
     let target = target?;
+    // One session for the whole run: every call's ledger header and a save's
+    // label name the same one, the flag's, the environment's or a fresh id.
+    let session = Some(memory::session_of(session)?);
     let connect = |target: &Target| {
         Memory::new(
             target,
@@ -563,9 +567,22 @@ pub async fn execute_memory(
                 Some(to) => target.copy_target(to, file, now)?,
                 None => target.clone(),
             };
-            // The copy's hints name `--to`, not `--workspace`, so the target
-            // carries no workspace flag of its own.
-            let into = Memory::new(&destination, session.as_deref(), purpose.as_deref(), None)?;
+            // A hint from the target's side (a save refused there) must run
+            // against the target: through its context when `--to` named
+            // another one, else with its workspace when that differs.
+            let into = if destination.context != target.context {
+                Memory::new(&destination, session.as_deref(), purpose.as_deref(), None)?
+                    .through_context(&destination.context)
+            } else if destination.workspace != target.workspace {
+                Memory::new(
+                    &destination,
+                    session.as_deref(),
+                    purpose.as_deref(),
+                    Some(&destination.workspace),
+                )?
+            } else {
+                connect(&destination)?
+            };
             let options = CopyOptions {
                 as_anchor,
                 replace,
@@ -622,7 +639,7 @@ pub async fn execute_memory(
                     anchor: Some((memory::anchor_arg(&raw)?, branch::AnchorSource::Flag)),
                 },
                 None => {
-                    let dir = std::env::current_dir().map_err(|err| {
+                    let dir = env::current_dir().map_err(|err| {
                         AgentError::usage(
                             "no_working_directory",
                             format!("cannot read the working directory: {err}"),
@@ -668,6 +685,281 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const HANDOFF: &str = "4b9f3c1e-8a2d-4c6b-9e0f-1a2b3c4d5e6f";
+
+    // --- memory -------------------------------------------------------------
+
+    const MEMORY_TOKEN: &str = "skardi_pat_mcp_token";
+    const MEMORY_WS: &str = "acme-eng";
+    const MEMORY_ANCHOR: &str = "url:github.com/SkardiLabs/skardi-cloud/issues/1400";
+
+    /// One of the contract's fixtures (`tests/fixtures/memory`).
+    fn memory_fixture(name: &str) -> serde_json::Value {
+        let file: PathBuf = [
+            env!("CARGO_MANIFEST_DIR"),
+            "tests",
+            "fixtures",
+            "memory",
+            name,
+        ]
+        .iter()
+        .collect();
+        serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap()
+    }
+
+    /// A gateway that answers every memory route from the fixtures.
+    async fn memory_gateway() -> MockServer {
+        use wiremock::matchers::{path_regex, query_param};
+        let server = MockServer::start().await;
+        let routes: [(&str, &str, &str, u8); 8] = [
+            ("PUT", "^/memory/consent$", "consent_response.json", 1),
+            ("PUT", "^/memory/[^/]+$", "save_response.json", 2),
+            (
+                "GET",
+                "^/memory/[^/]+/versions$",
+                "versions_response.json",
+                2,
+            ),
+            (
+                "POST",
+                "^/memory/[^/]+/versions/[0-9]+/redact$",
+                "redact_response.json",
+                1,
+            ),
+            (
+                "POST",
+                "^/memory/[^/]+/share$",
+                "share_response_needs_confirm.json",
+                1,
+            ),
+            ("DELETE", "^/memory/[^/]+$", "delete_response.json", 2),
+            ("GET", "^/memory/[^/]+$", "recall_response.json", 2),
+            ("GET", "^/memory$", "list_response.json", 2),
+        ];
+        Mock::given(method("GET"))
+            .and(path_regex("^/memory/[^/]+/versions$"))
+            .and(query_param("version", "3"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(memory_fixture("version_response.json")),
+            )
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        for (verb, route, fixture, priority) in routes {
+            Mock::given(method(verb))
+                .and(path_regex(route))
+                .respond_with(ResponseTemplate::new(200).set_body_json(memory_fixture(fixture)))
+                .with_priority(priority)
+                .mount(&server)
+                .await;
+        }
+        server
+    }
+
+    fn memory_config(server: &MockServer) -> Result<ClientConfig, ConfigError> {
+        Ok(ClientConfig {
+            server: server.uri(),
+            token: Some(MEMORY_TOKEN.to_string()),
+            context: Some(config::SelectedContext {
+                name: "acme/eng".to_string(),
+                mode: config::ContextMode::Cloud,
+                workspace: Some(MEMORY_WS.to_string()),
+                token_expires_at: None,
+            }),
+        })
+    }
+
+    fn memory_args(cmd: MemoryCmd) -> MemoryArgs {
+        MemoryArgs {
+            json: true,
+            workspace: None,
+            purpose: Some("hand over".to_string()),
+            session: None,
+            cmd,
+        }
+    }
+
+    /// Every memory command runs through `execute_memory` against the
+    /// contract's answers, and every call of one run carries one session:
+    /// the ledger header of each request, and a save's own label, are the
+    /// same id even with no `--session`.
+    #[tokio::test]
+    async fn every_memory_command_runs_and_one_run_is_one_session() {
+        let server = memory_gateway().await;
+        let record = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            record.path(),
+            serde_json::to_vec(&memory_fixture("save_request.json")["content"]).unwrap(),
+        )
+        .unwrap();
+        let anchor = || MEMORY_ANCHOR.to_string();
+        let commands = vec![
+            MemoryCmd::Save {
+                anchor: anchor(),
+                file: record.path().to_path_buf(),
+                if_version: Some(4),
+                parent: None,
+                agent: Some("codex".to_string()),
+            },
+            MemoryCmd::Recall {
+                anchor: anchor(),
+                version: None,
+            },
+            MemoryCmd::Recall {
+                anchor: anchor(),
+                version: Some(3),
+            },
+            MemoryCmd::List {
+                anchor: Some(anchor()),
+                text: None,
+            },
+            MemoryCmd::Copy {
+                anchor: anchor(),
+                to: Some("acme-ops".to_string()),
+                as_anchor: None,
+                replace: true,
+                agent: None,
+            },
+            MemoryCmd::Share {
+                anchor: anchor(),
+                confirm: false,
+                off: false,
+            },
+            MemoryCmd::Rm { anchor: anchor() },
+            MemoryCmd::History { anchor: anchor() },
+            MemoryCmd::Redact {
+                anchor: anchor(),
+                version: 3,
+            },
+            MemoryCmd::Consent {
+                state: Switch::On,
+                anchor: Some(anchor()),
+                workspace_wide: false,
+            },
+            MemoryCmd::Consent {
+                state: Switch::Off,
+                anchor: None,
+                workspace_wide: true,
+            },
+            MemoryCmd::Status {
+                anchor: Some(anchor()),
+            },
+        ];
+        for cmd in commands {
+            let name = format!("{cmd:?}");
+            let before = server.received_requests().await.unwrap().len();
+            let outcome =
+                execute_memory(memory_args(cmd), memory_config(&server), None, Utc::now()).await;
+            assert!(outcome.is_ok(), "{name}: {:?}", outcome.err());
+            let requests = server.received_requests().await.unwrap();
+            let run = &requests[before..];
+            assert!(!run.is_empty(), "{name} sent nothing");
+            let sessions: Vec<&str> = run
+                .iter()
+                .map(|r| {
+                    r.headers
+                        .get("x-skardi-session-id")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                })
+                .collect();
+            assert!(!sessions[0].is_empty(), "{name}: no session header");
+            assert!(
+                sessions.iter().all(|s| *s == sessions[0]),
+                "{name}: one run, several sessions: {sessions:?}"
+            );
+            for r in run.iter().filter(|r| r.method.as_str() == "PUT") {
+                let body: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+                if let Some(label) = body.get("session") {
+                    assert_eq!(
+                        label, sessions[0],
+                        "{name}: the save's label is another session"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `copy --to` another context runs the target side through it, and
+    /// still as one session.
+    #[tokio::test]
+    async fn copy_to_another_context_runs_through_it() {
+        let server = memory_gateway().await;
+        let context = |name: &str, workspace: &str| config::Context {
+            name: name.to_string(),
+            mode: config::ContextMode::Cloud,
+            server: Some(server.uri()),
+            workspace: Some(workspace.to_string()),
+            token: Some(MEMORY_TOKEN.to_string()),
+            ..config::Context::default()
+        };
+        let file = ContextsFile {
+            contexts: vec![
+                context("acme/eng", MEMORY_WS),
+                context("acme/team", "acme-team"),
+            ],
+            ..ContextsFile::default()
+        };
+        let cmd = MemoryCmd::Copy {
+            anchor: MEMORY_ANCHOR.to_string(),
+            to: Some("acme/team".to_string()),
+            as_anchor: None,
+            replace: true,
+            agent: None,
+        };
+        let outcome = execute_memory(
+            memory_args(cmd),
+            memory_config(&server),
+            Some(&file),
+            Utc::now(),
+        )
+        .await;
+        assert!(outcome.is_ok(), "{:?}", outcome.err());
+        let requests = server.received_requests().await.unwrap();
+        let workspaces: Vec<&str> = requests
+            .iter()
+            .filter_map(|r| r.headers.get("skardi-workspace")?.to_str().ok())
+            .collect();
+        assert_eq!(
+            workspaces.first(),
+            Some(&MEMORY_WS),
+            "recalled at the source"
+        );
+        assert_eq!(workspaces.last(), Some(&"acme-team"), "saved at the target");
+    }
+
+    /// `consent` names a task or says `--workspace-wide`.
+    #[tokio::test]
+    async fn consent_without_an_anchor_is_a_usage_error() {
+        let server = memory_gateway().await;
+        let cmd = MemoryCmd::Consent {
+            state: Switch::On,
+            anchor: None,
+            workspace_wide: false,
+        };
+        let err = execute_memory(memory_args(cmd), memory_config(&server), None, Utc::now())
+            .await
+            .unwrap_err();
+        assert_eq!((err.exit, err.code()), (EXIT_USAGE, "anchor_required"));
+    }
+
+    /// `status` in a context that has no memory is an answer for a hook,
+    /// not a failure.
+    #[tokio::test]
+    async fn status_outside_a_cloud_context_says_memory_is_off() {
+        let mut config = memory_config(&MockServer::start().await).unwrap();
+        if let Some(context) = config.context.as_mut() {
+            context.mode = config::ContextMode::Server;
+        }
+        let outcome = execute_memory(
+            memory_args(MemoryCmd::Status { anchor: None }),
+            Ok(config),
+            None,
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.result["enabled"], false);
+    }
 
     fn context(gateway: &str, mcp_token: Option<&str>) -> AgentContext {
         AgentContext {
