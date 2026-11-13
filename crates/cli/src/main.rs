@@ -9,7 +9,7 @@ use clap::error::ErrorKind;
 use clap::{Parser, Subcommand};
 use client::{ApiClient, ApiError};
 use cloud::Capability;
-use commands::agent::{AgentCmd, DocumentsArgs, HandoffArgs, IntegrationsArgs};
+use commands::agent::{AgentCmd, DocumentsArgs, HandoffArgs, IntegrationsArgs, MemoryArgs};
 use commands::config::ConfigCmd;
 use commands::jobs::JobCmd;
 use commands::login::{LoginArgs, LogoutArgs};
@@ -208,6 +208,11 @@ enum Commands {
 
     /// Upload local files into a personal skardi-cloud workspace.
     Documents(DocumentsArgs),
+
+    /// An agent's working memory of a task, saved in a skardi-cloud
+    /// workspace under an anchor (an issue, pull request or label) for the
+    /// next agent or session to recall.
+    Memory(MemoryArgs),
 }
 
 #[tokio::main]
@@ -358,6 +363,9 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             )
             .await;
         }
+        Commands::Memory(args) => {
+            return commands::agent::run_memory(args, cli.server, cli.token, cli.context).await;
+        }
         _ => {}
     }
 
@@ -434,7 +442,8 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         | Commands::Mcp { cmd: Some(_) }
         | Commands::Integrations(_)
         | Commands::Handoff(_)
-        | Commands::Documents(_) => Ok(()),
+        | Commands::Documents(_)
+        | Commands::Memory(_) => Ok(()),
     };
 
     outcome.map_err(|err| cloud::diagnose(err, capability, &config))
@@ -460,7 +469,8 @@ fn capability_of(command: &Commands) -> Option<Capability> {
         | Commands::Mcp { cmd: Some(_) }
         | Commands::Integrations(_)
         | Commands::Handoff(_)
-        | Commands::Documents(_) => None,
+        | Commands::Documents(_)
+        | Commands::Memory(_) => None,
     }
 }
 
@@ -532,6 +542,7 @@ mod tests {
             vec!["skardi", "integrations", "list"],
             vec!["skardi", "handoff", "wait", "h1"],
             vec!["skardi", "documents", "add", "a.pdf"],
+            vec!["skardi", "memory", "status"],
         ] {
             let cli = super::Cli::try_parse_from(&argv).expect("parses");
             assert_eq!(capability_of(&cli.command), None, "argv: {argv:?}");
@@ -617,7 +628,8 @@ mod tests {
                 | Commands::Mcp { .. }
                 | Commands::Integrations(_)
                 | Commands::Handoff(_)
-                | Commands::Documents(_) => true,
+                | Commands::Documents(_)
+                | Commands::Memory(_) => true,
             }
         }
         let cli = super::Cli::try_parse_from(["skardi", "schema"]).unwrap();

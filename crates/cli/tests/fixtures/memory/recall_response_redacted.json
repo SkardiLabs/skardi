@@ -1,0 +1,25 @@
+{
+  "anchor": "url:github.com/SkardiLabs/skardi-cloud/issues/1400",
+  "memories": [
+    {
+      "anchor": "url:github.com/SkardiLabs/skardi-cloud/issues/1400",
+      "author": "user:acme/u-1",
+      "own": true,
+      "visibility": "private",
+      "version": 5,
+      "content": {
+        "goal": "",
+        "status": "",
+        "done": [],
+        "decisions": [],
+        "findings": [],
+        "next": [],
+        "notes": ""
+      },
+      "saved_by_agent": "claude-code",
+      "updated_at": "2026-11-08T10:30:00Z",
+      "redacted": true
+    }
+  ],
+  "consent": "task"
+}

@@ -1,0 +1,5 @@
+{
+  "success": false,
+  "code": "invalid_anchor",
+  "error": "invalid label anchor: use letters, digits and single hyphens, like billing-v2-migration"
+}

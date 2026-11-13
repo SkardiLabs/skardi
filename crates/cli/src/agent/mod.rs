@@ -11,7 +11,12 @@
 //!            | cancel | status | sync
 //! handoff wait
 //! documents add
+//! memory save | recall | list | copy | share | rm | history | redact
+//!        | consent | status
 //! ```
+//!
+//! `memory` is the odd one out: it reaches the data plane under the
+//! context's query token, never the control token (see [`memory`]).
 //!
 //! # The interface is a contract
 //!
@@ -51,6 +56,7 @@ pub mod control;
 pub mod documents;
 pub mod handoff;
 pub mod integrations;
+pub mod memory;
 pub mod scope;
 
 use crate::config::{self, ClientConfig, ContextMode};
@@ -225,8 +231,11 @@ impl Invocation {
         // A hint that is not a skardi command (`skardi login --control` is,
         // so it qualifies) is left alone; every hint here is one today.
         let mut out = next.to_string();
+        // A hint that already names its context (a `copy --to` target's) is
+        // about that one, not this run's.
         if let Some(context) = &self.context
             && next.starts_with("skardi ")
+            && !next.contains(" --context ")
         {
             out.push_str(" --context ");
             out.push_str(&shell_quote(context));

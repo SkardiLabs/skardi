@@ -934,9 +934,133 @@ branches on:
 A `429 rate_limited` is retried after its `Retry-After` (twice) before it is
 reported.
 
+## Agent working memory — `memory`
+
+An agent's **working memory** of one task — its goal, where it stands, what
+is done, the decisions and their reasons, the findings the next agent needs,
+and what to do next — saved in a skardi-cloud workspace under an **anchor**,
+so another agent or a later session picks the task up where it was left.
+The `memory_*` MCP tools reach the same routes; these commands are the
+terminal's side, and the only way to delete, see the history of, or redact
+a memory. Memory is off unless the deployment turns it on
+(`memory.enabled`): with it off every command is refused with
+`memory_disabled`, and a gateway from before agent memory gives
+`memory_unavailable` (exit `5`).
+
+An anchor names one task: `url:<issue, pull request or document URL>`,
+`label:<slug>` (letters, digits and single hyphens, like
+`label:billing-v2-migration`), or `ontology:<entity id>`. A bare `https://`
+URL is read as `url:`. The server normalizes it — `https://GitHub.com/a/b/issues/7/`
+and `url:github.com/a/b/issues/7` are one anchor — and every response gives
+the normalized spelling.
+
+| Command | What it does |
+|---|---|
+| `skardi memory save <anchor> --file <path\|-> [--if-version <n>] [--parent <anchor>] [--agent <name>]` | saves your record as a new version; `--if-version` is required once the memory exists |
+| `skardi memory recall <anchor>` | your memory of the task and every memory teammates shared for it, with your remembered consent |
+| `skardi memory recall <anchor> --version <n>` | one kept version of your own memory |
+| `skardi memory list [--anchor <anchor>] [--text <text>]` | the memories you can read, newest first, and the workspace's count against its cap |
+| `skardi memory copy <anchor> [--to <workspace\|context>] [--as <anchor>] [--replace]` | copies your memory to a team workspace, or under another anchor |
+| `skardi memory share <anchor> [--confirm \| --off]` | shares your memory with every member, or unshares it |
+| `skardi memory rm <anchor>` | deletes your memory: hidden at once, removed with its versions after 3 days |
+| `skardi memory history <anchor>` | your memory's kept versions (at most 20), newest first |
+| `skardi memory redact <anchor> --version <n>` | empties one kept version for good, for something that got past the secret scan |
+| `skardi memory consent on\|off <anchor>` / `--workspace-wide` | remembers whether memory is saved without asking, for one task or for all your work in the workspace |
+| `skardi memory status [--anchor <anchor>]` | the current branch's task and its memory in a few lines, for a hook |
+
+They run under the context's **query token** — the one `query` uses, not the
+control token — in the context's workspace, or the one `--workspace <slug>`
+names when the token reaches it. `--purpose <text>` is recorded with the call
+in the workspace's query ledger, and `--session <id>` (default
+`$SKARDI_SESSION_ID`) groups calls there and labels saves: versions saved in
+one session within ten minutes merge into one, so a session does not use up
+the 20 kept versions by itself. `--agent` (default `$SKARDI_AGENT`, else
+`skardi-cli`) names the agent saving, for the next reader.
+
+**The record** is JSON, from a file or stdin:
+
+```bash
+skardi memory save https://github.com/acme/api/issues/7 --if-version 3 --file - <<'EOF'
+{
+  "goal": "Ship the audit export",
+  "status": "API route merged; UI next",
+  "done": [{"text": "Export route", "source": "https://github.com/acme/api/pull/12"}],
+  "decisions": [{"text": "CSV first, because finance reads it in Excel"}],
+  "findings": [{"text": "export_csv is flaky under parallel runs", "source": "cargo test export_csv"}],
+  "next": [{"text": "Add the console download button"}],
+  "notes": ""
+}
+EOF
+```
+
+An entry may carry `source` (a link or command, for a person) and `cites`
+(`[{source_name, document_id, section_path}]`, the corpus rows it draws on).
+The engine stamps each entry's `at` when it first appears and keeps it on
+later saves, marks lifecycle claims ("deprecated", "safe to delete")
+`caution: true`, and refuses a record over 64 KiB (`memory_too_large`) or
+one holding what looks like a secret (`memory_secret`, naming the rule).
+
+**Saves never overwrite blindly.** A save based on a stale version is
+refused with `version_conflict` and the `current_version`; `next` is the
+recall, after which the agent merges and saves with `--if-version` set to it.
+`recall` prints, as its `next`, the save that continues your record.
+
+**Recall** prints your memory and teammates' shared ones, each labelled with
+its author, the agent that saved it and when. A teammate's memory is marked
+as data to weigh, not instructions, and a `caution` entry is flagged for
+checking before acting on it. When consent is `off` the server's hint — offer
+once, at the first milestone — is printed as a `note:`.
+
+**`copy`** is a recall followed by a save, so it needs nothing new on the
+server and the save runs the secret scan as usual. The copy keeps every
+entry's `at`, `source` and `cites`, is private on arrival, and leaves the
+original unchanged. `--to` names a context (its token and gateway are used)
+or a workspace slug (a context for that workspace if there is one, else this
+context's token). An explicit `--server` — a port-forward to the context's
+gateway, say — is used for every target context on that same gateway; a
+context on another server keeps its own. If you already have a memory at the target, `copy` refuses
+(`memory_exists`) unless `--replace`, which saves over it as its next
+version. `copy <anchor> --as <right anchor>` followed by `rm <anchor>` is how
+a record saved under the wrong anchor is corrected.
+
+**`share`** without `--confirm` changes nothing: it prints what sharing would
+expose — which cited rows some members cannot read, and how many entries cite
+nothing — with the confirming command as `next`. Share only on the person's
+yes. Sharing arrives with phase 2 of agent memory; until the gateway serves
+it, `share` fails with `memory_share_unavailable` (exit `5`) and the memory
+stays private. A personal workspace's memory cannot be shared: `copy` it to a
+team workspace first.
+
+**`status`** is what a Claude Code hook runs at session start and after a
+branch switch. It finds the anchor without being told, in this order:
+
+1. an issue number in the branch name — a leading number
+   (`1400-audit-export`, `feat/1400-audit-export`) or one after `issue`,
+   `fix`, `gh`, `bug` and the like (`fix-1400`) — on a GitHub remote
+   (`upstream` if there is one, else `origin`):
+   `url:github.com/<owner>/<repo>/issues/1400`;
+2. otherwise the branch's pull request, from `gh pr view`: the one issue it
+   closes, else the pull request itself;
+3. otherwise none — `main`, `master` and a detached `HEAD` never name a task.
+
+It prints a few lines — the anchor and where it came from, your consent, the
+workspace's count against its cap, and each memory's goal, status and first
+`next` steps — and with `--json`, `{"enabled": true, "anchor", "consent",
+"memories", …}`. Where memory does not apply it still exits `0`, with
+`"enabled": false` and a `reason` (`not_a_cloud_context`, `memory_disabled`,
+`memory_unavailable`),
+so a hook does nothing; while the workspace's memory database is being
+prepared it reports `"ready": false`.
+
+Output and exit codes follow the agent commands' contract above (one object
+under `--json`, `next` hints, `2` usage, `3` refused, `5` unreachable or
+5xx), with `6` meaning no usable **query** token — the context is not a
+skardi-cloud one, holds no token, or the token expired or was revoked — and
+naming `skardi login`.
+
 ## Exit codes
 
-The agent commands above, and `login --control`'s `6`, have
+The agent commands above, `memory`, and `login --control`'s `6`, have
 [their own table](#connecting-data-sources-from-an-agent--integrations-handoff-documents).
 Everything else:
 
