@@ -34,7 +34,8 @@ tracing-subscriber = "0.3"
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util", "time"] }
+# `process`: `skardi memory status` asks git and gh for the branch's issue.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util", "time", "process"] }
 # PKCE S256 (§6.1 step 2): the code challenge is base64url(sha256(verifier)),
 # and the verifier/state must come from the OS CSPRNG — `getrandom` is that
 # and nothing more, with no PRNG state to seed or reason about.

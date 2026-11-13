@@ -1,0 +1,27 @@
+{
+  "memories": [
+    {
+      "anchor": "url:github.com/SkardiLabs/skardi-cloud/issues/1400",
+      "author": "user:acme/u-1",
+      "own": true,
+      "visibility": "private",
+      "goal": "Ship the audit export",
+      "status": "API route merged; UI next",
+      "version": 4,
+      "updated_at": "2026-11-08T10:30:00Z"
+    },
+    {
+      "anchor": "label:billing-v2-migration",
+      "author": "user:acme/u-2",
+      "own": false,
+      "visibility": "shared",
+      "goal": "Move billing to v2",
+      "status": "Blocked on the price table",
+      "version": 9,
+      "updated_at": "2026-11-02T17:00:00Z"
+    }
+  ],
+  "total": 2,
+  "workspace_used": 37,
+  "workspace_cap": 2000
+}

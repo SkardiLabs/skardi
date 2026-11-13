@@ -11,7 +11,12 @@
 //!            | cancel | status | sync
 //! handoff wait
 //! documents add
+//! memory save | recall | list | copy | share | rm | history | redact
+//!        | consent | status
 //! ```
+//!
+//! `memory` is the odd one out: it reaches the data plane under the
+//! context's query token, never the control token (see [`memory`]).
 //!
 //! # The interface is a contract
 //!
@@ -51,6 +56,7 @@ pub mod control;
 pub mod documents;
 pub mod handoff;
 pub mod integrations;
+pub mod memory;
 pub mod scope;
 
 use crate::config::{self, ClientConfig, ContextMode};

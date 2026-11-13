@@ -1,0 +1,6 @@
+{
+  "success": false,
+  "code": "version_conflict",
+  "error": "the memory is at version 5, not 4: recall it, merge, and save again",
+  "current_version": 5
+}

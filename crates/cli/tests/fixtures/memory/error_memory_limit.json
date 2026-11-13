@@ -1,0 +1,6 @@
+{
+  "success": false,
+  "code": "memory_limit",
+  "error": "this workspace holds 2000 memories, its cap; remove some with `skardi memory list` and `skardi memory rm`, or ask an admin to raise the cap",
+  "limit": 2000
+}
