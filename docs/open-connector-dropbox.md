@@ -378,7 +378,7 @@ The practical consequence: sustained Dropbox throttling exhausts the
 retry budget and the scan fails with a retry-exhausted error. **A failed
 scan caches nothing** — the scan cache is written only when the scan
 completes (LIMIT satisfied, or pagination exhausted), so a retry-exhausted
-429, a `ScanBoundsExceeded`, a deadline timeout, or contract drift on page
+429, a `ScanBoundsExceeded`, an idle timeout, or contract drift on page
 N all leave the cache untouched. Re-running restarts at page one and
 repays the full cost, which on `files` is a second recursive walk of the
 whole account into the same throttle. The remedy is therefore to narrow

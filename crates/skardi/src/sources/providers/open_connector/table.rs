@@ -2,7 +2,6 @@
 
 use std::any::Any;
 use std::sync::Arc;
-use std::time::Duration;
 
 use arrow::datatypes::SchemaRef;
 use datafusion::catalog::Session;
@@ -42,7 +41,6 @@ pub struct OpenConnectorTableProvider {
     resource: Value,
     max_pages: u32,
     max_rows: u64,
-    scan_timeout: Duration,
 }
 
 impl std::fmt::Debug for OpenConnectorTableProvider {
@@ -74,7 +72,6 @@ impl OpenConnectorTableProvider {
         resource: Value,
         max_pages: u32,
         max_rows: u64,
-        scan_timeout: Duration,
     ) -> Result<Self, super::error::OpenConnectorError> {
         let converter = Arc::new(RowConverter::new(table.fields)?);
         let row_path = match table.row_shape {
@@ -114,7 +111,6 @@ impl OpenConnectorTableProvider {
             resource,
             max_pages,
             max_rows,
-            scan_timeout,
         })
     }
 }
@@ -184,7 +180,6 @@ impl TableProvider for OpenConnectorTableProvider {
             limit,
             self.max_pages,
             self.max_rows,
-            self.scan_timeout,
         )?;
         Ok(Arc::new(exec))
     }
@@ -204,6 +199,7 @@ mod tests {
     use crate::sources::providers::open_connector::pagination::{AbsentCursor, PaginationStrategy};
     use datafusion::physical_plan::collect;
     use datafusion::prelude::{SessionContext, col, lit};
+    use std::time::Duration;
     // A `FilterMapping`'s operator is the pack's declaration, not
     // DataFusion's — this test builds a mapping, not an expression.
     use skardi_source_pack::filters::Operator;
@@ -307,7 +303,6 @@ mod tests {
             serde_json::json!({}),
             10,
             1000,
-            Duration::from_secs(30),
         )
         .expect("binds");
         let ctx = SessionContext::new();
@@ -363,7 +358,6 @@ mod tests {
             serde_json::json!({}),
             10,
             1000,
-            Duration::from_secs(30),
         )
         .unwrap_err();
         assert!(matches!(
@@ -393,7 +387,6 @@ mod tests {
             serde_json::json!({}),
             10,
             1000,
-            Duration::from_secs(30),
         )
         .expect("valid cursor pagination binds");
     }

@@ -10,7 +10,7 @@
 use std::collections::VecDeque;
 use std::fmt;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
@@ -56,7 +56,6 @@ pub struct OpenConnectorExec {
     limit: Option<usize>,
     max_pages: u32,
     max_rows: u64,
-    scan_timeout: Duration,
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
 }
@@ -92,7 +91,6 @@ impl OpenConnectorExec {
         limit: Option<usize>,
         max_pages: u32,
         max_rows: u64,
-        scan_timeout: Duration,
     ) -> DFResult<Self> {
         let full_schema = Arc::clone(converter.schema());
         let schema = match &projection {
@@ -120,7 +118,6 @@ impl OpenConnectorExec {
             limit,
             max_pages,
             max_rows,
-            scan_timeout,
             schema,
             properties: Arc::new(properties),
         })
@@ -313,7 +310,6 @@ impl ScanState {
             exec.row_path.as_str(),
             ScanBounds {
                 max_pages: exec.max_pages,
-                timeout: exec.scan_timeout,
             },
         )?;
         Ok(Self {
@@ -346,10 +342,6 @@ impl ScanState {
             cache.put(self.cache_key.clone(), self.fetched.clone());
         }
         self.cache_stored = true;
-    }
-
-    fn timeout_error(&self) -> OpenConnectorError {
-        self.scan.timeout_error()
     }
 
     /// Emit the scan-completion event exactly once. Identifying fields and
@@ -393,11 +385,6 @@ impl ScanState {
         let envelope = self.scan.fetch_page().await?;
         let rows = self.scan.rows(&envelope)?;
         let batch = self.converter.convert(rows, page)?;
-        // Conversion is synchronous, so it cannot be preempted by Tokio; do
-        // not emit its result if it consumed the remaining scan budget.
-        if Instant::now() >= self.scan.deadline() {
-            return Err(self.timeout_error());
-        }
         let batch = match &self.projection {
             Some(indices) => {
                 batch
@@ -496,6 +483,7 @@ mod tests {
     use futures::StreamExt;
     use serde_json::json;
     use std::sync::Mutex;
+    use std::time::Duration;
 
     fn build_exec(
         client: Arc<OpenConnectorClient>,
@@ -519,7 +507,6 @@ mod tests {
             limit,
             10,
             1000,
-            Duration::from_secs(30),
         )
         .expect("build exec")
     }
@@ -664,7 +651,6 @@ mod tests {
             None,
             10,
             1000,
-            Duration::from_secs(30),
         )
         .expect("build exec");
 
@@ -719,7 +705,6 @@ mod tests {
             None,
             10,
             1000,
-            Duration::from_secs(30),
         )
         .expect("build exec");
 
@@ -780,7 +765,6 @@ mod tests {
             None,
             10,
             1000,
-            Duration::from_secs(30),
         )
         .expect("build exec");
 

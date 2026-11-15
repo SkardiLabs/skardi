@@ -2,7 +2,7 @@
 //!
 //! One action, one resource, N pages: assemble the input, execute, check the
 //! provider's in-band error, extract the rows, advance the cursor, stop at the
-//! page budget or the deadline. Nothing in that list is specific to what the
+//! page budget. Nothing in that list is specific to what the
 //! rows become afterwards, and yet it was written four times over — once in
 //! this workspace's query engine and, in cloud, once in the ETL's folder
 //! walker and once per connector in the rbac syncer (six `for page in 1..`
@@ -23,14 +23,12 @@
 //! by). A consumer with no such interleaving calls
 //! [`ActionScan::collect_all`](crate::scan::ActionScan::collect_all) and gets the whole collection.
 //!
-//! The three errors this raises — [`OpenConnectorError::ScanTimeout`],
-//! [`OpenConnectorError::ScanBoundsExceeded`] and
+//! The two errors this raises — [`OpenConnectorError::ScanBoundsExceeded`] and
 //! [`OpenConnectorError::ProviderReportedError`] — already lived in this
 //! crate before the walk did.
 
 use std::slice;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value};
 
@@ -130,14 +128,12 @@ pub struct ScanBounds {
     /// Maximum pages to fetch. Exceeding it is
     /// [`OpenConnectorError::ScanBoundsExceeded`], never a quiet stop —
     /// stopping would report a PREFIX of the collection as the whole of it.
+    ///
+    /// There is deliberately no overall time bound. A scan makes progress or
+    /// it does not, and the client's per-request idle timeout is what catches
+    /// a stalled request; a wall clock over the whole walk would cut off a
+    /// slow but healthy one.
     pub max_pages: u32,
-    /// Wall-clock budget for this scan's requests, I/O and client-internal
-    /// retry backoff included: the entire walk for an in-process scan, and
-    /// this process's share of it for a [`ActionScan::resume`]d one. A
-    /// durable walk's overall bound belongs to its owner (one page per
-    /// leased work, under the owner's own deadline), not to a wall clock
-    /// carried across processes.
-    pub timeout: Duration,
 }
 
 /// One action's paginated walk.
@@ -163,7 +159,6 @@ pub struct ActionScan {
     error_path: Option<RowPath>,
     pagination: Pagination,
     bounds: ScanBounds,
-    deadline: Instant,
     pages_fetched: u32,
 }
 
@@ -204,7 +199,6 @@ impl ActionScan {
             error_path,
             pagination,
             bounds,
-            deadline: Instant::now() + bounds.timeout,
             pages_fetched: 0,
         })
     }
@@ -246,21 +240,6 @@ impl ActionScan {
     /// and a failure event that under-reports it misleads whoever reads it.
     pub fn pages_fetched(&self) -> u32 {
         self.pages_fetched
-    }
-
-    /// The scan's deadline, for a consumer that interleaves its own work and
-    /// must not emit a result produced after the budget ran out.
-    pub fn deadline(&self) -> Instant {
-        self.deadline
-    }
-
-    /// The error a consumer should raise when it observes the deadline passing
-    /// during its own work.
-    pub fn timeout_error(&self) -> OpenConnectorError {
-        OpenConnectorError::ScanTimeout {
-            table: self.target.table_id.to_string(),
-            seconds: self.bounds.timeout.as_secs(),
-        }
     }
 
     /// The row path, as declared. For error messages that must name it.
@@ -318,13 +297,9 @@ impl ActionScan {
 
     /// Fetch one page's response envelope.
     ///
-    /// Charges the page budget and the deadline first, so neither is exceeded
-    /// by the request this is about to make rather than only detected after
-    /// it.
+    /// Charges the page budget first, so it is not exceeded by the request
+    /// this is about to make rather than only detected after it.
     pub async fn fetch_page(&mut self) -> Result<Value, OpenConnectorError> {
-        if Instant::now() >= self.deadline {
-            return Err(self.timeout_error());
-        }
         if self.pagination.page() > self.bounds.max_pages as usize {
             return Err(OpenConnectorError::ScanBoundsExceeded {
                 table: self.target.table_id.to_string(),
@@ -335,24 +310,18 @@ impl ActionScan {
 
         let page = self.pagination.page();
         let (action_id, input) = self.request();
-        // The deadline covers the whole gateway operation, request I/O and any
-        // retry backoff inside the client included. Dropping this future on
-        // timeout also prevents another retry from being sent.
-        let envelope = tokio::time::timeout_at(
-            tokio::time::Instant::from_std(self.deadline),
-            self.client.execute(
+        // No scan-wide deadline: the client's idle timeout bounds each
+        // request's silence, which is the only time bound a scan has.
+        let envelope = self
+            .client
+            .execute(
                 &action_id,
                 &Value::Object(input),
                 self.connection_alias.as_deref(),
-            ),
-        )
-        .await
-        .map_err(|_| self.timeout_error())??;
+            )
+            .await?;
         // Counted at fetch time on purpose — see `pages_fetched`.
         self.pages_fetched += 1;
-        if Instant::now() >= self.deadline {
-            return Err(self.timeout_error());
-        }
 
         // Some gateways forward a provider's in-band application errors
         // unchanged (Slack-style HTTP 200, `ok: false` + `error`). Packs
@@ -440,6 +409,7 @@ mod tests {
     use crate::pagination::AbsentCursor;
     use crate::testing::{MockGateway, MockResponse, RecordedRequest};
     use serde_json::json;
+    use std::time::{Duration, Instant};
 
     const TABLE: &str = "mock.items";
 
@@ -474,10 +444,7 @@ mod tests {
     }
 
     fn bounds(max_pages: u32) -> ScanBounds {
-        ScanBounds {
-            max_pages,
-            timeout: Duration::from_secs(30),
-        }
+        ScanBounds { max_pages }
     }
 
     async fn scan_against(
@@ -580,6 +547,47 @@ mod tests {
         let ids: Vec<u64> = rows.iter().map(|r| r["id"].as_u64().expect("id")).collect();
         assert_eq!(ids, vec![1, 2, 3, 4, 5], "every page's rows, in order");
         assert_eq!(scan.pages_fetched(), 3, "three gateway requests");
+    }
+
+    /// **A scan has no overall deadline.** Every page here is slower than a
+    /// quarter of the client's idle bound, and the whole walk takes longer
+    /// than that bound, yet each request keeps making progress, so the walk
+    /// must finish. Real time, not a paused clock: the idle timeout is a
+    /// socket-level timer a paused tokio clock does not drive.
+    #[tokio::test]
+    async fn a_multi_page_scan_has_no_overall_deadline() {
+        let idle = Duration::from_millis(600);
+        let gateway = MockGateway::start(|req: &RecordedRequest| {
+            let response = match body_of(req)["input"]["cursor"].as_str() {
+                None => page_of(&[1, 2], Some("c1")),
+                Some("c1") => page_of(&[3, 4], Some("c2")),
+                Some("c2") => page_of(&[5, 6], Some("c3")),
+                _ => page_of(&[7], None),
+            };
+            response.with_delay(Duration::from_millis(250))
+        })
+        .await;
+        let client = Arc::new(OpenConnectorClient::new(&gateway.url, "t", idle).expect("client"));
+        let mut scan = ActionScan::new(
+            client,
+            target(cursor_pagination(AbsentCursor::EndsTheScan)),
+            None,
+            json!({ "folderId": "f1" }),
+            Vec::new(),
+            "$.items",
+            bounds(10),
+        )
+        .expect("scan binds");
+
+        let started = Instant::now();
+        let rows = scan.collect_all().await.expect("a slow scan still walks");
+
+        assert!(
+            started.elapsed() > idle,
+            "the walk must outlast the idle bound for this test to mean anything"
+        );
+        assert_eq!(rows.len(), 7);
+        assert_eq!(scan.pages_fetched(), 4);
     }
 
     /// A durable walk fetches one page per process: the saved position must
