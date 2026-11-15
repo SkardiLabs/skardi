@@ -285,7 +285,10 @@ pub struct TransportPolicy {
     /// stalled one.
     pub idle_timeout: Duration,
     /// Time to establish the connection, when the caller wants that bounded
-    /// separately. `None` leaves connecting unbounded by this policy.
+    /// separately. With `None` this policy sets no bound, and connecting is
+    /// bounded only by the operating system's TCP connect timeout (on Linux,
+    /// the SYN retries of `net.ipv4.tcp_syn_retries`, about two minutes by
+    /// default).
     pub connect_timeout: Option<Duration>,
     /// Whether to follow a redirect. `false` refuses outright.
     pub follow_redirects: bool,
