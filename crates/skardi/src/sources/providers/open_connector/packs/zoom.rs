@@ -1380,9 +1380,14 @@ bindings:
                 && message.contains("zoom.get_meeting_summary"),
             "the gateway's error code and the action are named: {message}"
         );
-        let typed = successors(Some(&err as &(dyn Error + 'static)), |cause| cause.source())
-            .find_map(|cause| cause.downcast_ref::<OpenConnectorError>())
-            .unwrap_or_else(|| panic!("an OpenConnectorError in the chain: {message}"));
+        // `(*cause)`, not `cause`: on the `&&dyn Error` the closure receives,
+        // `source` resolves to the `Error` impl for `&T` and borrows the
+        // closure's argument rather than the error behind it.
+        let typed = successors(Some(&err as &(dyn Error + 'static)), |cause| {
+            (*cause).source()
+        })
+        .find_map(|cause| cause.downcast_ref::<OpenConnectorError>())
+        .unwrap_or_else(|| panic!("an OpenConnectorError in the chain: {message}"));
         match typed {
             OpenConnectorError::ActionExecutionFailed {
                 action_id,
