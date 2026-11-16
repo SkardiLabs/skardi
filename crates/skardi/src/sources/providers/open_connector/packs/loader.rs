@@ -243,6 +243,13 @@ fn reads_at_or_below(read: &str, path: &str) -> bool {
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
 }
 
+/// Whether the row-relative path `read` descends below the top-level key
+/// `key` (`summary.id` below `summary`); reading `key` itself does not.
+fn reads_below(read: &str, key: &str) -> bool {
+    read.split_once('.')
+        .is_some_and(|(parent, _)| parent == key)
+}
+
 /// The `derive:` block's own invariants. Serde guarantees its shape; these
 /// are the ways a derivation could be declared and do nothing, or do
 /// something other than what its author read.
@@ -340,22 +347,94 @@ fn validate_derive(table: &SourcePackTable) -> Result<(), String> {
             ));
         }
     }
+    // Templates render one after another in key order, each onto the row
+    // the next one reads, so a template reading another template's key
+    // would see the wire value or the rendered one depending on how the
+    // two keys sort — the same order-as-implementation-fact problem as a
+    // key with two writers. A template reading its OWN key is not refused:
+    // it always reads the value from before format, whatever the order.
+    for (key, template) in derive.format {
+        let placeholders = template_placeholders(template).unwrap_or_default();
+        for read in placeholders {
+            let head = read.split('.').next().unwrap_or(read);
+            if head != *key && derive.format.iter().any(|(other, _)| *other == head) {
+                return Err(format!(
+                    "{id}: derive format '{key}' reads '{read}', which derive format '{head}' \
+                     writes; a template reads wire, explode and constant keys, never another \
+                     template's key"
+                ));
+            }
+        }
+    }
     // A derived key nothing reads is a declaration with no effect — and
-    // most likely a column path misspelt on one side or the other.
+    // most likely a column path misspelt on one side or the other. A
+    // template's read of its own key sees the pre-format value, never the
+    // derived one, so it does not count as reading it.
     for key in &written {
         let read_by_a_column = table
             .fields
             .iter()
             .any(|field| field.path.split('.').next() == Some(*key));
-        let read_by_a_template = derive.format.iter().any(|(_, template)| {
-            template_placeholders(template)
-                .map(|paths| paths.iter().any(|p| p.split('.').next() == Some(*key)))
-                .unwrap_or(false)
-        });
+        let read_by_a_template = derive
+            .format
+            .iter()
+            .filter(|(template_key, _)| template_key != key)
+            .any(|(_, template)| {
+                template_placeholders(template)
+                    .map(|paths| paths.iter().any(|p| p.split('.').next() == Some(*key)))
+                    .unwrap_or(false)
+            });
         if !read_by_a_column && !read_by_a_template {
             return Err(format!(
                 "{id}: derive writes '{key}', which no column path and no format template reads"
             ));
+        }
+    }
+    // A key written with a non-object value replaces whatever the wire had
+    // there, so a path below it never reaches the wire object it names: on
+    // a null it reads NULL on every row (failing a non-null column), on a
+    // scalar the converter or the template fails every scan. Such a key may
+    // only be read whole. Explode `into` is exempt: its value is an array
+    // element whose shape only the wire knows, and reading fields of an
+    // object element (`item.text`) is what `into` is for. A template below
+    // its own key is exempt too: it renders before its key is written, so
+    // it reads the wire object.
+    let mut non_object_keys: Vec<(&str, &str)> = Vec::new();
+    if let Some(index) = derive.explode.and_then(|explode| explode.index) {
+        non_object_keys.push(("explode `index`", index));
+    }
+    for (key, value) in derive.constants {
+        if !matches!(value, FixedValue::Json(json) if json.is_object()) {
+            non_object_keys.push(("constant", *key));
+        }
+    }
+    for (key, _) in derive.format {
+        non_object_keys.push(("format", *key));
+    }
+    for (what, key) in non_object_keys {
+        if let Some(field) = table
+            .fields
+            .iter()
+            .find(|field| reads_below(field.path, key))
+        {
+            return Err(format!(
+                "{id}: column '{}' reads '{}' below derive {what} '{key}', which writes no \
+                 object; a derived key is read whole (path '{key}'), never as a parent",
+                field.name, field.path
+            ));
+        }
+        for (format_key, template) in derive.format {
+            if *format_key == key {
+                continue;
+            }
+            let placeholders = template_placeholders(template).unwrap_or_default();
+            if let Some(read) = placeholders.iter().find(|read| reads_below(read, key)) {
+                return Err(format!(
+                    "{id}: derive format '{format_key}' reads '{read}' below derive {what} \
+                     '{key}', which writes no object; a derived key is read whole (path \
+                     '{key}'), never as a parent"
+                ));
+            }
         }
     }
     Ok(())
@@ -417,6 +496,46 @@ fn validate_table(table: &SourcePackTable) -> Result<(), String> {
                 "{id}: duplicate filter mapping for column '{}' and operator {:?}",
                 filter.column, filter.operator
             ));
+        }
+        // The gateway evaluates a pushed predicate against WIRE rows, but a
+        // column the derivation writes has no wire value: its value exists
+        // only after the fetch. Pushed, the predicate filters something else
+        // (whole source rows for an exploded element) and, under exact,
+        // DataFusion never re-checks it; under inexact the upstream subset
+        // is still not a superset of the matching rows. Refused whatever the
+        // fidelity. A column read off the source row is left alone: every
+        // derived row inherits it unchanged, so filtering source rows before
+        // explode or skip_when_null keeps exactly the rows that match —
+        // unless explode removed something below the column's path, which
+        // leaves the derived value different from the wire value.
+        if let Some(derive) = &table.derive
+            && let Some(field) = table.fields.iter().find(|f| f.name == filter.column)
+        {
+            if let Some(key) = derive
+                .written_keys()
+                .into_iter()
+                .find(|key| field.path.split('.').next() == Some(*key))
+            {
+                return Err(format!(
+                    "{id}: filter on '{}' ({:?}) reads '{}', which derive writes as '{key}' after \
+                     the fetch; the gateway would evaluate the pushed predicate against wire rows \
+                     that do not carry it",
+                    filter.column, filter.operator, field.path
+                ));
+            }
+            if let Some(explode) = &derive.explode
+                && let Some(path) = explode
+                    .paths
+                    .iter()
+                    .find(|path| reads_at_or_below(path, field.path))
+            {
+                return Err(format!(
+                    "{id}: filter on '{}' ({:?}) reads '{}', from which derive explode removes \
+                     '{path}'; the gateway would evaluate the pushed predicate against the wire \
+                     value, which still carries it",
+                    filter.column, filter.operator, field.path
+                ));
+            }
         }
         // A value domain is a finite list of equalities; under a range
         // operator it has no meaning the translation could honor, so an
@@ -1185,6 +1304,8 @@ enum FormatDoc {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
     /// Every registered asset parses AND passes the same structural
@@ -2206,6 +2327,224 @@ tables:
       - { name: text, path: text, type: utf8, nullable: true }"#,
         )
         .expect("a template reading the exploded index is legal");
+    }
+
+    /// A derive table for the filter-pushdown checks: one exploded element
+    /// per row, a constant, a formatted id, a column read off the source
+    /// row, and a JSON column holding the parent of the exploded array.
+    fn derive_table_with_filter(filter: &str) -> Result<SourcePack, String> {
+        pack_with(&format!(
+            r#"    action: demo.list
+    row_path: "$.items"
+    pagination: {{ strategy: single_page }}
+    derive:
+      skip_when_null: summary
+      explode: {{ paths: [summary.steps], into: text, index: position }}
+      constants: {{ provider: zoom }}
+      format: {{ item_id: "{{summary.meetingUuid}}#{{position}}" }}
+    columns:
+      - {{ name: meeting_id, path: summary.meetingUuid, type: utf8, nullable: false }}
+      - {{ name: item_id, path: item_id, type: utf8, nullable: false }}
+      - {{ name: text, path: text, type: utf8, nullable: true }}
+      - {{ name: position, path: position, type: uint64, nullable: false }}
+      - {{ name: provider, path: provider, type: utf8, nullable: false }}
+      - {{ name: summary, path: summary, type: json, nullable: true }}
+    filters:
+      - {filter}"#
+        ))
+    }
+
+    /// The gateway evaluates a pushed predicate against wire rows, which do
+    /// not carry what derive writes (or carry what explode removed).
+    #[rstest]
+    #[case::exploded_element(
+        "{ column: text, op: eq, input: text, fidelity: exact }",
+        "filter on 'text' (Eq) reads 'text', which derive writes as 'text'"
+    )]
+    #[case::exploded_index(
+        "{ column: position, op: gt, input: after, fidelity: inexact }",
+        "filter on 'position' (Gt) reads 'position', which derive writes as 'position'"
+    )]
+    #[case::constant(
+        "{ column: provider, op: eq, input: provider, fidelity: exact }",
+        "filter on 'provider' (Eq) reads 'provider', which derive writes as 'provider'"
+    )]
+    #[case::inexact_constant(
+        "{ column: provider, op: eq, input: provider, fidelity: inexact }",
+        "which derive writes as 'provider'"
+    )]
+    #[case::formatted(
+        "{ column: item_id, op: eq, input: id, fidelity: exact }",
+        "filter on 'item_id' (Eq) reads 'item_id', which derive writes as 'item_id'"
+    )]
+    #[case::parent_of_an_exploded_path(
+        "{ column: summary, op: eq, input: summary, fidelity: exact }",
+        "filter on 'summary' (Eq) reads 'summary', from which derive explode removes 'summary.steps'"
+    )]
+    fn a_filter_on_a_derived_column_is_refused(#[case] filter: &str, #[case] expected: &str) {
+        let err = derive_table_with_filter(filter).expect_err(expected);
+        assert!(err.contains("items"), "names the table: {err}");
+        assert!(err.contains(expected), "want {expected:?} in: {err}");
+    }
+
+    /// A column read off the source row is inherited unchanged by every
+    /// derived row, so filtering source rows upstream keeps exactly the
+    /// derived rows that match — explode and skip_when_null included.
+    #[test]
+    fn a_filter_on_a_source_column_of_a_derive_table_loads() {
+        let pack = derive_table_with_filter(
+            "{ column: meeting_id, op: eq, input: meetingUuid, fidelity: exact }",
+        )
+        .expect("a filter on a column the derivation does not write is legal");
+        assert_eq!(pack.tables[0].filters.len(), 1);
+        assert_eq!(pack.tables[0].filters[0].column, "meeting_id");
+    }
+
+    /// Templates render in key order, so one reading another's key would
+    /// depend on how the two keys sort; both orders are refused alike.
+    #[rstest]
+    #[case::earlier_key_reads_a_later_one(
+        r#"{ a_id: "{b_key}#x", b_key: "{id}" }"#,
+        "derive format 'a_id' reads 'b_key', which derive format 'b_key' writes"
+    )]
+    #[case::later_key_reads_an_earlier_one(
+        r#"{ z_id: "{b_key}#x", b_key: "{id}" }"#,
+        "derive format 'z_id' reads 'b_key', which derive format 'b_key' writes"
+    )]
+    #[case::nested_path_under_another_template_key(
+        r#"{ a_id: "{b_key.x}", b_key: "{id}" }"#,
+        "derive format 'a_id' reads 'b_key.x', which derive format 'b_key' writes"
+    )]
+    // Reading its own key reads the pre-format wire value, so it does not
+    // make the derived key "read" by anything.
+    #[case::self_read_does_not_count_as_a_reader(
+        r#"{ unread: "{unread}#x", a_id: "{id}" }"#,
+        "derive writes 'unread', which no column path and no format template reads"
+    )]
+    fn a_format_template_cannot_read_another_templates_key(
+        #[case] format: &str,
+        #[case] expected: &str,
+    ) {
+        let err = pack_with(&format!(
+            r#"    action: demo.get
+    row_path: "$"
+    row_shape: object
+    pagination: {{ strategy: single_page }}
+    derive:
+      format: {format}
+    columns:
+      - {{ name: a_id, path: a_id, type: utf8, nullable: true }}
+      - {{ name: z_id, path: z_id, type: utf8, nullable: true }}
+      - {{ name: b_key, path: b_key, type: utf8, nullable: true }}"#
+        ))
+        .expect_err(expected);
+        assert!(err.contains(expected), "want {expected:?} in: {err}");
+    }
+
+    /// Constants and explode run before format, so a template may read
+    /// both; and a template may read its own key, which is the wire value
+    /// whatever the key order.
+    #[test]
+    fn a_format_template_reads_constants_explode_keys_and_its_own_key() {
+        let pack = pack_with(
+            r#"    action: demo.get
+    row_path: "$"
+    row_shape: object
+    pagination: { strategy: single_page }
+    derive:
+      explode: { paths: [steps], into: text, index: position }
+      constants: { provider: zoom }
+      format: { item_id: "{provider}:{uuid}#{position}", meeting: "zoom-{meeting}" }
+    columns:
+      - { name: meeting, path: meeting, type: utf8, nullable: false }
+      - { name: item_id, path: item_id, type: utf8, nullable: false }
+      - { name: text, path: text, type: utf8, nullable: true }"#,
+        )
+        .expect("a template reading a constant, the exploded index and its own key is legal");
+        let derive = pack.tables[0].derive.expect("declared");
+        let page = serde_json::json!({ "uuid": "u-1", "meeting": "m-1", "steps": ["a"] });
+        let rows = derive
+            .apply(pack.tables[0].id, std::slice::from_ref(&page), 1)
+            .expect("derives");
+        assert_eq!(
+            rows,
+            [serde_json::json!({
+                "uuid": "u-1",
+                "meeting": "zoom-m-1",
+                "text": "a",
+                "position": 0,
+                "provider": "zoom",
+                "item_id": "zoom:u-1#0",
+            })]
+        );
+    }
+
+    /// A key written with a non-object value replaces the wire object of
+    /// that name, so a path below it would read NULL on every row (a null
+    /// constant) or fail every scan (a scalar); it is refused at load.
+    #[rstest]
+    #[case::column_below_a_null_constant(
+        "constants: { summary: null }",
+        "column 'id' reads 'summary.id' below derive constant 'summary'"
+    )]
+    #[case::column_below_a_scalar_constant(
+        "constants: { summary: zoom }",
+        "column 'id' reads 'summary.id' below derive constant 'summary'"
+    )]
+    #[case::column_below_a_format_key(
+        r#"format: { summary: "{provider}#x" }"#,
+        "column 'id' reads 'summary.id' below derive format 'summary'"
+    )]
+    #[case::column_below_the_explode_index(
+        "explode: { paths: [steps], into: text, index: summary }",
+        "column 'id' reads 'summary.id' below derive explode `index` 'summary'"
+    )]
+    #[case::template_below_a_constant(
+        r#"constants: { provider: zoom }, format: { text: "{provider.name}" }"#,
+        "derive format 'text' reads 'provider.name' below derive constant 'provider'"
+    )]
+    fn a_non_object_derived_key_cannot_be_read_as_a_parent(
+        #[case] derive: &str,
+        #[case] expected: &str,
+    ) {
+        let err = pack_with(&format!(
+            r#"    action: demo.get
+    row_path: "$"
+    row_shape: object
+    pagination: {{ strategy: single_page }}
+    derive: {{ {derive} }}
+    columns:
+      - {{ name: id, path: summary.id, type: utf8, nullable: false }}
+      - {{ name: text, path: text, type: utf8, nullable: true }}
+      - {{ name: provider, path: provider, type: utf8, nullable: true }}"#
+        ))
+        .expect_err(expected);
+        assert!(err.contains(expected), "want {expected:?} in: {err}");
+    }
+
+    /// Reading a derived key whole stays legal, and so does reading below
+    /// one that may hold an object: an exploded element (the planned Teams
+    /// pack reads `item.text`), an object constant, or a template below its
+    /// own key, which renders from the wire value before the key is written.
+    #[rstest]
+    #[case::whole_read_of_a_null_constant("constants: { summary: null }", "summary")]
+    #[case::below_an_explode_into_key("explode: { paths: [actionItems], into: item }", "item.text")]
+    #[case::below_an_object_constant("constants: { owner: { name: zoom } }", "owner.name")]
+    #[case::template_below_its_own_key(r#"format: { summary: "{summary.id}" }"#, "summary")]
+    fn a_derived_key_read_whole_or_below_a_possible_object_loads(
+        #[case] derive: &str,
+        #[case] path: &str,
+    ) {
+        pack_with(&format!(
+            r#"    action: demo.get
+    row_path: "$"
+    row_shape: object
+    pagination: {{ strategy: single_page }}
+    derive: {{ {derive} }}
+    columns:
+      - {{ name: derived, path: {path}, type: utf8, nullable: true }}"#
+        ))
+        .expect("a derived key read whole or below a possible object loads");
     }
 
     #[test]

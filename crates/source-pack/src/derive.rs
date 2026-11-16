@@ -49,9 +49,12 @@ use crate::source_pack::FixedValue;
 /// `paths` are tried in order and the first that resolves to a NON-EMPTY
 /// array supplies the elements; a path that is missing, null, or an empty
 /// array is passed over, and a path present with any other shape fails the
-/// scan with its kind. When no path supplies elements the source row
-/// yields zero rows. Each element lands under `into` on a copy of the
-/// source row, and its 0-based position under `index` when one is named.
+/// scan with its kind — every listed path, the ones after the chosen array
+/// included, since explode consumes them all (below) and a drifted
+/// fallback must not vanish unseen. When no path supplies elements the
+/// source row yields zero rows. Each element lands under `into` on a copy
+/// of the source row, and its 0-based position under `index` when one is
+/// named.
 ///
 /// **Explode consumes its paths.** The copy each element lands on is the
 /// source row WITHOUT the value at any of `paths` — the array that was
@@ -81,7 +84,8 @@ pub struct Explode {
 pub struct RowDerivation {
     /// Drop every source row where this row-relative path is missing or
     /// null (a null parent counts as missing). A present value of another
-    /// shape keeps the row.
+    /// shape keeps the row. A parent along the path that is present but not
+    /// an object fails the scan with its kind.
     pub skip_when_null: Option<&'static str>,
     /// One row per array element; see [`Explode`].
     pub explode: Option<Explode>,
@@ -95,7 +99,9 @@ pub struct RowDerivation {
     /// number or boolean as JSON text, and a missing or null value makes
     /// the WHOLE rendered value null (so a non-null identity column fails
     /// loudly rather than reading as `"#0"`). An array or object under a
-    /// placeholder fails the scan with its kind.
+    /// placeholder fails the scan with its kind. A template cannot read
+    /// another template's key (templates render in key order, so the loader
+    /// refuses it); reading its own key reads the value from before format.
     pub format: &'static [(&'static str, &'static str)],
 }
 
@@ -165,13 +171,15 @@ impl RowDerivation {
                 None => vec![source.clone()],
                 Some(explode) => {
                     let mut elements: Option<&[Value]> = None;
+                    // No early exit once an array is chosen: the paths after
+                    // it are consumed too, so a drifted fallback must fail
+                    // here rather than be dropped silently by `clone_without`.
                     for path in explode.paths {
                         match resolve(source, path) {
                             Ok(None) => {}
                             Ok(Some(Value::Array(items))) => {
-                                if !items.is_empty() {
+                                if elements.is_none() && !items.is_empty() {
                                     elements = Some(items.as_slice());
-                                    break;
                                 }
                             }
                             Ok(Some(other)) => {
@@ -621,6 +629,102 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("flattened"), "values never appear: {text}");
+    }
+
+    #[test]
+    fn explode_fails_on_a_wrong_shaped_path_after_the_chosen_array() {
+        let derivation = RowDerivation {
+            explode: Some(Explode {
+                paths: &["summary.editedSummary.nextSteps", "summary.nextSteps"],
+                into: "text",
+                index: None,
+            }),
+            ..RowDerivation::default()
+        };
+        let edited = json!({"nextSteps": ["Edited step"]});
+        let err = derivation
+            .apply(
+                "zoom.meeting_action_items",
+                &[summary_answer(json!("drifted legacy"), edited)],
+                3,
+            )
+            .unwrap_err();
+        match err {
+            OpenConnectorError::RowDerivationFailed {
+                step,
+                path,
+                page,
+                row,
+                expected,
+                found,
+                ..
+            } => {
+                assert_eq!(step, "explode");
+                assert_eq!(path, "summary.nextSteps", "the fallback is named");
+                assert_eq!(page, 3);
+                assert_eq!(row, 0);
+                assert_eq!(expected, "an array");
+                assert_eq!(found, "a string");
+            }
+            other => panic!("expected RowDerivationFailed, got {other}"),
+        }
+
+        // A non-object parent of a later path is a shape change too.
+        let derivation = RowDerivation {
+            explode: Some(Explode {
+                paths: &["steps", "legacy.steps"],
+                into: "text",
+                index: None,
+            }),
+            ..RowDerivation::default()
+        };
+        let err = derivation
+            .apply(
+                "t",
+                &[json!({"steps": ["Send the agenda"], "legacy": 7})],
+                1,
+            )
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("legacy.steps") && text.contains("a number"),
+            "{text}"
+        );
+        assert!(!text.contains("agenda"), "values never appear: {text}");
+    }
+
+    #[test]
+    fn explode_passes_over_a_later_path_that_is_missing_null_or_empty() {
+        let derivation = RowDerivation {
+            explode: Some(Explode {
+                paths: &["summary.editedSummary.nextSteps", "summary.nextSteps"],
+                into: "text",
+                index: Some("position"),
+            }),
+            ..RowDerivation::default()
+        };
+        let edited = json!({"nextSteps": ["Edited one", "Edited two"]});
+        let cases = [
+            (
+                "missing",
+                json!({"summary": {"meetingUuid": "uuid-1", "editedSummary": edited}}),
+            ),
+            ("null", summary_answer(NULL, edited.clone())),
+            ("empty_array", summary_answer(json!([]), edited.clone())),
+        ];
+        for (case, row) in cases {
+            let out = derivation
+                .apply("t", &[row], 1)
+                .unwrap_or_else(|err| panic!("{case}: {err}"));
+            assert_eq!(out.len(), 2, "{case}");
+            assert_eq!(out[0]["text"], "Edited one", "{case}");
+            assert_eq!(out[1]["text"], "Edited two", "{case}");
+            assert_eq!(out[1]["position"], 1, "{case}");
+            assert!(
+                out[0]["summary"].get("nextSteps").is_none(),
+                "{case}: the fallback is still consumed"
+            );
+        }
     }
 
     #[test]
