@@ -15,7 +15,8 @@
 //! and produces `serde_json::Value`.
 //!
 //! So the seam is the row slice. [`ActionScan::fetch_page`](crate::scan::ActionScan::fetch_page) and
-//! [`ActionScan::rows`](crate::scan::ActionScan::rows) hand a consumer the raw rows of one page and
+//! [`ActionScan::rows`](crate::scan::ActionScan::rows) hand a consumer the rows of one page (already
+//! rewritten by the table's derivation, when it declares one) and
 //! [`ActionScan::advance`](crate::scan::ActionScan::advance) moves to the next, which is the shape the engine
 //! needs because it must do Arrow work BETWEEN the extraction and the advance
 //! (a satisfied LIMIT means there is no next page to prepare, and `advance`
@@ -102,9 +103,9 @@ pub struct ScanTarget {
     /// it: this is the per-table response contract, exactly like `pagination`
     /// and `error_path`. Raw scans are always [`RowShape::Array`].
     pub row_shape: RowShape,
-    /// The table's row derivation (see [`RowDerivation`]), applied by
-    /// [`ActionScan::derive_rows`] after a page's rows are extracted and
-    /// before a consumer converts them. `None` for raw scans and for every
+    /// The table's row derivation (see [`RowDerivation`]), applied inside
+    /// [`ActionScan::rows`], so every consumer of the scan reads derived
+    /// rows and none can skip the step. `None` for raw scans and for every
     /// table that declares none.
     pub derive: Option<RowDerivation>,
 }
@@ -388,42 +389,48 @@ impl ActionScan {
         Ok(envelope)
     }
 
-    /// The rows of a fetched page.
+    /// The rows of a fetched page, as the table declares them: the extracted
+    /// rows rewritten by the table's [`RowDerivation`], or the extracted rows
+    /// themselves when it declares none.
     ///
-    /// Borrowed out of the envelope rather than cloned, so a consumer that
-    /// converts them into some other representation never materialises an
-    /// intermediate `Vec`. An object-shaped table hands its single response
-    /// object to the SAME slice, via `from_ref`, so there is no second
-    /// extraction path to keep in sync.
-    pub fn rows<'a>(&self, envelope: &'a Value) -> Result<&'a [Value], OpenConnectorError> {
+    /// This is the ONLY way a consumer reads a page's rows, so a derivation
+    /// cannot be skipped: a consumer that converted the wire rows of a
+    /// deriving table would fail on the constants it never wrote, or read a
+    /// skipped payload as a row.
+    ///
+    /// Borrowed out of the envelope in the common case, so a consumer that
+    /// converts the rows into some other representation never materialises
+    /// an intermediate `Vec`; owned only when a derivation rewrote them.
+    ///
+    /// The length of the result says nothing about the page the provider
+    /// answered: an explode can yield zero rows from a non-empty page, or
+    /// many from one. Whether the walk continues is [`Self::advance`]'s
+    /// answer, never `rows(..).is_empty()`.
+    pub fn rows<'a>(&self, envelope: &'a Value) -> Result<Cow<'a, [Value]>, OpenConnectorError> {
+        let raw = self.raw_rows(envelope)?;
+        match &self.target.derive {
+            Some(derivation) if !derivation.is_empty() => Ok(Cow::Owned(derivation.apply(
+                &self.target.table_id,
+                raw,
+                self.pagination.page(),
+            )?)),
+            _ => Ok(Cow::Borrowed(raw)),
+        }
+    }
+
+    /// The rows the action answered, before any derivation. Private:
+    /// pagination is the one reader that must see the wire page, and it
+    /// reads it through [`Self::advance`].
+    ///
+    /// An object-shaped table hands its single response object to the SAME
+    /// slice, via `from_ref`, so there is no second extraction path to keep
+    /// in sync.
+    fn raw_rows<'a>(&self, envelope: &'a Value) -> Result<&'a [Value], OpenConnectorError> {
         match self.target.row_shape {
             RowShape::Array => self.row_path.rows(envelope, self.pagination.page()),
             RowShape::Object => Ok(slice::from_ref(
                 self.row_path.row_object(envelope, self.pagination.page())?,
             )),
-        }
-    }
-
-    /// The rows a consumer converts: the extracted rows rewritten by the
-    /// table's [`RowDerivation`], or the extracted rows themselves when the
-    /// table declares none. Borrowed in the common case, owned only when a
-    /// derivation rewrote them.
-    ///
-    /// Takes the rows [`Self::rows`] returned rather than re-extracting
-    /// them, and deliberately does NOT replace that method: pagination
-    /// advances on the RAW page ([`Self::advance`]), so an explode that
-    /// yields nothing from a non-empty page cannot read as an empty page.
-    pub fn derive_rows<'a>(
-        &self,
-        rows: &'a [Value],
-    ) -> Result<Cow<'a, [Value]>, OpenConnectorError> {
-        match &self.target.derive {
-            Some(derivation) if !derivation.is_empty() => Ok(Cow::Owned(derivation.apply(
-                &self.target.table_id,
-                rows,
-                self.pagination.page(),
-            )?)),
-            _ => Ok(Cow::Borrowed(rows)),
         }
     }
 
@@ -434,20 +441,25 @@ impl ActionScan {
     /// does exactly that when a pushed-down LIMIT is satisfied. Calling this
     /// anyway would parse and validate continuation state on a final page,
     /// failing a scan whose result is already complete.
-    pub fn advance(
-        &mut self,
-        envelope: &Value,
-        rows: &[Value],
-    ) -> Result<bool, OpenConnectorError> {
-        self.pagination.advance(envelope, rows.len(), rows.last())
+    ///
+    /// Takes the envelope and not the rows [`Self::rows`] returned:
+    /// pagination reads the RAW page (its row count, and under keyset
+    /// pagination its last row), which the scan extracts again here. Handing
+    /// it derived rows would let an explode that yields nothing from a
+    /// non-empty page read as an empty page and end a listing early, so the
+    /// signature leaves a consumer no way to do that.
+    pub fn advance(&mut self, envelope: &Value) -> Result<bool, OpenConnectorError> {
+        let raw = self.raw_rows(envelope)?;
+        self.pagination.advance(envelope, raw.len(), raw.last())
     }
 
-    /// Walk every page and return all rows.
+    /// Walk every page and return all rows, as [`Self::rows`] hands them
+    /// back: derived, for a table that declares a derivation.
     ///
     /// For consumers that want the collection rather than the stream — an ACL
-    /// walk, a folder listing. Rows are cloned out of each envelope, which is
-    /// what "return them all" costs; a consumer that cannot afford that drives
-    /// [`Self::fetch_page`] itself.
+    /// walk, a folder listing. Rows that were not derived are cloned out of
+    /// each envelope, which is what "return them all" costs; a consumer that
+    /// cannot afford that drives [`Self::fetch_page`] itself.
     ///
     /// Every bound still applies, and every one of them REFUSES rather than
     /// truncating. That is the whole reason a syncer can use this: a short
@@ -456,9 +468,8 @@ impl ActionScan {
         let mut all = Vec::new();
         loop {
             let envelope = self.fetch_page().await?;
-            let rows = self.rows(&envelope)?;
-            all.extend(self.derive_rows(rows)?.iter().cloned());
-            if !self.advance(&envelope, rows)? {
+            all.extend(self.rows(&envelope)?.into_owned());
+            if !self.advance(&envelope)? {
                 return Ok(all);
             }
         }
@@ -468,6 +479,7 @@ impl ActionScan {
 #[cfg(all(test, feature = "testing"))]
 mod tests {
     use super::*;
+    use crate::derive::Explode;
     use crate::pagination::AbsentCursor;
     use crate::testing::{MockGateway, MockResponse, RecordedRequest};
     use serde_json::json;
@@ -631,8 +643,7 @@ mod tests {
         let pagination = cursor_pagination(AbsentCursor::EndsTheScan);
         let mut first = scan_against(&gateway, pagination, bounds(10)).await;
         let envelope = first.fetch_page().await.expect("page 1");
-        let rows = first.rows(&envelope).expect("rows");
-        assert!(first.advance(&envelope, rows).expect("advance"));
+        assert!(first.advance(&envelope).expect("advance"));
         let saved = serde_json::to_string(&first.position()).expect("serializable");
 
         let mut second = scan_against(&gateway, pagination, bounds(10))
@@ -649,7 +660,7 @@ mod tests {
             "the resumed request carries the saved cursor"
         );
         assert_eq!(body_of(&gateway.requests()[1])["input"]["cursor"], "c1");
-        assert!(second.advance(&envelope, rows).expect("advance"));
+        assert!(second.advance(&envelope).expect("advance"));
         let next = second.position();
         assert!(
             second.resume(next).is_err(),
@@ -809,5 +820,136 @@ mod tests {
             }
             other => panic!("expected ProviderReportedError, got {other}"),
         }
+    }
+
+    /// A table that explodes each row's `steps` array into one row per
+    /// element, walked by keyset pagination: the one strategy that reads the
+    /// raw page's LAST ROW as well as its length, so it is the one a scan
+    /// advancing on derived rows would break in both ways.
+    fn exploding_keyset_target() -> ScanTarget {
+        ScanTarget {
+            derive: Some(RowDerivation {
+                explode: Some(Explode {
+                    paths: &["steps"],
+                    into: "step",
+                    index: Some("position"),
+                }),
+                ..RowDerivation::default()
+            }),
+            ..target(PaginationStrategy::Keyset {
+                cursor_param: "after",
+                row_cursor_field: "id",
+                page_size_param: "limit",
+                page_size: 2,
+            })
+        }
+    }
+
+    /// Three keyset pages: a non-empty page whose every row explodes to
+    /// nothing, a page with two steps on its first row and none on its last,
+    /// then the empty terminator. Any cursor but the raw last row's id gets
+    /// the terminator, so a walk that continued from the wrong row ends
+    /// short and the assertions on the rows catch it.
+    fn exploding_pages(req: &RecordedRequest) -> MockResponse {
+        let items = match body_of(req)["input"]["after"].as_str() {
+            None => json!([{ "id": "1", "steps": [] }, { "id": "2", "steps": [] }]),
+            Some("2") => json!([
+                { "id": "3", "steps": ["a", "b"] },
+                { "id": "4", "steps": null }
+            ]),
+            _ => json!([]),
+        };
+        MockResponse::new(
+            200,
+            serde_json::to_string(&json!({
+                "success": true, "message": "", "data": { "items": items },
+                "errorCode": null, "meta": { "actionId": "mock.list" }
+            }))
+            .expect("serializable"),
+        )
+    }
+
+    async fn exploding_scan(gateway: &MockGateway) -> ActionScan {
+        let client = Arc::new(
+            OpenConnectorClient::new(&gateway.url, "t", Duration::from_secs(5)).expect("client"),
+        );
+        ActionScan::new(
+            client,
+            exploding_keyset_target(),
+            None,
+            json!({}),
+            Vec::new(),
+            "$.items",
+            bounds(10),
+        )
+        .expect("scan binds")
+    }
+
+    /// The collecting consumer reads the same derived rows the engine does,
+    /// and the walk underneath it still advances on the raw page: page 1
+    /// derives to nothing without ending the listing, and page 3 is asked
+    /// for from the id of page 2's last RAW row, which derived no row at all.
+    #[tokio::test]
+    async fn collect_all_returns_derived_rows_and_advances_on_the_raw_page() {
+        let gateway = MockGateway::start(exploding_pages).await;
+        let mut scan = exploding_scan(&gateway).await;
+
+        let rows = scan.collect_all().await.expect("walk completes");
+
+        assert_eq!(
+            rows,
+            vec![
+                json!({ "id": "3", "step": "a", "position": 0 }),
+                json!({ "id": "3", "step": "b", "position": 1 }),
+            ],
+            "one row per element, without the exploded array"
+        );
+        assert_eq!(
+            scan.pages_fetched(),
+            3,
+            "a page that derives to nothing is not the end of the listing"
+        );
+        let requests = gateway.requests();
+        assert_eq!(body_of(&requests[1])["input"]["after"], "2");
+        assert_eq!(
+            body_of(&requests[2])["input"]["after"],
+            "4",
+            "the keyset cursor is the raw page's last row, not the last derived row"
+        );
+    }
+
+    /// The per-page seam gives a consumer no raw rows to convert by mistake:
+    /// `rows` is already derived, and `advance` answers from the envelope, so
+    /// an empty `rows` does not stop a walk whose raw page was not empty.
+    #[tokio::test]
+    async fn rows_are_derived_and_advance_does_not_read_them() {
+        let gateway = MockGateway::start(exploding_pages).await;
+        let mut scan = exploding_scan(&gateway).await;
+
+        let envelope = scan.fetch_page().await.expect("page 1");
+        assert!(
+            scan.rows(&envelope).expect("rows").is_empty(),
+            "two raw rows with empty arrays derive to no rows"
+        );
+        assert!(
+            scan.advance(&envelope).expect("advance"),
+            "the raw page was not empty, so the walk continues"
+        );
+
+        let envelope = scan.fetch_page().await.expect("page 2");
+        let rows = scan.rows(&envelope).expect("rows");
+        let steps: Vec<&str> = rows
+            .iter()
+            .map(|r| r["step"].as_str().expect("step"))
+            .collect();
+        assert_eq!(steps, vec!["a", "b"]);
+        assert!(scan.advance(&envelope).expect("advance"));
+
+        let envelope = scan.fetch_page().await.expect("page 3");
+        assert!(scan.rows(&envelope).expect("rows").is_empty());
+        assert!(
+            !scan.advance(&envelope).expect("advance"),
+            "only the empty raw page ends a keyset walk"
+        );
     }
 }
