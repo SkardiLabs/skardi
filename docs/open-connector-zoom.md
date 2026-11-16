@@ -154,7 +154,9 @@ strings of the same summary response.
   list; when both are absent or empty it writes **zero rows** and the note
   still stands. Both are checked either way: either one present as
   anything but a list fails the scan, even when the other supplied the
-  items. The Markdown body is never split into items.
+  items. The Markdown body is never split into items. A null entry in the
+  list is an item with NULL `text` at its own position, so the ids of the
+  steps after it do not move.
 - `item_id` is positional: editing or reordering a summary's next steps
   shifts every id after the change. A consumer that syncs action items
   replaces a note's whole item set, keyed by `note_id`, rather than
@@ -174,7 +176,9 @@ consumers:
 - `explode` — one row per element of the first non-empty array among the
   listed paths; the element lands under `into`, its position under `index`.
   Every listed path is checked: one present as anything but an array fails
-  the scan, even when another path supplied the elements.
+  the scan, even when another path supplied the elements. Elements are not
+  inspected: a null one is still a row, at its own position, and the
+  column that reads it decides whether NULL is acceptable.
   Explode consumes its paths: a derived row carries the element and the
   row's other keys (`summary.meetingUuid` beside `summary.nextSteps`), but
   none of the listed arrays, so an array of `n` elements is never copied

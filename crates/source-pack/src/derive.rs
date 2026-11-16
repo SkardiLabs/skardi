@@ -65,7 +65,17 @@ use crate::source_pack::FixedValue;
 /// would cost `n²` elements before the converter or a row bound could
 /// refuse the page; a column or a `format` placeholder therefore cannot
 /// read an exploded path (the loader refuses one that tries) and reads the
-/// element through `into` instead.
+/// element through `into` instead. Each derived row does still carry every
+/// other key of the source row, so `n` elements cost `n` copies of the row
+/// without its arrays.
+///
+/// **Elements are not inspected.** Every element of the chosen array is a
+/// row, a `null` one included: its row carries a null under `into` and its
+/// own position under `index`, so a position is always the element's index
+/// in the array. What a null or wrongly typed element means is the reading
+/// column's call, made by the converter like for any wire value: a
+/// nullable column reads NULL, and a non-null column or a type mismatch
+/// fails the scan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Explode {
     /// Row-relative dotted paths, tried in order.
@@ -580,6 +590,33 @@ mod tests {
         // Both empty arrays: zero rows.
         let row = summary_answer(json!([]), json!({"nextSteps": []}));
         assert!(derivation.apply("t", &[row], 1).unwrap().is_empty());
+    }
+
+    /// Skipping a null element would shift every later position away from
+    /// its array index, and so every identity formatted from it.
+    #[test]
+    fn a_null_element_is_a_row_at_its_own_position() {
+        let derivation = RowDerivation {
+            explode: Some(Explode {
+                paths: &["summary.nextSteps"],
+                into: "text",
+                index: Some("position"),
+            }),
+            format: &[("item_id", "{summary.meetingUuid}#{position}")],
+            ..RowDerivation::default()
+        };
+        let rows = vec![summary_answer(
+            json!(["Send the agenda", null, "Book the room"]),
+            NULL,
+        )];
+        let out = derivation.apply("t", &rows, 1).unwrap();
+        assert_eq!(out.len(), 3, "a null element is not skipped");
+        assert_eq!(out[1].get("text"), Some(&NULL), "written, and null");
+        assert_eq!(out[1]["position"], 1);
+        assert_eq!(out[1]["item_id"], "uuid-1#1");
+        assert_eq!(out[2]["text"], "Book the room");
+        assert_eq!(out[2]["position"], 2, "positions stay array indices");
+        assert_eq!(out[2]["item_id"], "uuid-1#2");
     }
 
     #[test]

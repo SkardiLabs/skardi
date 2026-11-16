@@ -373,6 +373,27 @@ mod tests {
         assert_eq!(utf8(&batch, "text").value(1), "Book the room");
     }
 
+    /// `text` is nullable, so a null entry in the list is an item with NULL
+    /// text rather than a failed scan, and it keeps its own position: the
+    /// ids of the steps after it do not move.
+    #[test]
+    fn a_null_next_step_is_an_item_with_null_text_at_its_own_position() {
+        let page = json!({
+            "available": true,
+            "summary": {
+                "meetingUuid": UUID,
+                "nextSteps": ["Send the agenda", null, "Book the room"]
+            }
+        });
+        let items = convert_first_page(table("meeting_action_items"), &page);
+        assert_eq!(items.num_rows(), 3);
+        assert_eq!(utf8(&items, "text").value(0), "Send the agenda");
+        assert!(utf8(&items, "text").is_null(1));
+        assert_eq!(utf8(&items, "item_id").value(1), format!("{UUID}#1"));
+        assert_eq!(utf8(&items, "text").value(2), "Book the room");
+        assert_eq!(utf8(&items, "item_id").value(2), format!("{UUID}#2"));
+    }
+
     #[test]
     fn an_edited_summarys_next_steps_replace_the_legacy_list() {
         // The editor left one next step; the two legacy ones are not rows.
