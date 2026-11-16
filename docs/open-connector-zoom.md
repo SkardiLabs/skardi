@@ -152,7 +152,13 @@ strings of the same summary response.
   `edited_summary.next_steps` when someone edited the summary. The pack
   reads the edited list when it is present and non-empty, else the legacy
   list; when both are absent or empty it writes **zero rows** and the note
-  still stands. The Markdown body is never split into items.
+  still stands. Both are checked either way: either one present as
+  anything but a list fails the scan, even when the other supplied the
+  items. The Markdown body is never split into items.
+- `item_id` is positional: editing or reordering a summary's next steps
+  shifts every id after the change. A consumer that syncs action items
+  replaces a note's whole item set, keyed by `note_id`, rather than
+  upserting by `item_id`.
 
 ## How the contract shape is produced: `derive:`
 
@@ -167,6 +173,8 @@ consumers:
   always wins over a wire key of the same name.
 - `explode` — one row per element of the first non-empty array among the
   listed paths; the element lands under `into`, its position under `index`.
+  Every listed path is checked: one present as anything but an array fails
+  the scan, even when another path supplied the elements.
   Explode consumes its paths: a derived row carries the element and the
   row's other keys (`summary.meetingUuid` beside `summary.nextSteps`), but
   none of the listed arrays, so an array of `n` elements is never copied
@@ -174,12 +182,33 @@ consumers:
   reads a listed path is refused when the pack loads.
 - `format` — a key rendered from a template over the row
   (`"{summary.meetingUuid}#{position}"`); a missing part makes the whole
-  value NULL, so a non-null identity fails loudly.
+  value NULL, so a non-null identity fails loudly. A template cannot read
+  another template's key: templates render in key order, so the result
+  would depend on how the two keys sort, and the pack is refused when it
+  loads.
 - `skip_when_null` — drop the row when the named path is missing or null.
+  A parent along the path that is present but not an object fails the scan
+  with its kind.
 
-Pagination advances on the raw page, so an explode that yields nothing
-from a non-empty page cannot end a listing early. Every pre-existing pack
-declares no `derive:` and loads exactly as before.
+A derived key replaces the wire value of the same name, so a key written
+with a value that is never an object (a non-object constant, a `format`
+key, the explode `index`) can only be read whole: a column or a `format`
+placeholder that reads below it, such as `summary.meetingUuid` beside
+`constants: { summary: null }`, is refused when the pack loads. The explode
+`into` key is exempt, because an element may be an object whose fields the
+columns read.
+
+A `filters:` mapping on a column the derivation writes is also refused
+when the pack loads, and so is one on a column holding the parent of an
+exploded path: the gateway evaluates a pushed-down predicate against wire
+rows, which do not carry derived values. A filter on any other column
+stays legal, because every derived row inherits that value unchanged.
+
+A consumer cannot skip the derivation or paginate on its output:
+`ActionScan::rows` returns the derived rows, and `ActionScan::advance`
+reads the raw page from the response itself. An explode that yields
+nothing from a non-empty page therefore cannot end a listing early. Every
+pre-existing pack declares no `derive:` and loads exactly as before.
 
 ## Authorization and limits
 
@@ -191,6 +220,10 @@ declares no `derive:` and loads exactly as before.
   shared is **not answered** yet.
 - Rate label LIGHT; limits are per Zoom account, shared by every installed
   app.
+- `meeting_notes` and `meeting_action_items` each call
+  `zoom.get_meeting_summary`, so reading both costs two Zoom calls per
+  meeting. At LIGHT that is acceptable, and it keeps each table one action
+  over one response.
 - Summaries exist only on Pro-or-higher accounts with AI Companion on;
   end-to-end-encrypted meetings get none.
 
@@ -201,7 +234,8 @@ Connector main `dc3cc1c3` (open-connector#21 merged, 2026-11-09), without
 Zoom credentials:
 
 - Discovery of both actions; their output and input schemas captured under
-  `fixtures/zoom/contracts/` and pinned by fingerprint.
+  `crates/skardi/src/sources/providers/open_connector/packs/fixtures/zoom/contracts/`
+  and pinned by fingerprint.
 - Every input set the pack generates (`pageSize`+`from`+`to`, the same
   plus `nextPageToken`, `meetingUuid` alone) accepted by the strict
   schemas, reaching the credential wall; a snake_case key refused as
@@ -212,7 +246,15 @@ real Zoom account: real rows through skardi-server (every mapped column
 extracting a real non-NULL value somewhere), real multi-page pagination
 and the real final page, a real `403 2305`, whether `next_steps` is still
 returned and how `edited_summary.next_steps` behaves when an editor
-deletes every step. The fixtures under `fixtures/zoom/` are **synthetic**:
+deletes every step. The fixtures under
+`crates/skardi/src/sources/providers/open_connector/packs/fixtures/zoom/`
+are **synthetic**:
 shaped by the executor source and its tests, with invented UUIDs,
 `host@example.com` and topics like "Weekly sync". Zoom summaries are
 customer content; the live pass must redact before it replaces them.
+
+The live pass must also answer two questions about the summary itself.
+The body comes from `summary.summaryContent` while the items prefer
+`summary.editedSummary.nextSteps`: can the two come from different
+versions of an edited summary? And do older summaries lack
+`summaryContent`, landing as a NULL `body`?

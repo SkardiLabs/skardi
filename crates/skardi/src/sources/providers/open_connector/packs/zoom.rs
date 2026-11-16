@@ -198,7 +198,10 @@ mod tests {
     use arrow::array::{Array, ListArray, TimestampMillisecondArray};
     use arrow::record_batch::RecordBatch;
     use datafusion::prelude::SessionContext;
+    use rstest::rstest;
     use serde_json::{Value, json};
+    use std::error::Error;
+    use std::iter::successors;
 
     const UUID: &str = "Zm9vYmFyMTIzNDU2Nzg5MA==";
     const SLASH_UUID: &str = "/aB3cD4eF5gH6iJ7kL8mN9==";
@@ -1286,11 +1289,44 @@ bindings:
         );
     }
 
+    /// error_path is None on purpose: provider refusals the action does not
+    /// absorb arrive as the gateway's `authorization_failed` envelope, and
+    /// the scan fails with that code and the action named. The 401 is a
+    /// token missing the summary scope; the 403 is a Zoom refusal whose
+    /// provider code is NOT 2305 (code 200, "No permission."), which the
+    /// action must not turn into the `not_accessible` zero-row answer that
+    /// `an_unavailable_summary_scans_as_zero_rows_not_a_failure` pins.
+    #[rstest]
+    #[case::missing_scope_401(
+        "SKARDI_TEST_OC_ZOOM_SCOPE",
+        401,
+        envelope_err(
+            "authorization_failed",
+            "Invalid access token, does not contain scopes."
+        )
+    )]
+    #[case::forbidden_403_other_than_2305(
+        "SKARDI_TEST_OC_ZOOM_FORBIDDEN",
+        403,
+        json!({
+            "success": false,
+            "message": "No permission.",
+            "errorCode": "authorization_failed",
+            "data": {
+                "status": 403,
+                "details": {"providerStatus": 403, "providerCode": 200}
+            },
+            "meta": {"actionId": "zoom.get_meeting_summary"}
+        })
+        .to_string()
+    )]
     #[tokio::test]
-    async fn other_provider_errors_surface_through_the_gateway_failure_envelope() {
-        // error_path is None on purpose: any 403 other than Zoom's 2305 is
-        // the gateway's authorization failure, whose code reaches the user.
-        let gateway = MockGateway::start(|req| {
+    async fn other_provider_errors_surface_through_the_gateway_failure_envelope(
+        #[case] token_env: &'static str,
+        #[case] status: u16,
+        #[case] body: String,
+    ) {
+        let gateway = MockGateway::start(move |req| {
             if req.method == "GET" && req.path == "/v1/health" {
                 return MockResponse::ok("{}");
             }
@@ -1298,20 +1334,14 @@ bindings:
                 return zoom_discovery(&req.path);
             }
             if req.method == "POST" && req.path == "/v1/actions/zoom.get_meeting_summary" {
-                return MockResponse::new(
-                    401,
-                    envelope_err(
-                        "authorization_failed",
-                        "Invalid access token, does not contain scopes.",
-                    ),
-                );
+                return MockResponse::new(status, body.clone());
             }
             MockResponse::new(404, "{}")
         })
         .await;
         let (_gateway, ctx) = setup_with_gateway(
             gateway,
-            "SKARDI_TEST_OC_ZOOM_SCOPE",
+            token_env,
             "meeting_notes",
             &format!(r#"{{ meetingUuid: "{UUID}" }}"#),
         )
@@ -1322,13 +1352,29 @@ bindings:
             .expect("plan")
             .collect()
             .await
-            .expect_err("a missing-scope failure must fail the scan");
+            .expect_err("a refusal other than 2305 must fail the scan");
         let message = err.to_string();
         assert!(
             message.contains("authorization_failed")
                 && message.contains("zoom.get_meeting_summary"),
             "the gateway's error code and the action are named: {message}"
         );
+        let typed = successors(Some(&err as &(dyn Error + 'static)), |cause| cause.source())
+            .find_map(|cause| cause.downcast_ref::<OpenConnectorError>())
+            .unwrap_or_else(|| panic!("an OpenConnectorError in the chain: {message}"));
+        match typed {
+            OpenConnectorError::ActionExecutionFailed {
+                action_id,
+                status: got_status,
+                error_code,
+                ..
+            } => {
+                assert_eq!(action_id, "zoom.get_meeting_summary");
+                assert_eq!(*got_status, Some(status));
+                assert_eq!(error_code.as_deref(), Some("authorization_failed"));
+            }
+            other => panic!("expected ActionExecutionFailed, got {other}"),
+        }
     }
 
     #[tokio::test]

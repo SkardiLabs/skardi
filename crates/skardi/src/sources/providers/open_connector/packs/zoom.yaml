@@ -119,8 +119,8 @@ tables:
       - { name: kind, path: kind, type: utf8, nullable: true }
       - { name: producer, path: producer, type: utf8, nullable: true }
       - { name: title, path: summary.summaryTitle, type: utf8, nullable: true }
-      # `summary_content`, Zoom's unified Markdown field — the current
-      # summary. The legacy `summary_overview` / `summary_details` are not
+      # `summaryContent`, Zoom's unified Markdown field — the current
+      # summary. The legacy `summaryOverview` / `summaryDetails` are not
       # columns: Zoom marks them deprecated and the Markdown holds them.
       - { name: body, path: summary.summaryContent, type: utf8, nullable: true }
       - { name: document_path, path: document_path, type: utf8, nullable: true }
