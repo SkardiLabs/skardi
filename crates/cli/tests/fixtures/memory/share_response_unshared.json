@@ -1,0 +1,6 @@
+{
+  "anchor": "url:github.com/SkardiLabs/skardi-cloud/issues/1400",
+  "visibility": "private",
+  "needs_confirm": false,
+  "note": "Unsharing cannot take back what other members' agents already read."
+}

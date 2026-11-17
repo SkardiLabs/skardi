@@ -1,0 +1,32 @@
+{
+  "content": {
+    "goal": "Ship the audit export",
+    "status": "API route merged; UI next",
+    "done": [
+      {
+        "text": "Export route",
+        "source": "https://github.com/SkardiLabs/skardi-cloud/pull/1412"
+      }
+    ],
+    "decisions": [
+      {
+        "text": "CSV first, because finance reads it in Excel"
+      }
+    ],
+    "findings": [
+      {
+        "text": "export_csv test is flaky under parallel runs",
+        "source": "cargo test -p skardi-server export_csv"
+      }
+    ],
+    "next": [
+      {
+        "text": "Add the console download button"
+      }
+    ],
+    "notes": ""
+  },
+  "if_version": 3,
+  "agent": "claude-code",
+  "session": "9f2c1d7e-session"
+}

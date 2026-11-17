@@ -291,6 +291,13 @@ prints the next one. `skardi mcp register claude-code` adds the workspace's
 MCP server to Claude Code. See
 [docs/cli.md](docs/cli.md#connecting-data-sources-from-an-agent--integrations-handoff-documents).
 
+Agents can also keep a **working memory** of a task in the workspace: `skardi
+memory save` records the goal, decisions, findings and next steps under the
+task's issue, pull request or label, and the next agent or session picks it up
+with `skardi memory recall` — or `skardi memory status`, which finds the
+current branch's task by itself. See
+[docs/cli.md](docs/cli.md#agent-working-memory--memory).
+
 **Server** — a Docker image, or a source build (no pre-built binary yet):
 
 ```bash

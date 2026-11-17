@@ -1,0 +1,5 @@
+{
+  "success": false,
+  "code": "memory_disabled",
+  "error": "agent memory is not enabled on this deployment"
+}

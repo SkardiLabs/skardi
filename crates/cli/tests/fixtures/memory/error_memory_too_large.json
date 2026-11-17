@@ -1,0 +1,5 @@
+{
+  "success": false,
+  "code": "memory_too_large",
+  "error": "the record is 70211 bytes; at most 65536 are kept, so summarize rather than append"
+}
