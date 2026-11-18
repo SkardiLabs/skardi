@@ -42,10 +42,13 @@
 //! shared scan, so the engine and every other consumer of a pack table see
 //! the same rows.
 
+use std::borrow::Cow;
 use std::fmt::Write as _;
 
 use serde_json::{Map, Value};
 
+use crate::client::DEFAULT_MAX_RESPONSE_BYTES;
+use crate::config::DEFAULT_MAX_ROWS;
 use crate::error::OpenConnectorError;
 use crate::json::json_kind;
 use crate::source_pack::FixedValue;
@@ -165,6 +168,85 @@ pub struct RowDerivation {
     pub format: &'static [(&'static str, &'static str)],
 }
 
+/// What the rows derived from ONE page may cost, checked before each copy
+/// is made.
+///
+/// Explode and unpivot copy their source row once per row they yield, so a
+/// page inside the client's response bound can still ask for far more
+/// memory than it carried: one row with a large body and a long array costs
+/// `elements × body`, and neither a row count alone (a thousand rows of a
+/// 15 MB body) nor the converter's checks afterwards (which run on rows
+/// already built) bounds that. So the rows derived from a page may number
+/// no more than `max_rows` and weigh no more than `max_bytes`, and
+/// exceeding either is [`OpenConnectorError::ScanBoundsExceeded`] naming
+/// the bound — never a short page, which would read as a complete one.
+///
+/// Per page, not per scan: the budget starts over on every call, and the
+/// scan-wide row bound stays with the consumer that counts emitted rows.
+///
+/// # Example
+/// ```
+/// use skardi_source_pack::derive::DeriveBounds;
+///
+/// let bounds = DeriveBounds::default();
+/// assert_eq!(bounds.max_rows, 100_000);
+/// assert_eq!(bounds.max_bytes, 16 * 1024 * 1024);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeriveBounds {
+    /// Most rows one page may derive; named `max_rows` when exceeded, the
+    /// scan's own row bound, since one page past it fails the scan anyway.
+    pub max_rows: u64,
+    /// Most bytes the rows derived from one page may weigh, as
+    /// [`json_size_lower_bound`] counts them; named `max_response_bytes`
+    /// when exceeded: what a page derives may not outweigh what one page may
+    /// be.
+    pub max_bytes: u64,
+}
+
+impl Default for DeriveBounds {
+    /// The configuration defaults: `max_rows` 100 000 and
+    /// `max_response_bytes` 16 MiB.
+    fn default() -> Self {
+        Self {
+            max_rows: DEFAULT_MAX_ROWS,
+            max_bytes: DEFAULT_MAX_RESPONSE_BYTES as u64,
+        }
+    }
+}
+
+/// The running charge of one page's derivation against its [`DeriveBounds`].
+struct Budget<'a> {
+    table: &'a str,
+    bounds: DeriveBounds,
+    rows: u64,
+    bytes: u64,
+}
+
+impl Budget<'_> {
+    /// Charge copies ABOUT to be made; refusing here is what keeps an
+    /// amplifying page from ever being allocated.
+    fn charge(&mut self, rows: u64, bytes: u64) -> Result<(), OpenConnectorError> {
+        self.rows = self.rows.saturating_add(rows);
+        if self.rows > self.bounds.max_rows {
+            return Err(OpenConnectorError::ScanBoundsExceeded {
+                table: self.table.to_string(),
+                bound: "max_rows",
+                limit: self.bounds.max_rows,
+            });
+        }
+        self.bytes = self.bytes.saturating_add(bytes);
+        if self.bytes > self.bounds.max_bytes {
+            return Err(OpenConnectorError::ScanBoundsExceeded {
+                table: self.table.to_string(),
+                bound: "max_response_bytes",
+                limit: self.bounds.max_bytes,
+            });
+        }
+        Ok(())
+    }
+}
+
 impl RowDerivation {
     /// Whether the derivation declares nothing — the shape every pre-existing
     /// pack table has, for which the scan hands the wire rows straight to
@@ -196,18 +278,50 @@ impl RowDerivation {
         keys
     }
 
-    /// Derive the rows of one page. `table` and `page` are carried into
-    /// errors; `rows` are the wire rows the scan extracted.
+    /// Derive the rows of one page under the default [`DeriveBounds`].
+    /// `table` and `page` are carried into errors; `rows` are the wire rows
+    /// the scan extracted. A scan uses [`Self::apply_bounded`] with its
+    /// configured bounds.
     ///
     /// # Errors
-    /// [`OpenConnectorError::RowDerivationFailed`] names the step, the path,
-    /// the page, the source row and the JSON *kind* found — never a value.
+    /// As [`Self::apply_bounded`].
     pub fn apply(
         &self,
         table: &str,
         rows: &[Value],
         page: usize,
     ) -> Result<Vec<Value>, OpenConnectorError> {
+        self.apply_bounded(table, rows, page, DeriveBounds::default())
+    }
+
+    /// Derive the rows of one page, refusing before any copy that would
+    /// take the page past `bounds`.
+    ///
+    /// Every row the derivation emits is charged — a plain copy, an
+    /// exploded element, an unpivoted field — at the size of the source row
+    /// it copies (without the consumed paths) plus the value it carries, as
+    /// [`json_size_lower_bound`] counts them. Rows an explode builds for a
+    /// following unpivot are charged their bytes too, though only the final
+    /// rows count against `max_rows`.
+    ///
+    /// # Errors
+    /// [`OpenConnectorError::RowDerivationFailed`] names the step, the path,
+    /// the page, the source row and the JSON *kind* found — never a value.
+    /// [`OpenConnectorError::ScanBoundsExceeded`] names `max_rows` or
+    /// `max_response_bytes` when the page would derive past that bound.
+    pub fn apply_bounded(
+        &self,
+        table: &str,
+        rows: &[Value],
+        page: usize,
+        bounds: DeriveBounds,
+    ) -> Result<Vec<Value>, OpenConnectorError> {
+        let mut budget = Budget {
+            table,
+            bounds,
+            rows: 0,
+            bytes: 0,
+        };
         let mut out = Vec::with_capacity(rows.len());
         for (row_index, row) in rows.iter().enumerate() {
             let fail = |step: &str, path: &str, expected: &str, found: &str| {
@@ -233,8 +347,10 @@ impl RowDerivation {
                     }
                 }
             }
-            let derived: Vec<Map<String, Value>> = match &self.explode {
-                None => vec![source.clone()],
+            // Borrowed when nothing was exploded, so a row that is only
+            // unpivoted is copied once, by the unpivot, and charged once.
+            let exploded: Vec<Cow<'_, Map<String, Value>>> = match &self.explode {
+                None => vec![Cow::Borrowed(source)],
                 Some(explode) => {
                     let mut elements: Option<&[Value]> = None;
                     // No early exit once an array is chosen: the paths after
@@ -259,6 +375,17 @@ impl RowDerivation {
                     match elements {
                         None => Vec::new(),
                         Some(items) => {
+                            // Charged before a single copy: n elements cost
+                            // n copies of the row without its arrays, plus
+                            // the elements themselves.
+                            let count = items.len() as u64;
+                            let element_bytes: u64 = items.iter().map(json_size_lower_bound).sum();
+                            budget.charge(
+                                if self.unpivot.is_none() { count } else { 0 },
+                                count
+                                    .saturating_mul(size_without(source, explode.paths))
+                                    .saturating_add(element_bytes),
+                            )?;
                             // Built once per source row and never holding
                             // the arrays: cloning `source` per element
                             // would copy the n-element array n times.
@@ -272,19 +399,31 @@ impl RowDerivation {
                                     if let Some(index) = explode.index {
                                         row.insert(index.to_string(), Value::from(position as u64));
                                     }
-                                    row
+                                    Cow::Owned(row)
                                 })
                                 .collect()
                         }
                     }
                 }
             };
-            let derived = match &self.unpivot {
-                None => derived,
+            let derived: Vec<Map<String, Value>> = match &self.unpivot {
+                None => {
+                    let mut rows = Vec::with_capacity(exploded.len());
+                    for row in exploded {
+                        // An exploded row was charged when it was built; a
+                        // borrowed one is the source row, charged as the
+                        // copy about to be made of it.
+                        if let Cow::Borrowed(source) = &row {
+                            budget.charge(1, object_size(source))?;
+                        }
+                        rows.push(row.into_owned());
+                    }
+                    rows
+                }
                 Some(unpivot) => {
-                    let mut unpivoted = Vec::with_capacity(derived.len() * unpivot.from.len());
+                    let mut unpivoted = Vec::with_capacity(exploded.len() * unpivot.from.len());
                     let paths: Vec<&str> = unpivot.from.iter().map(|f| f.path).collect();
-                    for row in &derived {
+                    for row in &exploded {
                         let mut values: Vec<(&'static str, &Value)> = Vec::new();
                         // Every field is resolved before a row is yielded:
                         // all of them are consumed, so a drifted one must
@@ -317,6 +456,17 @@ impl RowDerivation {
                         if values.is_empty() {
                             continue;
                         }
+                        let count = values.len() as u64;
+                        let value_bytes: u64 = values
+                            .iter()
+                            .map(|(_, value)| json_size_lower_bound(value))
+                            .sum();
+                        budget.charge(
+                            count,
+                            count
+                                .saturating_mul(size_without(row, &paths))
+                                .saturating_add(value_bytes),
+                        )?;
                         let base = clone_without(row, &paths);
                         for (label, value) in values {
                             let mut out_row = base.clone();
@@ -342,6 +492,74 @@ impl RowDerivation {
         }
         Ok(out)
     }
+}
+
+/// A lower bound on the length of `value` written as compact JSON, counted
+/// without allocating: a string's UTF-8 bytes plus its quotes, `null`,
+/// `true` and `false` at their length, a number as one byte, and two bytes
+/// of brackets per array or object plus, per object entry, its key and the
+/// key's quotes and colon. Escapes, separating commas and a number's other
+/// digits are left out, so the count never exceeds the text the gateway
+/// sent; a page inside the response bound therefore cannot be refused for
+/// rows that merely copy it once. It is a cost to bound, not a size to
+/// report.
+///
+/// # Example
+/// ```
+/// use serde_json::json;
+/// use skardi_source_pack::derive::json_size_lower_bound;
+///
+/// let value = json!({"id": "m-1", "steps": ["a", null]});
+/// assert!(json_size_lower_bound(&value) <= value.to_string().len() as u64);
+/// ```
+pub fn json_size_lower_bound(value: &Value) -> u64 {
+    match value {
+        Value::Null | Value::Bool(true) => 4,
+        Value::Bool(false) => 5,
+        Value::Number(_) => 1,
+        Value::String(text) => text.len() as u64 + 2,
+        Value::Array(items) => 2 + items.iter().map(json_size_lower_bound).sum::<u64>(),
+        Value::Object(map) => object_size(map),
+    }
+}
+
+/// [`json_size_lower_bound`] of an object.
+fn object_size(map: &Map<String, Value>) -> u64 {
+    2 + map
+        .iter()
+        .map(|(key, value)| entry_size(key, json_size_lower_bound(value)))
+        .sum::<u64>()
+}
+
+/// One object entry: the key, its quotes and colon, and the value's count.
+fn entry_size(key: &str, value_size: u64) -> u64 {
+    key.len() as u64 + 3 + value_size
+}
+
+/// [`json_size_lower_bound`] of what [`clone_without`] returns for the same
+/// arguments, counted without building it.
+fn size_without(row: &Map<String, Value>, paths: &[&str]) -> u64 {
+    let mut size = 2;
+    for (key, value) in row {
+        let mut removed = false;
+        let mut below: Vec<&str> = Vec::new();
+        for path in paths {
+            match path.split_once('.') {
+                None => removed |= *path == key.as_str(),
+                Some((head, rest)) if head == key.as_str() => below.push(rest),
+                Some(_) => {}
+            }
+        }
+        if removed {
+            continue;
+        }
+        let value_size = match value {
+            Value::Object(child) if !below.is_empty() => size_without(child, &below),
+            other => json_size_lower_bound(other),
+        };
+        size += entry_size(key, value_size);
+    }
+    size
 }
 
 /// Clone `row` leaving out the value at each row-relative dotted path in
@@ -1161,5 +1379,194 @@ mod tests {
             )
             .unwrap();
         assert_eq!(out[0]["note_key"], "m-1#notes#doc-notes");
+    }
+    fn explode_steps() -> RowDerivation {
+        RowDerivation {
+            explode: Some(Explode {
+                paths: &["steps"],
+                into: "step",
+                index: None,
+            }),
+            ..RowDerivation::default()
+        }
+    }
+
+    fn bound_of(err: OpenConnectorError) -> (&'static str, u64) {
+        match err {
+            OpenConnectorError::ScanBoundsExceeded {
+                table,
+                bound,
+                limit,
+            } => {
+                assert_eq!(table, "t");
+                (bound, limit)
+            }
+            other => panic!("expected ScanBoundsExceeded, got {other}"),
+        }
+    }
+
+    /// One row with a 1 MiB body beside 100 000 elements would derive
+    /// 100 000 copies of the body, about 100 GiB, from a page that fits the
+    /// response bound. The default bounds refuse it on bytes BEFORE a copy
+    /// is made: were the check after the copies, this test could not finish.
+    #[test]
+    fn an_amplifying_explode_fails_on_the_byte_bound_before_copying() {
+        let row = json!({"body": "x".repeat(1 << 20), "steps": vec![Value::Null; 100_000]});
+        let err = explode_steps().apply("t", &[row], 2).unwrap_err();
+        assert_eq!(bound_of(err), ("max_response_bytes", 16 * 1024 * 1024));
+    }
+
+    /// `{"id":"m-1"}` without its array counts 12 and the two elements 3
+    /// each: two rows cost 2 × 12 + 6 = 30. At the bound the rows are
+    /// exactly what an unbounded explode yields; one byte under, refused.
+    #[test]
+    fn an_explode_within_the_byte_bound_is_unchanged_and_one_byte_over_is_refused() {
+        let rows = [json!({"id": "m-1", "steps": ["a", "b"]})];
+        let at = DeriveBounds {
+            max_rows: 2,
+            max_bytes: 30,
+        };
+        assert_eq!(
+            explode_steps().apply_bounded("t", &rows, 1, at).unwrap(),
+            vec![
+                json!({"id": "m-1", "step": "a"}),
+                json!({"id": "m-1", "step": "b"})
+            ]
+        );
+        let under = DeriveBounds {
+            max_bytes: 29,
+            ..at
+        };
+        let err = explode_steps()
+            .apply_bounded("t", &rows, 1, under)
+            .unwrap_err();
+        assert_eq!(bound_of(err), ("max_response_bytes", 29));
+    }
+
+    #[test]
+    fn an_explode_past_the_row_bound_fails_naming_max_rows() {
+        let bounds = DeriveBounds {
+            max_rows: 3,
+            max_bytes: u64::MAX,
+        };
+        let one_row = [json!({"id": 1, "steps": [1, 2, 3]})];
+        assert_eq!(
+            explode_steps()
+                .apply_bounded("t", &one_row, 1, bounds)
+                .unwrap()
+                .len(),
+            3
+        );
+        // Two source rows of two elements: the second row's charge is
+        // what crosses the bound, counted across the page.
+        let two_rows = [
+            json!({"id": 1, "steps": [1, 2]}),
+            json!({"id": 2, "steps": [3, 4]}),
+        ];
+        let err = explode_steps()
+            .apply_bounded("t", &two_rows, 1, bounds)
+            .unwrap_err();
+        assert_eq!(bound_of(err), ("max_rows", 3));
+    }
+
+    /// The budget is the page's: three pages that each derive up to the
+    /// bound all pass, though together they derive three times it.
+    #[test]
+    fn the_bound_is_per_page_not_per_scan() {
+        let bounds = DeriveBounds {
+            max_rows: 2,
+            max_bytes: u64::MAX,
+        };
+        for page in 1..=3 {
+            let rows = explode_steps()
+                .apply_bounded("t", &[json!({"steps": [1, 2]})], page, bounds)
+                .unwrap();
+            assert_eq!(rows.len(), 2, "page {page}");
+        }
+    }
+
+    /// Unpivot is charged the same way: `{"body": <100 x>}` without its
+    /// fields counts 111 and the two values 3 each, so two rows cost
+    /// 2 × 111 + 6 = 228.
+    #[test]
+    fn unpivot_is_charged_under_the_same_bounds() {
+        let derivation = RowDerivation {
+            unpivot: Some(Unpivot {
+                from: &[
+                    UnpivotField {
+                        label: "a",
+                        path: "a",
+                    },
+                    UnpivotField {
+                        label: "b",
+                        path: "b",
+                    },
+                ],
+                into: "v",
+                label: "k",
+            }),
+            ..RowDerivation::default()
+        };
+        let rows = [json!({"body": "x".repeat(100), "a": "1", "b": "2"})];
+        let at = DeriveBounds {
+            max_rows: 2,
+            max_bytes: 228,
+        };
+        assert_eq!(
+            derivation.apply_bounded("t", &rows, 1, at).unwrap().len(),
+            2
+        );
+        let err = derivation
+            .apply_bounded(
+                "t",
+                &rows,
+                1,
+                DeriveBounds {
+                    max_bytes: 227,
+                    ..at
+                },
+            )
+            .unwrap_err();
+        assert_eq!(bound_of(err), ("max_response_bytes", 227));
+        let err = derivation
+            .apply_bounded("t", &rows, 1, DeriveBounds { max_rows: 1, ..at })
+            .unwrap_err();
+        assert_eq!(bound_of(err), ("max_rows", 1));
+    }
+
+    /// A row that is only copied (constants, format) is charged once, so a
+    /// page cannot slip past the row bound by not exploding.
+    #[test]
+    fn a_plain_copy_is_charged_too() {
+        let derivation = RowDerivation {
+            constants: &[("provider", FixedValue::Str("p"))],
+            ..RowDerivation::default()
+        };
+        let bounds = DeriveBounds {
+            max_rows: 1,
+            max_bytes: u64::MAX,
+        };
+        let err = derivation
+            .apply_bounded("t", &[json!({"id": 1}), json!({"id": 2})], 1, bounds)
+            .unwrap_err();
+        assert_eq!(bound_of(err), ("max_rows", 1));
+    }
+
+    /// The count never exceeds the compact JSON text, escapes, digits and
+    /// commas included, so a page that fits the response bound is never
+    /// refused for rows that copy it once; on a value with none of those it
+    /// is exact.
+    #[test]
+    fn the_size_estimate_is_a_lower_bound_on_the_compact_text() {
+        let varied = json!({
+            "s": "é\"\n\u{1F600}", "n": 12345.5, "neg": -1,
+            "arr": [null, true, false, {"k": []}], "o": {}, "long": "x".repeat(300)
+        });
+        assert!(json_size_lower_bound(&varied) <= varied.to_string().len() as u64);
+        let plain = json!({"k": "v"});
+        assert_eq!(
+            json_size_lower_bound(&plain),
+            plain.to_string().len() as u64
+        );
     }
 }

@@ -609,6 +609,9 @@ pub enum OpenConnectorError {
 
     /// A scan hit a safety bound before the collection was exhausted, so the
     /// result would be incomplete — fail rather than return partial rows.
+    /// Also raised before a page's derivation copies a row past its
+    /// [`crate::derive::DeriveBounds`], naming `max_rows` or
+    /// `max_response_bytes`.
     #[error(
         "Open Connector scan of '{table}' exceeded {bound} (limit {limit}); \
          the result would be incomplete"

@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Map, Value};
 
 use crate::client::OpenConnectorClient;
-use crate::derive::RowDerivation;
+use crate::derive::{DeriveBounds, RowDerivation};
 use crate::error::OpenConnectorError;
 use crate::pagination::{CursorContinuation, PagePosition, Pagination, PaginationStrategy};
 use crate::row_path::RowPath;
@@ -172,6 +172,10 @@ pub struct ActionScan {
     error_path: Option<RowPath>,
     pagination: Pagination,
     bounds: ScanBounds,
+    /// What one page's derivation may cost (see [`DeriveBounds`]): the
+    /// client's response bound by default, and the configured `max_rows`
+    /// once a consumer sets it with [`Self::with_max_rows`].
+    derive_bounds: DeriveBounds,
     deadline: Instant,
     pages_fetched: u32,
 }
@@ -203,6 +207,10 @@ impl ActionScan {
         };
         let error_path = target.error_path.map(RowPath::parse).transpose()?;
         let pagination = Pagination::new(target.pagination)?;
+        let derive_bounds = DeriveBounds {
+            max_bytes: u64::try_from(client.max_response_bytes()).unwrap_or(u64::MAX),
+            ..DeriveBounds::default()
+        };
         Ok(Self {
             client,
             target,
@@ -213,9 +221,19 @@ impl ActionScan {
             error_path,
             pagination,
             bounds,
+            derive_bounds,
             deadline: Instant::now() + bounds.timeout,
             pages_fetched: 0,
         })
+    }
+
+    /// Bound the rows one page may derive by the consumer's own row bound
+    /// instead of the default (see [`DeriveBounds`]). A builder rather than a
+    /// [`ScanBounds`] field so that a consumer constructing `ScanBounds`
+    /// by hand is not made to pick a row bound it does not keep.
+    pub fn with_max_rows(mut self, max_rows: u64) -> Self {
+        self.derive_bounds.max_rows = max_rows;
+        self
     }
 
     /// Resume a durable page before any I/O. The caller's accepted-page store
@@ -406,14 +424,21 @@ impl ActionScan {
     /// answered: an explode can yield zero rows from a non-empty page, or
     /// many from one. Whether the walk continues is [`Self::advance`]'s
     /// answer, never `rows(..).is_empty()`.
+    ///
+    /// A derivation runs under the scan's [`DeriveBounds`], so a page that
+    /// would derive past them fails with
+    /// [`OpenConnectorError::ScanBoundsExceeded`] before its rows are built.
     pub fn rows<'a>(&self, envelope: &'a Value) -> Result<Cow<'a, [Value]>, OpenConnectorError> {
         let raw = self.raw_rows(envelope)?;
         match &self.target.derive {
-            Some(derivation) if !derivation.is_empty() => Ok(Cow::Owned(derivation.apply(
-                &self.target.table_id,
-                raw,
-                self.pagination.page(),
-            )?)),
+            Some(derivation) if !derivation.is_empty() => {
+                Ok(Cow::Owned(derivation.apply_bounded(
+                    &self.target.table_id,
+                    raw,
+                    self.pagination.page(),
+                    self.derive_bounds,
+                )?))
+            }
             _ => Ok(Cow::Borrowed(raw)),
         }
     }
@@ -951,5 +976,78 @@ mod tests {
             !scan.advance(&envelope).expect("advance"),
             "only the empty raw page ends a keyset walk"
         );
+    }
+    /// `with_max_rows` reaches the derivation: page 2 explodes two steps
+    /// past a one-row bound and fails naming it, while page 1, which
+    /// derives nothing, is charged nothing.
+    #[tokio::test]
+    async fn a_page_deriving_past_the_scans_row_bound_fails_by_name() {
+        let gateway = MockGateway::start(exploding_pages).await;
+        let mut scan = exploding_scan(&gateway).await.with_max_rows(1);
+
+        let envelope = scan.fetch_page().await.expect("page 1");
+        assert!(scan.rows(&envelope).expect("no rows").is_empty());
+        assert!(scan.advance(&envelope).expect("advance"));
+
+        let envelope = scan.fetch_page().await.expect("page 2");
+        match scan
+            .rows(&envelope)
+            .expect_err("two rows past a one-row bound")
+        {
+            OpenConnectorError::ScanBoundsExceeded {
+                table,
+                bound,
+                limit,
+            } => {
+                assert_eq!(table, TABLE);
+                assert_eq!(bound, "max_rows");
+                assert_eq!(limit, 1);
+            }
+            other => panic!("expected ScanBoundsExceeded, got {other}"),
+        }
+    }
+
+    /// The client's response bound is the page's derivation bound: a page
+    /// that fits it but would derive twenty copies of a 300-byte row is
+    /// refused naming it, before the copies.
+    #[tokio::test]
+    async fn a_page_deriving_past_the_response_bound_fails_by_name() {
+        let gateway = MockGateway::start(|_| {
+            MockResponse::new(
+                200,
+                serde_json::to_string(&json!({
+                    "success": true, "message": "",
+                    "data": { "items": [{
+                        "id": "1", "pad": "x".repeat(300), "steps": vec![Value::Null; 20]
+                    }] },
+                    "errorCode": null, "meta": { "actionId": "mock.list" }
+                }))
+                .expect("serializable"),
+            )
+        })
+        .await;
+        let client = Arc::new(
+            OpenConnectorClient::new(&gateway.url, "t", Duration::from_secs(5))
+                .expect("client")
+                .with_max_response_bytes(1024),
+        );
+        let mut scan = ActionScan::new(
+            client,
+            exploding_keyset_target(),
+            None,
+            json!({}),
+            Vec::new(),
+            "$.items",
+            bounds(10),
+        )
+        .expect("scan binds");
+        let envelope = scan.fetch_page().await.expect("the page fits 1024 bytes");
+        match scan.rows(&envelope).expect_err("twenty copies do not") {
+            OpenConnectorError::ScanBoundsExceeded { bound, limit, .. } => {
+                assert_eq!(bound, "max_response_bytes");
+                assert_eq!(limit, 1024);
+            }
+            other => panic!("expected ScanBoundsExceeded, got {other}"),
+        }
     }
 }

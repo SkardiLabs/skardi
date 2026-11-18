@@ -323,7 +323,10 @@ impl ScanState {
                 max_pages: exec.max_pages,
                 timeout: exec.scan_timeout,
             },
-        )?;
+        )?
+        // One page may not derive more rows than the whole scan may emit;
+        // the scan-wide count stays below, after LIMIT.
+        .with_max_rows(exec.max_rows);
         Ok(Self {
             scan,
             cache: exec.cache.clone(),
