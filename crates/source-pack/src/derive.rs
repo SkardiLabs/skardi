@@ -283,6 +283,7 @@ impl RowDerivation {
                 None => derived,
                 Some(unpivot) => {
                     let mut unpivoted = Vec::with_capacity(derived.len() * unpivot.from.len());
+                    let paths: Vec<&str> = unpivot.from.iter().map(|f| f.path).collect();
                     for row in &derived {
                         let mut values: Vec<(&'static str, &Value)> = Vec::new();
                         // Every field is resolved before a row is yielded:
@@ -316,7 +317,6 @@ impl RowDerivation {
                         if values.is_empty() {
                             continue;
                         }
-                        let paths: Vec<&str> = unpivot.from.iter().map(|f| f.path).collect();
                         let base = clone_without(row, &paths);
                         for (label, value) in values {
                             let mut out_row = base.clone();
