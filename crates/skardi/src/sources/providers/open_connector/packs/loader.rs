@@ -2525,6 +2525,77 @@ tables:
         assert_eq!(rows[0]["note_key"], "m-1#notes");
     }
 
+    /// An exploded null element is a row at its own position; the column
+    /// that reads it decides what it means: NULL for a nullable one, a
+    /// failed conversion for a non-null one. (Pinned through a pack first;
+    /// held here so it does not depend on any one pack.)
+    #[test]
+    fn an_exploded_null_element_converts_by_its_columns_nullability() {
+        use arrow::array::{Array, StringArray};
+
+        const TABLE: &str = r#"    action: demo.get
+    row_path: "$"
+    row_shape: object
+    pagination: { strategy: single_page }
+    derive:
+      explode: { paths: [summary.steps], into: text, index: position }
+      format: { item_id: "{summary.id}#{position}" }
+    columns:
+      - { name: item_id, path: item_id, type: utf8, nullable: false }
+      - { name: text, path: text, type: utf8, nullable: NULLABLE }"#;
+        let page = serde_json::json!({
+            "summary": {"id": "m-1", "steps": ["Send the agenda", null, "Book the room"]}
+        });
+
+        let pack = pack_with(&TABLE.replace("NULLABLE", "true")).expect("parses");
+        let table = &pack.tables[0];
+        let rows = table
+            .derive
+            .expect("declared")
+            .apply(table.id, std::slice::from_ref(&page), 1)
+            .expect("derives");
+        let batch = RowConverter::new(table.fields)
+            .expect("converter")
+            .convert(&rows, 1)
+            .expect("a nullable column reads the null element as NULL");
+        assert_eq!(batch.num_rows(), 3);
+        let text = batch
+            .column_by_name("text")
+            .expect("text")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("utf8");
+        assert!(text.is_null(1));
+        assert_eq!(text.value(2), "Book the room");
+        let ids = batch
+            .column_by_name("item_id")
+            .expect("item_id")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("utf8");
+        assert_eq!(ids.value(1), "m-1#1", "the null keeps its own position");
+        assert_eq!(ids.value(2), "m-1#2", "positions after it do not move");
+
+        let pack = pack_with(&TABLE.replace("NULLABLE", "false")).expect("parses");
+        let table = &pack.tables[0];
+        let rows = table
+            .derive
+            .expect("declared")
+            .apply(table.id, std::slice::from_ref(&page), 1)
+            .expect("derives");
+        let err = RowConverter::new(table.fields)
+            .expect("converter")
+            .convert(&rows, 1)
+            .expect_err("a non-null column refuses the null element");
+        assert!(
+            matches!(
+                err,
+                OpenConnectorError::ConversionFailed { ref column, row: 1, .. } if column == "text"
+            ),
+            "{err}"
+        );
+    }
+
     #[test]
     fn unpivot_invariants_are_rejected_with_targeted_errors() {
         const HEAD: &str = r#"    action: demo.get
