@@ -20,21 +20,22 @@ over the same `feishu` Open Connector provider.
 
 **The wire contract is Open Connector's.** The gateway's minutes executors
 rebuild the page envelope (`items`, `hasMore`, and a `pageToken` that is
-`null` on the last page) and wrap a meeting as `{meeting: ...}`, while
-passing Feishu's own objects through raw: snake_case keys, times as
-Unix-second digit strings. Inputs are camelCase strict
-(`additionalProperties: false`; a wrong key such as `query_mode` is a hard
-400). Everything below is reconciled against a local gateway built from
-Open Connector main `ea4e040e`
-([SkardiLabs/open-connector#24](https://github.com/SkardiLabs/open-connector/pull/24)
-merged, which gave `get_vc_meeting` its `queryMode`), where every input
-set the pack generates passed the strict schemas.
+`null` on the last page) and wrap a meeting as `{meeting: ...}`, plus
+`relatedArtifacts` when asked, while passing Feishu's own objects through
+raw: snake_case keys, times as Unix-second digit strings. Inputs are
+camelCase strict (`additionalProperties: false`; an undeclared key such as
+the retired `queryMode` is a hard 400). Everything below is reconciled
+against a local gateway built from Open Connector main `8a7d91a2`
+([SkardiLabs/open-connector#28](https://github.com/SkardiLabs/open-connector/pull/28)
+merged, which gave `get_vc_meeting` its `includeArtifacts`), where every
+input set the pack generates passed the strict schemas.
 
 > **No real Feishu tenant has been read.** The row shapes come from
-> Feishu's API reference and the executor source; the gateway declares both
-> answers loose, so the fingerprint gate protects no column. The
-> verification section at the end lists every assumption and the probe that
-> settles it.
+> Feishu's API reference, its Go SDK and the executor source. The gateway
+> declares the meeting and the search item loose, so the fingerprint gate
+> protects no column read from them; it does declare the two document
+> tokens. The verification section at the end lists every assumption and
+> the probe that settles it.
 
 ## Binding
 
@@ -93,12 +94,12 @@ listing of meeting ids to read. Not a contract table.
 - Feishu's reference says a search returns at most 150 results; walk a
   narrow window.
 
-### `meetings` — `feishu.get_vc_meeting`, `queryMode` 0
+### `meetings` — `feishu.get_vc_meeting`
 
-One row per meeting, read by id (`GET /vc/v1/meetings/{id}`) with
-`queryMode: 0` (the meeting's information) and `includeParticipants: true`.
-The response is the row (`row_shape: object`); bind one `meetingId` per
-binding. **Feishu answers only the member's own meetings, 90 days back.**
+One row per meeting, read by id (`GET /vc/v1/meetings/{id}`, one Feishu
+request) with `includeParticipants: true`. The response, `{meeting}`, is
+the row (`row_shape: object`); bind one `meetingId` per binding. **Feishu
+answers only the member's own meetings, 90 days back.**
 
 | Column | Type | From |
 | --- | --- | --- |
@@ -114,17 +115,20 @@ binding. **Feishu answers only the member's own meetings, 90 days back.**
 | `url` | utf8 | `meeting.url` |
 | `calendar_event_id` | utf8 | **always NULL** — no calendar link on a VC meeting |
 
-### `meeting_notes` — `feishu.get_vc_meeting`, `queryMode` 1
+### `meeting_notes` — `feishu.get_vc_meeting`, `includeArtifacts`
 
-One row per document Feishu wrote for a meeting, from the same action at
-`queryMode: 1`, which answers only the meeting's documents:
-`related_artifacts.note_doc_token` (the 智能纪要) and
-`related_artifacts.verbatim_doc_token` (the 逐字稿).
+One row per document Feishu wrote for a meeting, from the same action with
+`includeArtifacts: true`. Feishu answers a meeting and its documents one
+half per request, so the gateway makes two Feishu requests in this one
+call and answers `{meeting, relatedArtifacts}`: the meeting beside
+`relatedArtifacts.note_doc_token` (the 智能纪要) and
+`relatedArtifacts.verbatim_doc_token` (the 逐字稿). No participants are
+asked for; no notes column reads them.
 
 | Column | Type | From |
 | --- | --- | --- |
 | `provider` | utf8, not null | `feishu` |
-| `meeting_id` | utf8, not null | `meeting.id` |
+| `meeting_id` | utf8, not null | `meeting.id`, from the meeting half of the answer |
 | `meeting_started_at` | timestamp (ms, UTC) | `meeting.start_time` — the meeting's start, copied onto every note |
 | `note_id` | utf8, not null | the document token — the artifact's own id |
 | `kind` | utf8 | `notes` for the 智能纪要, `transcript` for the 逐字稿 |
@@ -138,8 +142,9 @@ One row per document Feishu wrote for a meeting, from the same action at
   Notes come first, then the transcript.
 - **A token that is absent or `""` is no row.** Per Feishu's reference the
   key is absent when the app lacks its field scope, and `""` when the
-  document is permitted but not generated yet. A meeting with neither has
-  zero notes; its `meetings` row still stands.
+  document is permitted but not generated yet; the gateway answers
+  `relatedArtifacts: {}` when Feishu sends none. A meeting with neither
+  has zero notes; its `meetings` row still stands.
 - **The document is reached by `document_path`, never copied.** No body is
   read: that would take a second read per document and the
   `docx:document:readonly` scope, which covers every document the member
@@ -159,11 +164,15 @@ no action-item rows, as Google Meet does.
   `vc:meeting.meetingevent:read` (the meeting read), and the field scopes
   `vc:meeting.artifact.note:read` and `vc:meeting.artifact.verbatim:read`.
   Without a field scope its token is absent and `meeting_notes` is
-  silently empty for that kind — grant both.
+  silently empty for that kind — grant both. The action lists the two
+  field scopes in its provider permissions, so the default consent asks
+  for them.
 - The search needs a user token from a custom app.
 - Rate limits per Feishu's reference: search 100 requests a minute; the
   meeting read 1000 a minute, 50 a second.
-- Reading both tables costs two meeting reads per meeting, one per mode.
+- Reading both tables costs two gateway calls and three Feishu requests
+  per meeting: one for `meetings`, and two inside the `meeting_notes`
+  call (the meeting, then its documents).
 - Provider refusals are not absorbed (`error_path` is unset): they arrive
   as the gateway's failure envelope and fail the scan with its code and
   the action named. That includes reading a listed meeting the member did
@@ -172,25 +181,34 @@ no action-item rows, as Google Meet does.
 ## Verification
 
 What has been observed, against a local gateway built from Open
-Connector main `ea4e040e` (2026-11-18), without Feishu credentials:
+Connector main `8a7d91a2` (2026-11-18), without Feishu credentials:
 
 - Discovery of both actions; their output and input schemas captured under
   `crates/skardi/src/sources/providers/open_connector/packs/fixtures/feishu_meetings/contracts/`
   and pinned by fingerprint. The `lark.*` twins of both actions have
   identical schemas on the same gateway.
 - Every input set the pack generates (`startTime`+`endTime`+`pageSize`,
-  the same plus `pageToken`, `meetingId`+`queryMode` 0+`includeParticipants`,
-  `meetingId`+`queryMode` 1) accepted by the strict schemas, reaching the
-  credential wall (`authorization_failed`, HTTP 403 with `data.status`
-  401); a snake_case `query_mode` refused as an input-schema mismatch.
+  the same plus `pageToken`, `meetingId`+`includeParticipants`,
+  `meetingId`+`includeArtifacts`) accepted by the strict schemas, reaching
+  the credential wall (`authorization_failed`, HTTP 403 with `data.status`
+  401); the retired `queryMode` refused as an input-schema mismatch.
+
+Settled without a probe, by Feishu's Go SDK (`larksuite/oapi-sdk-go`,
+`service/vc/v1/model.go`, `GetMeetingRespData`): the answer body is
+`{meeting, related_artifacts}`, the documents a sibling of the meeting,
+and the two modes are `GetOnlyMeeting` (0) and `GetOnlyRelatedArtifacts`
+(1). That is why the gateway makes both requests and the notes read the
+meeting half beside the documents.
 
 What has **not** been observed — each item is a probe against a real
 Feishu tenant:
 
-1. Whether `queryMode` 1 returns `meeting.id` and `meeting.start_time`. If
-   not, every note fails on the non-null `meeting_id`, loudly.
-2. Whether `queryMode` 0 also returns `note_id` / `related_artifacts`
-   (Open Connector's own `get_vc_meeting_note` assumes `note_id` there).
+1. That the documents request for a meeting without documents answers no
+   documents (zero notes) rather than an error, which would fail that
+   meeting's notes read.
+2. That the documents request is refused for a meeting the member does
+   not own the same way the meeting request is (item 9), never
+   half-answered.
 3. That a token is absent without its field scope and `""` before the
    document exists.
 4. That a document token belongs to one meeting, so `note_id` is unique

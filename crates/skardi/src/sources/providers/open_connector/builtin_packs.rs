@@ -116,11 +116,12 @@ mod tests {
         //
         // `feishu_meetings.meetings` and `feishu_meetings.meeting_notes` are
         // the fourth and fifth, over one point read: `get_vc_meeting` takes
-        // one `meetingId` and answers that meeting, at `queryMode` 0 (its
-        // information: the `meetings` row) or 1 (its documents: the pack's
-        // `derive.unpivot` turns the two document tokens into one note row
-        // each) — still object-shaped tables, since the shape names how the
-        // RESPONSE is read, and the derivation runs after.
+        // one `meetingId` and answers that meeting, `{meeting}` (the
+        // `meetings` row) or, with `includeArtifacts`, `{meeting,
+        // relatedArtifacts}` (the pack's `derive.unpivot` turns the two
+        // document tokens into one note row each) — still object-shaped
+        // tables, since the shape names how the RESPONSE is read, and the
+        // derivation runs after.
         //
         // `lark.document_content` mirrors `feishu.document_content` exactly:
         // Lark is Feishu's international edition, and `packs/lark.yaml` is

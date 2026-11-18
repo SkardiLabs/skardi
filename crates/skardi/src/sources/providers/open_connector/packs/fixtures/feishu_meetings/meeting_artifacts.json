@@ -1,11 +1,21 @@
 {
   "meeting": {
     "id": "7000000000000000001",
+    "topic": "Weekly sync",
+    "url": "https://vc.example.com/j/100000001",
+    "meeting_no": "100000001",
+    "create_time": "1793609940",
     "start_time": "1793610000",
-    "note_id": "note_synthetic_0001",
-    "related_artifacts": {
-      "note_doc_token": "docx_synthetic_notes_0001",
-      "verbatim_doc_token": "docx_synthetic_verbatim_0001"
-    }
+    "end_time": "1793612700",
+    "host_user": {
+      "id": "ou_00000000000000000000000000000001",
+      "user_type": 1
+    },
+    "status": 3,
+    "note_id": "note_synthetic_0001"
+  },
+  "relatedArtifacts": {
+    "note_doc_token": "docx_synthetic_notes_0001",
+    "verbatim_doc_token": "docx_synthetic_verbatim_0001"
   }
 }
