@@ -55,11 +55,17 @@ gateway **runtime token**.
 > delivered only by webhook and belong to the
 > [`kind: webhook` receiver](webhooks.md); pins captured from a live
 > gateway, live pass against a real WABA pending per the pack doc),
-> and [Zoom](open-connector-zoom.md) (AI Companion meeting summaries as
+> [Zoom](open-connector-zoom.md) (AI Companion meeting summaries as
 > the meeting-minutes contract's `meetings`, `meeting_notes` and
 > `meeting_action_items` — the first pack to use the loader's `derive:`
 > block; pins captured from a local gateway built from Open Connector
-> main, live pass against a real Zoom account pending per the pack doc).
+> main, live pass against a real Zoom account pending per the pack doc),
+> and [Feishu meetings](open-connector-feishu-meetings.md) (VC meetings
+> and the 智能纪要 / 逐字稿 documents Feishu wrote for them, as the
+> contract's `meetings` and `meeting_notes` beside a `meeting_search`
+> listing — two document tokens become two notes through the loader's
+> `derive.unpivot`; pins captured from a local gateway built from Open
+> Connector main, no real Feishu tenant read yet per the pack doc).
 > Further provider packs (Google Calendar, Jira, …) ship one pack per
 > release per the
 > [design spec](superpowers/specs/2026-07-11-open-connector-integration-design.md);
