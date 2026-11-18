@@ -467,6 +467,7 @@ mod tests {
             error_path: None,
             expected_fingerprint: None,
             continuation: None,
+            derive: None,
         }
     }
 
