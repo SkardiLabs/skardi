@@ -5,7 +5,7 @@
 //! already carried. A pack that must land a provider's answer in a shape
 //! shared with OTHER providers (the meeting-minutes contract: one
 //! `meetings` / `meeting_notes` / `meeting_action_items` shape for Zoom,
-//! Google Meet, Microsoft Teams and Feishu) needs four things no wire key
+//! Google Meet, Microsoft Teams and Feishu) needs five things no wire key
 //! gives it:
 //!
 //! - a **constant** on every row — `provider: zoom`, `kind: summary`, or
@@ -17,17 +17,23 @@
 //!   another's;
 //! - **skipping** a point-read whose payload is null — a summary Zoom will
 //!   not return (`available: false`, `summary: null`) is zero rows, not a
-//!   failed scan and not a row of NULLs.
+//!   failed scan and not a row of NULLs;
+//! - a row per **named field** that carries a value — Feishu answers a
+//!   meeting's notes document and its transcript document as two sibling
+//!   tokens (`note_doc_token`, `verbatim_doc_token`), each one note row of
+//!   its own kind, and an empty token is a document not generated yet, not
+//!   a row.
 //!
-//! A [`RowDerivation`](crate::derive::RowDerivation) declares those four,
+//! A [`RowDerivation`](crate::derive::RowDerivation) declares those five,
 //! and nothing else: no
 //! expressions, no lookups, no reading of prose. It rewrites rows as JSON
 //! and hands them to the SAME converter every other table uses, so a
 //! derived column has the same typing, nullability and error identity as a
-//! wire column. Steps run in a fixed order — skip, explode, constants,
-//! format — so a template can read an exploded element's position and a
-//! constant can never be shadowed by a wire key of the same name (derived
-//! keys overwrite; the pack's label is the pack's, not the provider's).
+//! wire column. Steps run in a fixed order — skip, explode, unpivot,
+//! constants, format — so a template can read an exploded element's
+//! position or an unpivoted field's label, and a constant can never be
+//! shadowed by a wire key of the same name (derived keys overwrite; the
+//! pack's label is the pack's, not the provider's).
 //!
 //! Pagination never sees derived rows. The scan advances on the RAW page
 //! (its row count and last row), so an explode that yields nothing from a
@@ -86,7 +92,47 @@ pub struct Explode {
     pub index: Option<&'static str>,
 }
 
-/// The derivation a table declares; see the module doc for the four steps
+/// One named field of an [`Unpivot`]: the label its row carries and the
+/// row-relative dotted path its value is read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnpivotField {
+    /// Written under [`Unpivot::label`] on this field's row (`notes`).
+    pub label: &'static str,
+    /// Where the field's value is read (`meeting.related_artifacts.note_doc_token`).
+    pub path: &'static str,
+}
+
+/// One row per named field that carries a value: the column-to-row turn a
+/// provider forces when it answers several things of one kind as sibling
+/// keys instead of an array.
+///
+/// For each source row, `from` is read in order. A field whose value is
+/// missing, null or the EMPTY STRING yields no row — an empty string is how
+/// a provider says "permitted, but nothing there yet" (Feishu sends `""`
+/// for a meeting document not generated yet), and a row carrying it would
+/// be an identity that names nothing. A field with any other scalar yields
+/// one row: the source row with the value under `into` and the field's
+/// label under `label`. A field holding an array or an object fails the
+/// scan with its kind, as does a non-object parent along a path — every
+/// field is checked before any row is yielded, so a drifted sibling cannot
+/// vanish behind one that still reads.
+///
+/// **Unpivot consumes its paths**, as [`Explode`] does: a derived row
+/// carries none of the `from` values, so one field's row never also
+/// carries the other field's value, and a column or a template reads the
+/// value through `into` (the loader refuses one reading a consumed path).
+/// When no field carries a value the source row yields zero rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Unpivot {
+    /// The fields, in the order their rows are yielded.
+    pub from: &'static [UnpivotField],
+    /// The key each field's value is written under.
+    pub into: &'static str,
+    /// The key each field's label is written under.
+    pub label: &'static str,
+}
+
+/// The derivation a table declares; see the module doc for the five steps
 /// and their order. `Default` is the no-op derivation, which `apply` turns
 /// into a plain clone of the rows — callers check [`Self::is_empty`] to
 /// skip even that.
@@ -99,6 +145,10 @@ pub struct RowDerivation {
     pub skip_when_null: Option<&'static str>,
     /// One row per array element; see [`Explode`].
     pub explode: Option<Explode>,
+    /// One row per named field that carries a value; see [`Unpivot`]. Runs
+    /// on the rows explode yields (the loader refuses a table declaring
+    /// both, so in a pack it runs on the source rows).
+    pub unpivot: Option<Unpivot>,
     /// Keys written on every row with a literal value, overwriting a wire
     /// key of the same name. `FixedValue::Json(&Value::Null)` spells an
     /// explicit NULL.
@@ -122,18 +172,24 @@ impl RowDerivation {
     pub fn is_empty(&self) -> bool {
         self.skip_when_null.is_none()
             && self.explode.is_none()
+            && self.unpivot.is_none()
             && self.constants.is_empty()
             && self.format.is_empty()
     }
 
     /// Every key the derivation writes onto a row, in declaration order:
-    /// the explode's `into` and `index`, then the constants, then the
-    /// formats. The loader cross-checks these against the table's columns.
+    /// the explode's `into` and `index`, the unpivot's `into` and `label`,
+    /// then the constants, then the formats. The loader cross-checks these
+    /// against the table's columns.
     pub fn written_keys(&self) -> Vec<&'static str> {
         let mut keys = Vec::new();
         if let Some(explode) = &self.explode {
             keys.push(explode.into);
             keys.extend(explode.index);
+        }
+        if let Some(unpivot) = &self.unpivot {
+            keys.push(unpivot.into);
+            keys.push(unpivot.label);
         }
         keys.extend(self.constants.iter().map(|(key, _)| *key));
         keys.extend(self.format.iter().map(|(key, _)| *key));
@@ -221,6 +277,55 @@ impl RowDerivation {
                                 .collect()
                         }
                     }
+                }
+            };
+            let derived = match &self.unpivot {
+                None => derived,
+                Some(unpivot) => {
+                    let mut unpivoted = Vec::with_capacity(derived.len() * unpivot.from.len());
+                    let paths: Vec<&str> = unpivot.from.iter().map(|f| f.path).collect();
+                    for row in &derived {
+                        let mut values: Vec<(&'static str, &Value)> = Vec::new();
+                        // Every field is resolved before a row is yielded:
+                        // all of them are consumed, so a drifted one must
+                        // fail here, not be dropped by `clone_without`.
+                        for field in unpivot.from {
+                            match resolve(row, field.path) {
+                                Ok(None) => {}
+                                Ok(Some(Value::String(text))) if text.is_empty() => {}
+                                Ok(Some(
+                                    value @ (Value::String(_) | Value::Number(_) | Value::Bool(_)),
+                                )) => values.push((field.label, value)),
+                                Ok(Some(other)) => {
+                                    return Err(fail(
+                                        "unpivot",
+                                        field.path,
+                                        "a scalar",
+                                        json_kind(other),
+                                    ));
+                                }
+                                Err(found) => {
+                                    return Err(fail(
+                                        "unpivot",
+                                        field.path,
+                                        "an object parent",
+                                        &found,
+                                    ));
+                                }
+                            }
+                        }
+                        if values.is_empty() {
+                            continue;
+                        }
+                        let base = clone_without(row, &paths);
+                        for (label, value) in values {
+                            let mut out_row = base.clone();
+                            out_row.insert(unpivot.into.to_string(), value.clone());
+                            out_row.insert(unpivot.label.to_string(), Value::from(label));
+                            unpivoted.push(out_row);
+                        }
+                    }
+                    unpivoted
                 }
             };
             for mut row in derived {
@@ -879,5 +984,182 @@ mod tests {
             template_placeholders("{a.b}-{c}").unwrap(),
             vec!["a.b", "c"]
         );
+    }
+
+    const ARTIFACTS: &[UnpivotField] = &[
+        UnpivotField {
+            label: "notes",
+            path: "meeting.related_artifacts.note_doc_token",
+        },
+        UnpivotField {
+            label: "transcript",
+            path: "meeting.related_artifacts.verbatim_doc_token",
+        },
+    ];
+
+    fn artifacts_derivation() -> RowDerivation {
+        RowDerivation {
+            unpivot: Some(Unpivot {
+                from: ARTIFACTS,
+                into: "doc_token",
+                label: "kind",
+            }),
+            constants: &[("provider", FixedValue::Str("feishu"))],
+            ..RowDerivation::default()
+        }
+    }
+
+    fn meeting_answer(artifacts: Value) -> Value {
+        json!({"meeting": {"id": "m-1", "start_time": "1700000000", "related_artifacts": artifacts}})
+    }
+
+    #[test]
+    fn unpivot_yields_one_row_per_field_in_declared_order() {
+        let derivation = artifacts_derivation();
+        let rows = vec![meeting_answer(
+            json!({"note_doc_token": "doc-notes", "verbatim_doc_token": "doc-verbatim"}),
+        )];
+        let out = derivation.apply("t", &rows, 1).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["kind"], "notes");
+        assert_eq!(out[0]["doc_token"], "doc-notes");
+        assert_eq!(out[1]["kind"], "transcript");
+        assert_eq!(out[1]["doc_token"], "doc-verbatim");
+        // The source row's other keys stay reachable on both rows, and the
+        // constants are written after the turn.
+        assert_eq!(out[1]["meeting"]["id"], "m-1");
+        assert_eq!(out[1]["meeting"]["start_time"], "1700000000");
+        assert_eq!(out[0]["provider"], "feishu");
+        assert_eq!(
+            derivation.written_keys(),
+            vec!["doc_token", "kind", "provider"]
+        );
+    }
+
+    #[test]
+    fn an_unpivoted_row_carries_none_of_the_fields() {
+        let rows = vec![meeting_answer(
+            json!({"note_doc_token": "doc-notes", "verbatim_doc_token": "doc-verbatim", "other": 1}),
+        )];
+        let out = artifacts_derivation().apply("t", &rows, 1).unwrap();
+        for row in &out {
+            let artifacts = &row["meeting"]["related_artifacts"];
+            assert!(artifacts.get("note_doc_token").is_none());
+            assert!(artifacts.get("verbatim_doc_token").is_none());
+            assert_eq!(artifacts["other"], 1, "a sibling of the fields stays");
+        }
+    }
+
+    #[test]
+    fn unpivot_skips_a_missing_null_or_empty_field() {
+        let cases: [(&str, Value, &[&str]); 6] = [
+            ("both missing", json!({}), &[]),
+            ("parent missing", NULL, &[]),
+            (
+                "both null",
+                json!({"note_doc_token": null, "verbatim_doc_token": null}),
+                &[],
+            ),
+            (
+                "both empty",
+                json!({"note_doc_token": "", "verbatim_doc_token": ""}),
+                &[],
+            ),
+            (
+                "notes only",
+                json!({"note_doc_token": "doc-notes", "verbatim_doc_token": ""}),
+                &["notes"],
+            ),
+            (
+                "transcript only",
+                json!({"verbatim_doc_token": "doc-verbatim"}),
+                &["transcript"],
+            ),
+        ];
+        for (case, artifacts, kinds) in cases {
+            let out = artifacts_derivation()
+                .apply("t", &[meeting_answer(artifacts)], 1)
+                .unwrap();
+            let got: Vec<&str> = out
+                .iter()
+                .map(|row| row["kind"].as_str().unwrap())
+                .collect();
+            assert_eq!(got, kinds, "{case}");
+        }
+    }
+
+    #[test]
+    fn unpivot_keeps_a_non_string_scalar() {
+        let out = artifacts_derivation()
+            .apply(
+                "t",
+                &[meeting_answer(
+                    json!({"note_doc_token": 42, "verbatim_doc_token": false}),
+                )],
+                1,
+            )
+            .unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["doc_token"], 42);
+        assert_eq!(out[1]["doc_token"], false);
+    }
+
+    #[test]
+    fn unpivot_fails_with_the_kind_on_a_drifted_field() {
+        // The object case drifts the SECOND field while the first still
+        // reads: every field is checked before a row is yielded.
+        let cases = [
+            (
+                json!({"note_doc_token": ["a"]}),
+                "meeting.related_artifacts.note_doc_token",
+                "an array",
+            ),
+            (
+                json!({"note_doc_token": "ok", "verbatim_doc_token": {"t": 1}}),
+                "meeting.related_artifacts.verbatim_doc_token",
+                "an object",
+            ),
+            (
+                json!("drifted"),
+                "meeting.related_artifacts.note_doc_token",
+                "a string",
+            ),
+        ];
+        for (artifacts, expected_path, expected_kind) in cases {
+            let err = artifacts_derivation()
+                .apply("t", &[meeting_answer(artifacts)], 3)
+                .unwrap_err();
+            match err {
+                OpenConnectorError::RowDerivationFailed {
+                    step,
+                    path,
+                    page,
+                    found,
+                    ..
+                } => {
+                    assert_eq!(step, "unpivot");
+                    assert_eq!(path, expected_path);
+                    assert_eq!(page, 3);
+                    assert_eq!(found, expected_kind);
+                }
+                other => panic!("expected RowDerivationFailed, got {other}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_format_template_reads_the_unpivoted_value_and_label() {
+        let derivation = RowDerivation {
+            format: &[("note_key", "{meeting.id}#{kind}#{doc_token}")],
+            ..artifacts_derivation()
+        };
+        let out = derivation
+            .apply(
+                "t",
+                &[meeting_answer(json!({"note_doc_token": "doc-notes"}))],
+                1,
+            )
+            .unwrap();
+        assert_eq!(out[0]["note_key"], "m-1#notes#doc-notes");
     }
 }

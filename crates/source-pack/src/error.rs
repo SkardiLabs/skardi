@@ -695,8 +695,10 @@ pub enum OpenConnectorError {
 
     /// A table's declared row derivation (`derive:` in the pack asset — see
     /// `skardi_source_pack::derive`) met a row it cannot rewrite: an array
-    /// path holding a non-array, a template placeholder over an object, a
-    /// parent of the wrong shape. `step` names which of the four steps,
+    /// path holding a non-array, an unpivoted field holding an array or an
+    /// object, a template placeholder over an object, a parent of the wrong
+    /// shape. `step` names which of the steps (or `row` for a source row
+    /// that is not an object),
     /// `found` the JSON *kind* only — never the value.
     #[error(
         "Open Connector row derivation ({step}) failed for table '{table}' at path '{path}', \
