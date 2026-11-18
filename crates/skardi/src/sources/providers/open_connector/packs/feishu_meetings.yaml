@@ -1,0 +1,152 @@
+# Feishu meetings source pack: Feishu VC meetings and the documents Feishu
+# wrote for them (the 智能纪要 notes and the 逐字稿 transcript), in the
+# meeting-minutes contract shape (`meetings`, `meeting_notes`) that every
+# meeting pack writes. Its own pack, not tables in feishu.yaml: the cloud
+# connects it as its own provider row `feishu_meetings` (design D18).
+#
+# Wire contract reconciled against a local Open Connector gateway built
+# from SkardiLabs/open-connector main ea4e040e (open-connector#24 merged,
+# 2026-11-18): the minutes executors rebuild the page ENVELOPE (camelCase
+# `$.items` / `$.pageToken` / `$.hasMore`, `pageToken` null on the last
+# page) and wrap the meeting as `{meeting: ...}`, while passing Feishu's
+# own objects through RAW — snake_case keys, times as Unix-second DIGIT
+# STRINGS. Inputs are camelCase strict (`additionalProperties: false`; a
+# wrong key is a hard 400, checked live without credentials). Every input
+# set below reached the credential wall on that gateway.
+#
+# ⚠️ UNPROBED AGAINST A REAL FEISHU TENANT. The row shapes come from
+# Feishu's API reference (read 2026-11-18) and the executor source; both
+# objects are declared LOOSE by the gateway (empty `properties`), so no
+# column below is protected by the fingerprint gate. The module doc of
+# packs/feishu_meetings.rs lists every unprobed assumption and the probe
+# that settles it, and records every wire decision with its why.
+#
+# Lark mirror: `lark_meetings` is this file with `feishu` replaced by
+# `lark` in the pack name, the action prefix and the `provider` constant
+# (the `lark.*` twins of both actions have identical schemas on that
+# gateway). Keep every other literal provider-neutral.
+kind: pack
+pack: feishu_meetings
+version: 1
+
+tables:
+  # The meeting listing: the ids of the member's meetings in a time window
+  # (`POST /vc/v1/meetings/search`). Not a contract table. A search item
+  # carries the meeting id as its only structured field — title, time and
+  # organizer exist only inside card text (`display_info`, `meta_data`),
+  # which is never parsed (design §0.3) — so the `meetings` row comes from
+  # a per-meeting read and this table is what lists the ids to read.
+  meeting_search:
+    action: feishu.search_vc_meetings
+    row_path: "$.items"
+    fingerprint: b7cc372e44cfe3f9f2d4fdb7194a67b0ff83c449a9b98b8e3962caa9ac665b6e
+    pagination:
+      strategy: cursor
+      cursor_input: pageToken
+      next_cursor_path: "$.pageToken"
+      page_size_input: pageSize
+      # Feishu's reference caps a search page at 30 (the action declares
+      # 50; Feishu's own CLI also sends 30).
+      page_size: 30
+      has_more_path: "$.hasMore"
+    # The window, RFC 3339 with an offset (`2026-11-01T00:00:00Z`), sent
+    # verbatim as `meeting_filter.start_time.{start_time, end_time}`. Both
+    # required: the action refuses a search with no query and no filter.
+    resources:
+      required: [startTime, endTime]
+    columns:
+      - { name: meeting_id, path: id, type: utf8, nullable: false }
+
+  # One row per meeting the member owns, read by id
+  # (`GET /vc/v1/meetings/{id}?query_mode=0&with_participants=true`).
+  # Feishu answers only the member's own meetings, 90 days back.
+  meetings:
+    action: feishu.get_vc_meeting
+    row_path: "$"
+    row_shape: object
+    fingerprint: 9f8b05617cffe40a77561615ae6167e34d6f3748911ad34b88bec6768a60b977
+    pagination:
+      strategy: single_page
+    resources:
+      required: [meetingId]
+    # Mode 0 is the meeting information; mode 1 (the notes table) is only
+    # the meeting's documents. Participants are the attendee ids.
+    fixed_inputs:
+      queryMode: 0
+      includeParticipants: true
+    derive:
+      constants:
+        provider: feishu
+        # Feishu documents no series id, no organizer email, no attendee
+        # email and no calendar link on a VC meeting (findings §2.4).
+        series_id: null
+        organizer_email: null
+        attendee_emails: null
+        calendar_event_id: null
+    columns:
+      - { name: provider, path: provider, type: utf8, nullable: false }
+      - { name: meeting_id, path: meeting.id, type: utf8, nullable: false }
+      - { name: series_id, path: series_id, type: utf8, nullable: true }
+      - { name: title, path: meeting.topic, type: utf8, nullable: true }
+      # Unix seconds as a digit string (`"1793610000"`).
+      - { name: started_at, path: meeting.start_time, type: timestamp_s_string_utc, nullable: true }
+      - { name: ended_at, path: meeting.end_time, type: timestamp_s_string_utc, nullable: true }
+      - { name: organizer_email, path: organizer_email, type: utf8, nullable: true }
+      # The host's open_id (the default `user_id_type`).
+      - { name: organizer_id, path: meeting.host_user.id, type: utf8, nullable: true }
+      - { name: attendee_emails, path: attendee_emails, type: utf8_list, nullable: true }
+      # Who actually joined: each participant's `id`, as Feishu returns it.
+      - { name: attendee_ids, path: meeting.participants, type: utf8_list_from_object_key, key: id, nullable: true }
+      # The meeting's own link.
+      - { name: url, path: meeting.url, type: utf8, nullable: true }
+      - { name: calendar_event_id, path: calendar_event_id, type: utf8, nullable: true }
+
+  # One row per document Feishu wrote for a meeting
+  # (`GET /vc/v1/meetings/{id}?query_mode=1`): the 智能纪要 as kind `notes`,
+  # the 逐字稿 as kind `transcript`. Each is a document, reached by its
+  # token in `document_path`; no body is read (design §3.2), and nothing
+  # here reads a transcript (design D7).
+  meeting_notes:
+    action: feishu.get_vc_meeting
+    row_path: "$"
+    row_shape: object
+    fingerprint: 9f8b05617cffe40a77561615ae6167e34d6f3748911ad34b88bec6768a60b977
+    pagination:
+      strategy: single_page
+    resources:
+      required: [meetingId]
+    fixed_inputs:
+      queryMode: 1
+    derive:
+      # Two sibling tokens, one row each. A token is ABSENT when the app
+      # lacks its field scope and `""` while Feishu has not generated the
+      # document yet: neither is a row. A meeting with neither is zero
+      # rows, not an error; its `meetings` row still stands.
+      unpivot:
+        into: doc_token
+        label: kind
+        from:
+          - { label: notes, path: meeting.related_artifacts.note_doc_token }
+          - { label: transcript, path: meeting.related_artifacts.verbatim_doc_token }
+      constants:
+        provider: feishu
+        # Both documents are Feishu VC's own; `kind` tells them apart.
+        producer: feishu
+        # No title, no text and no link on the answer: the document is
+        # reached by `document_path`, never copied.
+        title: null
+        body: null
+        url: null
+    columns:
+      - { name: provider, path: provider, type: utf8, nullable: false }
+      - { name: meeting_id, path: meeting.id, type: utf8, nullable: false }
+      # Copied onto every note so a note carries its meeting's date.
+      - { name: meeting_started_at, path: meeting.start_time, type: timestamp_s_string_utc, nullable: true }
+      # The document token is the artifact's own id.
+      - { name: note_id, path: doc_token, type: utf8, nullable: false }
+      - { name: kind, path: kind, type: utf8, nullable: true }
+      - { name: producer, path: producer, type: utf8, nullable: true }
+      - { name: title, path: title, type: utf8, nullable: true }
+      - { name: body, path: body, type: utf8, nullable: true }
+      - { name: document_path, path: doc_token, type: utf8, nullable: true }
+      - { name: url, path: url, type: utf8, nullable: true }

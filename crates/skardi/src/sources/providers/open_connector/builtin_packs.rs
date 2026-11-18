@@ -57,6 +57,7 @@ pub fn builtin_pack_registry() -> Result<SourcePackRegistry, OpenConnectorError>
         packs::google_drive::pack()?,
         packs::whatsapp::pack()?,
         packs::zoom::pack()?,
+        packs::feishu_meetings::pack()?,
     ])
 }
 
@@ -123,12 +124,21 @@ mod tests {
         // table, since the shape names how the RESPONSE is read, and the
         // derivation runs after.
         //
+        // `feishu_meetings.meetings` and `feishu_meetings.meeting_notes` are
+        // the sixth and seventh, over one point read: `get_vc_meeting` takes
+        // one `meetingId` and answers that meeting, at `queryMode` 0 (its
+        // information: the `meetings` row) or 1 (its documents: the
+        // pack's `derive.unpivot` turns the two document tokens into one
+        // note row each).
+        //
         // `lark.document_content` mirrors `feishu.document_content` exactly:
         // Lark is Feishu's international edition, and `packs/lark.yaml` is
         // the feishu pack with every `feishu.*` action renamed `lark.*` (see
         // the warning at the top of that file about what remains unverified).
         const OBJECT_ROW_TABLES: &[&str] = &[
             "feishu.document_content",
+            "feishu_meetings.meeting_notes",
+            "feishu_meetings.meetings",
             "lark.document_content",
             "notion.page_markdown",
             "whatsapp.business_profile",
@@ -229,6 +239,7 @@ mod tests {
                 "discord",
                 "dropbox",
                 "feishu",
+                "feishu_meetings",
                 "github",
                 "gmail",
                 "google_drive",

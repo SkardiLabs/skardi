@@ -5,6 +5,7 @@ pub(crate) mod loader;
 pub mod discord;
 pub mod dropbox;
 pub mod feishu;
+pub mod feishu_meetings;
 pub mod github;
 pub mod gmail;
 pub mod google_drive;
