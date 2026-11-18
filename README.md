@@ -291,6 +291,13 @@ prints the next one. `skardi mcp register claude-code` adds the workspace's
 MCP server to Claude Code. See
 [docs/cli.md](docs/cli.md#connecting-data-sources-from-an-agent--integrations-handoff-documents).
 
+Agents can also keep a **working memory** of a task in the workspace: `skardi
+memory save` records the goal, decisions, findings and next steps under the
+task's issue, pull request or label, and the next agent or session picks it up
+with `skardi memory recall` — or `skardi memory status`, which finds the
+current branch's task by itself. See
+[docs/cli.md](docs/cli.md#agent-working-memory--memory).
+
 **Server** — a Docker image, or a source build (no pre-built binary yet):
 
 ```bash
@@ -354,7 +361,7 @@ agents; deploy it next to your data, behind your usual auth.
 | InfluxDB 3 | Read | No | Time series over Arrow Flight SQL | [docs](docs/influxdb/) |
 | S3 / GCS / Azure | Read | No | CSV, Parquet, Lance in object stores | [docs](docs/S3_USAGE.md) |
 | CSV / Parquet | Read | No | Local or remote files | [docs](docs/server.md) |
-| SaaS via Open Connector | Read | Yes | GitHub, Slack, Notion, Feishu, Lark, Gmail, Discord, Outlook, OneDrive, Google Drive, Dropbox, WhatsApp, Zoom, Feishu meetings packs as stable SQL tables; Slack channel history and Feishu/Lark document text as content tables, with time-window pushdown for incremental scans; pushdown + TTL cache | [docs](docs/open-connector.md) |
+| SaaS via Open Connector | Read | Yes | GitHub, Slack, Notion, Feishu, Lark, Gmail, Discord, Outlook, OneDrive, Google Drive, Dropbox, WhatsApp, Feishu meetings packs as stable SQL tables; Slack channel history and Feishu/Lark document text as content tables, with time-window pushdown for incremental scans; pushdown + TTL cache | [docs](docs/open-connector.md) |
 | Documents | Read | No | PDF/Office/ODF/image → per-page Markdown, tables, images; Markdown and plain text read directly, one row per heading or paragraph run; optional empty-text rows | [docs](docs/documents.md) |
 | RSS / Atom | Read | Yes | Feeds as `feeds` + `items`; per-feed TTL cache, fault isolation, un-sandboxed fetch egress | [docs](docs/rss.md) |
 | Obsidian | Read | Yes | Vault as `notes`/`links`/`tags`; frontmatter JSON, resolved link graph, tags (feature `obsidian`) | [docs](docs/obsidian.md) |

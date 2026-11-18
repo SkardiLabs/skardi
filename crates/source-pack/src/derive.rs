@@ -98,7 +98,7 @@ pub struct Explode {
 pub struct UnpivotField {
     /// Written under [`Unpivot::label`] on this field's row (`notes`).
     pub label: &'static str,
-    /// Where the field's value is read (`meeting.related_artifacts.note_doc_token`).
+    /// Where the field's value is read (`relatedArtifacts.note_doc_token`).
     pub path: &'static str,
 }
 
@@ -989,11 +989,11 @@ mod tests {
     const ARTIFACTS: &[UnpivotField] = &[
         UnpivotField {
             label: "notes",
-            path: "meeting.related_artifacts.note_doc_token",
+            path: "relatedArtifacts.note_doc_token",
         },
         UnpivotField {
             label: "transcript",
-            path: "meeting.related_artifacts.verbatim_doc_token",
+            path: "relatedArtifacts.verbatim_doc_token",
         },
     ];
 
@@ -1010,7 +1010,7 @@ mod tests {
     }
 
     fn meeting_answer(artifacts: Value) -> Value {
-        json!({"meeting": {"id": "m-1", "start_time": "1700000000", "related_artifacts": artifacts}})
+        json!({"meeting": {"id": "m-1", "start_time": "1700000000"}, "relatedArtifacts": artifacts})
     }
 
     #[test]
@@ -1043,7 +1043,7 @@ mod tests {
         )];
         let out = artifacts_derivation().apply("t", &rows, 1).unwrap();
         for row in &out {
-            let artifacts = &row["meeting"]["related_artifacts"];
+            let artifacts = &row["relatedArtifacts"];
             assert!(artifacts.get("note_doc_token").is_none());
             assert!(artifacts.get("verbatim_doc_token").is_none());
             assert_eq!(artifacts["other"], 1, "a sibling of the fields stays");
@@ -1111,17 +1111,17 @@ mod tests {
         let cases = [
             (
                 json!({"note_doc_token": ["a"]}),
-                "meeting.related_artifacts.note_doc_token",
+                "relatedArtifacts.note_doc_token",
                 "an array",
             ),
             (
                 json!({"note_doc_token": "ok", "verbatim_doc_token": {"t": 1}}),
-                "meeting.related_artifacts.verbatim_doc_token",
+                "relatedArtifacts.verbatim_doc_token",
                 "an object",
             ),
             (
                 json!("drifted"),
-                "meeting.related_artifacts.note_doc_token",
+                "relatedArtifacts.note_doc_token",
                 "a string",
             ),
         ];

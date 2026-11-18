@@ -5,19 +5,20 @@
 # connects it as its own provider row `feishu_meetings` (design D18).
 #
 # Wire contract reconciled against a local Open Connector gateway built
-# from SkardiLabs/open-connector main ea4e040e (open-connector#24 merged,
+# from SkardiLabs/open-connector main 8a7d91a2 (open-connector#28 merged,
 # 2026-11-18): the minutes executors rebuild the page ENVELOPE (camelCase
 # `$.items` / `$.pageToken` / `$.hasMore`, `pageToken` null on the last
-# page) and wrap the meeting as `{meeting: ...}`, while passing Feishu's
-# own objects through RAW — snake_case keys, times as Unix-second DIGIT
-# STRINGS. Inputs are camelCase strict (`additionalProperties: false`; a
+# page) and wrap the meeting as `{meeting: ...}` (plus `relatedArtifacts`
+# with `includeArtifacts`), while passing Feishu's own objects through
+# RAW — snake_case keys, times as Unix-second DIGIT STRINGS. Inputs are camelCase strict (`additionalProperties: false`; a
 # wrong key is a hard 400, checked live without credentials). Every input
 # set below reached the credential wall on that gateway.
 #
 # ⚠️ UNPROBED AGAINST A REAL FEISHU TENANT. The row shapes come from
-# Feishu's API reference (read 2026-11-18) and the executor source; both
-# objects are declared LOOSE by the gateway (empty `properties`), so no
-# column below is protected by the fingerprint gate. The module doc of
+# Feishu's API reference (read 2026-11-18), Feishu's Go SDK and the
+# executor source. The meeting and the search item are declared LOOSE by
+# the gateway (empty `properties`), so no column reading them is protected
+# by the fingerprint gate; `relatedArtifacts` declares its two tokens. The module doc of
 # packs/feishu_meetings.rs lists every unprobed assumption and the probe
 # that settles it, and records every wire decision with its why.
 #
@@ -58,21 +59,21 @@ tables:
       - { name: meeting_id, path: id, type: utf8, nullable: false }
 
   # One row per meeting the member owns, read by id
-  # (`GET /vc/v1/meetings/{id}?query_mode=0&with_participants=true`).
-  # Feishu answers only the member's own meetings, 90 days back.
+  # (`GET /vc/v1/meetings/{id}?query_mode=0&with_participants=true`, one
+  # Feishu request). Feishu answers only the member's own meetings, 90 days
+  # back.
   meetings:
     action: feishu.get_vc_meeting
     row_path: "$"
     row_shape: object
-    fingerprint: 9f8b05617cffe40a77561615ae6167e34d6f3748911ad34b88bec6768a60b977
+    fingerprint: 5893a045850f61fadcfffb5628ab7d8e54b7522d4834922aade49a95f7c9e275
     pagination:
       strategy: single_page
     resources:
       required: [meetingId]
-    # Mode 0 is the meeting information; mode 1 (the notes table) is only
-    # the meeting's documents. Participants are the attendee ids.
+    # Participants are the attendee ids. No artifacts: the answer is
+    # `{meeting}` alone, one Feishu request.
     fixed_inputs:
-      queryMode: 0
       includeParticipants: true
     derive:
       constants:
@@ -101,22 +102,25 @@ tables:
       - { name: url, path: meeting.url, type: utf8, nullable: true }
       - { name: calendar_event_id, path: calendar_event_id, type: utf8, nullable: true }
 
-  # One row per document Feishu wrote for a meeting
-  # (`GET /vc/v1/meetings/{id}?query_mode=1`): the 智能纪要 as kind `notes`,
-  # the 逐字稿 as kind `transcript`. Each is a document, reached by its
+  # One row per document Feishu wrote for a meeting: the 智能纪要 as kind
+  # `notes`, the 逐字稿 as kind `transcript`. With `includeArtifacts` the
+  # gateway makes TWO Feishu requests inside one call — `query_mode=0` for
+  # the meeting, `query_mode=1` for its artifacts — and answers
+  # `{meeting, relatedArtifacts}`, the artifacts a sibling of the meeting. Each is a document, reached by its
   # token in `document_path`; no body is read (design §3.2), and nothing
   # here reads a transcript (design D7).
   meeting_notes:
     action: feishu.get_vc_meeting
     row_path: "$"
     row_shape: object
-    fingerprint: 9f8b05617cffe40a77561615ae6167e34d6f3748911ad34b88bec6768a60b977
+    fingerprint: 5893a045850f61fadcfffb5628ab7d8e54b7522d4834922aade49a95f7c9e275
     pagination:
       strategy: single_page
     resources:
       required: [meetingId]
+    # No participants: no notes column reads them.
     fixed_inputs:
-      queryMode: 1
+      includeArtifacts: true
     derive:
       # Two sibling tokens, one row each. A token is ABSENT when the app
       # lacks its field scope and `""` while Feishu has not generated the
@@ -126,8 +130,8 @@ tables:
         into: doc_token
         label: kind
         from:
-          - { label: notes, path: meeting.related_artifacts.note_doc_token }
-          - { label: transcript, path: meeting.related_artifacts.verbatim_doc_token }
+          - { label: notes, path: relatedArtifacts.note_doc_token }
+          - { label: transcript, path: relatedArtifacts.verbatim_doc_token }
       constants:
         provider: feishu
         # Both documents are Feishu VC's own; `kind` tells them apart.
@@ -139,6 +143,7 @@ tables:
         url: null
     columns:
       - { name: provider, path: provider, type: utf8, nullable: false }
+      # From the meeting half of the answer, which the gateway always reads.
       - { name: meeting_id, path: meeting.id, type: utf8, nullable: false }
       # Copied onto every note so a note carries its meeting's date.
       - { name: meeting_started_at, path: meeting.start_time, type: timestamp_s_string_utc, nullable: true }

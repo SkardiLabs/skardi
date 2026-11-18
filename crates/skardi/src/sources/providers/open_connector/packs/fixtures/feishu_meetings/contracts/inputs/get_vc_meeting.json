@@ -10,12 +10,9 @@
       "type": "boolean",
       "description": "Whether to include participant data."
     },
-    "queryMode": {
-      "type": "integer",
-      "minimum": 0,
-      "maximum": 1,
-      "description": "0 returns the meeting information; 1 returns only the meeting's artifacts.",
-      "default": 0
+    "includeArtifacts": {
+      "type": "boolean",
+      "description": "Whether to also return the meeting's related artifacts (note and verbatim document tokens)."
     }
   },
   "additionalProperties": false,

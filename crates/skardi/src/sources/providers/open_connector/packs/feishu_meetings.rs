@@ -17,28 +17,30 @@
 //! Open Connector provider and the customer's own Feishu app.
 //!
 //! **The wire contract is Open Connector's.** Reconciled against a local
-//! gateway built from SkardiLabs/open-connector main ea4e040e
-//! (open-connector#24 merged: `get_vc_meeting` gained `queryMode`) on
-//! 2026-11-18. The minutes executors rebuild the page envelope —
-//! `{items, hasMore, pageToken}`, `pageToken` null on the last page — and
-//! wrap a meeting as `{meeting: ...}`, while passing Feishu's own objects
+//! gateway built from SkardiLabs/open-connector main 8a7d91a2
+//! (open-connector#28 merged: `get_vc_meeting` takes `includeArtifacts`
+//! and no longer `queryMode`) on 2026-11-18. The minutes executors rebuild
+//! the page envelope — `{items, hasMore, pageToken}`, `pageToken` null on
+//! the last page — and wrap a meeting as `{meeting: ...}`, plus
+//! `relatedArtifacts` when asked, while passing Feishu's own objects
 //! through RAW: snake_case keys, times as Unix-second DIGIT STRINGS.
-//! Inputs are camelCase strict (`additionalProperties: false`; a wrong key
-//! such as `query_mode` was checked to be a hard 400), and every input set
-//! this pack generates — the search window with and without `pageToken`,
-//! the meeting read at mode 0 with participants and at mode 1 — reached
-//! the credential wall on that gateway (`authorization_failed`, "Connect
+//! Inputs are camelCase strict (`additionalProperties: false`; the retired
+//! `queryMode` was checked to be a hard 400), and every input set this
+//! pack generates — the search window with and without `pageToken`, the
+//! meeting read with participants, and with artifacts — reached the
+//! credential wall on that gateway (`authorization_failed`, "Connect
 //! feishu with OAuth first.", HTTP 403 with `data.status` 401). The
 //! contracts under `fixtures/feishu_meetings/contracts/` were captured
 //! there.
 //!
 //! **UNPROBED: no real Feishu tenant has been read.** Every row-shape fact
 //! below comes from Feishu's API reference (`GET /vc/v1/meetings/:id` and
-//! `POST /vc/v1/meetings/search`, read 2026-11-18) and the executor source.
-//! Both action outputs are declared LOOSE (`meeting` and each search item
-//! are objects with empty `properties`), so the fingerprint gate protects
-//! no column; real rows are the only column truth, and the fixtures are
-//! SYNTHETIC. The numbered list at the end is every assumption the pack
+//! `POST /vc/v1/meetings/search`, read 2026-11-18), Feishu's Go SDK
+//! (`larksuite/oapi-sdk-go`, `service/vc/v1/model.go`) and the executor
+//! source. `meeting` and each search item are declared LOOSE (objects with
+//! empty `properties`), so the fingerprint gate protects no column read
+//! from them; `relatedArtifacts` declares its two tokens as strings. Real
+//! rows are the only column truth, and the fixtures are SYNTHETIC. The numbered list at the end is every assumption the pack
 //! leans on and the probe that settles it.
 //!
 //! Design decisions, per the integration design spec, the source-pack
@@ -56,8 +58,8 @@
 //!   topic, time and organizer exist only inside card text with highlight
 //!   tags, which is prose and never parsed (§0.3). So `meeting_search` has
 //!   one column, and the `meetings` row comes from a per-meeting read. The
-//!   cloud's `meetings` head therefore reads each listed meeting, unlike
-//!   Zoom's, whose listing carries the meeting.
+//!   cloud's `meetings` head therefore reads each listed meeting rather
+//!   than taking the meeting off the listed row.
 //! - **`meeting_search` is a cursor listing** (`pageToken` in, top-level
 //!   `$.pageToken` out, `pageSize` 30 — Feishu's documented cap; the action
 //!   declares 50), with `$.hasMore` as the end flag beside the null token.
@@ -65,14 +67,22 @@
 //!   search with neither a query nor a filter. Both are RFC 3339 with an
 //!   offset, sent verbatim as `meeting_filter.start_time` (open-connector#24;
 //!   Feishu's reference shows `2026-03-21T16:15:30+08:00`).
-//! - **One action, two modes.** `feishu.get_vc_meeting` answers a meeting's
-//!   information at `queryMode` 0 ("只查询会议信息") and only its documents at
-//!   1 ("只查询会议产物（纪要、逐字稿）"). `meetings` pins mode 0 with
-//!   `includeParticipants: true`; `meeting_notes` pins mode 1. Chosen over
-//!   `feishu.get_vc_meeting_note`, which makes two Feishu calls, needs
-//!   `vc:note:read`, and fails outright (`invalid_input`) for a meeting
-//!   that has no note, where mode 1 answers no token and the table yields
-//!   zero rows. Two reads per meeting, as Zoom's two summary reads.
+//! - **One action, two input sets.** Feishu's meeting read answers one half
+//!   per request: `query_mode` 0 the meeting ("只查询会议信息"), 1 only its
+//!   related artifacts ("只查询会议产物（纪要、逐字稿）"), as a sibling of the
+//!   meeting (the SDK's `GetMeetingRespData{meeting, related_artifacts}`,
+//!   modes `GetOnlyMeeting`/`GetOnlyRelatedArtifacts`).
+//!   `feishu.get_vc_meeting` hides the modes: without `includeArtifacts`
+//!   it makes the mode-0 request and answers `{meeting}`; with it, it makes
+//!   both requests and answers `{meeting, relatedArtifacts}`. `meetings`
+//!   pins `includeParticipants: true` (one Feishu request);
+//!   `meeting_notes` pins `includeArtifacts: true` and sends no
+//!   participants, which no notes column reads (two Feishu requests in one
+//!   gateway call). Chosen over `feishu.get_vc_meeting_note`, which needs
+//!   `vc:note:read` and fails outright (`invalid_input`) for a meeting that
+//!   has no note, where this answers no token and the table yields zero
+//!   rows. Reading both tables costs two gateway calls and three Feishu
+//!   requests per meeting.
 //! - **`meetings` columns**: `id` → `meeting_id`, `topic` → `title`,
 //!   `start_time`/`end_time` → the times (`timestamp_s_string_utc`),
 //!   `host_user.id` (an open_id under the default `user_id_type`) →
@@ -81,14 +91,16 @@
 //!   documents no series, no organizer email, no attendee email and no
 //!   calendar link on a VC meeting: `series_id`, `organizer_email`,
 //!   `attendee_emails`, `calendar_event_id` are explicit-NULL constants.
-//! - **One note row per document token, by `derive.unpivot`.** Mode 1
-//!   answers `related_artifacts.note_doc_token` (the 智能纪要) and
-//!   `verbatim_doc_token` (the 逐字稿) as sibling keys. Each is a note of its
+//! - **One note row per document token, by `derive.unpivot`.** The answer
+//!   carries `relatedArtifacts.note_doc_token` (the 智能纪要) and
+//!   `verbatim_doc_token` (the 逐字稿) as sibling keys, Feishu's own object
+//!   under the gateway's camelCase envelope key. Each is a note of its
 //!   own `kind` — `notes`, `transcript` — through the loader's `unpivot`
 //!   step, added for this pack. Per Feishu's reference a token is ABSENT
 //!   when the app lacks its field scope and `""` when permitted but not
-//!   generated yet: neither is a row, so a meeting without documents has
-//!   zero notes and its `meetings` row still stands.
+//!   generated yet: neither is a row, and the gateway answers
+//!   `relatedArtifacts: {}` when Feishu sends none. A meeting without
+//!   documents has zero notes and its `meetings` row still stands.
 //! - **`note_id` and `document_path` are the document token.** The token is
 //!   the artifact's own id — present on every note row by construction,
 //!   independent of any other field — and the document's address, passed
@@ -98,11 +110,11 @@
 //!   `docx:document:readonly` — every document the member can read — and a
 //!   second read keyed by the token. `title` and `url` are NULL: the
 //!   answer carries neither. `producer` is `feishu` on both kinds.
-//! - **`meeting_id` and `meeting_started_at` on a note come from the mode-1
-//!   answer itself** (`meeting.id`, `meeting.start_time`). That mode 1
-//!   returns them is UNPROBED (item 1). If it does not, the failure is
-//!   loud: a missing id fails the scan on the non-null column, and a note
-//!   without its meeting's start is refused by the cloud's listing.
+//! - **`meeting_id` and `meeting_started_at` on a note come from the same
+//!   answer** (`meeting.id`, `meeting.start_time`): the gateway always makes
+//!   the mode-0 request beside the artifacts one, so the meeting half is
+//!   there. Should the id ever be missing, the failure is loud: the scan
+//!   fails on the non-null column.
 //! - **No action items.** The meeting carries no minute token and Feishu
 //!   documents no meeting → minute link; `feishu.get_minutes_todos` needs a
 //!   minute token, reads an undocumented endpoint, and answers rows with no
@@ -118,29 +130,45 @@
 //! - **`error_path: None`**: the Feishu client throws on a non-zero code,
 //!   so provider failures arrive as gateway failure envelopes, pinned by
 //!   e2e tests.
-//! - **Fingerprints are pinned** from the gateway capture. Both outputs are
-//!   loose, so the coverage walker reports every column of every table
-//!   (case 1 of `fingerprint_uncovered_columns`: passthrough the schema
-//!   does not declare) — pinned so the gap stays visible.
+//! - **Fingerprints are pinned** from the gateway capture. `meeting` and
+//!   the search item are loose, so the coverage walker reports every
+//!   column of every table (case 1 of `fingerprint_uncovered_columns`:
+//!   passthrough the schema does not declare) — pinned so the gap stays
+//!   visible. The two tokens are declared under `relatedArtifacts`, so
+//!   their declared drift fails registration, though no column reads them
+//!   by that path (`unpivot` consumes them).
 //! - **Scopes**: `vc:meeting.search:read` (search),
 //!   `vc:meeting.meetingevent:read` (the meeting read), and the field
 //!   scopes `vc:meeting.artifact.note:read` and
 //!   `vc:meeting.artifact.verbatim:read`, without which the tokens are
-//!   absent and `meeting_notes` is silently empty.
+//!   absent and `meeting_notes` is silently empty. The action lists the two
+//!   field scopes in its `providerPermissions`, so default consent asks for
+//!   them; its `requiredScopes` stay the meeting read's alone, because
+//!   Feishu omits a token rather than refusing the call.
 //! - **Lark** is meant to be a near copy: `lark_meetings` changes the pack
 //!   name, the action prefix and the `provider` constant (the `lark.*`
 //!   twins of both actions have identical schemas on the same gateway). The
 //!   tests here name the provider through the constants at the top of the
 //!   test module for that reason.
 //!
+//! **Settled without a probe, by Feishu's Go SDK** (`larksuite/oapi-sdk-go`,
+//! `service/vc/v1/model.go`, `GetMeetingRespData`): the answer body is
+//! `{meeting, related_artifacts}`, the artifacts a sibling of the meeting;
+//! `note_id` is a field of `meeting`; mode 0 is `GetOnlyMeeting` and mode 1
+//! `GetOnlyRelatedArtifacts`. That is why the gateway makes both requests
+//! and this pack reads the meeting half beside the artifacts.
+//!
 //! **UNPROBED, with the probe that settles each:**
 //!
-//! 1. Mode 1 returns `meeting.id` and `meeting.start_time`. Probe:
-//!    `get_vc_meeting {meetingId, queryMode: 1}` on an own meeting with
-//!    notes; print the key set.
-//! 2. Mode 0 returns no `note_id`/`related_artifacts` (Open Connector's own
-//!    `get_vc_meeting_note` reads `note_id` at mode 0). Probe: the same
-//!    meeting at mode 0.
+//! 1. For a meeting without artifacts, the mode-1 request answers no
+//!    `related_artifacts` (so `relatedArtifacts: {}` and zero notes) rather
+//!    than an error, which would fail that meeting's notes read. Probe:
+//!    `get_vc_meeting {meetingId, includeArtifacts: true}` on an own
+//!    meeting that recorded nothing.
+//! 2. The artifacts request is refused for a meeting the member does not
+//!    own the same way the meeting request is (`403 121005`, item 9), and
+//!    never half-answers. Probe: the same read on a meeting the member
+//!    joined but did not host.
 //! 3. A token is absent without its field scope and `""` before Feishu
 //!    generates the document. Probe: a grant without
 //!    `vc:meeting.artifact.verbatim:read`; a meeting read right after it
@@ -165,8 +193,8 @@
 //!    host.
 //! 10. A meeting older than 90 days answers `404 121004`. Probe.
 //! 11. `start_time`/`end_time` are second digit strings; what `end_time` is
-//!     for a meeting still running (`"0"` reads as 1970). Probe: mode 0
-//!     during a meeting.
+//!     for a meeting still running (`"0"` reads as 1970). Probe: the
+//!     meeting read during a meeting.
 //! 12. What `participants[].id` holds for an external guest, a room or a
 //!     phone participant (`user_type`). Probe: such a meeting.
 //! 13. `host_user.id` is the host's open_id. Probe: compare with
@@ -240,6 +268,8 @@ mod tests {
     use datafusion::prelude::SessionContext;
     use rstest::rstest;
     use serde_json::{Value, json};
+    use std::error::Error;
+    use std::iter::successors;
 
     // The provider-specific literals, in one place: `lark_meetings` is this
     // module with these four changed (the fixtures are shared).
@@ -452,19 +482,28 @@ mod tests {
             table("meeting_notes").fields.len(),
             "an empty batch still carries the fixed schema"
         );
-        // No field scope: the key is absent. Still zero rows, no error.
+        // No field scope: the token keys are absent, and the gateway answers
+        // `relatedArtifacts: {}` when Feishu sends no artifacts at all.
+        // Still zero rows, no error.
         let mut unscoped = pending.clone();
-        unscoped["meeting"]
+        unscoped["relatedArtifacts"] = json!({});
+        assert_eq!(
+            convert_first_page(table("meeting_notes"), &unscoped).num_rows(),
+            0
+        );
+        // An answer without `relatedArtifacts` (the meeting half alone):
+        // zero rows too, never a failure.
+        unscoped
             .as_object_mut()
-            .expect("meeting object")
-            .remove("related_artifacts");
+            .expect("answer object")
+            .remove("relatedArtifacts");
         assert_eq!(
             convert_first_page(table("meeting_notes"), &unscoped).num_rows(),
             0
         );
         // One scope held (notes only): one row, of that kind.
         let mut notes_only = pending;
-        notes_only["meeting"]["related_artifacts"] = json!({"note_doc_token": NOTES_TOKEN});
+        notes_only["relatedArtifacts"] = json!({"note_doc_token": NOTES_TOKEN});
         let batch = convert_first_page(table("meeting_notes"), &notes_only);
         assert_eq!(
             column_values(std::slice::from_ref(&batch), "kind"),
@@ -517,10 +556,12 @@ mod tests {
     fn a_document_token_that_is_not_a_scalar_fails_the_derivation_by_kind() {
         // Upstream drift on a token — an object where the string was —
         // fails loudly with the table, step and kind, never as zero notes.
+        // (The contract now declares both tokens as strings, so declared
+        // drift fails registration first; this is the undeclared case.)
         let mut page = fixture(include_str!(
             "fixtures/feishu_meetings/meeting_artifacts.json"
         ));
-        page["meeting"]["related_artifacts"]["verbatim_doc_token"] = json!({"token": "x"});
+        page["relatedArtifacts"]["verbatim_doc_token"] = json!({"token": "x"});
         let t = table("meeting_notes");
         let err = t
             .derive
@@ -537,7 +578,7 @@ mod tests {
             } => {
                 assert_eq!(table, format!("{PACK_NAME}.meeting_notes"));
                 assert_eq!(step, "unpivot");
-                assert_eq!(path, "meeting.related_artifacts.verbatim_doc_token");
+                assert_eq!(path, "relatedArtifacts.verbatim_doc_token");
                 assert_eq!(found, "an object");
             }
             other => panic!("expected RowDerivationFailed, got {other}"),
@@ -546,8 +587,10 @@ mod tests {
 
     #[test]
     fn a_documents_answer_without_the_meeting_id_fails_loudly() {
-        // UNPROBED item 1: if mode 1 omits `meeting.id`, every note fails
-        // on the non-null column rather than landing under no meeting.
+        // The gateway always reads the meeting half beside the artifacts,
+        // and Feishu's SDK types `meeting.id` there. Should it ever be
+        // missing, every note fails on the non-null column rather than
+        // landing under no meeting.
         let mut page = fixture(include_str!(
             "fixtures/feishu_meetings/meeting_artifacts.json"
         ));
@@ -605,7 +648,7 @@ mod tests {
         // The fingerprint gate hashes OUTPUT schemas only; both actions are
         // `additionalProperties: false`, so an undeclared key is a 400 on
         // every scan. Both sides here are committed artifacts (gateway
-        // built from open-connector main ea4e040e).
+        // built from open-connector main 8a7d91a2).
         let search =
             include_str!("fixtures/feishu_meetings/contracts/inputs/search_vc_meetings.json");
         let get = include_str!("fixtures/feishu_meetings/contracts/inputs/get_vc_meeting.json");
@@ -693,10 +736,12 @@ mod tests {
     }
 
     #[test]
-    fn the_two_meeting_reads_pin_their_query_modes() {
-        // Mode 0 is the meeting's information, mode 1 only its documents;
-        // swapping them would leave each table reading fields its answer
-        // never carries.
+    fn the_two_meeting_reads_pin_their_inputs() {
+        // `meetings` asks for participants and no artifacts (one Feishu
+        // request); `meeting_notes` asks for the artifacts and no
+        // participants (two Feishu requests in one call). Without
+        // `includeArtifacts` the notes table would read no token and be
+        // silently empty.
         let fixed = |short: &str| -> Vec<(&str, Value)> {
             let mut pairs: Vec<(&str, Value)> = table(short)
                 .fixed_inputs
@@ -708,12 +753,12 @@ mod tests {
         };
         assert_eq!(
             fixed("meetings"),
-            vec![
-                ("includeParticipants", json!(true)),
-                ("queryMode", json!(0))
-            ]
+            vec![("includeParticipants", json!(true))]
         );
-        assert_eq!(fixed("meeting_notes"), vec![("queryMode", json!(1))]);
+        assert_eq!(
+            fixed("meeting_notes"),
+            vec![("includeArtifacts", json!(true))]
+        );
         assert!(table("meeting_search").fixed_inputs.is_empty());
         for short in ["meetings", "meeting_notes"] {
             assert_eq!(table(short).action_id, GET, "{short}");
@@ -728,9 +773,13 @@ mod tests {
 
     #[test]
     fn columns_the_coverage_walker_cannot_resolve_are_pinned() {
-        // Both outputs are loose objects (empty `properties`), so no column
-        // resolves under them: case 1 of the walker, a real gap only real
-        // rows can close. Pinned so it stays visible.
+        // The search item and `meeting` are loose objects (empty
+        // `properties`), so no column resolves under them: case 1 of the
+        // walker, a real gap only real rows can close. Pinned so it stays
+        // visible. The two document tokens ARE declared (under
+        // `relatedArtifacts`), but no column reads them by that path —
+        // `unpivot` consumes them into `doc_token` — so they never appear
+        // here; their declared drift still fails registration.
         let search = include_str!("fixtures/feishu_meetings/contracts/search_vc_meetings.json");
         let get = include_str!("fixtures/feishu_meetings/contracts/get_vc_meeting.json");
         for (short, contract) in [
@@ -751,22 +800,10 @@ mod tests {
     #[test]
     fn the_contract_tables_carry_the_contracts_column_names_in_order() {
         // The cloud's recipe, item tables and ontology recipe name these
-        // columns; a rename here is a contract break there. They are
-        // Zoom's, column for column.
+        // columns; a rename here is a contract break there. The lists are
+        // the contract's (design §3.2), the same for every meeting pack.
         let names =
             |short: &str| -> Vec<&str> { table(short).fields.iter().map(|f| f.name).collect() };
-        let zoom = |short: &str| -> Vec<&str> {
-            super::super::zoom::pack()
-                .expect("zoom pack parses")
-                .tables
-                .iter()
-                .find(|t| t.id.rsplit('.').next() == Some(short))
-                .unwrap_or_else(|| panic!("zoom table {short}"))
-                .fields
-                .iter()
-                .map(|f| f.name)
-                .collect()
-        };
         assert_eq!(
             names("meetings"),
             [
@@ -800,7 +837,6 @@ mod tests {
             ]
         );
         for short in ["meetings", "meeting_notes"] {
-            assert_eq!(names(short), zoom(short), "{short}: the same shape as Zoom");
             let t = table(short);
             let non_null: Vec<&str> = t
                 .fields
@@ -892,13 +928,18 @@ bindings:
     const WINDOW_JSON: &str =
         r#"{"startTime": "2026-11-01T00:00:00Z", "endTime": "2026-11-08T00:00:00Z"}"#;
 
-    /// One meeting answer per mode, keyed on the request's `queryMode`.
+    /// The gateway's two answers: `{meeting, relatedArtifacts}` with
+    /// `includeArtifacts`, `{meeting}` without. `queryMode` is no longer an
+    /// input; the real gateway refuses it, and so does this stub.
     fn meeting_answer(body: &str) -> MockResponse {
         let body: Value = serde_json::from_str(body).unwrap_or_default();
-        let answer = match body["input"]["queryMode"].as_i64() {
-            Some(0) => include_str!("fixtures/feishu_meetings/meeting.json"),
-            Some(1) => include_str!("fixtures/feishu_meetings/meeting_artifacts.json"),
-            _ => return MockResponse::new(400, "queryMode must be pinned"),
+        if body["input"].get("queryMode").is_some() {
+            return MockResponse::new(400, "queryMode is not an input");
+        }
+        let answer = if body["input"]["includeArtifacts"] == true {
+            include_str!("fixtures/feishu_meetings/meeting_artifacts.json")
+        } else {
+            include_str!("fixtures/feishu_meetings/meeting.json")
         };
         MockResponse::ok(&envelope_ok(answer))
     }
@@ -998,10 +1039,10 @@ bindings:
     }
 
     #[tokio::test]
-    async fn the_meeting_reads_send_exactly_their_mode_and_the_meeting_id() {
+    async fn the_meeting_reads_send_exactly_their_inputs_and_the_meeting_id() {
         // Both object-row tables bound to one meeting: each issues exactly
-        // one request, `meetings` at mode 0 with participants, the notes at
-        // mode 1 without; the window keys of the same binding never travel.
+        // one request, `meetings` with participants, the notes with the
+        // artifacts; the window keys of the same binding never travel.
         let gateway = MockGateway::start(|req| {
             if req.method == "GET" && req.path == "/v1/health" {
                 return MockResponse::ok("{}");
@@ -1062,31 +1103,28 @@ bindings:
             2,
             "one request per table, never a second page"
         );
-        let mut by_mode: Vec<(i64, Vec<&str>)> = inputs
+        let mut key_sets: Vec<Vec<&str>> = inputs
             .iter()
             .map(|input| {
                 assert_eq!(input["meetingId"], MEETING);
-                (
-                    input["queryMode"].as_i64().expect("queryMode is pinned"),
-                    input_keys(input),
-                )
+                input_keys(input)
             })
             .collect();
-        by_mode.sort_by_key(|(mode, _)| *mode);
+        key_sets.sort();
         assert_eq!(
-            by_mode,
+            key_sets,
             vec![
-                (0, vec!["includeParticipants", "meetingId", "queryMode"]),
-                (1, vec!["meetingId", "queryMode"]),
+                vec!["includeArtifacts", "meetingId"],
+                vec!["includeParticipants", "meetingId"],
             ]
         );
-        assert_eq!(
-            inputs
-                .iter()
-                .filter(|i| i["includeParticipants"] == true)
-                .count(),
-            1
-        );
+        for flag in ["includeArtifacts", "includeParticipants"] {
+            assert_eq!(
+                inputs.iter().filter(|i| i[flag] == true).count(),
+                1,
+                "{flag} is sent true by exactly one table"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1120,7 +1158,8 @@ bindings:
     #[tokio::test]
     async fn the_two_reads_sharing_one_cache_never_replay_each_others_rows() {
         // With the scan cache on, the two tables are the same action and
-        // resource; the mode and the table differ, and so do the rows.
+        // resource; the fixed inputs and the table differ, and so do the
+        // rows.
         let gateway = MockGateway::start(|req| {
             if req.method == "GET" && req.path == "/v1/health" {
                 return MockResponse::ok("{}");
@@ -1272,7 +1311,21 @@ bindings:
         r#"{ meetingId: "7000000000000000009" }"#,
         GET,
         403,
-        envelope_err("authorization_failed", "no permission")
+        // The gateway's full failure shape, as it forwards a provider
+        // refusal: Feishu's HTTP status and code under `data`, the action
+        // echoed under `meta`. Feishu's code here is the reference's
+        // `121005 no permission`; the envelope itself is UNPROBED.
+        json!({
+            "success": false,
+            "message": "no permission",
+            "errorCode": "authorization_failed",
+            "data": {
+                "status": 403,
+                "details": {"providerStatus": 403, "providerCode": 121005}
+            },
+            "meta": {"actionId": "feishu.get_vc_meeting"}
+        })
+        .to_string()
     )]
     #[tokio::test]
     async fn provider_refusals_surface_through_the_gateway_failure_envelope(
@@ -1323,6 +1376,29 @@ bindings:
             message.contains(code) && message.contains(action),
             "the gateway's error code and the action are named: {message}"
         );
+        // The typed failure survives DataFusion's wrapping: walk the chain
+        // from the error itself. `(*cause)`, not `cause`: on the
+        // `&&dyn Error` the closure receives, `source` resolves to the
+        // `Error` impl for `&T` and borrows the closure's argument rather
+        // than the error behind it.
+        let typed = successors(Some(&err as &(dyn Error + 'static)), |cause| {
+            (*cause).source()
+        })
+        .find_map(|cause| cause.downcast_ref::<OpenConnectorError>())
+        .unwrap_or_else(|| panic!("an OpenConnectorError in the chain: {message}"));
+        match typed {
+            OpenConnectorError::ActionExecutionFailed {
+                action_id,
+                status: got_status,
+                error_code,
+                ..
+            } => {
+                assert_eq!(action_id, action);
+                assert_eq!(*got_status, Some(status));
+                assert_eq!(error_code.as_deref(), Some(code));
+            }
+            other => panic!("expected ActionExecutionFailed, got {other}"),
+        }
     }
 
     #[tokio::test]

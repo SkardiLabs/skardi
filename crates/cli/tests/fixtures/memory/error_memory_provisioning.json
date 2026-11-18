@@ -1,0 +1,5 @@
+{
+  "success": false,
+  "code": "memory_provisioning",
+  "error": "this workspace's database is being prepared; save again at the next milestone"
+}

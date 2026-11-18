@@ -56,7 +56,6 @@ pub fn builtin_pack_registry() -> Result<SourcePackRegistry, OpenConnectorError>
         packs::one_drive::pack()?,
         packs::google_drive::pack()?,
         packs::whatsapp::pack()?,
-        packs::zoom::pack()?,
         packs::feishu_meetings::pack()?,
     ])
 }
@@ -115,21 +114,14 @@ mod tests {
         // gate covers only the declared keys; the executor's normalizer
         // emits exactly those, which the live pass confirms column by column.
         //
-        // `zoom.meeting_notes` and `zoom.meeting_action_items` are the fourth
-        // and fifth, over the same point read: `get_meeting_summary` takes
-        // one `meetingUuid` and answers the one summary Zoom keeps for that
-        // meeting instance. The response object is the row for the note;
-        // for the items the pack's `derive.explode` turns that one object
-        // into a row per `nextSteps[]` string — still an object-shaped
-        // table, since the shape names how the RESPONSE is read, and the
-        // derivation runs after.
-        //
         // `feishu_meetings.meetings` and `feishu_meetings.meeting_notes` are
-        // the sixth and seventh, over one point read: `get_vc_meeting` takes
-        // one `meetingId` and answers that meeting, at `queryMode` 0 (its
-        // information: the `meetings` row) or 1 (its documents: the
-        // pack's `derive.unpivot` turns the two document tokens into one
-        // note row each).
+        // the fourth and fifth, over one point read: `get_vc_meeting` takes
+        // one `meetingId` and answers that meeting, `{meeting}` (the
+        // `meetings` row) or, with `includeArtifacts`, `{meeting,
+        // relatedArtifacts}` (the pack's `derive.unpivot` turns the two
+        // document tokens into one note row each) — still object-shaped
+        // tables, since the shape names how the RESPONSE is read, and the
+        // derivation runs after.
         //
         // `lark.document_content` mirrors `feishu.document_content` exactly:
         // Lark is Feishu's international edition, and `packs/lark.yaml` is
@@ -142,8 +134,6 @@ mod tests {
             "lark.document_content",
             "notion.page_markdown",
             "whatsapp.business_profile",
-            "zoom.meeting_action_items",
-            "zoom.meeting_notes",
         ];
 
         let registry = super::builtin_pack_registry().expect("embedded assets parse");
@@ -249,8 +239,7 @@ mod tests {
                 "one_drive",
                 "outlook",
                 "slack",
-                "whatsapp",
-                "zoom"
+                "whatsapp"
             ]
         );
     }
