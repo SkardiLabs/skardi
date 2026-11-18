@@ -1021,7 +1021,10 @@ bindings:
         let (gateway, ctx) = setup_with_gateway(
             gateway,
             "SKARDI_TEST_OC_FEISHU_MEETINGS_READS",
-            "meetings, meeting_notes",
+            // `meeting_search` is bound (never scanned) so the window keys
+            // are declared by some table: registration refuses a resource
+            // key no bound table consumes.
+            "meetings, meeting_notes, meeting_search",
             &resource,
         )
         .await;
