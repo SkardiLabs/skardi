@@ -266,6 +266,33 @@ fn reads_below(read: &str, key: &str) -> bool {
         .is_some_and(|(parent, _)| parent == key)
 }
 
+/// Refuse a step's consumed paths when one is the same as another or lies
+/// below it (`payload` and `payload.items`). No answer satisfies both — the
+/// upper path must hold `holds` (an array, a scalar), the lower one needs it
+/// to be the object it descends into — so the step could only ever read one
+/// of them, and the other's drift would be consumed unseen.
+fn check_disjoint_paths(id: &str, step: &str, holds: &str, paths: &[&str]) -> Result<(), String> {
+    for (position, first) in paths.iter().enumerate() {
+        for second in &paths[position + 1..] {
+            if first == second {
+                return Err(format!("{id}: {step} reads the path '{first}' twice"));
+            }
+            let (upper, lower) = if reads_at_or_below(second, first) {
+                (first, second)
+            } else if reads_at_or_below(first, second) {
+                (second, first)
+            } else {
+                continue;
+            };
+            return Err(format!(
+                "{id}: {step} reads '{lower}' below '{upper}'; no answer holds {holds} at \
+                 '{upper}' and a value inside it"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The `derive:` block's own invariants. Serde guarantees its shape; these
 /// are the ways a derivation could be declared and do nothing, or do
 /// something other than what its author read.
@@ -290,6 +317,7 @@ fn validate_derive(table: &SourcePackTable) -> Result<(), String> {
         for path in explode.paths {
             check_row_relative_path(id, "derive explode", path)?;
         }
+        check_disjoint_paths(id, "derive explode", "an array", explode.paths)?;
         check_derived_key(id, "derive explode `into`", explode.into)?;
         if let Some(index) = explode.index {
             check_derived_key(id, "derive explode `index`", index)?;
@@ -344,6 +372,8 @@ fn validate_derive(table: &SourcePackTable) -> Result<(), String> {
                 ));
             }
         }
+        let from: Vec<&str> = unpivot.from.iter().map(|field| field.path).collect();
+        check_disjoint_paths(id, "derive unpivot", "a scalar", &from)?;
         check_derived_key(id, "derive unpivot `into`", unpivot.into)?;
         check_derived_key(id, "derive unpivot `label`", unpivot.label)?;
         // The same reason explode is refused there: the consumer's row
@@ -2682,6 +2712,78 @@ tables:
         )
         .expect_err("unpivot on page_number");
         assert!(err.contains("page_number/keyset"), "{err}");
+    }
+
+    #[test]
+    fn consumed_paths_at_or_below_one_another_are_refused() {
+        // Explode: an array cannot also be the object holding another path.
+        const EXPLODE_HEAD: &str = r#"    action: demo.get
+    row_path: "$"
+    row_shape: object
+    pagination: { strategy: single_page }
+    columns:
+      - { name: id, path: summary.id, type: utf8, nullable: false }
+      - { name: text, path: text, type: utf8, nullable: true }
+"#;
+        // Unpivot: a scalar cannot either.
+        const UNPIVOT_HEAD: &str = r#"    action: demo.get
+    row_path: "$"
+    row_shape: object
+    pagination: { strategy: single_page }
+    columns:
+      - { name: id, path: meeting.id, type: utf8, nullable: false }
+      - { name: token, path: token, type: utf8, nullable: true }
+      - { name: kind, path: kind, type: utf8, nullable: true }
+"#;
+        for (table, expected) in [
+            (
+                format!(
+                    "{EXPLODE_HEAD}    derive: {{ explode: {{ paths: [payload, payload.items], into: text }} }}"
+                ),
+                "derive explode reads 'payload.items' below 'payload'; no answer holds an array at 'payload' and a value inside it",
+            ),
+            (
+                format!(
+                    "{EXPLODE_HEAD}    derive: {{ explode: {{ paths: [payload.items, payload], into: text }} }}"
+                ),
+                "derive explode reads 'payload.items' below 'payload'",
+            ),
+            (
+                format!(
+                    "{EXPLODE_HEAD}    derive: {{ explode: {{ paths: [payload, payload], into: text }} }}"
+                ),
+                "derive explode reads the path 'payload' twice",
+            ),
+            (
+                format!(
+                    "{UNPIVOT_HEAD}    derive: {{ unpivot: {{ into: token, label: kind, from: [{{ label: a, path: x }}, {{ label: b, path: x.y }}] }} }}"
+                ),
+                "derive unpivot reads 'x.y' below 'x'; no answer holds a scalar at 'x' and a value inside it",
+            ),
+            (
+                format!(
+                    "{UNPIVOT_HEAD}    derive: {{ unpivot: {{ into: token, label: kind, from: [{{ label: a, path: x.y.z }}, {{ label: b, path: x.y }}] }} }}"
+                ),
+                "derive unpivot reads 'x.y.z' below 'x.y'",
+            ),
+        ] {
+            let err = pack_with(&table).expect_err(expected);
+            assert!(err.contains(expected), "want {expected:?} in: {err}");
+        }
+        // Siblings and keys that merely share a text prefix are not nested.
+        for table in [
+            format!(
+                "{EXPLODE_HEAD}    derive: {{ explode: {{ paths: [payload, payloads], into: text }} }}"
+            ),
+            format!(
+                "{EXPLODE_HEAD}    derive: {{ explode: {{ paths: [payload.a, payload.b], into: text }} }}"
+            ),
+            format!(
+                "{UNPIVOT_HEAD}    derive: {{ unpivot: {{ into: token, label: kind, from: [{{ label: a, path: x.y }}, {{ label: b, path: x.yz }}] }} }}"
+            ),
+        ] {
+            pack_with(&table).unwrap_or_else(|err| panic!("{table}: {err}"));
+        }
     }
 
     #[test]
