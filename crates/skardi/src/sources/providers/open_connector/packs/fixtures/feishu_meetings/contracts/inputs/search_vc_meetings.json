@@ -1,0 +1,59 @@
+{
+  "type": "object",
+  "properties": {
+    "query": {
+      "type": "string",
+      "description": "Full-text search terms for video meetings."
+    },
+    "participantIds": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "description": "A participant user ID."
+      },
+      "description": "Participant user IDs to match."
+    },
+    "organizerIds": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "description": "An organizer user ID."
+      },
+      "description": "Organizer user IDs to match."
+    },
+    "roomIds": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "description": "A meeting room ID."
+      },
+      "description": "Meeting room IDs to match."
+    },
+    "startTime": {
+      "type": "string",
+      "description": "The earliest creation or meeting start time.",
+      "format": "date-time"
+    },
+    "endTime": {
+      "type": "string",
+      "description": "The latest creation or meeting end time.",
+      "format": "date-time"
+    },
+    "pageSize": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 50,
+      "description": "The maximum number of results on this page."
+    },
+    "pageToken": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The page token returned by the previous request."
+    }
+  },
+  "additionalProperties": false,
+  "description": "Describe the video meeting search."
+}

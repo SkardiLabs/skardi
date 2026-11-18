@@ -1,0 +1,26 @@
+{
+  "type": "object",
+  "properties": {
+    "meetingId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The Feishu video meeting ID."
+    },
+    "includeParticipants": {
+      "type": "boolean",
+      "description": "Whether to include participant data."
+    },
+    "queryMode": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 1,
+      "description": "0 returns the meeting information; 1 returns only the meeting's artifacts.",
+      "default": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "meetingId"
+  ],
+  "description": "Identify the meeting."
+}

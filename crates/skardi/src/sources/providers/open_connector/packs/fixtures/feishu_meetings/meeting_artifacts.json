@@ -1,0 +1,11 @@
+{
+  "meeting": {
+    "id": "7000000000000000001",
+    "start_time": "1793610000",
+    "note_id": "note_synthetic_0001",
+    "related_artifacts": {
+      "note_doc_token": "docx_synthetic_notes_0001",
+      "verbatim_doc_token": "docx_synthetic_verbatim_0001"
+    }
+  }
+}

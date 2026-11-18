@@ -1,13 +1,13 @@
 //! The built-in source packs this Skardi build ships, and their tests.
 //!
 //! `skardi-source-pack` owns `SourcePackRegistry`; this owns what goes in it.
-//! The split is content versus machinery: twelve provider assets are this
+//! The split is content versus machinery: thirteen provider assets are this
 //! binary's choices, and a library that hardcoded them would be making its
 //! consumers' choices too — cloud registers a different set against the same
 //! type.
 //!
 //! The tests came here with the content rather than staying with the type they
-//! call. Every one of them asserts something about the twelve assets — that
+//! call. Every one of them asserts something about the thirteen assets — that
 //! github's pack is registered, that iteration is in name order, that the
 //! reconciled set matches what the cloud pin carried — which is a fact about
 //! this build, not about a registry.
@@ -20,7 +20,7 @@ use super::packs;
 /// The built-in source packs this Skardi build ships.
 ///
 /// The list lives here rather than in `skardi-source-pack` because it is
-/// CONTENT, not machinery: twelve provider assets are this binary's choices,
+/// CONTENT, not machinery: thirteen provider assets are this binary's choices,
 /// and a library that hardcoded them would be making its consumers' choices
 /// too. The pack owns `SourcePackRegistry`; callers supply what goes in it,
 /// which is what lets cloud register a different set against the same type.
@@ -56,6 +56,7 @@ pub fn builtin_pack_registry() -> Result<SourcePackRegistry, OpenConnectorError>
         packs::one_drive::pack()?,
         packs::google_drive::pack()?,
         packs::whatsapp::pack()?,
+        packs::feishu_meetings::pack()?,
     ])
 }
 
@@ -113,12 +114,22 @@ mod tests {
         // gate covers only the declared keys; the executor's normalizer
         // emits exactly those, which the live pass confirms column by column.
         //
+        // `feishu_meetings.meetings` and `feishu_meetings.meeting_notes` are
+        // the fourth and fifth, over one point read: `get_vc_meeting` takes
+        // one `meetingId` and answers that meeting, at `queryMode` 0 (its
+        // information: the `meetings` row) or 1 (its documents: the pack's
+        // `derive.unpivot` turns the two document tokens into one note row
+        // each) — still object-shaped tables, since the shape names how the
+        // RESPONSE is read, and the derivation runs after.
+        //
         // `lark.document_content` mirrors `feishu.document_content` exactly:
         // Lark is Feishu's international edition, and `packs/lark.yaml` is
         // the feishu pack with every `feishu.*` action renamed `lark.*` (see
         // the warning at the top of that file about what remains unverified).
         const OBJECT_ROW_TABLES: &[&str] = &[
             "feishu.document_content",
+            "feishu_meetings.meeting_notes",
+            "feishu_meetings.meetings",
             "lark.document_content",
             "notion.page_markdown",
             "whatsapp.business_profile",
@@ -217,6 +228,7 @@ mod tests {
                 "discord",
                 "dropbox",
                 "feishu",
+                "feishu_meetings",
                 "github",
                 "gmail",
                 "google_drive",
