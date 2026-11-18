@@ -34,7 +34,9 @@ use std::sync::OnceLock;
 use serde::Deserialize;
 
 use crate::sources::providers::open_connector::error::OpenConnectorError;
-use skardi_source_pack::derive::{Explode, RowDerivation, template_placeholders};
+use skardi_source_pack::derive::{
+    Explode, RowDerivation, Unpivot, UnpivotField, template_placeholders,
+};
 // `Operator` here is the pack's neutral declaration, not DataFusion's.
 // The loader reads YAML and writes declarations; nothing about that needs
 // a query planner, and it used to convert to DataFusion's on the way in
@@ -128,6 +130,20 @@ fn convert_table(
                     paths: leak_str_slice(explode.paths),
                     into: leak_str(explode.into),
                     index: explode.index.map(leak_str),
+                }),
+                unpivot: derive.unpivot.map(|unpivot| Unpivot {
+                    from: leak_slice(
+                        unpivot
+                            .from
+                            .into_iter()
+                            .map(|field| UnpivotField {
+                                label: leak_str(field.label),
+                                path: leak_str(field.path),
+                            })
+                            .collect(),
+                    ),
+                    into: leak_str(unpivot.into),
+                    label: leak_str(unpivot.label),
                 }),
                 constants: leak_slice(constants),
                 format: leak_slice(
@@ -261,7 +277,7 @@ fn validate_derive(table: &SourcePackTable) -> Result<(), String> {
     if derive.is_empty() {
         return Err(format!(
             "{id}: `derive` declares nothing; drop the block or declare one of skip_when_null, \
-             explode, constants, format"
+             explode, unpivot, constants, format"
         ));
     }
     if let Some(path) = derive.skip_when_null {
@@ -289,6 +305,55 @@ fn validate_derive(table: &SourcePackTable) -> Result<(), String> {
         ) {
             return Err(format!(
                 "{id}: derive explode is declared on a page_number/keyset table; explode is \
+                 supported with the cursor and single_page strategies"
+            ));
+        }
+    }
+    if let Some(unpivot) = &derive.unpivot {
+        // Two row-multiplying steps on one table would multiply each
+        // other's rows, and the consumed paths of one could hide below the
+        // other's; no table has needed both.
+        if derive.explode.is_some() {
+            return Err(format!(
+                "{id}: derive declares both explode and unpivot; a table turns its rows one way"
+            ));
+        }
+        if unpivot.from.is_empty() {
+            return Err(format!("{id}: derive unpivot names no `from` fields"));
+        }
+        let mut labels = HashSet::new();
+        let mut paths = HashSet::new();
+        for field in unpivot.from {
+            if field.label.trim().is_empty() {
+                return Err(format!(
+                    "{id}: derive unpivot field '{}' has an empty label",
+                    field.path
+                ));
+            }
+            if !labels.insert(field.label) {
+                return Err(format!(
+                    "{id}: derive unpivot names the label '{}' twice",
+                    field.label
+                ));
+            }
+            check_row_relative_path(id, "derive unpivot", field.path)?;
+            if !paths.insert(field.path) {
+                return Err(format!(
+                    "{id}: derive unpivot reads the path '{}' twice",
+                    field.path
+                ));
+            }
+        }
+        check_derived_key(id, "derive unpivot `into`", unpivot.into)?;
+        check_derived_key(id, "derive unpivot `label`", unpivot.label)?;
+        // The same reason explode is refused there: the consumer's row
+        // count no longer tracks the wire's.
+        if matches!(
+            table.pagination,
+            PaginationStrategy::PageNumber { .. } | PaginationStrategy::Keyset { .. }
+        ) {
+            return Err(format!(
+                "{id}: derive unpivot is declared on a page_number/keyset table; unpivot is \
                  supported with the cursor and single_page strategies"
             ));
         }
@@ -336,6 +401,36 @@ fn validate_derive(table: &SourcePackTable) -> Result<(), String> {
             }
         }
     }
+    // Unpivot consumes its paths the same way: a derived row carries the
+    // field's value under `into`, never the field itself.
+    if let Some(unpivot) = &derive.unpivot {
+        for path in unpivot.from.iter().map(|field| field.path) {
+            if let Some(field) = table
+                .fields
+                .iter()
+                .find(|field| reads_at_or_below(field.path, path))
+            {
+                return Err(format!(
+                    "{id}: column '{}' reads '{}', which derive unpivot consumes; a derived row \
+                     carries the value under '{}', not the field",
+                    field.name, field.path, unpivot.into
+                ));
+            }
+            for (key, template) in derive.format {
+                let placeholders = template_placeholders(template).unwrap_or_default();
+                if let Some(read) = placeholders
+                    .iter()
+                    .find(|read| reads_at_or_below(read, path))
+                {
+                    return Err(format!(
+                        "{id}: derive format '{key}' reads '{read}', which derive unpivot \
+                         consumes; a derived row carries the value under '{}', not the field",
+                        unpivot.into
+                    ));
+                }
+            }
+        }
+    }
     // One key, one writer: a key two steps write would be whichever ran
     // last, and the order is an implementation fact, not a declaration.
     let written = derive.written_keys();
@@ -343,7 +438,7 @@ fn validate_derive(table: &SourcePackTable) -> Result<(), String> {
     for key in &written {
         if !seen.insert(*key) {
             return Err(format!(
-                "{id}: derive writes '{key}' twice (across explode, constants and format)"
+                "{id}: derive writes '{key}' twice (across explode, unpivot, constants and format)"
             ));
         }
     }
@@ -402,6 +497,11 @@ fn validate_derive(table: &SourcePackTable) -> Result<(), String> {
     let mut non_object_keys: Vec<(&str, &str)> = Vec::new();
     if let Some(index) = derive.explode.and_then(|explode| explode.index) {
         non_object_keys.push(("explode `index`", index));
+    }
+    // Unpivot yields a row only for a scalar value, and its label is text.
+    if let Some(unpivot) = &derive.unpivot {
+        non_object_keys.push(("unpivot `into`", unpivot.into));
+        non_object_keys.push(("unpivot `label`", unpivot.label));
     }
     for (key, value) in derive.constants {
         if !matches!(value, FixedValue::Json(json) if json.is_object()) {
@@ -531,6 +631,20 @@ fn validate_table(table: &SourcePackTable) -> Result<(), String> {
             {
                 return Err(format!(
                     "{id}: filter on '{}' ({:?}) reads '{}', from which derive explode removes \
+                     '{path}'; the gateway would evaluate the pushed predicate against the wire \
+                     value, which still carries it",
+                    filter.column, filter.operator, field.path
+                ));
+            }
+            if let Some(unpivot) = &derive.unpivot
+                && let Some(path) = unpivot
+                    .from
+                    .iter()
+                    .map(|field| field.path)
+                    .find(|path| reads_at_or_below(path, field.path))
+            {
+                return Err(format!(
+                    "{id}: filter on '{}' ({:?}) reads '{}', from which derive unpivot removes \
                      '{path}'; the gateway would evaluate the pushed predicate against the wire \
                      value, which still carries it",
                     filter.column, filter.operator, field.path
@@ -960,6 +1074,7 @@ struct TableDoc {
 /// `explode` consumes its `paths`: a derived row carries each element under
 /// `into` and none of the listed arrays, so no column path and no `format`
 /// placeholder may read at or below one (`validate_derive` refuses it).
+/// `unpivot` consumes its `from` paths the same way.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DeriveDoc {
@@ -967,6 +1082,8 @@ struct DeriveDoc {
     skip_when_null: Option<String>,
     #[serde(default)]
     explode: Option<ExplodeDoc>,
+    #[serde(default)]
+    unpivot: Option<UnpivotDoc>,
     /// BTreeMap so the written keys (and so any collision error) are
     /// deterministic regardless of asset layout.
     #[serde(default)]
@@ -982,6 +1099,25 @@ struct ExplodeDoc {
     into: String,
     #[serde(default)]
     index: Option<String>,
+}
+
+/// `unpivot` consumes its `from` paths: a derived row carries the field's
+/// value under `into` and its label under `label`, and none of the fields,
+/// so no column path and no `format` placeholder may read at or below one.
+/// `from` is a list, not a map, so the rows come out in the order written.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UnpivotDoc {
+    from: Vec<UnpivotFieldDoc>,
+    into: String,
+    label: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UnpivotFieldDoc {
+    label: String,
+    path: String,
 }
 
 #[derive(Deserialize, Default, Clone, Copy)]
@@ -2327,6 +2463,175 @@ tables:
       - { name: text, path: text, type: utf8, nullable: true }"#,
         )
         .expect("a template reading the exploded index is legal");
+    }
+
+    /// An object-row table turning two sibling tokens into one row each,
+    /// the Feishu meeting-notes shape.
+    const UNPIVOT_TABLE: &str = r#"    action: demo.get
+    row_path: "$"
+    row_shape: object
+    pagination: { strategy: single_page }
+    resources: { required: [id] }
+    derive:
+      unpivot:
+        into: token
+        label: kind
+        from:
+          - { label: notes, path: meeting.artifacts.notes }
+          - { label: transcript, path: meeting.artifacts.verbatim }
+      constants: { provider: demo }
+      format: { note_key: "{meeting.id}#{kind}" }
+    columns:
+      - { name: provider, path: provider, type: utf8, nullable: false }
+      - { name: meeting_id, path: meeting.id, type: utf8, nullable: false }
+      - { name: note_id, path: token, type: utf8, nullable: false }
+      - { name: kind, path: kind, type: utf8, nullable: true }
+      - { name: note_key, path: note_key, type: utf8, nullable: true }"#;
+
+    #[test]
+    fn derive_parses_unpivot_in_the_written_order() {
+        let pack = pack_with(UNPIVOT_TABLE).expect("an unpivot block parses");
+        let derive = pack.tables[0].derive.expect("declared");
+        assert!(derive.explode.is_none());
+        let unpivot = derive.unpivot.expect("unpivot");
+        assert_eq!(unpivot.into, "token");
+        assert_eq!(unpivot.label, "kind");
+        assert_eq!(
+            unpivot.from,
+            [
+                UnpivotField {
+                    label: "notes",
+                    path: "meeting.artifacts.notes"
+                },
+                UnpivotField {
+                    label: "transcript",
+                    path: "meeting.artifacts.verbatim"
+                },
+            ]
+        );
+        // The derived rows convert through the ordinary converter, the
+        // empty token yielding no row.
+        let page = serde_json::json!({
+            "meeting": {"id": "m-1", "artifacts": {"notes": "doc-a", "verbatim": ""}}
+        });
+        let rows = derive
+            .apply(pack.tables[0].id, std::slice::from_ref(&page), 1)
+            .expect("derives");
+        let batch = RowConverter::new(pack.tables[0].fields)
+            .expect("converter")
+            .convert(&rows, 1)
+            .expect("converts");
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(rows[0]["note_key"], "m-1#notes");
+    }
+
+    #[test]
+    fn unpivot_invariants_are_rejected_with_targeted_errors() {
+        const HEAD: &str = r#"    action: demo.get
+    row_path: "$"
+    row_shape: object
+    pagination: { strategy: single_page }
+    columns:
+      - { name: id, path: meeting.id, type: utf8, nullable: false }
+      - { name: token, path: token, type: utf8, nullable: true }
+      - { name: kind, path: kind, type: utf8, nullable: true }
+"#;
+        for (derive, expected) in [
+            (
+                "    derive: { unpivot: { into: token, label: kind, from: [] } }",
+                "names no `from` fields",
+            ),
+            (
+                "    derive: { unpivot: { into: token, label: kind, from: [{ label: a, path: x }, { label: a, path: y }] } }",
+                "names the label 'a' twice",
+            ),
+            (
+                "    derive: { unpivot: { into: token, label: kind, from: [{ label: a, path: x }, { label: b, path: x }] } }",
+                "reads the path 'x' twice",
+            ),
+            (
+                "    derive: { unpivot: { into: token, label: kind, from: [{ label: \" \", path: x }] } }",
+                "has an empty label",
+            ),
+            (
+                "    derive: { unpivot: { into: token, label: kind, from: [{ label: a, path: \"$.x\" }] } }",
+                "must not start with '$'",
+            ),
+            (
+                "    derive: { unpivot: { into: a.b, label: kind, from: [{ label: a, path: x }] } }",
+                "contains '.'",
+            ),
+            (
+                "    derive: { unpivot: { into: token, label: kind, from: [{ label: a, path: x }] }, explode: { paths: [steps], into: token } }",
+                "both explode and unpivot",
+            ),
+            (
+                "    derive: { unpivot: { into: token, label: token, from: [{ label: a, path: x }] } }",
+                "writes 'token' twice",
+            ),
+            // Unpivot consumes its fields: nothing may read one afterwards.
+            (
+                "    derive: { unpivot: { into: token, label: kind, from: [{ label: a, path: meeting.id }] } }",
+                "column 'id' reads 'meeting.id', which derive unpivot consumes",
+            ),
+            (
+                "    derive: { unpivot: { into: token, label: kind, from: [{ label: a, path: x }] }, format: { other: \"{x}\" } }",
+                "derive format 'other' reads 'x', which derive unpivot consumes",
+            ),
+            (
+                "    derive: { unpivot: { into: token, label: kind, from: [{ label: a, path: x }], typo: 1 } }",
+                "typo",
+            ),
+        ] {
+            let err = pack_with(&format!("{HEAD}{derive}")).expect_err(expected);
+            assert!(err.contains(expected), "want {expected:?} in: {err}");
+        }
+        // A derived key unpivot writes is read whole, never as a parent.
+        let err = pack_with(
+            r#"    action: demo.get
+    row_path: "$"
+    row_shape: object
+    pagination: { strategy: single_page }
+    derive: { unpivot: { into: token, label: kind, from: [{ label: a, path: x }] } }
+    columns:
+      - { name: token, path: token.id, type: utf8, nullable: true }
+      - { name: kind, path: kind, type: utf8, nullable: true }"#,
+        )
+        .expect_err("a column below unpivot `into`");
+        assert!(err.contains("below derive unpivot `into` 'token'"), "{err}");
+        // Unpivot is refused where a short page is a termination signal.
+        let err = pack_with(
+            r#"    action: demo.list
+    row_path: "$.items"
+    pagination: { strategy: page_number, page_input: page, page_size_input: perPage, page_size: 10 }
+    derive: { unpivot: { into: token, label: kind, from: [{ label: a, path: x }] } }
+    columns:
+      - { name: token, path: token, type: utf8, nullable: true }
+      - { name: kind, path: kind, type: utf8, nullable: true }"#,
+        )
+        .expect_err("unpivot on page_number");
+        assert!(err.contains("page_number/keyset"), "{err}");
+    }
+
+    #[test]
+    fn a_filter_reading_above_an_unpivoted_field_is_refused() {
+        let err = pack_with(
+            r#"    action: demo.list
+    row_path: "$.items"
+    pagination: { strategy: single_page }
+    derive: { unpivot: { into: token, label: kind, from: [{ label: a, path: meeting.artifacts.notes }] } }
+    columns:
+      - { name: token, path: token, type: utf8, nullable: true }
+      - { name: kind, path: kind, type: utf8, nullable: true }
+      - { name: artifacts, path: meeting.artifacts, type: json, nullable: true }
+    filters:
+      - { column: artifacts, op: eq, input: artifacts, fidelity: exact }"#,
+        )
+        .expect_err("a filter on the parent of an unpivoted field");
+        assert!(
+            err.contains("from which derive unpivot removes 'meeting.artifacts.notes'"),
+            "{err}"
+        );
     }
 
     /// A derive table for the filter-pushdown checks: one exploded element

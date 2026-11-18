@@ -184,6 +184,16 @@ consumers:
   none of the listed arrays, so an array of `n` elements is never copied
   onto each of its own `n` rows. A column or a `format` placeholder that
   reads a listed path is refused when the pack loads.
+- `unpivot` — one row per named field that carries a value, for a provider
+  that answers several things of one kind as sibling keys rather than an
+  array (added by the Feishu meetings pack, see
+  [open-connector-feishu-meetings.md](open-connector-feishu-meetings.md)).
+  `from` lists `{label, path}` pairs in the order their rows come out; the
+  value lands under `into`, the label under `label`. A field that is
+  missing, null or the empty string yields no row; an array or object fails
+  the scan with its kind, checked for every field before any row is
+  yielded. Unpivot consumes its paths as explode does, and a table cannot
+  declare both.
 - `format` — a key rendered from a template over the row
   (`"{summary.meetingUuid}#{position}"`); a missing part makes the whole
   value NULL, so a non-null identity fails loudly. A template cannot read
@@ -196,16 +206,16 @@ consumers:
 
 A derived key replaces the wire value of the same name, so a key written
 with a value that is never an object (a non-object constant, a `format`
-key, the explode `index`) can only be read whole: a column or a `format`
-placeholder that reads below it, such as `summary.meetingUuid` beside
-`constants: { summary: null }`, is refused when the pack loads. The explode
-`into` key is exempt, because an element may be an object whose fields the
-columns read.
+key, the explode `index`, the unpivot `into` and `label`) can only be read
+whole: a column or a `format` placeholder that reads below it, such as
+`summary.meetingUuid` beside `constants: { summary: null }`, is refused
+when the pack loads. The explode `into` key is exempt, because an element
+may be an object whose fields the columns read.
 
 A `filters:` mapping on a column the derivation writes is also refused
 when the pack loads, and so is one on a column holding the parent of an
-exploded path: the gateway evaluates a pushed-down predicate against wire
-rows, which do not carry derived values. A filter on any other column
+exploded or unpivoted path: the gateway evaluates a pushed-down predicate
+against wire rows, which do not carry derived values. A filter on any other column
 stays legal, because every derived row inherits that value unchanged.
 
 A consumer cannot skip the derivation or paginate on its output:
