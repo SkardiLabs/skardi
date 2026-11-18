@@ -1,0 +1,22 @@
+{
+  "items": [
+    {
+      "id": "7000000000000000001",
+      "display_info": "Weekly sync \n <h>sync</h> \n 2026-11-02 17:00 | Organizer: Host Example | ID: 100000001",
+      "meta_data": {
+        "app_link": "https://applink.example.com/client/videochat/open?id=7000000000000000001",
+        "avatar": "https://example.com/avatar.png",
+        "description": "2026-11-02 17:00 | Organizer: Host Example | ID: 100000001"
+      }
+    },
+    {
+      "id": "7000000000000000002",
+      "display_info": "Design review",
+      "meta_data": {
+        "description": "2026-11-03 10:00"
+      }
+    }
+  ],
+  "hasMore": true,
+  "pageToken": "tok-2"
+}

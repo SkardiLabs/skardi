@@ -13,6 +13,7 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
+use crate::derive::RowDerivation;
 use crate::error::OpenConnectorError;
 use crate::filters::FilterMapping;
 use crate::pagination::{CursorContinuation, PaginationStrategy};
@@ -140,6 +141,13 @@ pub struct SourcePackTable {
     /// (see [`CursorContinuation`]). `None` for every table whose provider
     /// accepts the cursor on its own action.
     pub continuation: Option<CursorContinuation>,
+    /// How the wire rows are rewritten before the columns read them —
+    /// constants, one row per array element, formatted identities, a
+    /// skipped null payload (see [`RowDerivation`]). `None` for every table
+    /// whose columns map straight onto wire keys, which is every table
+    /// before the meeting packs; the scan then hands the extracted rows to
+    /// the converter untouched.
+    pub derive: Option<RowDerivation>,
 }
 
 impl SourcePackTable {

@@ -50,6 +50,16 @@ pub struct ScanKeyParts<'a> {
     pub connection_alias: Option<&'a str>,
     /// Open Connector action ID backing the table.
     pub action_id: &'a str,
+    /// Source-pack table ID (`<pack>.<table>`). Part of the key because two
+    /// tables of one pack can share every other field — the same action,
+    /// row path, row shape, resource and, under a narrow projection, the
+    /// same emitted schema — and still derive different rows from the same
+    /// response: one reads the answer as a single row, the other explodes
+    /// an array inside it into one row per element. Without this, one
+    /// would replay the other's cached batches. The table's `derive` block
+    /// itself is not serialized into the key: it is functionally determined
+    /// by (table_id, source_pack_version), both keyed here.
+    pub table_id: &'a str,
     /// Source-pack version of the table definition.
     pub source_pack_version: u32,
     /// Resource inputs bound to the table (owner/repo, workspace, …).
@@ -89,6 +99,7 @@ pub fn scan_cache_key(parts: &ScanKeyParts) -> String {
         "gateway": parts.gateway,
         "connection_alias": parts.connection_alias,
         "action_id": parts.action_id,
+        "table_id": parts.table_id,
         "source_pack_version": parts.source_pack_version,
         "resource": parts.resource,
         "filters": filters,
@@ -264,6 +275,7 @@ mod tests {
             gateway,
             connection_alias: None,
             action_id: "mock.list_items",
+            table_id: "mock.items",
             source_pack_version: 1,
             resource: Box::leak(Box::new(json!({"workspace": "demo"}))),
             filter_inputs: &[],
@@ -388,6 +400,36 @@ mod tests {
 
         let other_projection = scan_cache_key(&parts("saas", &["name".to_string()]));
         assert_ne!(base, other_projection);
+    }
+
+    #[test]
+    fn key_distinguishes_tables_that_differ_only_in_table_id() {
+        // Two tables of one pack over the same action, pack version,
+        // resource, row shape and projected schema: nothing but the table
+        // tells their scans apart, and they derive different rows from the
+        // same response, so they must never share an entry.
+        let projection = vec!["provider".to_string(), "meeting_id".to_string()];
+        let one_row_per_answer = ScanKeyParts {
+            table_id: "mock.notes",
+            row_shape: RowShape::Object,
+            ..parts("saas", &projection)
+        };
+        let one_row_per_element = ScanKeyParts {
+            table_id: "mock.action_items",
+            row_shape: RowShape::Object,
+            ..parts("saas", &projection)
+        };
+        assert_ne!(
+            scan_cache_key(&one_row_per_answer),
+            scan_cache_key(&one_row_per_element)
+        );
+        // The same table keys the same way twice.
+        let again = ScanKeyParts {
+            table_id: "mock.notes",
+            row_shape: RowShape::Object,
+            ..parts("saas", &projection)
+        };
+        assert_eq!(scan_cache_key(&one_row_per_answer), scan_cache_key(&again));
     }
 
     #[test]

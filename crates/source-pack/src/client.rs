@@ -468,6 +468,13 @@ impl OpenConnectorClient {
         self
     }
 
+    /// The response-size decoding bound this client enforces. A scan bounds
+    /// the rows it derives from one page by the same figure (see
+    /// [`crate::derive::DeriveBounds`]).
+    pub fn max_response_bytes(&self) -> usize {
+        self.max_response_bytes
+    }
+
     /// Override the per-call attempt cap (default 3).
     pub fn with_max_attempts(mut self, max_attempts: u32) -> Self {
         self.max_attempts = max_attempts.max(1);

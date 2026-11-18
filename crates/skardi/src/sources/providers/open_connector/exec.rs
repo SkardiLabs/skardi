@@ -275,10 +275,18 @@ impl ScanState {
         // functionally determined by (action_id, source_pack_version), both
         // already keyed. If fixed inputs ever become binding-configurable or
         // vary within a pack version, they must join the key.
+        //
+        // `table_id` IS in the key: two tables of one pack can read the
+        // same action's answer into different rows (a `derive` block that
+        // explodes an array on one and not the other), and no other key
+        // part tells them apart. The derivation itself is absent for the
+        // same reason `fixed_inputs` is — it is functionally determined by
+        // (table_id, source_pack_version).
         let cache_key = scan_cache_key(&ScanKeyParts {
             gateway: &exec.gateway,
             connection_alias: exec.connection_alias.as_deref(),
             action_id: &exec.target.action_id,
+            table_id: &exec.target.table_id,
             source_pack_version: exec.target.source_pack_version,
             resource: &exec.resource,
             filter_inputs: &exec.filter_inputs,
@@ -315,7 +323,10 @@ impl ScanState {
                 max_pages: exec.max_pages,
                 timeout: exec.scan_timeout,
             },
-        )?;
+        )?
+        // One page may not derive more rows than the whole scan may emit;
+        // the scan-wide count stays below, after LIMIT.
+        .with_max_rows(exec.max_rows);
         Ok(Self {
             scan,
             cache: exec.cache.clone(),
@@ -391,8 +402,11 @@ impl ScanState {
         }
         let page = self.scan.page();
         let envelope = self.scan.fetch_page().await?;
+        // The scan hands back the rows the table declares (derived, for a
+        // table with a `derive:` block) and advances on the raw page itself,
+        // from the envelope, below.
         let rows = self.scan.rows(&envelope)?;
-        let batch = self.converter.convert(rows, page)?;
+        let batch = self.converter.convert(&rows, page)?;
         // Conversion is synchronous, so it cannot be preempted by Tokio; do
         // not emit its result if it consumed the remaining scan budget.
         if Instant::now() >= self.scan.deadline() {
@@ -453,7 +467,7 @@ impl ScanState {
         // page would fail a scan whose result is already complete for its
         // key.
         if !self.done {
-            let more = self.scan.advance(&envelope, rows)?;
+            let more = self.scan.advance(&envelope)?;
             if !more {
                 self.done = true;
                 self.store_cache();
@@ -594,6 +608,7 @@ mod tests {
                 expected_fingerprint: "unused-in-exec",
                 cursor_only: true,
             }),
+            derive: None,
         }))
     }
 
@@ -630,6 +645,7 @@ mod tests {
             error_path: None,
             expected_fingerprint: None,
             continuation: None,
+            derive: None,
         }))
     }
 

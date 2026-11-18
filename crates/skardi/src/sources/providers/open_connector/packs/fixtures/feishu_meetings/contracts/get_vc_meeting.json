@@ -1,0 +1,31 @@
+{
+  "type": "object",
+  "properties": {
+    "meeting": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": true,
+      "description": "A Feishu Minutes or VC object."
+    },
+    "relatedArtifacts": {
+      "type": "object",
+      "properties": {
+        "note_doc_token": {
+          "type": "string",
+          "description": "The document token of the meeting notes."
+        },
+        "verbatim_doc_token": {
+          "type": "string",
+          "description": "The document token of the verbatim transcript."
+        }
+      },
+      "additionalProperties": true,
+      "description": "The meeting's related artifacts, as Feishu returns them. A token is absent without its permission and an empty string until the document exists."
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "meeting"
+  ],
+  "description": "The requested meeting, and its related artifacts when includeArtifacts is set."
+}
