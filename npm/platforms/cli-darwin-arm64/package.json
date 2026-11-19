@@ -1,0 +1,19 @@
+{
+  "name": "@skardi/cli-darwin-arm64",
+  "version": "0.0.0",
+  "description": "Prebuilt skardi CLI binary for macOS arm64 (Apple Silicon)",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/SkardiLabs/skardi"
+  },
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "files": [
+    "bin"
+  ]
+}

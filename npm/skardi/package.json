@@ -1,0 +1,36 @@
+{
+  "name": "skardi",
+  "version": "0.0.0",
+  "description": "CLI for Skardi — federated SQL engine and YAML-driven API server",
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/SkardiLabs/skardi",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/SkardiLabs/skardi"
+  },
+  "keywords": [
+    "sql",
+    "datafusion",
+    "rest-api",
+    "mcp",
+    "ai-agents"
+  ],
+  "bin": {
+    "skardi": "bin/skardi.js"
+  },
+  "files": [
+    "bin"
+  ],
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "engines": {
+    "node": ">=16"
+  },
+  "optionalDependencies": {
+    "@skardi/cli-darwin-arm64": "0.0.0",
+    "@skardi/cli-linux-arm64": "0.0.0",
+    "@skardi/cli-linux-x64": "0.0.0"
+  }
+}
