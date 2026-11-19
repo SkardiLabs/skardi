@@ -1,13 +1,13 @@
 //! The built-in source packs this Skardi build ships, and their tests.
 //!
 //! `skardi-source-pack` owns `SourcePackRegistry`; this owns what goes in it.
-//! The split is content versus machinery: twelve provider assets are this
+//! The split is content versus machinery: thirteen provider assets are this
 //! binary's choices, and a library that hardcoded them would be making its
 //! consumers' choices too — cloud registers a different set against the same
 //! type.
 //!
 //! The tests came here with the content rather than staying with the type they
-//! call. Every one of them asserts something about the twelve assets — that
+//! call. Every one of them asserts something about the thirteen assets — that
 //! github's pack is registered, that iteration is in name order, that the
 //! reconciled set matches what the cloud pin carried — which is a fact about
 //! this build, not about a registry.
@@ -20,7 +20,7 @@ use super::packs;
 /// The built-in source packs this Skardi build ships.
 ///
 /// The list lives here rather than in `skardi-source-pack` because it is
-/// CONTENT, not machinery: twelve provider assets are this binary's choices,
+/// CONTENT, not machinery: thirteen provider assets are this binary's choices,
 /// and a library that hardcoded them would be making its consumers' choices
 /// too. The pack owns `SourcePackRegistry`; callers supply what goes in it,
 /// which is what lets cloud register a different set against the same type.
@@ -56,6 +56,7 @@ pub fn builtin_pack_registry() -> Result<SourcePackRegistry, OpenConnectorError>
         packs::one_drive::pack()?,
         packs::google_drive::pack()?,
         packs::whatsapp::pack()?,
+        packs::zoom::pack()?,
     ])
 }
 
@@ -113,6 +114,15 @@ mod tests {
         // gate covers only the declared keys; the executor's normalizer
         // emits exactly those, which the live pass confirms column by column.
         //
+        // `zoom.meeting_notes` and `zoom.meeting_action_items` are the fourth
+        // and fifth, over the same point read: `get_meeting_summary` takes
+        // one `meetingUuid` and answers the one summary Zoom keeps for that
+        // meeting instance. The response object is the row for the note;
+        // for the items the pack's `derive.explode` turns that one object
+        // into a row per `nextSteps[]` string — still an object-shaped
+        // table, since the shape names how the RESPONSE is read, and the
+        // derivation runs after.
+        //
         // `lark.document_content` mirrors `feishu.document_content` exactly:
         // Lark is Feishu's international edition, and `packs/lark.yaml` is
         // the feishu pack with every `feishu.*` action renamed `lark.*` (see
@@ -122,6 +132,8 @@ mod tests {
             "lark.document_content",
             "notion.page_markdown",
             "whatsapp.business_profile",
+            "zoom.meeting_action_items",
+            "zoom.meeting_notes",
         ];
 
         let registry = super::builtin_pack_registry().expect("embedded assets parse");
@@ -226,7 +238,8 @@ mod tests {
                 "one_drive",
                 "outlook",
                 "slack",
-                "whatsapp"
+                "whatsapp",
+                "zoom"
             ]
         );
     }
@@ -467,6 +480,7 @@ mod tests {
             error_path: None,
             expected_fingerprint: None,
             continuation: None,
+            derive: None,
         }
     }
 

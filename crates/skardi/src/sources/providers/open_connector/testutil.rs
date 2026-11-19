@@ -21,7 +21,7 @@ use tracing::field::{Field, Visit};
 
 use crate::sources::providers::open_connector::json_to_arrow::RowConverter;
 use crate::sources::providers::open_connector::row_path::RowPath;
-use crate::sources::providers::open_connector::source_pack::SourcePackTable;
+use crate::sources::providers::open_connector::source_pack::{RowShape, SourcePackTable};
 
 // The gateway mock and its envelope builders now live in
 // `skardi-source-pack`, beside the client they exercise. Re-exported so
@@ -46,13 +46,29 @@ pub(crate) async fn collect(ctx: &SessionContext, sql: &str) -> Vec<RecordBatch>
 /// context is pinned to page 1, as the name promises: fixtures are
 /// single-page corpora, never a mid-scan continuation.
 pub(crate) fn convert_first_page(table: &SourcePackTable, page: &Value) -> RecordBatch {
-    let rows = RowPath::parse(table.row_path)
-        .expect("row path")
-        .rows(page, 1)
-        .expect("row array");
+    let rows = match table.row_shape {
+        RowShape::Array => RowPath::parse(table.row_path)
+            .expect("row path")
+            .rows(page, 1)
+            .expect("row array")
+            .to_vec(),
+        RowShape::Object => vec![
+            RowPath::parse_object_root(table.row_path)
+                .expect("object root")
+                .row_object(page, 1)
+                .expect("row object")
+                .clone(),
+        ],
+    };
+    // The scan derives before it converts; so does this helper, or a
+    // fixture test would vouch for a conversion the scan never performs.
+    let rows = match &table.derive {
+        Some(derivation) => derivation.apply(table.id, &rows, 1).expect("page derives"),
+        None => rows,
+    };
     RowConverter::new(table.fields)
         .expect("converter")
-        .convert(rows, 1)
+        .convert(&rows, 1)
         .expect("page converts")
 }
 
