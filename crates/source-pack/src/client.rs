@@ -11,7 +11,8 @@
 //!   POST execute only retries a pre-execution 429 — 5xx and transport
 //!   failures are terminal so a possibly-executed action is never re-sent;
 //! - bounded response decoding;
-//! - per-request timeouts (from [`OpenConnectorConfig::request_timeout_seconds`]).
+//! - a per-request idle timeout (from [`OpenConnectorConfig::idle_timeout_seconds`]):
+//!   the longest gap with no bytes. There is no total timeout.
 //!
 //! It does not understand Arrow or DataFusion, and it never logs the runtime
 //! token, provider credentials, or response bodies at `INFO` level.
@@ -265,23 +266,29 @@ struct ExecuteEnvelope<'a> {
 /// security posture:
 ///
 /// * the **syncer** wants no redirects at all, a five-second connect timeout
-///   and a fifteen-second request timeout. The redirect rule is the important
+///   and a fifteen-second idle timeout. The redirect rule is the important
 ///   one: every call carries a source's Open Connector runtime token as a
 ///   bearer, and a `302` would otherwise have the client replay the request at
 ///   whatever host the `Location` names. `reqwest` strips `Authorization`
 ///   across hosts, so it is defence in depth rather than a live leak — but
 ///   depth is the point when the header being stripped is a credential.
 /// * the **engine** keeps its existing redirect behaviour and its configured
-///   request timeout, with no separate connect timeout.
+///   idle timeout, with no separate connect timeout.
 ///
 /// So this carries no `Default`. A caller states what it wants, which is what
 /// stops one consumer's policy becoming the other's by omission.
 #[derive(Debug, Clone)]
 pub struct TransportPolicy {
-    /// Total time for a request, connect included.
-    pub request_timeout: Duration,
+    /// The longest gap with no bytes, on any read of the request (the
+    /// response head and each piece of the body). There is no total timeout:
+    /// a slow transfer that keeps making progress is never cut off, only a
+    /// stalled one.
+    pub idle_timeout: Duration,
     /// Time to establish the connection, when the caller wants that bounded
-    /// separately. `None` leaves it to the total.
+    /// separately. With `None` this policy sets no bound, and connecting is
+    /// bounded only by the operating system's TCP connect timeout (on Linux,
+    /// the SYN retries of `net.ipv4.tcp_syn_retries`, about two minutes by
+    /// default).
     pub connect_timeout: Option<Duration>,
     /// Whether to follow a redirect. `false` refuses outright.
     pub follow_redirects: bool,
@@ -294,9 +301,9 @@ impl TransportPolicy {
     /// together: a caller that copied two of them and forgot the redirect rule
     /// would have a client that leaks its bearer on a `302`, and nothing in a
     /// review of the two timeouts would show it.
-    pub fn credential_bearing(request_timeout: Duration, connect_timeout: Duration) -> Self {
+    pub fn credential_bearing(idle_timeout: Duration, connect_timeout: Duration) -> Self {
         Self {
-            request_timeout,
+            idle_timeout,
             connect_timeout: Some(connect_timeout),
             follow_redirects: false,
         }
@@ -369,7 +376,7 @@ impl OpenConnectorClient {
         let client = Self::new(
             gateway_url,
             token,
-            Duration::from_secs(config.request_timeout_seconds),
+            Duration::from_secs(config.idle_timeout_seconds),
         )?;
         Ok(client
             .with_max_response_bytes(
@@ -384,17 +391,17 @@ impl OpenConnectorClient {
     pub fn new(
         gateway_url: &str,
         token: impl Into<String>,
-        request_timeout: Duration,
+        idle_timeout: Duration,
     ) -> Result<Self, OpenConnectorError> {
         // The ENGINE's policy, unchanged by the extraction: its existing
-        // redirect behaviour and its configured request timeout, with no
+        // redirect behaviour and its configured idle timeout, with no
         // separate connect timeout. Stated here rather than inherited so that
         // a consumer reading `new` sees whose defaults these are.
         Self::build(
             gateway_url,
             token,
             TransportPolicy {
-                request_timeout,
+                idle_timeout,
                 connect_timeout: None,
                 follow_redirects: true,
             },
@@ -440,7 +447,10 @@ impl OpenConnectorClient {
             base_url.set_path(&path);
         }
 
-        let mut builder = reqwest::Client::builder().timeout(policy.request_timeout);
+        // `read_timeout`, never `timeout`: the bound is on silence, not on
+        // the whole request, so a slow transfer that keeps producing bytes is
+        // never cut off.
+        let mut builder = reqwest::Client::builder().read_timeout(policy.idle_timeout);
         if let Some(connect) = policy.connect_timeout {
             builder = builder.connect_timeout(connect);
         }
@@ -791,9 +801,23 @@ impl OpenConnectorClient {
         let mut buf: Vec<u8> = Vec::new();
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| OpenConnectorError::InvalidGatewayResponse {
-                operation: operation.to_string(),
-                reason: format!("failed to read response body: {e}"),
+            let chunk = chunk.map_err(|e| {
+                let reason = format!("failed to read response body: {e}");
+                // The idle timeout surfaces here as a body error that also
+                // answers `is_timeout`; keep it distinguishable from a
+                // malformed body.
+                if e.is_timeout() {
+                    OpenConnectorError::ResponseBodyStalled {
+                        operation: operation.to_string(),
+                        transport: TransportFailure::of(&e),
+                        reason,
+                    }
+                } else {
+                    OpenConnectorError::InvalidGatewayResponse {
+                        operation: operation.to_string(),
+                        reason,
+                    }
+                }
             })?;
             if buf.len() as u64 + chunk.len() as u64 > limit {
                 return Err(OpenConnectorError::ResponseTooLarge {
@@ -1947,5 +1971,100 @@ mod transport_policy_tests {
         let client =
             OpenConnectorClient::new("http://gateway.invalid", "t", Duration::from_secs(30));
         assert!(client.is_ok());
+    }
+}
+
+#[cfg(test)]
+mod idle_timeout_tests {
+    use super::*;
+    use crate::testing::{MockGateway, MockResponse, envelope_ok};
+    use std::time::Instant;
+
+    fn client(gateway: &MockGateway, idle: Duration) -> OpenConnectorClient {
+        OpenConnectorClient::new(&gateway.url, "t", idle).expect("client")
+    }
+
+    /// **No total timeout.** The body arrives a few bytes at a time, each gap
+    /// well inside the idle bound, and the whole transfer takes longer than
+    /// the idle bound. A total timeout of that size would have cut it off;
+    /// an idle timeout must not. Real time: the idle timeout is a timer the
+    /// socket drives, which a paused tokio clock does not advance.
+    #[tokio::test]
+    async fn a_slow_body_that_keeps_arriving_is_not_cut_off() {
+        let idle = Duration::from_millis(400);
+        let gateway = MockGateway::start(|_| {
+            MockResponse::ok(&envelope_ok(r#"{"id":1}"#))
+                .with_paced_body(10, Duration::from_millis(120))
+        })
+        .await;
+
+        let started = Instant::now();
+        let result = client(&gateway, idle)
+            .execute("x.y", &serde_json::json!({}), None)
+            .await;
+
+        assert!(
+            started.elapsed() > idle,
+            "the transfer must outlast the idle bound for this test to mean anything"
+        );
+        result.expect("a transfer that keeps making progress succeeds");
+    }
+
+    /// A body that goes silent for longer than the idle bound fails, and the
+    /// failure is classified as the transport timeout.
+    #[tokio::test]
+    async fn a_body_that_stalls_fails_as_a_timeout() {
+        let gateway = MockGateway::start(|_| {
+            MockResponse::ok(&envelope_ok(r#"{"id":1}"#))
+                .with_body_stall(10, Duration::from_secs(5))
+        })
+        .await;
+
+        let started = Instant::now();
+        let err = client(&gateway, Duration::from_millis(300))
+            .execute("x.y", &serde_json::json!({}), None)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                OpenConnectorError::ResponseBodyStalled {
+                    transport: TransportFailure::Timeout,
+                    ..
+                }
+            ),
+            "a stalled body must be a Timeout, got {err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "the idle bound, not the stall, ended the wait"
+        );
+    }
+
+    /// The same bound covers the wait for the response head: an established
+    /// connection that never answers is a `Timeout`, not a `Connect`.
+    #[tokio::test]
+    async fn a_response_head_that_never_comes_fails_as_a_timeout() {
+        let gateway = MockGateway::start(|_| {
+            MockResponse::ok(&envelope_ok("{}")).with_delay(Duration::from_secs(5))
+        })
+        .await;
+
+        let err = client(&gateway, Duration::from_millis(300))
+            .execute("x.y", &serde_json::json!({}), None)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                OpenConnectorError::NonIdempotentAmbiguousFailure {
+                    transport: TransportFailure::Timeout,
+                    ..
+                }
+            ),
+            "a silent head must be a Timeout, got {err}"
+        );
     }
 }

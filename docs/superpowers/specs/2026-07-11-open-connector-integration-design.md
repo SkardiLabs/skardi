@@ -267,8 +267,7 @@ spec:
 
       open_connector:
         runtime_token_env: OPEN_CONNECTOR_TOKEN
-        request_timeout_seconds: 30
-        scan_timeout_seconds: 300
+        idle_timeout_seconds: 60
         max_pages: 100
         max_rows: 100000
         cache_max_bytes: 268435456

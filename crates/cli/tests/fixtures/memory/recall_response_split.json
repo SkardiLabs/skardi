@@ -1,0 +1,88 @@
+{
+  "anchor": "ontology:ent_01J9",
+  "memories": [
+    {
+      "anchor": "url:github.com/SkardiLabs/skardi-cloud/issues/1400",
+      "author": "user:acme/u-1",
+      "own": true,
+      "visibility": "private",
+      "version": 4,
+      "content": {
+        "goal": "Ship the audit export",
+        "status": "API route merged; UI next",
+        "done": [
+          {
+            "text": "Export route",
+            "at": "2026-11-08T09:12:00Z",
+            "source": "https://github.com/SkardiLabs/skardi-cloud/pull/1412"
+          }
+        ],
+        "decisions": [
+          {
+            "text": "CSV first, because finance reads it in Excel",
+            "at": "2026-11-07T15:40:00Z"
+          }
+        ],
+        "findings": [
+          {
+            "text": "export_csv test is flaky under parallel runs",
+            "at": "2026-11-08T10:05:00Z",
+            "source": "cargo test -p skardi-server export_csv"
+          }
+        ],
+        "next": [
+          {
+            "text": "Add the console download button",
+            "at": "2026-11-08T10:30:00Z"
+          }
+        ],
+        "notes": ""
+      },
+      "saved_by_agent": "claude-code",
+      "updated_at": "2026-11-08T10:30:00Z",
+      "split": true
+    },
+    {
+      "anchor": "ontology:ent_01J9",
+      "author": "user:acme/u-1",
+      "own": true,
+      "visibility": "private",
+      "version": 1,
+      "content": {
+        "goal": "Ship the audit export",
+        "status": "API route merged; UI next",
+        "done": [
+          {
+            "text": "Export route",
+            "at": "2026-11-08T09:12:00Z",
+            "source": "https://github.com/SkardiLabs/skardi-cloud/pull/1412"
+          }
+        ],
+        "decisions": [
+          {
+            "text": "CSV first, because finance reads it in Excel",
+            "at": "2026-11-07T15:40:00Z"
+          }
+        ],
+        "findings": [
+          {
+            "text": "export_csv test is flaky under parallel runs",
+            "at": "2026-11-08T10:05:00Z",
+            "source": "cargo test -p skardi-server export_csv"
+          }
+        ],
+        "next": [
+          {
+            "text": "Add the console download button",
+            "at": "2026-11-08T10:30:00Z"
+          }
+        ],
+        "notes": ""
+      },
+      "saved_by_agent": "codex",
+      "updated_at": "2026-11-05T10:30:00Z",
+      "split": true
+    }
+  ],
+  "consent": "workspace"
+}

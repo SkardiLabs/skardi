@@ -12,8 +12,7 @@
 //! ```yaml
 //! open_connector:
 //!   runtime_token_env: OPEN_CONNECTOR_TOKEN
-//!   request_timeout_seconds: 30
-//!   scan_timeout_seconds: 300
+//!   idle_timeout_seconds: 60
 //!   max_pages: 100
 //!   max_rows: 100000
 //!   cache_max_bytes: 268435456
@@ -42,10 +41,9 @@ use std::collections::{BTreeMap, HashSet};
 
 use crate::error::OpenConnectorError;
 
-/// Default timeout for a single gateway HTTP request.
-const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 30;
-/// Default deadline for one full scan (all pages).
-const DEFAULT_SCAN_TIMEOUT_SECONDS: u64 = 300;
+/// Default idle timeout for a gateway HTTP request: the longest gap with no
+/// bytes. There is no total timeout.
+const DEFAULT_IDLE_TIMEOUT_SECONDS: u64 = 60;
 /// Default cap on pages fetched per scan.
 const DEFAULT_MAX_PAGES: u32 = 100;
 /// Default cap on rows emitted per scan.
@@ -53,12 +51,8 @@ const DEFAULT_MAX_ROWS: u64 = 100_000;
 /// Default byte budget of the shared scan cache (256 MiB).
 const DEFAULT_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
-fn default_request_timeout_seconds() -> u64 {
-    DEFAULT_REQUEST_TIMEOUT_SECONDS
-}
-
-fn default_scan_timeout_seconds() -> u64 {
-    DEFAULT_SCAN_TIMEOUT_SECONDS
+fn default_idle_timeout_seconds() -> u64 {
+    DEFAULT_IDLE_TIMEOUT_SECONDS
 }
 
 fn default_max_pages() -> u32 {
@@ -109,8 +103,7 @@ fn default_max_attempts() -> u32 {
 /// config.validate().unwrap();
 ///
 /// // Defaults follow the design spec's safety bounds.
-/// assert_eq!(config.request_timeout_seconds, 30);
-/// assert_eq!(config.scan_timeout_seconds, 300);
+/// assert_eq!(config.idle_timeout_seconds, 60);
 /// assert_eq!(config.max_pages, 100);
 /// assert_eq!(config.max_rows, 100_000);
 /// assert_eq!(config.cache_ttl_seconds, 0); // live reads by default
@@ -124,13 +117,24 @@ pub struct OpenConnectorConfig {
     /// time, never from this file.
     pub runtime_token_env: String,
 
-    /// Timeout for one gateway HTTP request, in seconds.
-    #[serde(default = "default_request_timeout_seconds")]
-    pub request_timeout_seconds: u64,
+    /// Idle timeout for one gateway HTTP request, in seconds: the longest gap
+    /// with no bytes received. There is no total timeout, so a slow transfer
+    /// that keeps making progress is never cut off.
+    ///
+    /// `request_timeout_seconds` is the old name and is still accepted, so a
+    /// config rendered by an older operator parses.
+    #[serde(
+        default = "default_idle_timeout_seconds",
+        alias = "request_timeout_seconds"
+    )]
+    pub idle_timeout_seconds: u64,
 
-    /// Total deadline for one scan across all pages, in seconds.
-    #[serde(default = "default_scan_timeout_seconds")]
-    pub scan_timeout_seconds: u64,
+    /// The old scan-wide deadline. Accepted so an old config still parses
+    /// (this struct denies unknown fields), but it is IGNORED and never
+    /// written back out: a scan has no overall deadline.
+    #[allow(dead_code)]
+    #[serde(default, rename = "scan_timeout_seconds", skip_serializing)]
+    _ignored_scan_timeout_seconds: Option<u64>,
 
     /// Maximum pages a single scan may fetch.
     #[serde(default = "default_max_pages")]
@@ -183,14 +187,9 @@ impl OpenConnectorConfig {
         }
         // Zero timeouts make every request fail instantly (as an opaque
         // retryable transport error), so they are config bugs, not bounds.
-        if self.request_timeout_seconds == 0 {
+        if self.idle_timeout_seconds == 0 {
             return Err(OpenConnectorError::ZeroSafetyBound {
-                field: "request_timeout_seconds",
-            });
-        }
-        if self.scan_timeout_seconds == 0 {
-            return Err(OpenConnectorError::ZeroSafetyBound {
-                field: "scan_timeout_seconds",
+                field: "idle_timeout_seconds",
             });
         }
         if self.max_pages == 0 {
@@ -380,8 +379,7 @@ mod tests {
         let config = parse(
             r#"
 runtime_token_env: OPEN_CONNECTOR_TOKEN
-request_timeout_seconds: 30
-scan_timeout_seconds: 300
+idle_timeout_seconds: 60
 max_pages: 100
 max_rows: 100000
 cache_max_bytes: 268435456
@@ -420,8 +418,7 @@ bindings:
     fn defaults_applied_to_minimal_config() {
         let config = parse("runtime_token_env: OPEN_CONNECTOR_TOKEN");
         config.validate().expect("minimal config is valid");
-        assert_eq!(config.request_timeout_seconds, 30);
-        assert_eq!(config.scan_timeout_seconds, 300);
+        assert_eq!(config.idle_timeout_seconds, 60);
         assert_eq!(config.max_pages, 100);
         assert_eq!(config.max_rows, 100_000);
         assert_eq!(config.cache_max_bytes, 256 * 1024 * 1024);
@@ -535,21 +532,33 @@ bindings:
         // A zero timeout fails every request instantly, surfacing as an
         // opaque retryable transport error at registration — it must be a
         // targeted config error instead.
-        let config = parse("runtime_token_env: T\nrequest_timeout_seconds: 0");
+        let config = parse("runtime_token_env: T\nidle_timeout_seconds: 0");
         assert!(matches!(
             config.validate(),
             Err(OpenConnectorError::ZeroSafetyBound {
-                field: "request_timeout_seconds"
+                field: "idle_timeout_seconds"
             })
         ));
+    }
 
+    /// A config rendered by an older operator carries the old keys. It must
+    /// still parse: `request_timeout_seconds` is the idle timeout's old name,
+    /// and `scan_timeout_seconds` is accepted and ignored.
+    #[test]
+    fn an_old_config_with_the_old_timeout_keys_still_parses() {
+        let config =
+            parse("runtime_token_env: T\nrequest_timeout_seconds: 45\nscan_timeout_seconds: 300");
+        config.validate().expect("old config is valid");
+        assert_eq!(config.idle_timeout_seconds, 45);
+
+        // An old zero scan deadline no longer fails: the field is ignored.
         let config = parse("runtime_token_env: T\nscan_timeout_seconds: 0");
-        assert!(matches!(
-            config.validate(),
-            Err(OpenConnectorError::ZeroSafetyBound {
-                field: "scan_timeout_seconds"
-            })
-        ));
+        config.validate().expect("ignored field is not validated");
+
+        // The ignored field is not written back out.
+        let yaml = serde_yaml::to_string(&config).expect("serialize");
+        assert!(!yaml.contains("scan_timeout"), "{yaml}");
+        assert!(yaml.contains("idle_timeout_seconds: 60"), "{yaml}");
     }
 
     #[test]
