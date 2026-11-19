@@ -1,0 +1,22 @@
+{
+  "anchor": "url:github.com/SkardiLabs/skardi-cloud/issues/1400",
+  "visibility": "private",
+  "needs_confirm": true,
+  "version": 4,
+  "warning": {
+    "message": "Sharing makes this memory readable by every member of acme-eng. It may hold text drawn from sources some of them cannot read. 3 entries cite the 2 sources listed under `cited`. Who can read those sources was not checked: share only if every member may see what this memory says about them.",
+    "uncited_entries": 4,
+    "cited": [
+      {
+        "source_name": "drive",
+        "document_id": "1AbC",
+        "section_path": "drive/pricing/2026.md"
+      },
+      {
+        "source_name": "github",
+        "document_id": "acme/api#7"
+      }
+    ],
+    "unreadable": []
+  }
+}

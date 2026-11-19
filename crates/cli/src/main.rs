@@ -506,6 +506,30 @@ mod tests {
         }
     }
 
+    /// `--if-version` names the version a yes was given for, so it goes with
+    /// `--confirm` only. Alone it would read as a guard on a preview, and
+    /// with `--off` as a conditional unshare; neither exists.
+    #[test]
+    fn memory_share_takes_a_version_only_with_confirm() {
+        let share = |extra: &[&str]| {
+            let mut argv = vec!["skardi", "memory", "share", "label:billing-v2-migration"];
+            argv.extend_from_slice(extra);
+            super::Cli::try_parse_from(argv)
+        };
+        assert!(share(&[]).is_ok());
+        assert!(share(&["--confirm"]).is_ok());
+        assert!(share(&["--confirm", "--if-version", "4"]).is_ok());
+        assert!(share(&["--off"]).is_ok());
+        for refused in [
+            &["--if-version", "4"][..],
+            &["--off", "--if-version", "4"],
+            &["--confirm", "--off"],
+            &["--confirm", "--if-version", "four"],
+        ] {
+            assert!(share(refused).is_err(), "{refused:?}");
+        }
+    }
+
     /// The table gating and the route-specific error mapping both read. A
     /// remote command with no entry would silently skip cloud gating, so the
     /// pairing is asserted rather than assumed.
