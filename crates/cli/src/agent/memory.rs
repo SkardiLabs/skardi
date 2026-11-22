@@ -1100,9 +1100,21 @@ pub async fn share(
         .map_err(|err| {
             // A save's conflict is answered by recalling and merging. A
             // share's is answered by looking at the warning again: the
-            // memory changed after the one the person said yes to.
+            // memory changed after the one the person said yes to. The
+            // server words every version conflict for a save, so its message
+            // would contradict that; the share's own replaces it.
             let err = if err.code() == "version_conflict" && err.next.is_none() {
-                err.with_next(memory.hint(format!("skardi memory share {}", shell_quote(anchor))))
+                let now_at = match err.error.get("current_version").and_then(Value::as_i64) {
+                    Some(current) => format!(" and is now at version {current}"),
+                    None => String::new(),
+                };
+                err.with_field(
+                    "message",
+                    json!(format!(
+                        "the memory was saved after the warning you confirmed{now_at}: nothing was shared, so show its new warning and confirm that one"
+                    )),
+                )
+                .with_next(memory.hint(format!("skardi memory share {}", shell_quote(anchor))))
             } else {
                 err
             };
@@ -2379,6 +2391,11 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("cannot be read by"), "{text}");
+        // The message points at the list ("listed with this warning") and
+        // names no source itself, so each is printed once.
+        for source in ["drive/1AbC", "github/acme/api#7"] {
+            assert_eq!(text.matches(source).count(), 1, "{text}");
+        }
     }
 
     /// A server from before a share answered its version names none, so the
@@ -2435,6 +2452,40 @@ mod tests {
         assert_eq!(
             err.next.as_deref(),
             Some(format!("skardi memory share {ANCHOR}").as_str())
+        );
+        // The server words every version conflict for a save. Under a share
+        // that would send the person to recall and merge, against `next`.
+        assert_eq!(
+            err.message(),
+            "the memory was saved after the warning you confirmed and is now at version 5: nothing was shared, so show its new warning and confirm that one"
+        );
+        assert_eq!(err.error["current_version"], 5);
+    }
+
+    /// An answer that names no current version still says what happened and
+    /// keeps nothing of the save's wording.
+    #[tokio::test]
+    async fn share_conflict_without_a_current_version_is_still_worded_for_a_share() {
+        let server = MockServer::start().await;
+        let mut refusal = fixture("error_version_conflict.json");
+        refusal.as_object_mut().unwrap().remove("current_version");
+        authed(
+            Mock::given(method("POST")).and(path(format!("{ANCHOR_PATH}/share"))),
+            WS,
+        )
+        .respond_with(ResponseTemplate::new(409).set_body_json(refusal))
+        .mount(&server)
+        .await;
+        let options = ShareOptions {
+            confirm: true,
+            if_version: Some(4),
+        };
+        let err = share(&memory(&server), ANCHOR, true, options)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.message(),
+            "the memory was saved after the warning you confirmed: nothing was shared, so show its new warning and confirm that one"
         );
     }
 
