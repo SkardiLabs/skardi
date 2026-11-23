@@ -9,6 +9,7 @@ pub mod feishu_meetings;
 pub mod github;
 pub mod gmail;
 pub mod google_drive;
+pub mod google_meet;
 pub mod lark;
 pub mod mock;
 pub mod notion;

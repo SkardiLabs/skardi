@@ -1,0 +1,14 @@
+{
+  "conferenceRecord": {
+    "name": "conferenceRecords/synthetic-conference-0002",
+    "space": "spaces/syntheticSpace0002",
+    "startTime": "2026-11-03T15:30:00Z"
+  },
+  "smartNotes": [
+    {
+      "name": "conferenceRecords/synthetic-conference-0002/smartNotes/synthetic-note-0003",
+      "state": "STARTED",
+      "startTime": "2026-11-03T15:31:00Z"
+    }
+  ]
+}

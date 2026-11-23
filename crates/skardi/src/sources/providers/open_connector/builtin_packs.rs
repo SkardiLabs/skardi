@@ -1,13 +1,13 @@
 //! The built-in source packs this Skardi build ships, and their tests.
 //!
 //! `skardi-source-pack` owns `SourcePackRegistry`; this owns what goes in it.
-//! The split is content versus machinery: thirteen provider assets are this
+//! The split is content versus machinery: fourteen provider assets are this
 //! binary's choices, and a library that hardcoded them would be making its
 //! consumers' choices too — cloud registers a different set against the same
 //! type.
 //!
 //! The tests came here with the content rather than staying with the type they
-//! call. Every one of them asserts something about the thirteen assets — that
+//! call. Every one of them asserts something about the fourteen assets — that
 //! github's pack is registered, that iteration is in name order, that the
 //! reconciled set matches what the cloud pin carried — which is a fact about
 //! this build, not about a registry.
@@ -20,7 +20,7 @@ use super::packs;
 /// The built-in source packs this Skardi build ships.
 ///
 /// The list lives here rather than in `skardi-source-pack` because it is
-/// CONTENT, not machinery: thirteen provider assets are this binary's choices,
+/// CONTENT, not machinery: fourteen provider assets are this binary's choices,
 /// and a library that hardcoded them would be making its consumers' choices
 /// too. The pack owns `SourcePackRegistry`; callers supply what goes in it,
 /// which is what lets cloud register a different set against the same type.
@@ -57,6 +57,7 @@ pub fn builtin_pack_registry() -> Result<SourcePackRegistry, OpenConnectorError>
         packs::google_drive::pack()?,
         packs::whatsapp::pack()?,
         packs::feishu_meetings::pack()?,
+        packs::google_meet::pack()?,
     ])
 }
 
@@ -123,6 +124,12 @@ mod tests {
         // tables, since the shape names how the RESPONSE is read, and the
         // derivation runs after.
         //
+        // `google_meet.meeting_notes` is the sixth: `get_conference_artifacts`
+        // takes one conference record `name` and answers `{conferenceRecord,
+        // smartNotes}`, the record beside its Gemini notes (the pack's
+        // `derive.explode` turns each smart note into one note row). Its
+        // `meetings` table is a plain array listing.
+        //
         // `lark.document_content` mirrors `feishu.document_content` exactly:
         // Lark is Feishu's international edition, and `packs/lark.yaml` is
         // the feishu pack with every `feishu.*` action renamed `lark.*` (see
@@ -131,6 +138,7 @@ mod tests {
             "feishu.document_content",
             "feishu_meetings.meeting_notes",
             "feishu_meetings.meetings",
+            "google_meet.meeting_notes",
             "lark.document_content",
             "notion.page_markdown",
             "whatsapp.business_profile",
@@ -233,6 +241,7 @@ mod tests {
                 "github",
                 "gmail",
                 "google_drive",
+                "google_meet",
                 "lark",
                 "mock",
                 "notion",
@@ -443,6 +452,7 @@ mod tests {
             "one_drive",
             "google_drive",
             "whatsapp",
+            "google_meet",
         ] {
             let pack = registry.require(name).unwrap();
             let mut seen = std::collections::HashSet::new();

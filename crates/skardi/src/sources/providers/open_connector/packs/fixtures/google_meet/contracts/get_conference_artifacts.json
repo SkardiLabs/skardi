@@ -1,0 +1,100 @@
+{
+  "type": "object",
+  "properties": {
+    "conferenceRecord": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The conference record resource name."
+        },
+        "space": {
+          "type": "string",
+          "description": "The meeting space resource name."
+        },
+        "startTime": {
+          "type": "string",
+          "description": "When the conference started.",
+          "format": "date-time"
+        },
+        "endTime": {
+          "type": "string",
+          "description": "When the conference ended, when finished.",
+          "format": "date-time"
+        },
+        "expireTime": {
+          "type": "string",
+          "description": "When Google deletes the conference record resource.",
+          "format": "date-time"
+        }
+      },
+      "additionalProperties": true,
+      "required": [
+        "name"
+      ],
+      "description": "One instance of a conference held in a Google Meet space."
+    },
+    "smartNotes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "description": "The smart-note resource name."
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "STATE_UNSPECIFIED",
+              "STARTED",
+              "ENDED",
+              "FILE_GENERATED"
+            ],
+            "description": "The current artifact generation state."
+          },
+          "startTime": {
+            "type": "string",
+            "description": "When smart-note generation started.",
+            "format": "date-time"
+          },
+          "endTime": {
+            "type": "string",
+            "description": "When smart-note generation ended.",
+            "format": "date-time"
+          },
+          "docsDestination": {
+            "type": "object",
+            "properties": {
+              "document": {
+                "type": "string",
+                "description": "The Google Docs document ID."
+              },
+              "exportUri": {
+                "type": "string",
+                "description": "The browser URL for the document.",
+                "format": "uri"
+              }
+            },
+            "additionalProperties": false,
+            "description": "The Google Docs destination of a generated artifact."
+          }
+        },
+        "additionalProperties": true,
+        "required": [
+          "name"
+        ],
+        "description": "Metadata for smart notes generated during a Google Meet conference."
+      },
+      "description": "Every smart note of the conference, all pages read."
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "conferenceRecord",
+    "smartNotes"
+  ],
+  "description": "A Google Meet conference record and every smart note generated for it."
+}

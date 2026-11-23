@@ -1,0 +1,10 @@
+{
+  "conferenceRecord": {
+    "name": "conferenceRecords/synthetic-conference-0003",
+    "space": "spaces/syntheticSpace0003",
+    "startTime": "2026-11-04T10:00:00Z",
+    "endTime": "2026-11-04T10:30:00Z",
+    "expireTime": "2026-12-04T10:30:00Z"
+  },
+  "smartNotes": []
+}

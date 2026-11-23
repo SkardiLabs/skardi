@@ -1,0 +1,61 @@
+{
+  "type": "object",
+  "properties": {
+    "conferenceRecords": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "description": "The conference record resource name."
+          },
+          "space": {
+            "type": "string",
+            "description": "The meeting space resource name."
+          },
+          "startTime": {
+            "type": "string",
+            "description": "When the conference started.",
+            "format": "date-time"
+          },
+          "endTime": {
+            "type": "string",
+            "description": "When the conference ended, when finished.",
+            "format": "date-time"
+          },
+          "expireTime": {
+            "type": "string",
+            "description": "When Google deletes the conference record resource.",
+            "format": "date-time"
+          }
+        },
+        "additionalProperties": true,
+        "required": [
+          "name"
+        ],
+        "description": "One instance of a conference held in a Google Meet space."
+      },
+      "description": "Conference records in the requested page."
+    },
+    "nextPageToken": {
+      "anyOf": [
+        {
+          "type": "string",
+          "description": "A pagination token for the next page, or null when the page is final."
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "A pagination token for the next page, or null when the page is final."
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "conferenceRecords",
+    "nextPageToken"
+  ],
+  "description": "A paginated Google Meet conferenceRecords response."
+}
