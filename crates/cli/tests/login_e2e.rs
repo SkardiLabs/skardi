@@ -91,7 +91,9 @@ async fn login_writes_a_context_that_query_then_uses_and_logout_clears() {
         .and(path("/v1/me/tokens"))
         .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
             "token": "skardi_pat_e2e",
-            "pat": {"token_id": "tok-e2e", "expires_at": "2026-11-22T12:00:00Z"},
+            // Far ahead on purpose: `query` refuses a context whose
+            // credential has expired, and this test runs on the real clock.
+            "pat": {"token_id": "tok-e2e", "expires_at": "2099-01-01T00:00:00Z"},
         })))
         .mount(&control_plane)
         .await;
