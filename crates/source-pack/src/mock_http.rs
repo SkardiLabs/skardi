@@ -55,6 +55,12 @@ pub struct MockResponse {
     body: Vec<u8>,
     delay: Option<Duration>,
     truncate_body_at: Option<usize>,
+    /// `(chunk_bytes, gap)`: write the body `chunk_bytes` at a time, sleeping
+    /// `gap` between chunks.
+    paced_body: Option<(usize, Duration)>,
+    /// `(after_bytes, stall)`: write `after_bytes` of the body, go silent for
+    /// `stall`, then write the rest.
+    stall_body: Option<(usize, Duration)>,
 }
 
 impl MockResponse {
@@ -67,6 +73,8 @@ impl MockResponse {
             body: body.into(),
             delay: None,
             truncate_body_at: None,
+            paced_body: None,
+            stall_body: None,
         }
     }
 
@@ -97,6 +105,22 @@ impl MockResponse {
     /// rather than mistaking the prefix for a short-but-complete response.
     pub fn with_truncated_body(mut self, sent_bytes: usize) -> Self {
         self.truncate_body_at = Some(sent_bytes);
+        self
+    }
+
+    /// Write the body `chunk_bytes` at a time with `gap` between chunks,
+    /// simulating a slow transfer that keeps making progress. Each gap is
+    /// short, but the whole body takes `gap` times the chunk count.
+    pub fn with_paced_body(mut self, chunk_bytes: usize, gap: Duration) -> Self {
+        self.paced_body = Some((chunk_bytes.max(1), gap));
+        self
+    }
+
+    /// Write the first `after_bytes` of the body, go silent for `stall`,
+    /// then write the rest, simulating a transfer that stops making
+    /// progress after the head has arrived.
+    pub fn with_body_stall(mut self, after_bytes: usize, stall: Duration) -> Self {
+        self.stall_body = Some((after_bytes, stall));
         self
     }
 }
@@ -262,6 +286,9 @@ async fn serve_connection(
     }
     head_out.push_str("\r\n");
 
+    // Paced and stalled bodies write small pieces on purpose; Nagle would
+    // merge or delay them and blur the timing the tests assert on.
+    stream.set_nodelay(true)?;
     stream.write_all(head_out.as_bytes()).await?;
     // `content-length` above always declares the full body; sending less
     // (see `MockResponse::with_truncated_body`) is deliberate, so the
@@ -271,7 +298,21 @@ async fn serve_connection(
         Some(n) => &response.body[..n.min(response.body.len())],
         None => &response.body[..],
     };
-    stream.write_all(sent).await?;
+    if let Some((chunk_bytes, gap)) = response.paced_body {
+        for chunk in sent.chunks(chunk_bytes) {
+            stream.write_all(chunk).await?;
+            stream.flush().await?;
+            tokio::time::sleep(gap).await;
+        }
+    } else if let Some((after_bytes, stall)) = response.stall_body {
+        let (first, rest) = sent.split_at(after_bytes.min(sent.len()));
+        stream.write_all(first).await?;
+        stream.flush().await?;
+        tokio::time::sleep(stall).await;
+        stream.write_all(rest).await?;
+    } else {
+        stream.write_all(sent).await?;
+    }
     stream.shutdown().await
 }
 

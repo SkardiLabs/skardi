@@ -32,7 +32,6 @@
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
 
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
@@ -69,7 +68,6 @@ pub struct GatewayHandle {
     raw_action_allowlist: HashSet<String>,
     max_pages: u32,
     max_rows: u64,
-    scan_timeout: Duration,
 }
 
 impl std::fmt::Debug for GatewayHandle {
@@ -96,7 +94,6 @@ impl GatewayHandle {
             raw_action_allowlist: config.raw_action_allowlist.iter().cloned().collect(),
             max_pages: config.max_pages,
             max_rows: config.max_rows,
-            scan_timeout: Duration::from_secs(config.scan_timeout_seconds),
         }
     }
 }
@@ -276,7 +273,6 @@ impl TableFunctionImpl for OpenConnectorQueryFunction {
             resource,
             handle.max_pages,
             handle.max_rows,
-            handle.scan_timeout,
         )
         .map_err(plan_error)?;
         Ok(Arc::new(provider))
@@ -395,7 +391,6 @@ impl TableFunctionImpl for OpenConnectorScanFunction {
             input,
             max_pages: handle.max_pages,
             max_rows: handle.max_rows,
-            scan_timeout: handle.scan_timeout,
         }))
     }
 }
@@ -417,7 +412,6 @@ struct RawScanProvider {
     input: Value,
     max_pages: u32,
     max_rows: u64,
-    scan_timeout: Duration,
 }
 
 impl std::fmt::Debug for RawScanProvider {
@@ -465,7 +459,6 @@ impl TableProvider for RawScanProvider {
             limit,
             self.max_pages,
             self.max_rows,
-            self.scan_timeout,
         )?;
         Ok(Arc::new(exec))
     }

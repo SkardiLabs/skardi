@@ -14,7 +14,9 @@ use thiserror::Error;
 /// each.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportFailure {
-    /// The request outlived its timeout.
+    /// The connection was established and then went silent: no bytes arrived
+    /// within the idle timeout. There is no total timeout, so a slow transfer
+    /// that keeps making progress never lands here.
     Timeout,
     /// The connection was never established.
     Connect,
@@ -406,6 +408,20 @@ pub enum OpenConnectorError {
         reason: String,
     },
 
+    /// The response head arrived and then the body went silent: no bytes
+    /// within the client's idle timeout. A slow body that keeps arriving never
+    /// raises this; there is no total timeout.
+    ///
+    /// Its own variant because a body read failure is otherwise an
+    /// [`Self::InvalidGatewayResponse`], and a stalled connection is not a
+    /// malformed response. `transport` is [`TransportFailure::Timeout`].
+    #[error("Open Connector {operation}: the response body stalled ({reason})")]
+    ResponseBodyStalled {
+        operation: String,
+        transport: TransportFailure,
+        reason: String,
+    },
+
     /// The provider reported an in-band error inside an otherwise
     /// successful response envelope — Slack's HTTP-200 `ok: false` +
     /// `error` pattern. The code is a short provider-authored identifier
@@ -621,10 +637,6 @@ pub enum OpenConnectorError {
         bound: &'static str,
         limit: u64,
     },
-
-    /// A scan exceeded its total time budget.
-    #[error("Open Connector scan of '{table}' timed out after {seconds}s")]
-    ScanTimeout { table: String, seconds: u64 },
 
     /// A row path was malformed (must be `$.key[.key…]` object-key segments).
     #[error("Open Connector row path '{path}' is invalid: {reason}")]

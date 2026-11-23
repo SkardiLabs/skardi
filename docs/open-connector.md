@@ -97,8 +97,7 @@ spec:
         runtime_token_env: OPEN_CONNECTOR_TOKEN
 
         # Safety bounds (defaults shown).
-        request_timeout_seconds: 30      # one gateway HTTP request
-        scan_timeout_seconds: 300        # one whole scan, all pages
+        idle_timeout_seconds: 60         # longest gap with no bytes on a request; no total timeout
         max_pages: 100                   # pages per scan
         max_rows: 100000                 # rows per scan
         max_response_bytes: 16777216     # decoded bytes per response
@@ -331,8 +330,8 @@ A resumed scan keeps every in-process check: authoritative raw page counts,
 has-more validation, split continuation actions, and immediate cursor-repeat
 detection. What it cannot see is history from other processes, so the owner
 of the walk must refuse a position it has already accepted (cross-process loop
-fencing), and owns the walk's overall deadline: `ScanBounds::timeout` bounds
-only the resumed process's share. A refused action's structured `data` (for
+fencing). A scan has no overall deadline; only the client's per-request idle
+timeout bounds a stalled request. A refused action's structured `data` (for
 example Dropbox's `reset` cursor) is kept on `ActionExecutionFailed` as a
 `ProviderData`, which never prints its contents.
 
@@ -375,9 +374,14 @@ pagination guarantees.
 
 ## Bounds, retries, and errors
 
-Every scan is bounded by `max_pages`, `max_rows`, `request_timeout_seconds`,
-`scan_timeout_seconds`, and `max_response_bytes`; hitting a bound fails the
-scan rather than returning a partial result as success. Idempotent gateway
+Every scan is bounded by `max_pages`, `max_rows`, and `max_response_bytes`;
+hitting a bound fails the scan rather than returning a partial result as
+success. There is no total timeout on a request or a scan: each request has an
+idle timeout (`idle_timeout_seconds`, default 60; the old name
+`request_timeout_seconds` is still accepted, and the old
+`scan_timeout_seconds` is accepted and ignored), the longest gap with no
+bytes. A slow transfer that keeps making progress is never cut off; a stalled
+one fails as a transport timeout. Idempotent gateway
 calls (health, discovery) retry `429`/transient `5xx` with capped
 exponential backoff honoring `Retry-After`; non-idempotent execute calls
 retry only a pre-execution `429` and never re-send a request that may have

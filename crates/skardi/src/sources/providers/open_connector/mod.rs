@@ -265,7 +265,6 @@ pub async fn register_open_connector_tables(
         Duration::from_secs(config.cache_ttl_seconds),
         usize::try_from(config.cache_max_bytes).unwrap_or(usize::MAX),
     ));
-    let scan_timeout = Duration::from_secs(config.scan_timeout_seconds);
 
     for binding in &config.bindings {
         let pack = pack_registry.require(&binding.source_pack)?;
@@ -345,7 +344,6 @@ pub async fn register_open_connector_tables(
                 Value::Object(binding.resource.clone().into_iter().collect()),
                 config.max_pages,
                 config.max_rows,
-                scan_timeout,
             )?;
             schema_provider
                 .register_table(table_name.clone(), Arc::new(provider))
@@ -911,56 +909,6 @@ bindings:
     }
 
     #[tokio::test]
-    async fn scan_deadline_bounds_retry_waits() {
-        let gateway = MockGateway::start(|req| {
-            if req.method == "GET" && req.path == "/v1/health" {
-                return MockResponse::ok("{}");
-            }
-            if req.method == "GET" && req.path == "/v1/actions/mock.list_items" {
-                return MockResponse::ok(&discovery_ok("{}", r#"{"type": "object"}"#, true, None));
-            }
-            if req.method == "POST" && req.path == "/v1/actions/mock.list_items" {
-                // The client would wait two seconds before retrying this 429,
-                // but the one-second scan deadline must cut that wait short.
-                return MockResponse::new(429, "{}").with_header("retry-after", "2");
-            }
-            MockResponse::new(404, "{}")
-        })
-        .await;
-
-        unsafe {
-            std::env::set_var(TOKEN_ENV_CATALOG_TIMEOUT, "test-token");
-        }
-        let mut config = mock_config(TOKEN_ENV_CATALOG_TIMEOUT, 0);
-        config.scan_timeout_seconds = 1;
-        config.request_timeout_seconds = 30;
-        let mut ctx = SessionContext::new();
-        register_open_connector_tables(
-            &mut ctx,
-            "saas",
-            &gateway.url,
-            Some(&config),
-            false,
-            HierarchyLevel::Catalog,
-            None,
-        )
-        .await
-        .expect("catalog registration succeeds");
-        unsafe {
-            std::env::remove_var(TOKEN_ENV_CATALOG_TIMEOUT);
-        }
-
-        let df = ctx.sql("SELECT id FROM saas.ws.items").await.expect("plan");
-        let err = df.collect().await.expect_err("scan must time out");
-        assert!(err.to_string().contains("timed out after 1s"), "got {err}");
-        assert_eq!(
-            execute_requests(&gateway).len(),
-            1,
-            "retry wait was cancelled"
-        );
-    }
-
-    #[tokio::test]
     async fn gteq_is_not_pushed_to_strict_gt_input() {
         // The gateway's `min_value` is strictly greater-than, so `>=` has no
         // faithful pushdown and must stay in DataFusion. Pushing it as Exact
@@ -1257,9 +1205,6 @@ bindings:
 
     #[cfg(test)]
     const TOKEN_ENV_CATALOG_LIMIT_FULL: &str = "SKARDI_TEST_OC_REGISTER_CATALOG_LIMIT_FULL";
-
-    #[cfg(test)]
-    const TOKEN_ENV_CATALOG_TIMEOUT: &str = "SKARDI_TEST_OC_REGISTER_CATALOG_TIMEOUT";
 
     #[cfg(test)]
     fn mock_config(token_env: &str, cache_ttl_seconds: u64) -> OpenConnectorConfig {
