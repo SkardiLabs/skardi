@@ -55,13 +55,19 @@ gateway **runtime token**.
 > delivered only by webhook and belong to the
 > [`kind: webhook` receiver](webhooks.md); pins captured from a live
 > gateway, live pass against a real WABA pending per the pack doc),
-> and [Feishu meetings](open-connector-feishu-meetings.md) (VC meetings
+> [Feishu meetings](open-connector-feishu-meetings.md) (VC meetings
 > and the 智能纪要 / 逐字稿 documents Feishu wrote for them, as the
 > meeting-minutes contract's `meetings` and `meeting_notes` beside a
 > `meeting_search` listing — the first pack to use the loader's
 > [`derive:` block](#row-derivation-derive); pins captured from a local
 > gateway built from Open Connector main, no real Feishu tenant read yet
-> per the pack doc).
+> per the pack doc),
+> and [Google Meet](open-connector-google-meet.md) (the conferences a user
+> organized and the Gemini notes Docs Google wrote for them, as the
+> meeting-minutes contract's `meetings` and `meeting_notes`; the listing
+> pin captured from a local gateway, the notes read's pin provisional
+> until its action is reviewed; no real Google account read yet per the
+> pack doc).
 > Further provider packs (Google Calendar, Jira, …) ship one pack per
 > release per the
 > [design spec](superpowers/specs/2026-07-11-open-connector-integration-design.md);
