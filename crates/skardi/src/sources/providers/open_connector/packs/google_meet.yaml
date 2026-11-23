@@ -3,11 +3,12 @@
 # contract shape (`meetings`, `meeting_notes`) that every meeting pack
 # writes.
 #
-# Wire contract: Open Connector's `googlemeet` provider. `meetings`'
-# contract was captured from a local gateway built from
-# SkardiLabs/open-connector 6962d827 (open-connector#22 merged with main);
-# `meeting_notes`' is PROVISIONAL until `get_conference_artifacts` is
-# reviewed (see that table). The executors
+# Wire contract: Open Connector's `googlemeet` provider. Both tables'
+# contracts were captured from a local gateway built from
+# SkardiLabs/open-connector 27e6b0fbff35ae06858651a2b2bf31251053d7a8, the
+# head of open-connector#30 (`get_conference_artifacts`) until it merges,
+# on main ce9952024d004895ffa80b6525361fa9c2a01eed (open-connector#22, the
+# start-time window). The executors
 # rebuild the list ENVELOPE — `conferenceRecords` always present (`[]` for
 # Google's `{}` page), `nextPageToken` null on the last page — and pass
 # Google's own objects through RAW: camelCase keys, times as RFC 3339
@@ -88,18 +89,16 @@ tables:
   # One row per Gemini smart note of one conference, read by the record's
   # name. The action answers `{conferenceRecord, smartNotes}` — the record
   # beside its notes, so every note carries its meeting's id and start from
-  # a field. A note is a Google Doc in the organizer's Drive, reached by
+  # a field. The gateway walks the notes oldest first, at most ten pages of
+  # 100, and answers a provider error past that rather than a short list.
+  # A note is a Google Doc in the organizer's Drive, reached by
   # `document_path`; no text is read, and Gemini's "Next steps" stay prose
   # inside that Doc (no action-item table).
   meeting_notes:
     action: googlemeet.get_conference_artifacts
     row_path: "$"
     row_shape: object
-    # PROVISIONAL: the action is not reviewed yet. This pins a contract
-    # generated with Open Connector's own schema helpers from the field
-    # schemas the provider already declares (module doc); re-capture from
-    # the reviewed action and re-pin before this pack merges.
-    fingerprint: a19419bd44ad02adc583fb9120563b835476135548a696acc419893fb5b90a77
+    fingerprint: aae1009d44dd3f6b71c8062f499ea282c28e26c7ff28ad5f904a6a320c2d8ae3
     pagination:
       strategy: single_page
     resources:

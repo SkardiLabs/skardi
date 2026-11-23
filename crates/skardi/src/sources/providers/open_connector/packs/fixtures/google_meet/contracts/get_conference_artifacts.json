@@ -88,7 +88,7 @@
         ],
         "description": "Metadata for smart notes generated during a Google Meet conference."
       },
-      "description": "Every smart note of the conference, all pages read."
+      "description": "Every smart-note session of the conference, oldest first."
     }
   },
   "additionalProperties": false,
@@ -96,5 +96,5 @@
     "conferenceRecord",
     "smartNotes"
   ],
-  "description": "A Google Meet conference record and every smart note generated for it."
+  "description": "A Google Meet conference record and its smart notes."
 }

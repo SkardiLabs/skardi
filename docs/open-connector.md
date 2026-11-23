@@ -64,10 +64,9 @@ gateway **runtime token**.
 > per the pack doc),
 > and [Google Meet](open-connector-google-meet.md) (the conferences a user
 > organized and the Gemini notes Docs Google wrote for them, as the
-> meeting-minutes contract's `meetings` and `meeting_notes`; the listing
-> pin captured from a local gateway, the notes read's pin provisional
-> until its action is reviewed; no real Google account read yet per the
-> pack doc).
+> meeting-minutes contract's `meetings` and `meeting_notes`; pins
+> captured from a local gateway built from Open Connector, no real Google
+> account read yet per the pack doc).
 > Further provider packs (Google Calendar, Jira, …) ship one pack per
 > release per the
 > [design spec](superpowers/specs/2026-07-11-open-connector-integration-design.md);

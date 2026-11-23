@@ -11,23 +11,34 @@
 //! explicit NULL on every row, and a note is a row only because Google
 //! answered a smart note for it (design §0.3, D14).
 //!
-//! **The wire contract is Open Connector's.** `meetings` was reconciled
-//! against a local gateway built from SkardiLabs/open-connector `6962d827`
-//! (open-connector#22, the start-time window and `get_current_user`, merged
-//! with main) on 2026-11-24: its output and input contracts under
-//! `fixtures/google_meet/contracts/` were captured there, and every input
-//! set this table generates — the window with and without `pageToken`, and
-//! no window at all — reached the credential wall (`authorization_failed`,
-//! "Connect googlemeet with OAuth or service account credentials first.",
-//! `data.status` 401), while an undeclared key was refused as
-//! `additionalProperties`. `meeting_notes` reads
-//! `googlemeet.get_conference_artifacts`, which is **not reviewed yet**: its
-//! contract fixtures are PROVISIONAL, generated with Open Connector's own
-//! schema helpers (`s.object`, `s.array`, …) from the conference-record and
-//! smart-note schemas the provider already declares, wrapped as
-//! `{conferenceRecord, smartNotes}` with the input `{name}`. Re-capture both
-//! from the reviewed action and re-pin before this pack merges. The
-//! executors rebuild the list envelope — `conferenceRecords` always present
+//! **The wire contract is Open Connector's.** Both actions' output and input
+//! contracts under `fixtures/google_meet/contracts/` were captured on
+//! 2026-11-24 from a local gateway built from SkardiLabs/open-connector
+//! `27e6b0fbff35ae06858651a2b2bf31251053d7a8`, the head of
+//! open-connector#30 (`get_conference_artifacts`), until that PR merges.
+//! Its base is main `ce9952024d004895ffa80b6525361fa9c2a01eed`
+//! (open-connector#22, the start-time window and `get_current_user`).
+//! `list_conference_records` hashes the same there as on #22's own branch.
+//! Every input set this pack generates reached the credential wall
+//! (`authorization_failed`, "Connect googlemeet with OAuth or service
+//! account credentials first.", `data.status` 401):
+//!
+//! - the window with and without `pageToken`;
+//! - no window at all;
+//! - the notes read's `{name}`.
+//!
+//! An undeclared key was refused as `additionalProperties`.
+//!
+//! `get_conference_artifacts` takes the `name` `get_conference_record`
+//! takes and answers `{conferenceRecord, smartNotes}`:
+//!
+//! - the record, with `get_conference_record`'s schema;
+//! - beside it, every smart-note session, oldest first, always an array.
+//!
+//! The gateway walks smart notes at `pageSize` 100 for at most ten pages,
+//! and past that answers a provider error rather than a short list.
+//!
+//! The executors rebuild the list envelope — `conferenceRecords` always present
 //! (`looseArray` answers Google's `{}` page as `[]`), `nextPageToken` null
 //! on the last page — and pass Google's own objects through RAW: camelCase
 //! keys, times as RFC 3339 strings with up to nine fractional digits.
@@ -575,8 +586,7 @@ mod tests {
     fn pinned_fingerprints_match_the_contracts() {
         // Pin <-> contract lock through the SAME function registration
         // uses; mismatch output is also how pins are (re)taken after an
-        // upstream upgrade. `get_conference_artifacts`' contract is
-        // PROVISIONAL until the action is reviewed (module doc).
+        // upstream upgrade.
         let mut mismatches = Vec::new();
         for (short, contract) in [
             ("meetings", LIST_CONTRACT),

@@ -28,22 +28,20 @@ reads text.
 envelope (`conferenceRecords` always present, `nextPageToken` `null` on
 the last page) and passes Google's own objects through raw: camelCase keys,
 times as RFC 3339 strings with up to nine fractional digits. Inputs are
-strict (`additionalProperties: false`). The `meetings` contract was
-captured from a local gateway built from Open Connector `6962d827`
-([SkardiLabs/open-connector#22](https://github.com/SkardiLabs/open-connector/pull/22),
-the start-time window, merged with main), where every input set the table
-generates passed the strict schema.
+strict (`additionalProperties: false`). Both tables' contracts were
+captured from a local gateway built from Open Connector
+`27e6b0fbff35ae06858651a2b2bf31251053d7a8`. That is the head of
+[SkardiLabs/open-connector#30](https://github.com/SkardiLabs/open-connector/pull/30)
+(`get_conference_artifacts`) until it merges. Its base is main
+`ce9952024d004895ffa80b6525361fa9c2a01eed`, which includes
+[SkardiLabs/open-connector#22](https://github.com/SkardiLabs/open-connector/pull/22)
+(the start-time window). Every input set the pack generates passed the
+strict schemas.
 
 > **No real Google account has been read.** The row shapes come from
 > Google's Meet REST v2 discovery document and guides and the executor
 > source. The conference record and the smart note are declared with their
 > fields, so the fingerprint gate protects the wire columns.
->
-> **`meeting_notes` reads `googlemeet.get_conference_artifacts`, which is
-> not reviewed yet.** Its pinned contract is provisional, generated with
-> Open Connector's own schema helpers from the field schemas the provider
-> already declares; it is re-captured from the reviewed action before this
-> pack ships.
 
 ## Binding
 
@@ -111,8 +109,10 @@ table needs no per-meeting read.
 
 One row per Gemini smart note of one conference, read by the conference
 record's `name`. The action answers `{conferenceRecord, smartNotes}`: the
-record beside every smart note of it, all pages read, so every note
-carries its meeting's id and start from a field.
+record beside every smart-note session of it, oldest first, so every note
+carries its meeting's id and start from a field. The gateway walks the
+smart notes at 100 a page for at most ten pages. Past that it answers a
+provider error rather than a short list.
 
 | Column | Type | From |
 | --- | --- | --- |
@@ -166,21 +166,24 @@ rows.
 
 ## Verification
 
-What has been observed, against a local gateway built from Open Connector
-`6962d827` (2026-11-24), without Google credentials:
+What has been observed on 2026-11-24, without Google credentials, against
+a local gateway built from Open Connector
+`27e6b0fbff35ae06858651a2b2bf31251053d7a8` (the head of
+open-connector#30 until it merges):
 
-- Discovery of `googlemeet.list_conference_records`; its output and input
-  schemas captured under
+- Discovery of `googlemeet.list_conference_records` and
+  `googlemeet.get_conference_artifacts`. Their output and input schemas
+  are captured under
   `crates/skardi/src/sources/providers/open_connector/packs/fixtures/google_meet/contracts/`
-  and pinned by fingerprint.
-- Every input set `meetings` generates (`startTime`+`endTime`+`pageSize`,
-  the same plus `pageToken`, and `pageSize` alone) accepted by the strict
-  schema, reaching the credential wall (`authorization_failed`,
-  `data.status` 401); an undeclared key refused as an input-schema
-  mismatch.
-
-`get_conference_artifacts` was not on that gateway; its contract fixtures
-are provisional until the reviewed action is captured.
+  and pinned by fingerprint. `list_conference_records` hashes the same as
+  on open-connector#22's own branch.
+- Every input set the pack generates was accepted by the strict schemas
+  and reached the credential wall (`authorization_failed`, `data.status`
+  401). The sets are:
+  - for `meetings`: `startTime`+`endTime`+`pageSize`, the same plus
+    `pageToken`, and `pageSize` alone;
+  - for `meeting_notes`: `name`.
+- An undeclared key was refused as an input-schema mismatch.
 
 What has **not** been observed — each item is a probe against a real
 Google Workspace account:
