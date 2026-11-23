@@ -14,11 +14,9 @@
 //! **The wire contract is Open Connector's.** Both actions' output and input
 //! contracts under `fixtures/google_meet/contracts/` were captured on
 //! 2026-11-24 from a local gateway built from SkardiLabs/open-connector
-//! `27e6b0fbff35ae06858651a2b2bf31251053d7a8`, the head of
-//! open-connector#30 (`get_conference_artifacts`), until that PR merges.
-//! Its base is main `ce9952024d004895ffa80b6525361fa9c2a01eed`
-//! (open-connector#22, the start-time window and `get_current_user`).
-//! `list_conference_records` hashes the same there as on #22's own branch.
+//! main `02ba682a322e35636f1b927eb1abee1d79af6249`, which carries
+//! open-connector#22 (the start-time window and `get_current_user`) and
+//! open-connector#30 (`get_conference_artifacts`).
 //! Every input set this pack generates reached the credential wall
 //! (`authorization_failed`, "Connect googlemeet with OAuth or service
 //! account credentials first.", `data.status` 401):

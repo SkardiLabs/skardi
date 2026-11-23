@@ -29,13 +29,12 @@ envelope (`conferenceRecords` always present, `nextPageToken` `null` on
 the last page) and passes Google's own objects through raw: camelCase keys,
 times as RFC 3339 strings with up to nine fractional digits. Inputs are
 strict (`additionalProperties: false`). Both tables' contracts were
-captured from a local gateway built from Open Connector
-`27e6b0fbff35ae06858651a2b2bf31251053d7a8`. That is the head of
-[SkardiLabs/open-connector#30](https://github.com/SkardiLabs/open-connector/pull/30)
-(`get_conference_artifacts`) until it merges. Its base is main
-`ce9952024d004895ffa80b6525361fa9c2a01eed`, which includes
+captured from a local gateway built from Open Connector main
+`02ba682a322e35636f1b927eb1abee1d79af6249`, which carries
 [SkardiLabs/open-connector#22](https://github.com/SkardiLabs/open-connector/pull/22)
-(the start-time window). Every input set the pack generates passed the
+(the start-time window) and
+[SkardiLabs/open-connector#30](https://github.com/SkardiLabs/open-connector/pull/30)
+(`get_conference_artifacts`). Every input set the pack generates passed the
 strict schemas.
 
 > **No real Google account has been read.** The row shapes come from
@@ -167,16 +166,14 @@ rows.
 ## Verification
 
 What has been observed on 2026-11-24, without Google credentials, against
-a local gateway built from Open Connector
-`27e6b0fbff35ae06858651a2b2bf31251053d7a8` (the head of
-open-connector#30 until it merges):
+a local gateway built from Open Connector main
+`02ba682a322e35636f1b927eb1abee1d79af6249`:
 
 - Discovery of `googlemeet.list_conference_records` and
   `googlemeet.get_conference_artifacts`. Their output and input schemas
   are captured under
   `crates/skardi/src/sources/providers/open_connector/packs/fixtures/google_meet/contracts/`
-  and pinned by fingerprint. `list_conference_records` hashes the same as
-  on open-connector#22's own branch.
+  and pinned by fingerprint.
 - Every input set the pack generates was accepted by the strict schemas
   and reached the credential wall (`authorization_failed`, `data.status`
   401). The sets are:

@@ -5,10 +5,9 @@
 #
 # Wire contract: Open Connector's `googlemeet` provider. Both tables'
 # contracts were captured from a local gateway built from
-# SkardiLabs/open-connector 27e6b0fbff35ae06858651a2b2bf31251053d7a8, the
-# head of open-connector#30 (`get_conference_artifacts`) until it merges,
-# on main ce9952024d004895ffa80b6525361fa9c2a01eed (open-connector#22, the
-# start-time window). The executors
+# SkardiLabs/open-connector main 02ba682a322e35636f1b927eb1abee1d79af6249
+# (open-connector#22, the start-time window, and #30,
+# `get_conference_artifacts`). The executors
 # rebuild the list ENVELOPE — `conferenceRecords` always present (`[]` for
 # Google's `{}` page), `nextPageToken` null on the last page — and pass
 # Google's own objects through RAW: camelCase keys, times as RFC 3339
