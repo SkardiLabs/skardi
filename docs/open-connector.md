@@ -376,7 +376,8 @@ pagination guarantees.
 
 Every scan is bounded by `max_pages`, `max_rows`, and `max_response_bytes`;
 hitting a bound fails the scan rather than returning a partial result as
-success. There is no total timeout on a request or a scan: each request has an
+success. A table with a `derive:` block is also bounded per page, before
+its rows are built: see [Row derivation](#row-derivation-derive). There is no total timeout on a request or a scan: each request has an
 idle timeout (`idle_timeout_seconds`, default 60; the old name
 `request_timeout_seconds` is still accepted, and the old
 `scan_timeout_seconds` is accepted and ignored), the longest gap with no
@@ -553,7 +554,17 @@ key, the explode `index`, the unpivot `into` and `label`) can only be read
 whole: a column or a `format` placeholder that reads below it is refused
 when the pack loads. The explode `into` key is exempt, because an element
 may be an object whose fields the columns read. Explode and unpivot are
-also refused on `page_number` and `keyset` tables.
+also refused on `page_number` and `keyset` tables, and so is a step whose
+listed paths repeat or nest (`payload` and `payload.items`): no answer
+holds an array or a scalar at one path and a value inside it.
+
+Explode and unpivot copy the source row once per row they yield, so a page
+inside `max_response_bytes` could otherwise ask for far more memory than it
+carried. The rows one page derives may number no more than `max_rows` and
+weigh no more than `max_response_bytes`, counted before each copy is made
+by a lower bound on the copy's compact JSON size, so a page that merely
+copies its rows once is never refused. Exceeding either fails the scan with
+`ScanBoundsExceeded` naming the bound; the page is never cut short.
 
 A `filters:` mapping on a column the derivation writes is refused when the
 pack loads, and so is one on a column holding the parent of an exploded or
