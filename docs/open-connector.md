@@ -49,12 +49,19 @@ gateway **runtime token**.
 > [Dropbox](open-connector-dropbox.md) (files, shared links, file
 > search — split-action cursor continuation; live-verified against a real
 > account, all five pins captured from a live gateway),
-> and [WhatsApp](open-connector-whatsapp.md) (phone numbers, business
+> [WhatsApp](open-connector-whatsapp.md) (phone numbers, business
 > profile, message templates, and the message / pricing / template
 > analytics fields — the account side of a WABA; messages themselves are
 > delivered only by webhook and belong to the
 > [`kind: webhook` receiver](webhooks.md); pins captured from a live
-> gateway, live pass against a real WABA pending per the pack doc).
+> gateway, live pass against a real WABA pending per the pack doc),
+> and [Feishu meetings](open-connector-feishu-meetings.md) (VC meetings
+> and the 智能纪要 / 逐字稿 documents Feishu wrote for them, as the
+> meeting-minutes contract's `meetings` and `meeting_notes` beside a
+> `meeting_search` listing — the first pack to use the loader's
+> [`derive:` block](#row-derivation-derive); pins captured from a local
+> gateway built from Open Connector main, no real Feishu tenant read yet
+> per the pack doc).
 > Further provider packs (Google Calendar, Jira, …) ship one pack per
 > release per the
 > [design spec](superpowers/specs/2026-07-11-open-connector-integration-design.md);
@@ -369,7 +376,8 @@ pagination guarantees.
 
 Every scan is bounded by `max_pages`, `max_rows`, and `max_response_bytes`;
 hitting a bound fails the scan rather than returning a partial result as
-success. There is no total timeout on a request or a scan: each request has an
+success. A table with a `derive:` block is also bounded per page, before
+its rows are built: see [Row derivation](#row-derivation-derive). There is no total timeout on a request or a scan: each request has an
 idle timeout (`idle_timeout_seconds`, default 60; the old name
 `request_timeout_seconds` is still accepted, and the old
 `scan_timeout_seconds` is accepted and ignored), the longest gap with no
@@ -491,6 +499,88 @@ forwards such envelopes unchanged, a pack table must declare an
 provider's own code (bounded, value-free), never the misleading
 missing-row-array error. A pack whose gateway does neither would
 otherwise report `RowPathNotFound` on an in-band error page.
+
+## Row derivation: `derive:`
+
+A pack column maps onto one wire key. A pack that lands a provider's
+answer in a shape shared with other providers — the meeting-minutes
+contract's tables, which every meeting pack writes with the same column
+names — also needs rows and keys the wire does not carry: a `provider`
+label on every row, an explicit NULL for a column the tool has no field
+for, one row per element of a list, an identity formatted from several
+fields. A table declares those in a `derive:` block. It runs after a
+page's rows are extracted and before the ordinary converter reads them,
+in the scan shared by the engine and its other consumers, so a derived
+column has the same typing, nullability and error identity as a wire
+column. Every table without a `derive:` block loads and scans exactly as
+before.
+
+The steps, run in this fixed order:
+
+- `skip_when_null: <path>` — drop the row when the named path is missing
+  or null. A parent along the path that is present but not an object fails
+  the scan with its kind.
+- `explode: { paths, into, index }` — one row per element of the first
+  non-empty array among the listed paths; the element lands under `into`,
+  its 0-based position under `index`. Every listed path is checked: one
+  present as anything but an array fails the scan, even when another path
+  supplied the elements. Elements are not inspected: a null one is still a
+  row, at its own position, and the column that reads it decides whether
+  NULL is acceptable. Explode consumes its paths: a derived row carries the
+  element and the row's other keys but none of the listed arrays, so an
+  array of `n` elements is never copied onto each of its own `n` rows. A
+  column or a `format` placeholder that reads a listed path is refused
+  when the pack loads.
+- `unpivot: { into, label, from }` — one row per named field that carries
+  a value, for a provider that answers several things of one kind as
+  sibling keys rather than an array (the Feishu meetings pack's two
+  document tokens). `from` lists `{label, path}` pairs in the order their
+  rows come out; the value lands under `into`, the label under `label`. A
+  field that is missing, null or the empty string yields no row; an array
+  or object fails the scan with its kind, checked for every field before
+  any row is yielded. Unpivot consumes its paths as explode does, and a
+  table cannot declare both.
+- `constants: { key: literal }` — keys written on every row, `null`
+  allowed; a derived key always wins over a wire key of the same name.
+- `format: { key: "…{path}…" }` — a key rendered from a template over the
+  row; a missing part makes the whole value NULL, so a non-null identity
+  fails loudly. A template cannot read another template's key: templates
+  render in key order, so the result would depend on how the two keys
+  sort, and the pack is refused when it loads.
+
+A derived key replaces the wire value of the same name, so a key written
+with a value that is never an object (a non-object constant, a `format`
+key, the explode `index`, the unpivot `into` and `label`) can only be read
+whole: a column or a `format` placeholder that reads below it is refused
+when the pack loads. The explode `into` key is exempt, because an element
+may be an object whose fields the columns read. Explode and unpivot are
+also refused on `page_number` and `keyset` tables, and so is a step whose
+listed paths repeat or nest (`payload` and `payload.items`): no answer
+holds an array or a scalar at one path and a value inside it.
+
+Explode and unpivot copy the source row once per row they yield, so a page
+inside `max_response_bytes` could otherwise ask for far more memory than it
+carried. The rows one page derives may number no more than `max_rows` and
+weigh no more than `max_response_bytes`, counted before each copy is made
+by a lower bound on the copy's compact JSON size, so a page that merely
+copies its rows once is never refused. Exceeding either fails the scan with
+`ScanBoundsExceeded` naming the bound; the page is never cut short.
+
+A `filters:` mapping on a column the derivation writes is refused when the
+pack loads, and so is one on a column holding the parent of an exploded or
+unpivoted path: the gateway evaluates a pushed-down predicate against wire
+rows, which do not carry derived values. A filter on any other column
+stays legal, because every derived row inherits that value unchanged.
+
+A consumer cannot skip the derivation or paginate on its output:
+`ActionScan::rows` returns the derived rows, and `ActionScan::advance`
+reads the raw page from the response itself, so an explode or unpivot
+that yields nothing from a non-empty page cannot end a listing early. A
+derivation that meets a row it cannot rewrite fails the scan with
+`RowDerivationFailed`, naming the table, step, path, page and row and the
+JSON kind found — never the value. The scan cache keys each entry by
+table, so two tables reading one answer into different rows never replay
+each other's batches.
 
 ## Compatibility and schema drift
 

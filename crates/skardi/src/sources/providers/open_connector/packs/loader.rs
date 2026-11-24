@@ -34,6 +34,9 @@ use std::sync::OnceLock;
 use serde::Deserialize;
 
 use crate::sources::providers::open_connector::error::OpenConnectorError;
+use skardi_source_pack::derive::{
+    Explode, RowDerivation, Unpivot, UnpivotField, template_placeholders,
+};
 // `Operator` here is the pack's neutral declaration, not DataFusion's.
 // The loader reads YAML and writes declarations; nothing about that needs
 // a query planner, and it used to convert to DataFusion's on the way in
@@ -110,36 +113,49 @@ fn convert_table(
         .collect::<Vec<_>>();
     let mut fixed_inputs = Vec::with_capacity(doc.fixed_inputs.len());
     for (key, value) in doc.fixed_inputs {
-        // YAML happily parses `.nan` / `.inf` / `-.inf`, but JSON has no
-        // spelling for them — FixedValue::to_json would silently send null
-        // at query time, bypassing the startup diagnostic this loader
-        // promises. Finite-only, enforced here. The nested case CANNOT be
-        // checked after the fact on a `serde_json::Value`: serde_json's
-        // f64 visitor maps a non-finite to `Value::Null` during
-        // deserialization (`Number::from_f64(...).map_or(Value::Null, …)`),
-        // so the loss has already happened by then — which is why the
-        // `Json` variant captures `serde_yaml::Value` and converts here,
-        // where the non-finite is still observable.
-        let fixed = match value {
-            FixedValueDoc::Float(v) if !v.is_finite() => {
-                return Err(format!(
-                    "{id}: fixed input '{key}' contains {v}, which has no JSON \
-                     spelling; pin finite numbers only"
-                ));
-            }
-            FixedValueDoc::Bool(v) => FixedValue::Bool(v),
-            FixedValueDoc::Int(v) => FixedValue::Int(v),
-            FixedValueDoc::Float(v) => FixedValue::Float(v),
-            FixedValueDoc::Str(v) => FixedValue::Str(leak_str(v)),
-            FixedValueDoc::StrList(v) => FixedValue::StrList(leak_str_slice(v)),
-            FixedValueDoc::Json(v) => {
-                let json = yaml_to_json(v)
-                    .map_err(|reason| format!("{id}: fixed input '{key}' {reason}"))?;
-                FixedValue::Json(Box::leak(Box::new(json)))
-            }
-        };
+        let fixed = convert_fixed_value(id, "fixed input", &key, value)?;
         fixed_inputs.push((leak_str(key), fixed));
     }
+    let derive = match doc.derive {
+        None => None,
+        Some(derive) => {
+            let mut constants = Vec::with_capacity(derive.constants.len());
+            for (key, value) in derive.constants {
+                let constant = convert_fixed_value(id, "derive constant", &key, value)?;
+                constants.push((leak_str(key), constant));
+            }
+            Some(RowDerivation {
+                skip_when_null: derive.skip_when_null.map(leak_str),
+                explode: derive.explode.map(|explode| Explode {
+                    paths: leak_str_slice(explode.paths),
+                    into: leak_str(explode.into),
+                    index: explode.index.map(leak_str),
+                }),
+                unpivot: derive.unpivot.map(|unpivot| Unpivot {
+                    from: leak_slice(
+                        unpivot
+                            .from
+                            .into_iter()
+                            .map(|field| UnpivotField {
+                                label: leak_str(field.label),
+                                path: leak_str(field.path),
+                            })
+                            .collect(),
+                    ),
+                    into: leak_str(unpivot.into),
+                    label: leak_str(unpivot.label),
+                }),
+                constants: leak_slice(constants),
+                format: leak_slice(
+                    derive
+                        .format
+                        .into_iter()
+                        .map(|(key, template)| (leak_str(key), leak_str(template)))
+                        .collect(),
+                ),
+            })
+        }
+    };
     let action_id = leak_str(doc.action);
     let (pagination, continuation) = doc.pagination.into_parts(action_id);
     let table = SourcePackTable {
@@ -157,9 +173,401 @@ fn convert_table(
         error_path: doc.error_path.map(leak_str),
         expected_fingerprint: doc.fingerprint.map(leak_str),
         continuation,
+        derive,
     };
     validate_table(&table)?;
     Ok(table)
+}
+
+/// One pinned literal — a fixed action input or a derive constant — from
+/// its YAML spelling. `what` names the declaration in errors.
+///
+/// YAML happily parses `.nan` / `.inf` / `-.inf`, but JSON has no spelling
+/// for them — FixedValue::to_json would silently send null at query time,
+/// bypassing the startup diagnostic this loader promises. Finite-only,
+/// enforced here. The nested case CANNOT be checked after the fact on a
+/// `serde_json::Value`: serde_json's f64 visitor maps a non-finite to
+/// `Value::Null` during deserialization
+/// (`Number::from_f64(...).map_or(Value::Null, …)`), so the loss has
+/// already happened by then — which is why the `Json` variant captures
+/// `serde_yaml::Value` and converts here, where the non-finite is still
+/// observable.
+fn convert_fixed_value(
+    id: &str,
+    what: &str,
+    key: &str,
+    value: FixedValueDoc,
+) -> Result<FixedValue, String> {
+    Ok(match value {
+        FixedValueDoc::Float(v) if !v.is_finite() => {
+            return Err(format!(
+                "{id}: {what} '{key}' contains {v}, which has no JSON spelling; pin finite \
+                 numbers only"
+            ));
+        }
+        FixedValueDoc::Bool(v) => FixedValue::Bool(v),
+        FixedValueDoc::Int(v) => FixedValue::Int(v),
+        FixedValueDoc::Float(v) => FixedValue::Float(v),
+        FixedValueDoc::Str(v) => FixedValue::Str(leak_str(v)),
+        FixedValueDoc::StrList(v) => FixedValue::StrList(leak_str_slice(v)),
+        FixedValueDoc::Json(v) => {
+            let json =
+                yaml_to_json(v).map_err(|reason| format!("{id}: {what} '{key}' {reason}"))?;
+            FixedValue::Json(Box::leak(Box::new(json)))
+        }
+    })
+}
+
+/// A row-relative dotted path as the converter and the derivation walk it:
+/// object keys only, no `$` prefix, no empty segment. The same rule
+/// `ColumnDoc::into_spec` applies to column paths, for the paths a
+/// `derive:` block names.
+fn check_row_relative_path(id: &str, what: &str, path: &str) -> Result<(), String> {
+    if path.is_empty() {
+        return Err(format!("{id}: {what} has an empty path"));
+    }
+    if path == "$" || path.starts_with("$.") {
+        return Err(format!(
+            "{id}: {what} path '{path}' must not start with '$' — derive paths are row-relative \
+             object keys"
+        ));
+    }
+    if path.split('.').any(str::is_empty) {
+        return Err(format!("{id}: {what} path '{path}' has an empty segment"));
+    }
+    Ok(())
+}
+
+/// A key a derivation writes onto a row: one object key, never a path.
+fn check_derived_key(id: &str, what: &str, key: &str) -> Result<(), String> {
+    if key.trim().is_empty() {
+        return Err(format!("{id}: {what} has an empty key"));
+    }
+    if key.contains('.') {
+        return Err(format!(
+            "{id}: {what} key '{key}' contains '.'; a derived key is one object key, not a path"
+        ));
+    }
+    Ok(())
+}
+
+/// Whether the row-relative path `read` names `path` itself or a key below
+/// it (`summary.steps.0` below `summary.steps`; `summary.stepsTaken` is a
+/// sibling, not below).
+fn reads_at_or_below(read: &str, path: &str) -> bool {
+    read.strip_prefix(path)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+}
+
+/// Whether the row-relative path `read` descends below the top-level key
+/// `key` (`summary.id` below `summary`); reading `key` itself does not.
+fn reads_below(read: &str, key: &str) -> bool {
+    read.split_once('.')
+        .is_some_and(|(parent, _)| parent == key)
+}
+
+/// Refuse a step's consumed paths when one is the same as another or lies
+/// below it (`payload` and `payload.items`). No answer satisfies both — the
+/// upper path must hold `holds` (an array, a scalar), the lower one needs it
+/// to be the object it descends into — so the step could only ever read one
+/// of them, and the other's drift would be consumed unseen.
+fn check_disjoint_paths(id: &str, step: &str, holds: &str, paths: &[&str]) -> Result<(), String> {
+    for (position, first) in paths.iter().enumerate() {
+        for second in &paths[position + 1..] {
+            if first == second {
+                return Err(format!("{id}: {step} reads the path '{first}' twice"));
+            }
+            let (upper, lower) = if reads_at_or_below(second, first) {
+                (first, second)
+            } else if reads_at_or_below(first, second) {
+                (second, first)
+            } else {
+                continue;
+            };
+            return Err(format!(
+                "{id}: {step} reads '{lower}' below '{upper}'; no answer holds {holds} at \
+                 '{upper}' and a value inside it"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The `derive:` block's own invariants. Serde guarantees its shape; these
+/// are the ways a derivation could be declared and do nothing, or do
+/// something other than what its author read.
+fn validate_derive(table: &SourcePackTable) -> Result<(), String> {
+    let Some(derive) = &table.derive else {
+        return Ok(());
+    };
+    let id = table.id;
+    if derive.is_empty() {
+        return Err(format!(
+            "{id}: `derive` declares nothing; drop the block or declare one of skip_when_null, \
+             explode, unpivot, constants, format"
+        ));
+    }
+    if let Some(path) = derive.skip_when_null {
+        check_row_relative_path(id, "derive skip_when_null", path)?;
+    }
+    if let Some(explode) = &derive.explode {
+        if explode.paths.is_empty() {
+            return Err(format!("{id}: derive explode names no `paths`"));
+        }
+        for path in explode.paths {
+            check_row_relative_path(id, "derive explode", path)?;
+        }
+        check_disjoint_paths(id, "derive explode", "an array", explode.paths)?;
+        check_derived_key(id, "derive explode `into`", explode.into)?;
+        if let Some(index) = explode.index {
+            check_derived_key(id, "derive explode `index`", index)?;
+        }
+        // A short or empty page is a termination signal under these two
+        // strategies, read off the RAW page — which stays sound — but the
+        // consumer's row count no longer tracks the wire's, so a page
+        // budget sized for wire rows would be wrong. Refused rather than
+        // documented: no table has needed it.
+        if matches!(
+            table.pagination,
+            PaginationStrategy::PageNumber { .. } | PaginationStrategy::Keyset { .. }
+        ) {
+            return Err(format!(
+                "{id}: derive explode is declared on a page_number/keyset table; explode is \
+                 supported with the cursor and single_page strategies"
+            ));
+        }
+    }
+    if let Some(unpivot) = &derive.unpivot {
+        // Two row-multiplying steps on one table would multiply each
+        // other's rows, and the consumed paths of one could hide below the
+        // other's; no table has needed both.
+        if derive.explode.is_some() {
+            return Err(format!(
+                "{id}: derive declares both explode and unpivot; a table turns its rows one way"
+            ));
+        }
+        if unpivot.from.is_empty() {
+            return Err(format!("{id}: derive unpivot names no `from` fields"));
+        }
+        let mut labels = HashSet::new();
+        let mut paths = HashSet::new();
+        for field in unpivot.from {
+            if field.label.trim().is_empty() {
+                return Err(format!(
+                    "{id}: derive unpivot field '{}' has an empty label",
+                    field.path
+                ));
+            }
+            if !labels.insert(field.label) {
+                return Err(format!(
+                    "{id}: derive unpivot names the label '{}' twice",
+                    field.label
+                ));
+            }
+            check_row_relative_path(id, "derive unpivot", field.path)?;
+            if !paths.insert(field.path) {
+                return Err(format!(
+                    "{id}: derive unpivot reads the path '{}' twice",
+                    field.path
+                ));
+            }
+        }
+        let from: Vec<&str> = unpivot.from.iter().map(|field| field.path).collect();
+        check_disjoint_paths(id, "derive unpivot", "a scalar", &from)?;
+        check_derived_key(id, "derive unpivot `into`", unpivot.into)?;
+        check_derived_key(id, "derive unpivot `label`", unpivot.label)?;
+        // The same reason explode is refused there: the consumer's row
+        // count no longer tracks the wire's.
+        if matches!(
+            table.pagination,
+            PaginationStrategy::PageNumber { .. } | PaginationStrategy::Keyset { .. }
+        ) {
+            return Err(format!(
+                "{id}: derive unpivot is declared on a page_number/keyset table; unpivot is \
+                 supported with the cursor and single_page strategies"
+            ));
+        }
+    }
+    for (key, _) in derive.constants {
+        check_derived_key(id, "derive constant", key)?;
+    }
+    for (key, template) in derive.format {
+        check_derived_key(id, "derive format", key)?;
+        let placeholders = template_placeholders(template)
+            .map_err(|reason| format!("{id}: derive format '{key}' template {reason}"))?;
+        for path in placeholders {
+            check_row_relative_path(id, &format!("derive format '{key}' placeholder"), path)?;
+        }
+    }
+    // Explode consumes its paths: a derived row carries the element under
+    // `into`, never the arrays it came from (see `Explode`). A column or a
+    // template reading at or below an exploded path would read nothing on
+    // every row, silently NULL on a nullable column, so it is refused here.
+    if let Some(explode) = &derive.explode {
+        for path in explode.paths {
+            if let Some(field) = table
+                .fields
+                .iter()
+                .find(|field| reads_at_or_below(field.path, path))
+            {
+                return Err(format!(
+                    "{id}: column '{}' reads '{}', which derive explode consumes; a derived row \
+                     carries the element under '{}', not the array",
+                    field.name, field.path, explode.into
+                ));
+            }
+            for (key, template) in derive.format {
+                let placeholders = template_placeholders(template).unwrap_or_default();
+                if let Some(read) = placeholders
+                    .iter()
+                    .find(|read| reads_at_or_below(read, path))
+                {
+                    return Err(format!(
+                        "{id}: derive format '{key}' reads '{read}', which derive explode \
+                         consumes; a derived row carries the element under '{}', not the array",
+                        explode.into
+                    ));
+                }
+            }
+        }
+    }
+    // Unpivot consumes its paths the same way: a derived row carries the
+    // field's value under `into`, never the field itself.
+    if let Some(unpivot) = &derive.unpivot {
+        for path in unpivot.from.iter().map(|field| field.path) {
+            if let Some(field) = table
+                .fields
+                .iter()
+                .find(|field| reads_at_or_below(field.path, path))
+            {
+                return Err(format!(
+                    "{id}: column '{}' reads '{}', which derive unpivot consumes; a derived row \
+                     carries the value under '{}', not the field",
+                    field.name, field.path, unpivot.into
+                ));
+            }
+            for (key, template) in derive.format {
+                let placeholders = template_placeholders(template).unwrap_or_default();
+                if let Some(read) = placeholders
+                    .iter()
+                    .find(|read| reads_at_or_below(read, path))
+                {
+                    return Err(format!(
+                        "{id}: derive format '{key}' reads '{read}', which derive unpivot \
+                         consumes; a derived row carries the value under '{}', not the field",
+                        unpivot.into
+                    ));
+                }
+            }
+        }
+    }
+    // One key, one writer: a key two steps write would be whichever ran
+    // last, and the order is an implementation fact, not a declaration.
+    let written = derive.written_keys();
+    let mut seen = HashSet::new();
+    for key in &written {
+        if !seen.insert(*key) {
+            return Err(format!(
+                "{id}: derive writes '{key}' twice (across explode, unpivot, constants and format)"
+            ));
+        }
+    }
+    // Templates render one after another in key order, each onto the row
+    // the next one reads, so a template reading another template's key
+    // would see the wire value or the rendered one depending on how the
+    // two keys sort — the same order-as-implementation-fact problem as a
+    // key with two writers. A template reading its OWN key is not refused:
+    // it always reads the value from before format, whatever the order.
+    for (key, template) in derive.format {
+        let placeholders = template_placeholders(template).unwrap_or_default();
+        for read in placeholders {
+            let head = read.split('.').next().unwrap_or(read);
+            if head != *key && derive.format.iter().any(|(other, _)| *other == head) {
+                return Err(format!(
+                    "{id}: derive format '{key}' reads '{read}', which derive format '{head}' \
+                     writes; a template reads wire, explode and constant keys, never another \
+                     template's key"
+                ));
+            }
+        }
+    }
+    // A derived key nothing reads is a declaration with no effect — and
+    // most likely a column path misspelt on one side or the other. A
+    // template's read of its own key sees the pre-format value, never the
+    // derived one, so it does not count as reading it.
+    for key in &written {
+        let read_by_a_column = table
+            .fields
+            .iter()
+            .any(|field| field.path.split('.').next() == Some(*key));
+        let read_by_a_template = derive
+            .format
+            .iter()
+            .filter(|(template_key, _)| template_key != key)
+            .any(|(_, template)| {
+                template_placeholders(template)
+                    .map(|paths| paths.iter().any(|p| p.split('.').next() == Some(*key)))
+                    .unwrap_or(false)
+            });
+        if !read_by_a_column && !read_by_a_template {
+            return Err(format!(
+                "{id}: derive writes '{key}', which no column path and no format template reads"
+            ));
+        }
+    }
+    // A key written with a non-object value replaces whatever the wire had
+    // there, so a path below it never reaches the wire object it names: on
+    // a null it reads NULL on every row (failing a non-null column), on a
+    // scalar the converter or the template fails every scan. Such a key may
+    // only be read whole. Explode `into` is exempt: its value is an array
+    // element whose shape only the wire knows, and reading fields of an
+    // object element (`item.text`) is what `into` is for. A template below
+    // its own key is exempt too: it renders before its key is written, so
+    // it reads the wire object.
+    let mut non_object_keys: Vec<(&str, &str)> = Vec::new();
+    if let Some(index) = derive.explode.and_then(|explode| explode.index) {
+        non_object_keys.push(("explode `index`", index));
+    }
+    // Unpivot yields a row only for a scalar value, and its label is text.
+    if let Some(unpivot) = &derive.unpivot {
+        non_object_keys.push(("unpivot `into`", unpivot.into));
+        non_object_keys.push(("unpivot `label`", unpivot.label));
+    }
+    for (key, value) in derive.constants {
+        if !matches!(value, FixedValue::Json(json) if json.is_object()) {
+            non_object_keys.push(("constant", *key));
+        }
+    }
+    for (key, _) in derive.format {
+        non_object_keys.push(("format", *key));
+    }
+    for (what, key) in non_object_keys {
+        if let Some(field) = table
+            .fields
+            .iter()
+            .find(|field| reads_below(field.path, key))
+        {
+            return Err(format!(
+                "{id}: column '{}' reads '{}' below derive {what} '{key}', which writes no \
+                 object; a derived key is read whole (path '{key}'), never as a parent",
+                field.name, field.path
+            ));
+        }
+        for (format_key, template) in derive.format {
+            if *format_key == key {
+                continue;
+            }
+            let placeholders = template_placeholders(template).unwrap_or_default();
+            if let Some(read) = placeholders.iter().find(|read| reads_below(read, key)) {
+                return Err(format!(
+                    "{id}: derive format '{format_key}' reads '{read}' below derive {what} \
+                     '{key}', which writes no object; a derived key is read whole (path \
+                     '{key}'), never as a parent"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Cross-field validation, run before the document becomes a runtime
@@ -167,6 +575,7 @@ fn convert_table(
 /// engine assumes but does not re-check per scan.
 fn validate_table(table: &SourcePackTable) -> Result<(), String> {
     let id = table.id;
+    validate_derive(table)?;
     // Structural pieces the engine parses lazily elsewhere fail HERE so a
     // generated asset gets one complete diagnostic pass.
     // Two shapes, two contracts. Array tables keep the strict path parser;
@@ -217,6 +626,60 @@ fn validate_table(table: &SourcePackTable) -> Result<(), String> {
                 "{id}: duplicate filter mapping for column '{}' and operator {:?}",
                 filter.column, filter.operator
             ));
+        }
+        // The gateway evaluates a pushed predicate against WIRE rows, but a
+        // column the derivation writes has no wire value: its value exists
+        // only after the fetch. Pushed, the predicate filters something else
+        // (whole source rows for an exploded element) and, under exact,
+        // DataFusion never re-checks it; under inexact the upstream subset
+        // is still not a superset of the matching rows. Refused whatever the
+        // fidelity. A column read off the source row is left alone: every
+        // derived row inherits it unchanged, so filtering source rows before
+        // explode or skip_when_null keeps exactly the rows that match —
+        // unless explode removed something below the column's path, which
+        // leaves the derived value different from the wire value.
+        if let Some(derive) = &table.derive
+            && let Some(field) = table.fields.iter().find(|f| f.name == filter.column)
+        {
+            if let Some(key) = derive
+                .written_keys()
+                .into_iter()
+                .find(|key| field.path.split('.').next() == Some(*key))
+            {
+                return Err(format!(
+                    "{id}: filter on '{}' ({:?}) reads '{}', which derive writes as '{key}' after \
+                     the fetch; the gateway would evaluate the pushed predicate against wire rows \
+                     that do not carry it",
+                    filter.column, filter.operator, field.path
+                ));
+            }
+            if let Some(explode) = &derive.explode
+                && let Some(path) = explode
+                    .paths
+                    .iter()
+                    .find(|path| reads_at_or_below(path, field.path))
+            {
+                return Err(format!(
+                    "{id}: filter on '{}' ({:?}) reads '{}', from which derive explode removes \
+                     '{path}'; the gateway would evaluate the pushed predicate against the wire \
+                     value, which still carries it",
+                    filter.column, filter.operator, field.path
+                ));
+            }
+            if let Some(unpivot) = &derive.unpivot
+                && let Some(path) = unpivot
+                    .from
+                    .iter()
+                    .map(|field| field.path)
+                    .find(|path| reads_at_or_below(path, field.path))
+            {
+                return Err(format!(
+                    "{id}: filter on '{}' ({:?}) reads '{}', from which derive unpivot removes \
+                     '{path}'; the gateway would evaluate the pushed predicate against the wire \
+                     value, which still carries it",
+                    filter.column, filter.operator, field.path
+                ));
+            }
         }
         // A value domain is a finite list of equalities; under a range
         // operator it has no meaning the translation could honor, so an
@@ -627,6 +1090,64 @@ struct TableDoc {
     columns: Vec<ColumnDoc>,
     #[serde(default)]
     filters: Vec<FilterDoc>,
+    /// How the wire rows are rewritten before the columns read them; see
+    /// `skardi_source_pack::derive`. Absent for every table whose columns
+    /// map straight onto wire keys.
+    #[serde(default)]
+    derive: Option<DeriveDoc>,
+}
+
+/// The `derive:` block as written in YAML. Every part optional, every key
+/// strict: a misspelt step must fail the asset, not silently leave a
+/// contract column unwritten.
+///
+/// `explode` consumes its `paths`: a derived row carries each element under
+/// `into` and none of the listed arrays, so no column path and no `format`
+/// placeholder may read at or below one (`validate_derive` refuses it).
+/// `unpivot` consumes its `from` paths the same way.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeriveDoc {
+    #[serde(default)]
+    skip_when_null: Option<String>,
+    #[serde(default)]
+    explode: Option<ExplodeDoc>,
+    #[serde(default)]
+    unpivot: Option<UnpivotDoc>,
+    /// BTreeMap so the written keys (and so any collision error) are
+    /// deterministic regardless of asset layout.
+    #[serde(default)]
+    constants: BTreeMap<String, FixedValueDoc>,
+    #[serde(default)]
+    format: BTreeMap<String, String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExplodeDoc {
+    paths: Vec<String>,
+    into: String,
+    #[serde(default)]
+    index: Option<String>,
+}
+
+/// `unpivot` consumes its `from` paths: a derived row carries the field's
+/// value under `into` and its label under `label`, and none of the fields,
+/// so no column path and no `format` placeholder may read at or below one.
+/// `from` is a list, not a map, so the rows come out in the order written.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UnpivotDoc {
+    from: Vec<UnpivotFieldDoc>,
+    into: String,
+    label: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UnpivotFieldDoc {
+    label: String,
+    path: String,
 }
 
 #[derive(Deserialize, Default, Clone, Copy)]
@@ -949,6 +1470,8 @@ enum FormatDoc {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
     /// Every registered asset parses AND passes the same structural
@@ -1805,6 +2328,701 @@ tables:
             let err = pack_with(body).expect_err(expected);
             assert!(err.contains(expected), "want {expected:?} in: {err}");
         }
+    }
+
+    /// A table that declares no `derive` loads with `None`, which is what
+    /// keeps every pre-existing pack's scan byte-for-byte unchanged.
+    #[test]
+    fn derive_is_absent_unless_declared() {
+        let pack = pack_with(
+            r#"    action: demo.list
+    row_path: "$.items"
+    pagination: { strategy: single_page }
+    columns:
+      - { name: id, path: id, type: uint64, nullable: false }"#,
+        )
+        .expect("a pack without derive still parses");
+        assert!(pack.tables[0].derive.is_none());
+    }
+
+    #[test]
+    fn derive_parses_every_step_into_the_runtime_declaration() {
+        let pack = pack_with(
+            r#"    action: demo.get
+    row_path: "$"
+    row_shape: object
+    pagination: { strategy: single_page }
+    resources: { required: [id] }
+    derive:
+      skip_when_null: summary
+      explode: { paths: [summary.edited.steps, summary.steps], into: text, index: position }
+      constants: { provider: zoom, owner_name: null, rank: 2 }
+      format: { item_id: "{summary.id}#{position}" }
+    columns:
+      - { name: provider, path: provider, type: utf8, nullable: false }
+      - { name: item_id, path: item_id, type: utf8, nullable: false }
+      - { name: text, path: text, type: utf8, nullable: true }
+      - { name: owner_name, path: owner_name, type: utf8, nullable: true }
+      - { name: rank, path: rank, type: int64, nullable: true }"#,
+        )
+        .expect("a full derive block parses");
+        let derive = pack.tables[0].derive.expect("declared");
+        assert_eq!(derive.skip_when_null, Some("summary"));
+        let explode = derive.explode.expect("explode");
+        assert_eq!(explode.paths, ["summary.edited.steps", "summary.steps"]);
+        assert_eq!(explode.into, "text");
+        assert_eq!(explode.index, Some("position"));
+        // BTreeMap order: the asset's layout cannot reorder the constants.
+        assert_eq!(
+            derive.constants,
+            [
+                ("owner_name", FixedValue::Json(&serde_json::Value::Null)),
+                ("provider", FixedValue::Str("zoom")),
+                ("rank", FixedValue::Int(2)),
+            ]
+        );
+        assert_eq!(derive.format, [("item_id", "{summary.id}#{position}")]);
+        // The derived rows then convert through the ordinary converter.
+        let page = serde_json::json!({
+            "summary": {"id": "m-1", "steps": ["a", "b"], "edited": null}
+        });
+        let rows = derive
+            .apply(pack.tables[0].id, std::slice::from_ref(&page), 1)
+            .expect("derives");
+        let batch = RowConverter::new(pack.tables[0].fields)
+            .expect("converter")
+            .convert(&rows, 1)
+            .expect("converts");
+        assert_eq!(batch.num_rows(), 2);
+    }
+
+    #[test]
+    fn derive_invariants_are_rejected_with_targeted_errors() {
+        const HEAD: &str = r#"    action: demo.get
+    row_path: "$"
+    row_shape: object
+    pagination: { strategy: single_page }
+    columns:
+      - { name: id, path: summary.id, type: utf8, nullable: false }
+      - { name: text, path: text, type: utf8, nullable: true }
+      - { name: provider, path: provider, type: utf8, nullable: true }
+"#;
+        for (derive, expected) in [
+            ("    derive: {}", "declares nothing"),
+            (
+                "    derive: { skip_when_null: \"$.summary\" }",
+                "must not start with '$'",
+            ),
+            (
+                "    derive: { explode: { paths: [], into: text } }",
+                "names no `paths`",
+            ),
+            (
+                "    derive: { explode: { paths: [summary..steps], into: text } }",
+                "empty segment",
+            ),
+            (
+                "    derive: { explode: { paths: [summary.steps], into: a.b } }",
+                "contains '.'",
+            ),
+            (
+                "    derive: { constants: { provider: zoom, text: x }, explode: { paths: [summary.steps], into: text } }",
+                "writes 'text' twice",
+            ),
+            (
+                "    derive: { constants: { unread: zoom } }",
+                "writes 'unread', which no column path and no format template reads",
+            ),
+            // Explode consumes its paths, the chosen array and every
+            // fallback: nothing may read one afterwards.
+            (
+                "    derive: { explode: { paths: [summary.id], into: text } }",
+                "column 'id' reads 'summary.id', which derive explode consumes",
+            ),
+            (
+                "    derive: { explode: { paths: [steps, summary], into: text } }",
+                "column 'id' reads 'summary.id', which derive explode consumes",
+            ),
+            (
+                "    derive: { explode: { paths: [summary.steps], into: text }, format: { provider: \"{summary.steps}\" } }",
+                "derive format 'provider' reads 'summary.steps', which derive explode consumes",
+            ),
+            (
+                "    derive: { format: { provider: \"{summary.id\" } }",
+                "no matching '}'",
+            ),
+            (
+                "    derive: { format: { provider: \"fixed\" } }",
+                "no placeholder",
+            ),
+            (
+                "    derive: { constants: { provider: .nan } }",
+                "no JSON spelling",
+            ),
+            (
+                "    derive: { constants: { provider: zoom }, typo: 1 }",
+                "typo",
+            ),
+        ] {
+            let err = pack_with(&format!("{HEAD}{derive}")).expect_err(expected);
+            assert!(err.contains(expected), "want {expected:?} in: {err}");
+        }
+        // Explode is refused where a short page is a termination signal.
+        let err = pack_with(
+            r#"    action: demo.list
+    row_path: "$.items"
+    pagination: { strategy: page_number, page_input: page, page_size_input: perPage, page_size: 10 }
+    derive: { explode: { paths: [steps], into: text } }
+    columns:
+      - { name: text, path: text, type: utf8, nullable: true }"#,
+        )
+        .expect_err("explode on page_number");
+        assert!(err.contains("page_number/keyset"), "{err}");
+        // ...and a format placeholder may read a derived key (the exploded
+        // position), which is the whole point of the fixed step order.
+        pack_with(
+            r#"    action: demo.get
+    row_path: "$"
+    row_shape: object
+    pagination: { strategy: single_page }
+    derive:
+      explode: { paths: [steps], into: text, index: position }
+      format: { item_id: "{id}#{position}" }
+    columns:
+      - { name: item_id, path: item_id, type: utf8, nullable: false }
+      - { name: text, path: text, type: utf8, nullable: true }"#,
+        )
+        .expect("a template reading the exploded index is legal");
+    }
+
+    /// An object-row table turning two sibling tokens into one row each,
+    /// the Feishu meeting-notes shape.
+    const UNPIVOT_TABLE: &str = r#"    action: demo.get
+    row_path: "$"
+    row_shape: object
+    pagination: { strategy: single_page }
+    resources: { required: [id] }
+    derive:
+      unpivot:
+        into: token
+        label: kind
+        from:
+          - { label: notes, path: meeting.artifacts.notes }
+          - { label: transcript, path: meeting.artifacts.verbatim }
+      constants: { provider: demo }
+      format: { note_key: "{meeting.id}#{kind}" }
+    columns:
+      - { name: provider, path: provider, type: utf8, nullable: false }
+      - { name: meeting_id, path: meeting.id, type: utf8, nullable: false }
+      - { name: note_id, path: token, type: utf8, nullable: false }
+      - { name: kind, path: kind, type: utf8, nullable: true }
+      - { name: note_key, path: note_key, type: utf8, nullable: true }"#;
+
+    #[test]
+    fn derive_parses_unpivot_in_the_written_order() {
+        let pack = pack_with(UNPIVOT_TABLE).expect("an unpivot block parses");
+        let derive = pack.tables[0].derive.expect("declared");
+        assert!(derive.explode.is_none());
+        let unpivot = derive.unpivot.expect("unpivot");
+        assert_eq!(unpivot.into, "token");
+        assert_eq!(unpivot.label, "kind");
+        assert_eq!(
+            unpivot.from,
+            [
+                UnpivotField {
+                    label: "notes",
+                    path: "meeting.artifacts.notes"
+                },
+                UnpivotField {
+                    label: "transcript",
+                    path: "meeting.artifacts.verbatim"
+                },
+            ]
+        );
+        // The derived rows convert through the ordinary converter, the
+        // empty token yielding no row.
+        let page = serde_json::json!({
+            "meeting": {"id": "m-1", "artifacts": {"notes": "doc-a", "verbatim": ""}}
+        });
+        let rows = derive
+            .apply(pack.tables[0].id, std::slice::from_ref(&page), 1)
+            .expect("derives");
+        let batch = RowConverter::new(pack.tables[0].fields)
+            .expect("converter")
+            .convert(&rows, 1)
+            .expect("converts");
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(rows[0]["note_key"], "m-1#notes");
+    }
+
+    /// An exploded null element is a row at its own position; the column
+    /// that reads it decides what it means: NULL for a nullable one, a
+    /// failed conversion for a non-null one. (Pinned through a pack first;
+    /// held here so it does not depend on any one pack.)
+    #[test]
+    fn an_exploded_null_element_converts_by_its_columns_nullability() {
+        use arrow::array::{Array, StringArray};
+
+        const TABLE: &str = r#"    action: demo.get
+    row_path: "$"
+    row_shape: object
+    pagination: { strategy: single_page }
+    derive:
+      explode: { paths: [summary.steps], into: text, index: position }
+      format: { item_id: "{summary.id}#{position}" }
+    columns:
+      - { name: item_id, path: item_id, type: utf8, nullable: false }
+      - { name: text, path: text, type: utf8, nullable: NULLABLE }"#;
+        let page = serde_json::json!({
+            "summary": {"id": "m-1", "steps": ["Send the agenda", null, "Book the room"]}
+        });
+
+        let pack = pack_with(&TABLE.replace("NULLABLE", "true")).expect("parses");
+        let table = &pack.tables[0];
+        let rows = table
+            .derive
+            .expect("declared")
+            .apply(table.id, std::slice::from_ref(&page), 1)
+            .expect("derives");
+        let batch = RowConverter::new(table.fields)
+            .expect("converter")
+            .convert(&rows, 1)
+            .expect("a nullable column reads the null element as NULL");
+        assert_eq!(batch.num_rows(), 3);
+        let text = batch
+            .column_by_name("text")
+            .expect("text")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("utf8");
+        assert!(text.is_null(1));
+        assert_eq!(text.value(2), "Book the room");
+        let ids = batch
+            .column_by_name("item_id")
+            .expect("item_id")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("utf8");
+        assert_eq!(ids.value(1), "m-1#1", "the null keeps its own position");
+        assert_eq!(ids.value(2), "m-1#2", "positions after it do not move");
+
+        let pack = pack_with(&TABLE.replace("NULLABLE", "false")).expect("parses");
+        let table = &pack.tables[0];
+        let rows = table
+            .derive
+            .expect("declared")
+            .apply(table.id, std::slice::from_ref(&page), 1)
+            .expect("derives");
+        let err = RowConverter::new(table.fields)
+            .expect("converter")
+            .convert(&rows, 1)
+            .expect_err("a non-null column refuses the null element");
+        assert!(
+            matches!(
+                err,
+                OpenConnectorError::ConversionFailed { ref column, row: 1, .. } if column == "text"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn unpivot_invariants_are_rejected_with_targeted_errors() {
+        const HEAD: &str = r#"    action: demo.get
+    row_path: "$"
+    row_shape: object
+    pagination: { strategy: single_page }
+    columns:
+      - { name: id, path: meeting.id, type: utf8, nullable: false }
+      - { name: token, path: token, type: utf8, nullable: true }
+      - { name: kind, path: kind, type: utf8, nullable: true }
+"#;
+        for (derive, expected) in [
+            (
+                "    derive: { unpivot: { into: token, label: kind, from: [] } }",
+                "names no `from` fields",
+            ),
+            (
+                "    derive: { unpivot: { into: token, label: kind, from: [{ label: a, path: x }, { label: a, path: y }] } }",
+                "names the label 'a' twice",
+            ),
+            (
+                "    derive: { unpivot: { into: token, label: kind, from: [{ label: a, path: x }, { label: b, path: x }] } }",
+                "reads the path 'x' twice",
+            ),
+            (
+                "    derive: { unpivot: { into: token, label: kind, from: [{ label: \" \", path: x }] } }",
+                "has an empty label",
+            ),
+            (
+                "    derive: { unpivot: { into: token, label: kind, from: [{ label: a, path: \"$.x\" }] } }",
+                "must not start with '$'",
+            ),
+            (
+                "    derive: { unpivot: { into: a.b, label: kind, from: [{ label: a, path: x }] } }",
+                "contains '.'",
+            ),
+            (
+                "    derive: { unpivot: { into: token, label: kind, from: [{ label: a, path: x }] }, explode: { paths: [steps], into: token } }",
+                "both explode and unpivot",
+            ),
+            (
+                "    derive: { unpivot: { into: token, label: token, from: [{ label: a, path: x }] } }",
+                "writes 'token' twice",
+            ),
+            // Unpivot consumes its fields: nothing may read one afterwards.
+            (
+                "    derive: { unpivot: { into: token, label: kind, from: [{ label: a, path: meeting.id }] } }",
+                "column 'id' reads 'meeting.id', which derive unpivot consumes",
+            ),
+            (
+                "    derive: { unpivot: { into: token, label: kind, from: [{ label: a, path: x }] }, format: { other: \"{x}\" } }",
+                "derive format 'other' reads 'x', which derive unpivot consumes",
+            ),
+            (
+                "    derive: { unpivot: { into: token, label: kind, from: [{ label: a, path: x }], typo: 1 } }",
+                "typo",
+            ),
+        ] {
+            let err = pack_with(&format!("{HEAD}{derive}")).expect_err(expected);
+            assert!(err.contains(expected), "want {expected:?} in: {err}");
+        }
+        // A derived key unpivot writes is read whole, never as a parent.
+        let err = pack_with(
+            r#"    action: demo.get
+    row_path: "$"
+    row_shape: object
+    pagination: { strategy: single_page }
+    derive: { unpivot: { into: token, label: kind, from: [{ label: a, path: x }] } }
+    columns:
+      - { name: token, path: token.id, type: utf8, nullable: true }
+      - { name: kind, path: kind, type: utf8, nullable: true }"#,
+        )
+        .expect_err("a column below unpivot `into`");
+        assert!(err.contains("below derive unpivot `into` 'token'"), "{err}");
+        // Unpivot is refused where a short page is a termination signal.
+        let err = pack_with(
+            r#"    action: demo.list
+    row_path: "$.items"
+    pagination: { strategy: page_number, page_input: page, page_size_input: perPage, page_size: 10 }
+    derive: { unpivot: { into: token, label: kind, from: [{ label: a, path: x }] } }
+    columns:
+      - { name: token, path: token, type: utf8, nullable: true }
+      - { name: kind, path: kind, type: utf8, nullable: true }"#,
+        )
+        .expect_err("unpivot on page_number");
+        assert!(err.contains("page_number/keyset"), "{err}");
+    }
+
+    #[test]
+    fn consumed_paths_at_or_below_one_another_are_refused() {
+        // Explode: an array cannot also be the object holding another path.
+        const EXPLODE_HEAD: &str = r#"    action: demo.get
+    row_path: "$"
+    row_shape: object
+    pagination: { strategy: single_page }
+    columns:
+      - { name: id, path: summary.id, type: utf8, nullable: false }
+      - { name: text, path: text, type: utf8, nullable: true }
+"#;
+        // Unpivot: a scalar cannot either.
+        const UNPIVOT_HEAD: &str = r#"    action: demo.get
+    row_path: "$"
+    row_shape: object
+    pagination: { strategy: single_page }
+    columns:
+      - { name: id, path: meeting.id, type: utf8, nullable: false }
+      - { name: token, path: token, type: utf8, nullable: true }
+      - { name: kind, path: kind, type: utf8, nullable: true }
+"#;
+        for (table, expected) in [
+            (
+                format!(
+                    "{EXPLODE_HEAD}    derive: {{ explode: {{ paths: [payload, payload.items], into: text }} }}"
+                ),
+                "derive explode reads 'payload.items' below 'payload'; no answer holds an array at 'payload' and a value inside it",
+            ),
+            (
+                format!(
+                    "{EXPLODE_HEAD}    derive: {{ explode: {{ paths: [payload.items, payload], into: text }} }}"
+                ),
+                "derive explode reads 'payload.items' below 'payload'",
+            ),
+            (
+                format!(
+                    "{EXPLODE_HEAD}    derive: {{ explode: {{ paths: [payload, payload], into: text }} }}"
+                ),
+                "derive explode reads the path 'payload' twice",
+            ),
+            (
+                format!(
+                    "{UNPIVOT_HEAD}    derive: {{ unpivot: {{ into: token, label: kind, from: [{{ label: a, path: x }}, {{ label: b, path: x.y }}] }} }}"
+                ),
+                "derive unpivot reads 'x.y' below 'x'; no answer holds a scalar at 'x' and a value inside it",
+            ),
+            (
+                format!(
+                    "{UNPIVOT_HEAD}    derive: {{ unpivot: {{ into: token, label: kind, from: [{{ label: a, path: x.y.z }}, {{ label: b, path: x.y }}] }} }}"
+                ),
+                "derive unpivot reads 'x.y.z' below 'x.y'",
+            ),
+        ] {
+            let err = pack_with(&table).expect_err(expected);
+            assert!(err.contains(expected), "want {expected:?} in: {err}");
+        }
+        // Siblings and keys that merely share a text prefix are not nested.
+        for table in [
+            format!(
+                "{EXPLODE_HEAD}    derive: {{ explode: {{ paths: [payload, payloads], into: text }} }}"
+            ),
+            format!(
+                "{EXPLODE_HEAD}    derive: {{ explode: {{ paths: [payload.a, payload.b], into: text }} }}"
+            ),
+            format!(
+                "{UNPIVOT_HEAD}    derive: {{ unpivot: {{ into: token, label: kind, from: [{{ label: a, path: x.y }}, {{ label: b, path: x.yz }}] }} }}"
+            ),
+        ] {
+            pack_with(&table).unwrap_or_else(|err| panic!("{table}: {err}"));
+        }
+    }
+
+    #[test]
+    fn a_filter_reading_above_an_unpivoted_field_is_refused() {
+        let err = pack_with(
+            r#"    action: demo.list
+    row_path: "$.items"
+    pagination: { strategy: single_page }
+    derive: { unpivot: { into: token, label: kind, from: [{ label: a, path: meeting.artifacts.notes }] } }
+    columns:
+      - { name: token, path: token, type: utf8, nullable: true }
+      - { name: kind, path: kind, type: utf8, nullable: true }
+      - { name: artifacts, path: meeting.artifacts, type: json, nullable: true }
+    filters:
+      - { column: artifacts, op: eq, input: artifacts, fidelity: exact }"#,
+        )
+        .expect_err("a filter on the parent of an unpivoted field");
+        assert!(
+            err.contains("from which derive unpivot removes 'meeting.artifacts.notes'"),
+            "{err}"
+        );
+    }
+
+    /// A derive table for the filter-pushdown checks: one exploded element
+    /// per row, a constant, a formatted id, a column read off the source
+    /// row, and a JSON column holding the parent of the exploded array.
+    fn derive_table_with_filter(filter: &str) -> Result<SourcePack, String> {
+        pack_with(&format!(
+            r#"    action: demo.list
+    row_path: "$.items"
+    pagination: {{ strategy: single_page }}
+    derive:
+      skip_when_null: summary
+      explode: {{ paths: [summary.steps], into: text, index: position }}
+      constants: {{ provider: zoom }}
+      format: {{ item_id: "{{summary.meetingUuid}}#{{position}}" }}
+    columns:
+      - {{ name: meeting_id, path: summary.meetingUuid, type: utf8, nullable: false }}
+      - {{ name: item_id, path: item_id, type: utf8, nullable: false }}
+      - {{ name: text, path: text, type: utf8, nullable: true }}
+      - {{ name: position, path: position, type: uint64, nullable: false }}
+      - {{ name: provider, path: provider, type: utf8, nullable: false }}
+      - {{ name: summary, path: summary, type: json, nullable: true }}
+    filters:
+      - {filter}"#
+        ))
+    }
+
+    /// The gateway evaluates a pushed predicate against wire rows, which do
+    /// not carry what derive writes (or carry what explode removed).
+    #[rstest]
+    #[case::exploded_element(
+        "{ column: text, op: eq, input: text, fidelity: exact }",
+        "filter on 'text' (Eq) reads 'text', which derive writes as 'text'"
+    )]
+    #[case::exploded_index(
+        "{ column: position, op: gt, input: after, fidelity: inexact }",
+        "filter on 'position' (Gt) reads 'position', which derive writes as 'position'"
+    )]
+    #[case::constant(
+        "{ column: provider, op: eq, input: provider, fidelity: exact }",
+        "filter on 'provider' (Eq) reads 'provider', which derive writes as 'provider'"
+    )]
+    #[case::inexact_constant(
+        "{ column: provider, op: eq, input: provider, fidelity: inexact }",
+        "which derive writes as 'provider'"
+    )]
+    #[case::formatted(
+        "{ column: item_id, op: eq, input: id, fidelity: exact }",
+        "filter on 'item_id' (Eq) reads 'item_id', which derive writes as 'item_id'"
+    )]
+    #[case::parent_of_an_exploded_path(
+        "{ column: summary, op: eq, input: summary, fidelity: exact }",
+        "filter on 'summary' (Eq) reads 'summary', from which derive explode removes 'summary.steps'"
+    )]
+    fn a_filter_on_a_derived_column_is_refused(#[case] filter: &str, #[case] expected: &str) {
+        let err = derive_table_with_filter(filter).expect_err(expected);
+        assert!(err.contains("items"), "names the table: {err}");
+        assert!(err.contains(expected), "want {expected:?} in: {err}");
+    }
+
+    /// A column read off the source row is inherited unchanged by every
+    /// derived row, so filtering source rows upstream keeps exactly the
+    /// derived rows that match — explode and skip_when_null included.
+    #[test]
+    fn a_filter_on_a_source_column_of_a_derive_table_loads() {
+        let pack = derive_table_with_filter(
+            "{ column: meeting_id, op: eq, input: meetingUuid, fidelity: exact }",
+        )
+        .expect("a filter on a column the derivation does not write is legal");
+        assert_eq!(pack.tables[0].filters.len(), 1);
+        assert_eq!(pack.tables[0].filters[0].column, "meeting_id");
+    }
+
+    /// Templates render in key order, so one reading another's key would
+    /// depend on how the two keys sort; both orders are refused alike.
+    #[rstest]
+    #[case::earlier_key_reads_a_later_one(
+        r#"{ a_id: "{b_key}#x", b_key: "{id}" }"#,
+        "derive format 'a_id' reads 'b_key', which derive format 'b_key' writes"
+    )]
+    #[case::later_key_reads_an_earlier_one(
+        r#"{ z_id: "{b_key}#x", b_key: "{id}" }"#,
+        "derive format 'z_id' reads 'b_key', which derive format 'b_key' writes"
+    )]
+    #[case::nested_path_under_another_template_key(
+        r#"{ a_id: "{b_key.x}", b_key: "{id}" }"#,
+        "derive format 'a_id' reads 'b_key.x', which derive format 'b_key' writes"
+    )]
+    // Reading its own key reads the pre-format wire value, so it does not
+    // make the derived key "read" by anything.
+    #[case::self_read_does_not_count_as_a_reader(
+        r#"{ unread: "{unread}#x", a_id: "{id}" }"#,
+        "derive writes 'unread', which no column path and no format template reads"
+    )]
+    fn a_format_template_cannot_read_another_templates_key(
+        #[case] format: &str,
+        #[case] expected: &str,
+    ) {
+        let err = pack_with(&format!(
+            r#"    action: demo.get
+    row_path: "$"
+    row_shape: object
+    pagination: {{ strategy: single_page }}
+    derive:
+      format: {format}
+    columns:
+      - {{ name: a_id, path: a_id, type: utf8, nullable: true }}
+      - {{ name: z_id, path: z_id, type: utf8, nullable: true }}
+      - {{ name: b_key, path: b_key, type: utf8, nullable: true }}"#
+        ))
+        .expect_err(expected);
+        assert!(err.contains(expected), "want {expected:?} in: {err}");
+    }
+
+    /// Constants and explode run before format, so a template may read
+    /// both; and a template may read its own key, which is the wire value
+    /// whatever the key order.
+    #[test]
+    fn a_format_template_reads_constants_explode_keys_and_its_own_key() {
+        let pack = pack_with(
+            r#"    action: demo.get
+    row_path: "$"
+    row_shape: object
+    pagination: { strategy: single_page }
+    derive:
+      explode: { paths: [steps], into: text, index: position }
+      constants: { provider: zoom }
+      format: { item_id: "{provider}:{uuid}#{position}", meeting: "zoom-{meeting}" }
+    columns:
+      - { name: meeting, path: meeting, type: utf8, nullable: false }
+      - { name: item_id, path: item_id, type: utf8, nullable: false }
+      - { name: text, path: text, type: utf8, nullable: true }"#,
+        )
+        .expect("a template reading a constant, the exploded index and its own key is legal");
+        let derive = pack.tables[0].derive.expect("declared");
+        let page = serde_json::json!({ "uuid": "u-1", "meeting": "m-1", "steps": ["a"] });
+        let rows = derive
+            .apply(pack.tables[0].id, std::slice::from_ref(&page), 1)
+            .expect("derives");
+        assert_eq!(
+            rows,
+            [serde_json::json!({
+                "uuid": "u-1",
+                "meeting": "zoom-m-1",
+                "text": "a",
+                "position": 0,
+                "provider": "zoom",
+                "item_id": "zoom:u-1#0",
+            })]
+        );
+    }
+
+    /// A key written with a non-object value replaces the wire object of
+    /// that name, so a path below it would read NULL on every row (a null
+    /// constant) or fail every scan (a scalar); it is refused at load.
+    #[rstest]
+    #[case::column_below_a_null_constant(
+        "constants: { summary: null }",
+        "column 'id' reads 'summary.id' below derive constant 'summary'"
+    )]
+    #[case::column_below_a_scalar_constant(
+        "constants: { summary: zoom }",
+        "column 'id' reads 'summary.id' below derive constant 'summary'"
+    )]
+    #[case::column_below_a_format_key(
+        r#"format: { summary: "{provider}#x" }"#,
+        "column 'id' reads 'summary.id' below derive format 'summary'"
+    )]
+    #[case::column_below_the_explode_index(
+        "explode: { paths: [steps], into: text, index: summary }",
+        "column 'id' reads 'summary.id' below derive explode `index` 'summary'"
+    )]
+    #[case::template_below_a_constant(
+        r#"constants: { provider: zoom }, format: { text: "{provider.name}" }"#,
+        "derive format 'text' reads 'provider.name' below derive constant 'provider'"
+    )]
+    fn a_non_object_derived_key_cannot_be_read_as_a_parent(
+        #[case] derive: &str,
+        #[case] expected: &str,
+    ) {
+        let err = pack_with(&format!(
+            r#"    action: demo.get
+    row_path: "$"
+    row_shape: object
+    pagination: {{ strategy: single_page }}
+    derive: {{ {derive} }}
+    columns:
+      - {{ name: id, path: summary.id, type: utf8, nullable: false }}
+      - {{ name: text, path: text, type: utf8, nullable: true }}
+      - {{ name: provider, path: provider, type: utf8, nullable: true }}"#
+        ))
+        .expect_err(expected);
+        assert!(err.contains(expected), "want {expected:?} in: {err}");
+    }
+
+    /// Reading a derived key whole stays legal, and so does reading below
+    /// one that may hold an object: an exploded element (the planned Teams
+    /// pack reads `item.text`), an object constant, or a template below its
+    /// own key, which renders from the wire value before the key is written.
+    #[rstest]
+    #[case::whole_read_of_a_null_constant("constants: { summary: null }", "summary")]
+    #[case::below_an_explode_into_key("explode: { paths: [actionItems], into: item }", "item.text")]
+    #[case::below_an_object_constant("constants: { owner: { name: zoom } }", "owner.name")]
+    #[case::template_below_its_own_key(r#"format: { summary: "{summary.id}" }"#, "summary")]
+    fn a_derived_key_read_whole_or_below_a_possible_object_loads(
+        #[case] derive: &str,
+        #[case] path: &str,
+    ) {
+        pack_with(&format!(
+            r#"    action: demo.get
+    row_path: "$"
+    row_shape: object
+    pagination: {{ strategy: single_page }}
+    derive: {{ {derive} }}
+    columns:
+      - {{ name: derived, path: {path}, type: utf8, nullable: true }}"#
+        ))
+        .expect("a derived key read whole or below a possible object loads");
     }
 
     #[test]
