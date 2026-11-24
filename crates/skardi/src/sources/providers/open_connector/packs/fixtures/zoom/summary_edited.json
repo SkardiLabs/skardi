@@ -1,0 +1,31 @@
+{
+  "available": true,
+  "unavailableReason": null,
+  "unavailableMessage": null,
+  "summary": {
+    "meetingUuid": "/aB3cD4eF5gH6iJ7kL8mN9==",
+    "meetingId": "81234567891",
+    "meetingHostId": "AbCdEfGhIjKlMnOpQrStUv",
+    "meetingHostEmail": null,
+    "meetingTopic": "Design review",
+    "meetingStartTime": "2026-11-03T14:00:00Z",
+    "meetingEndTime": null,
+    "summaryStartTime": "2026-11-03T14:02:00Z",
+    "summaryEndTime": "2026-11-03T14:50:00Z",
+    "summaryCreatedTime": "2026-11-03T14:51:00Z",
+    "summaryLastModifiedTime": "2026-11-03T16:00:00Z",
+    "summaryLastModifiedUserId": "AbCdEfGhIjKlMnOpQrStUv",
+    "summaryLastModifiedUserEmail": "host@example.com",
+    "summaryTitle": null,
+    "summaryContent": "## Summary\n\nThe design was reviewed.",
+    "summaryDocUrl": null,
+    "summaryOverview": "The design was reviewed.",
+    "summaryDetails": [],
+    "nextSteps": ["Legacy step one", "Legacy step two"],
+    "editedSummary": {
+      "summaryOverview": "The design was reviewed and approved.",
+      "summaryDetails": "Edited details as text.",
+      "nextSteps": ["Publish the design"]
+    }
+  }
+}

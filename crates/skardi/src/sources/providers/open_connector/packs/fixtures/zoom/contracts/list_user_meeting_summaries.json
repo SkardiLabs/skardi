@@ -1,0 +1,207 @@
+{
+  "type": "object",
+  "properties": {
+    "summaries": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "meetingUuid": {
+            "anyOf": [
+              {
+                "type": "string",
+                "description": "The meeting instance UUID. Pass it to get_meeting_summary; it differs for every occurrence."
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The meeting instance UUID. Pass it to get_meeting_summary; it differs for every occurrence."
+          },
+          "meetingId": {
+            "anyOf": [
+              {
+                "anyOf": [
+                  {
+                    "type": "integer",
+                    "description": "The numeric Zoom meeting ID."
+                  },
+                  {
+                    "type": "string",
+                    "description": "The string Zoom meeting ID."
+                  }
+                ],
+                "description": "The numeric Zoom meeting ID, shared by every occurrence of a recurring meeting."
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The numeric Zoom meeting ID, shared by every occurrence of a recurring meeting."
+          },
+          "meetingHostId": {
+            "anyOf": [
+              {
+                "type": "string",
+                "description": "The Zoom user ID of the meeting host."
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The Zoom user ID of the meeting host."
+          },
+          "meetingHostEmail": {
+            "anyOf": [
+              {
+                "type": "string",
+                "description": "The email address of the meeting host."
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The email address of the meeting host."
+          },
+          "meetingTopic": {
+            "anyOf": [
+              {
+                "type": "string",
+                "description": "The meeting topic."
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The meeting topic."
+          },
+          "meetingStartTime": {
+            "anyOf": [
+              {
+                "type": "string",
+                "description": "The time the meeting started."
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The time the meeting started."
+          },
+          "meetingEndTime": {
+            "anyOf": [
+              {
+                "type": "string",
+                "description": "The time the meeting ended."
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The time the meeting ended."
+          },
+          "summaryStartTime": {
+            "anyOf": [
+              {
+                "type": "string",
+                "description": "The start of the meeting span the summary covers."
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The start of the meeting span the summary covers."
+          },
+          "summaryEndTime": {
+            "anyOf": [
+              {
+                "type": "string",
+                "description": "The end of the meeting span the summary covers."
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The end of the meeting span the summary covers."
+          },
+          "summaryCreatedTime": {
+            "anyOf": [
+              {
+                "type": "string",
+                "description": "The time Zoom created the summary."
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The time Zoom created the summary."
+          },
+          "summaryLastModifiedTime": {
+            "anyOf": [
+              {
+                "type": "string",
+                "description": "The time the summary was last edited."
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The time the summary was last edited."
+          }
+        },
+        "additionalProperties": false,
+        "description": "One AI Companion meeting summary listed for the user, without its content."
+      },
+      "description": "The summaries on this page; empty when the window has none."
+    },
+    "nextPageToken": {
+      "anyOf": [
+        {
+          "type": "string",
+          "description": "The token for the next page, or null on the last page."
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The token for the next page, or null on the last page."
+    },
+    "pageSize": {
+      "anyOf": [
+        {
+          "type": "integer",
+          "description": "The page size Zoom applied."
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The page size Zoom applied."
+    },
+    "from": {
+      "anyOf": [
+        {
+          "type": "string",
+          "description": "The window start Zoom applied."
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The window start Zoom applied."
+    },
+    "to": {
+      "anyOf": [
+        {
+          "type": "string",
+          "description": "The window end Zoom applied."
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The window end Zoom applied."
+    }
+  },
+  "additionalProperties": false,
+  "description": "The response returned when listing Zoom meeting summaries."
+}

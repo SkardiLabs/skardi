@@ -52,6 +52,11 @@ pub mod action_registry;
 /// gateway envelope it unwraps.
 pub mod client;
 pub mod config;
+/// The declarative step between a provider's rows and a table's columns:
+/// constants, one row per array element, formatted identities, and skipping
+/// a null payload — what a pack needs to land one provider's answer in a
+/// shape shared with others.
+pub mod derive;
 pub mod error;
 /// The filter vocabulary a provider declares; the engine translates.
 pub mod filters;
