@@ -1,0 +1,13 @@
+{
+  "meeting": {
+    "id": "7000000000000000002",
+    "topic": "Weekly sync",
+    "start_time": "1793690000",
+    "end_time": "1793692700",
+    "status": 3
+  },
+  "relatedArtifacts": {
+    "note_doc_token": "",
+    "verbatim_doc_token": ""
+  }
+}

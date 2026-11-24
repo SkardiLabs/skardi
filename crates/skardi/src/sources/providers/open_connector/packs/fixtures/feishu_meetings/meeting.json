@@ -1,0 +1,54 @@
+{
+  "meeting": {
+    "id": "7000000000000000001",
+    "topic": "Weekly sync",
+    "url": "https://vc.example.com/j/100000001",
+    "meeting_no": "100000001",
+    "create_time": "1793609940",
+    "start_time": "1793610000",
+    "end_time": "1793612700",
+    "host_user": {
+      "id": "ou_00000000000000000000000000000001",
+      "user_type": 1
+    },
+    "meeting_connect": false,
+    "status": 3,
+    "participant_count": "3",
+    "participant_count_accumulated": "3",
+    "participants": [
+      {
+        "id": "ou_00000000000000000000000000000001",
+        "first_join_time": "1793610000",
+        "final_leave_time": "1793612700",
+        "in_meeting_duration": "2700",
+        "user_type": 1,
+        "is_host": true,
+        "is_cohost": false,
+        "is_external": false,
+        "status": 4
+      },
+      {
+        "id": "ou_00000000000000000000000000000002",
+        "first_join_time": "1793610060",
+        "final_leave_time": "1793612640",
+        "in_meeting_duration": "2580",
+        "user_type": 1,
+        "is_host": false,
+        "is_cohost": false,
+        "is_external": false,
+        "status": 4
+      },
+      {
+        "id": "ou_00000000000000000000000000000003",
+        "first_join_time": "1793610300",
+        "final_leave_time": "1793612400",
+        "in_meeting_duration": "2100",
+        "user_type": 1,
+        "is_host": false,
+        "is_cohost": false,
+        "is_external": true,
+        "status": 4
+      }
+    ]
+  }
+}

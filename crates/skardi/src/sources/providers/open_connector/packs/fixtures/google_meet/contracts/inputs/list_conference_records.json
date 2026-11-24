@@ -1,0 +1,33 @@
+{
+  "type": "object",
+  "properties": {
+    "filter": {
+      "type": "string",
+      "minLength": 1,
+      "description": "A Google Meet API filter expression for this resource collection."
+    },
+    "startTime": {
+      "type": "string",
+      "description": "Only records that started at or after this RFC 3339 time, such as 2026-11-01T00:00:00Z. Sent as start_time>=\"...\" and combined with filter by AND.",
+      "format": "date-time"
+    },
+    "endTime": {
+      "type": "string",
+      "description": "Only records that started at or before this RFC 3339 time, such as 2026-11-08T00:00:00Z. Sent as start_time<=\"...\" and combined with filter by AND.",
+      "format": "date-time"
+    },
+    "pageSize": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 100,
+      "description": "The maximum number of conference records to return."
+    },
+    "pageToken": {
+      "type": "string",
+      "minLength": 1,
+      "description": "A pagination token returned by a previous list call."
+    }
+  },
+  "additionalProperties": false,
+  "description": "Action input."
+}

@@ -1,0 +1,136 @@
+# Google Meet source pack: the member's Google Meet conferences and the
+# notes Gemini wrote for them ("Take notes for me"), in the meeting-minutes
+# contract shape (`meetings`, `meeting_notes`) that every meeting pack
+# writes.
+#
+# Wire contract: Open Connector's `googlemeet` provider. Both tables'
+# contracts were captured from a local gateway built from
+# SkardiLabs/open-connector main 02ba682a322e35636f1b927eb1abee1d79af6249
+# (open-connector#22, the start-time window, and #30,
+# `get_conference_artifacts`). The executors
+# rebuild the list ENVELOPE — `conferenceRecords` always present (`[]` for
+# Google's `{}` page), `nextPageToken` null on the last page — and pass
+# Google's own objects through RAW: camelCase keys, times as RFC 3339
+# strings with up to nine fractional digits (the Meet REST v2 discovery
+# document, revision 20261117).
+#
+# ⚠️ UNPROBED AGAINST A REAL GOOGLE ACCOUNT. Row shapes come from Google's
+# Meet REST v2 discovery document and guides (read 2026-11-24) and the
+# executor source; the fixtures are SYNTHETIC. The module doc of
+# packs/google_meet.rs records every wire decision and lists every unprobed
+# assumption with the probe that settles it.
+#
+# Two contract facts shape the pack (Google's conferences guide):
+#  - `conferenceRecords.list` "only returns conferences where you're the
+#    meeting organizer": meetings the member only attended are not here.
+#  - A conference record is deleted 30 days after the conference ends
+#    (`expireTime`), so the API holds at most 30 days of meetings.
+kind: pack
+pack: google_meet
+version: 1
+
+tables:
+  # One row per conference the member organized: an occurrence of a call in
+  # a Meet space. Every column is on the listed record, so the cloud's
+  # `meetings` head takes rows straight off the listing — no per-meeting
+  # read.
+  meetings:
+    action: googlemeet.list_conference_records
+    row_path: "$.conferenceRecords"
+    fingerprint: 8611df91892d13fecb4c7b1f6884e06184476a9ade3379b082b9df8350705b68
+    pagination:
+      strategy: cursor
+      cursor_input: pageToken
+      next_cursor_path: "$.nextPageToken"
+      page_size_input: pageSize
+      # Google's maximum ("values above 100 are coerced to 100").
+      page_size: 100
+    # The window on the conference's START time, RFC 3339, sent verbatim;
+    # the action builds `start_time>="…" AND start_time<="…"` (both ends
+    # inclusive). Optional: without it the list is every record the member
+    # organized that Google still holds — 30 days at most.
+    resources:
+      optional: [startTime, endTime]
+    derive:
+      constants:
+        provider: google_meet
+        # A Meet space is a reusable room, not a series; Calendar's
+        # `recurringEventId` needs a scope this pack does not take.
+        series_id: null
+        # A conference record carries no title, no organizer, no attendee
+        # email, no link and no calendar event (discovery document,
+        # `ConferenceRecord`). Attendees are participants, a per-meeting
+        # read this version does not make.
+        title: null
+        organizer_email: null
+        organizer_id: null
+        attendee_emails: null
+        attendee_ids: null
+        url: null
+        calendar_event_id: null
+    columns:
+      - { name: provider, path: provider, type: utf8, nullable: false }
+      # `conferenceRecords/{conference_record}`: one id per occurrence.
+      - { name: meeting_id, path: name, type: utf8, nullable: false }
+      - { name: series_id, path: series_id, type: utf8, nullable: true }
+      - { name: title, path: title, type: utf8, nullable: true }
+      # "Always set."
+      - { name: started_at, path: startTime, type: timestamp_ms_utc, nullable: true }
+      # Absent while the conference is still running.
+      - { name: ended_at, path: endTime, type: timestamp_ms_utc, nullable: true }
+      - { name: organizer_email, path: organizer_email, type: utf8, nullable: true }
+      - { name: organizer_id, path: organizer_id, type: utf8, nullable: true }
+      - { name: attendee_emails, path: attendee_emails, type: utf8_list, nullable: true }
+      - { name: attendee_ids, path: attendee_ids, type: utf8_list, nullable: true }
+      - { name: url, path: url, type: utf8, nullable: true }
+      - { name: calendar_event_id, path: calendar_event_id, type: utf8, nullable: true }
+
+  # One row per Gemini smart note of one conference, read by the record's
+  # name. The action answers `{conferenceRecord, smartNotes}` — the record
+  # beside its notes, so every note carries its meeting's id and start from
+  # a field. The gateway walks the notes oldest first, at most ten pages of
+  # 100, and answers a provider error past that rather than a short list.
+  # A note is a Google Doc in the organizer's Drive, reached by
+  # `document_path`; no text is read, and Gemini's "Next steps" stay prose
+  # inside that Doc (no action-item table).
+  meeting_notes:
+    action: googlemeet.get_conference_artifacts
+    row_path: "$"
+    row_shape: object
+    fingerprint: aae1009d44dd3f6b71c8062f499ea282c28e26c7ff28ad5f904a6a320c2d8ae3
+    pagination:
+      strategy: single_page
+    resources:
+      required: [name]
+    derive:
+      # One row per smart note; a conference without notes is zero rows,
+      # not an error, and its `meetings` row still stands.
+      explode:
+        paths: [smartNotes]
+        into: note
+      constants:
+        provider: google_meet
+        # Gemini's notes Doc holds a summary, next steps and details: the
+        # tool's notes, not a summary field.
+        kind: notes
+        # Google: "notes generated from Take Notes with Gemini".
+        producer: gemini
+        # No title and no text on the answer: the Doc is reached by
+        # `document_path`, never copied.
+        title: null
+        body: null
+    columns:
+      - { name: provider, path: provider, type: utf8, nullable: false }
+      - { name: meeting_id, path: conferenceRecord.name, type: utf8, nullable: false }
+      # Copied onto every note so a note carries its meeting's date.
+      - { name: meeting_started_at, path: conferenceRecord.startTime, type: timestamp_ms_utc, nullable: true }
+      # `conferenceRecords/{c}/smartNotes/{s}`: the note's own id.
+      - { name: note_id, path: note.name, type: utf8, nullable: false }
+      - { name: kind, path: kind, type: utf8, nullable: true }
+      - { name: producer, path: producer, type: utf8, nullable: true }
+      - { name: title, path: title, type: utf8, nullable: true }
+      - { name: body, path: body, type: utf8, nullable: true }
+      # The Docs document id, which is also the Drive file id. Absent until
+      # Google has written the Doc (UNPROBED): NULL then.
+      - { name: document_path, path: note.docsDestination.document, type: utf8, nullable: true }
+      - { name: url, path: note.docsDestination.exportUri, type: utf8, nullable: true }

@@ -1,0 +1,15 @@
+{
+  "type": "object",
+  "properties": {
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The conference record resource name, such as conferenceRecords/{conference_record}."
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "name"
+  ],
+  "description": "Action input."
+}

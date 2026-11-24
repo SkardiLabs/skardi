@@ -1,0 +1,31 @@
+{
+  "conferenceRecord": {
+    "name": "conferenceRecords/synthetic-conference-0001",
+    "space": "spaces/syntheticSpace0001",
+    "startTime": "2026-11-02T09:00:00.123456789Z",
+    "endTime": "2026-11-02T09:45:00Z",
+    "expireTime": "2026-12-02T09:45:00Z"
+  },
+  "smartNotes": [
+    {
+      "name": "conferenceRecords/synthetic-conference-0001/smartNotes/synthetic-note-0001",
+      "state": "FILE_GENERATED",
+      "startTime": "2026-11-02T09:01:00Z",
+      "endTime": "2026-11-02T09:20:00Z",
+      "docsDestination": {
+        "document": "1SyntheticNotesDoc000000000000001",
+        "exportUri": "https://docs.google.com/document/d/1SyntheticNotesDoc000000000000001/view"
+      }
+    },
+    {
+      "name": "conferenceRecords/synthetic-conference-0001/smartNotes/synthetic-note-0002",
+      "state": "FILE_GENERATED",
+      "startTime": "2026-11-02T09:25:00Z",
+      "endTime": "2026-11-02T09:45:00Z",
+      "docsDestination": {
+        "document": "1SyntheticNotesDoc000000000000002",
+        "exportUri": "https://docs.google.com/document/d/1SyntheticNotesDoc000000000000002/view"
+      }
+    }
+  ]
+}

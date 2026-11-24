@@ -1,0 +1,19 @@
+{
+  "conferenceRecords": [
+    {
+      "name": "conferenceRecords/synthetic-conference-0002",
+      "space": "spaces/syntheticSpace0002",
+      "startTime": "2026-11-03T15:30:00.000000001Z",
+      "expireTime": "2026-12-03T16:30:00Z"
+    },
+    {
+      "name": "conferenceRecords/synthetic-conference-0001",
+      "space": "spaces/syntheticSpace0001",
+      "startTime": "2026-11-02T09:00:00.123456789Z",
+      "endTime": "2026-11-02T09:45:00Z",
+      "expireTime": "2026-12-02T09:45:00Z",
+      "futureField": {"addedBy": "a later Meet API revision"}
+    }
+  ],
+  "nextPageToken": null
+}

@@ -1,13 +1,13 @@
 //! The built-in source packs this Skardi build ships, and their tests.
 //!
 //! `skardi-source-pack` owns `SourcePackRegistry`; this owns what goes in it.
-//! The split is content versus machinery: twelve provider assets are this
+//! The split is content versus machinery: fourteen provider assets are this
 //! binary's choices, and a library that hardcoded them would be making its
 //! consumers' choices too — cloud registers a different set against the same
 //! type.
 //!
 //! The tests came here with the content rather than staying with the type they
-//! call. Every one of them asserts something about the twelve assets — that
+//! call. Every one of them asserts something about the fourteen assets — that
 //! github's pack is registered, that iteration is in name order, that the
 //! reconciled set matches what the cloud pin carried — which is a fact about
 //! this build, not about a registry.
@@ -20,7 +20,7 @@ use super::packs;
 /// The built-in source packs this Skardi build ships.
 ///
 /// The list lives here rather than in `skardi-source-pack` because it is
-/// CONTENT, not machinery: twelve provider assets are this binary's choices,
+/// CONTENT, not machinery: fourteen provider assets are this binary's choices,
 /// and a library that hardcoded them would be making its consumers' choices
 /// too. The pack owns `SourcePackRegistry`; callers supply what goes in it,
 /// which is what lets cloud register a different set against the same type.
@@ -56,6 +56,8 @@ pub fn builtin_pack_registry() -> Result<SourcePackRegistry, OpenConnectorError>
         packs::one_drive::pack()?,
         packs::google_drive::pack()?,
         packs::whatsapp::pack()?,
+        packs::feishu_meetings::pack()?,
+        packs::google_meet::pack()?,
     ])
 }
 
@@ -113,12 +115,30 @@ mod tests {
         // gate covers only the declared keys; the executor's normalizer
         // emits exactly those, which the live pass confirms column by column.
         //
+        // `feishu_meetings.meetings` and `feishu_meetings.meeting_notes` are
+        // the fourth and fifth, over one point read: `get_vc_meeting` takes
+        // one `meetingId` and answers that meeting, `{meeting}` (the
+        // `meetings` row) or, with `includeArtifacts`, `{meeting,
+        // relatedArtifacts}` (the pack's `derive.unpivot` turns the two
+        // document tokens into one note row each) — still object-shaped
+        // tables, since the shape names how the RESPONSE is read, and the
+        // derivation runs after.
+        //
+        // `google_meet.meeting_notes` is the sixth: `get_conference_artifacts`
+        // takes one conference record `name` and answers `{conferenceRecord,
+        // smartNotes}`, the record beside its Gemini notes (the pack's
+        // `derive.explode` turns each smart note into one note row). Its
+        // `meetings` table is a plain array listing.
+        //
         // `lark.document_content` mirrors `feishu.document_content` exactly:
         // Lark is Feishu's international edition, and `packs/lark.yaml` is
         // the feishu pack with every `feishu.*` action renamed `lark.*` (see
         // the warning at the top of that file about what remains unverified).
         const OBJECT_ROW_TABLES: &[&str] = &[
             "feishu.document_content",
+            "feishu_meetings.meeting_notes",
+            "feishu_meetings.meetings",
+            "google_meet.meeting_notes",
             "lark.document_content",
             "notion.page_markdown",
             "whatsapp.business_profile",
@@ -217,9 +237,11 @@ mod tests {
                 "discord",
                 "dropbox",
                 "feishu",
+                "feishu_meetings",
                 "github",
                 "gmail",
                 "google_drive",
+                "google_meet",
                 "lark",
                 "mock",
                 "notion",
@@ -430,6 +452,7 @@ mod tests {
             "one_drive",
             "google_drive",
             "whatsapp",
+            "google_meet",
         ] {
             let pack = registry.require(name).unwrap();
             let mut seen = std::collections::HashSet::new();
@@ -467,6 +490,7 @@ mod tests {
             error_path: None,
             expected_fingerprint: None,
             continuation: None,
+            derive: None,
         }
     }
 

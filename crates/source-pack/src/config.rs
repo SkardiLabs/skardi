@@ -47,7 +47,7 @@ const DEFAULT_IDLE_TIMEOUT_SECONDS: u64 = 60;
 /// Default cap on pages fetched per scan.
 const DEFAULT_MAX_PAGES: u32 = 100;
 /// Default cap on rows emitted per scan.
-const DEFAULT_MAX_ROWS: u64 = 100_000;
+pub(crate) const DEFAULT_MAX_ROWS: u64 = 100_000;
 /// Default byte budget of the shared scan cache (256 MiB).
 const DEFAULT_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 

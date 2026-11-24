@@ -625,6 +625,9 @@ pub enum OpenConnectorError {
 
     /// A scan hit a safety bound before the collection was exhausted, so the
     /// result would be incomplete — fail rather than return partial rows.
+    /// Also raised before a page's derivation copies a row past its
+    /// [`crate::derive::DeriveBounds`], naming `max_rows` or
+    /// `max_response_bytes`.
     #[error(
         "Open Connector scan of '{table}' exceeded {bound} (limit {limit}); \
          the result would be incomplete"
@@ -699,6 +702,27 @@ pub enum OpenConnectorError {
     ConversionFailed {
         path: String,
         column: String,
+        page: usize,
+        row: usize,
+        expected: String,
+        found: String,
+    },
+
+    /// A table's declared row derivation (`derive:` in the pack asset — see
+    /// `skardi_source_pack::derive`) met a row it cannot rewrite: an array
+    /// path holding a non-array, an unpivoted field holding an array or an
+    /// object, a template placeholder over an object, a parent of the wrong
+    /// shape. `step` names which of the steps (or `row` for a source row
+    /// that is not an object),
+    /// `found` the JSON *kind* only — never the value.
+    #[error(
+        "Open Connector row derivation ({step}) failed for table '{table}' at path '{path}', \
+         page {page}, row {row}: expected {expected}, found {found}"
+    )]
+    RowDerivationFailed {
+        table: String,
+        step: String,
+        path: String,
         page: usize,
         row: usize,
         expected: String,
