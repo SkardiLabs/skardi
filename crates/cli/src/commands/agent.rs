@@ -8,7 +8,9 @@ use crate::agent::control::Control;
 use crate::agent::documents::{self, DataPlane};
 use crate::agent::handoff::{self, Polling};
 use crate::agent::integrations::{self, CandidateArgs};
-use crate::agent::memory::{self, CopyOptions, Labels, Memory, SaveOptions, Target, branch};
+use crate::agent::memory::{
+    self, CopyOptions, Labels, Memory, SaveOptions, ShareOptions, Target, branch,
+};
 use crate::agent::{AgentContext, AgentError, EXIT_NO_CONTROL, Invocation, LOGIN_CONTROL, Outcome};
 use crate::config::{self, ClientConfig, ConfigError, ContextsFile};
 use chrono::{DateTime, Utc};
@@ -288,6 +290,14 @@ pub enum MemoryCmd {
         /// share it, after the person has seen the warning
         #[arg(long)]
         confirm: bool,
+
+        /// with --confirm: the version the warning was for (the confirming
+        /// command it prints carries it); refused if the memory was saved since
+        // `conflicts_with` as well as `requires`: clap waives a requirement
+        // once a conflicting flag is given, so `--off --if-version 4` would
+        // parse, and read as a conditional unshare.
+        #[arg(long, value_name = "N", requires = "confirm", conflicts_with = "off")]
+        if_version: Option<i64>,
 
         /// unshare it
         #[arg(long, conflicts_with = "confirm")]
@@ -593,10 +603,15 @@ pub async fn execute_memory(
         MemoryCmd::Share {
             anchor: raw,
             confirm,
+            if_version,
             off,
         } => {
             let anchor = anchor(&raw)?;
-            memory::share(&connect(&target)?, &anchor, !off, confirm).await
+            let options = ShareOptions {
+                confirm,
+                if_version,
+            };
+            memory::share(&connect(&target)?, &anchor, !off, options).await
         }
         MemoryCmd::Rm { anchor: raw } => {
             let anchor = anchor(&raw)?;
@@ -822,6 +837,7 @@ mod tests {
             MemoryCmd::Share {
                 anchor: anchor(),
                 confirm: false,
+                if_version: None,
                 off: false,
             },
             MemoryCmd::Rm { anchor: anchor() },

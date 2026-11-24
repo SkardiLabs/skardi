@@ -961,7 +961,7 @@ the normalized spelling.
 | `skardi memory recall <anchor> --version <n>` | one kept version of your own memory |
 | `skardi memory list [--anchor <anchor>] [--text <text>]` | the memories you can read, newest first, and the workspace's count against its cap |
 | `skardi memory copy <anchor> [--to <workspace\|context>] [--as <anchor>] [--replace]` | copies your memory to a team workspace, or under another anchor |
-| `skardi memory share <anchor> [--confirm \| --off]` | shares your memory with every member, or unshares it |
+| `skardi memory share <anchor> [--confirm [--if-version <n>] \| --off]` | shares your memory with every member, or unshares it |
 | `skardi memory rm <anchor>` | deletes your memory: hidden at once, removed with its versions after 3 days |
 | `skardi memory history <anchor>` | your memory's kept versions (at most 20), newest first |
 | `skardi memory redact <anchor> --version <n>` | empties one kept version for good, for something that got past the secret scan |
@@ -1024,9 +1024,14 @@ version. `copy <anchor> --as <right anchor>` followed by `rm <anchor>` is how
 a record saved under the wrong anchor is corrected.
 
 **`share`** without `--confirm` changes nothing: it prints what sharing would
-expose — which cited rows some members cannot read, and how many entries cite
-nothing — with the confirming command as `next`. Share only on the person's
-yes. Sharing arrives with phase 2 of agent memory; until the gateway serves
+expose — the sources the memory cites, one a line, and how many entries cite
+nothing — with the confirming command as `next`. The server does not check
+who can read a cited source; the person sharing judges. Share only on their
+yes. The confirming command carries `--if-version <n>`, the version the
+warning was for: if the memory was saved since, the share is refused with
+`version_conflict` (exit `3`) and nothing is shared, so run `share` again and
+show the new warning. `--if-version` goes with `--confirm` only. Sharing
+arrives with phase 2 of agent memory; until the gateway serves
 it, `share` fails with `memory_share_unavailable` (exit `5`) and the memory
 stays private. A personal workspace's memory cannot be shared: `copy` it to a
 team workspace first.

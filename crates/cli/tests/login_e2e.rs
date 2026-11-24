@@ -10,6 +10,7 @@
 //! The config file is redirected with `SKARDI_CONFIG_DIR`, which works on
 //! Windows too, where `dirs::home_dir()` ignores `HOME`.
 
+use chrono::{Duration, SecondsFormat, Utc};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use tempfile::TempDir;
@@ -87,11 +88,15 @@ async fn login_writes_a_context_that_query_then_uses_and_logout_clears() {
         })))
         .mount(&control_plane)
         .await;
+    // `query` refuses a context whose stored expiry has passed, before any
+    // request is sent, so this stamp is read against the real clock: a fixed
+    // date here is a test that starts failing on that date.
+    let expires_at = (Utc::now() + Duration::days(1)).to_rfc3339_opts(SecondsFormat::Secs, true);
     Mock::given(method("POST"))
         .and(path("/v1/me/tokens"))
         .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
             "token": "skardi_pat_e2e",
-            "pat": {"token_id": "tok-e2e", "expires_at": "2026-11-22T12:00:00Z"},
+            "pat": {"token_id": "tok-e2e", "expires_at": expires_at},
         })))
         .mount(&control_plane)
         .await;
