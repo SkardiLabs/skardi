@@ -1,0 +1,19 @@
+{
+  "name": "@skardi/cli-linux-arm64",
+  "version": "0.0.0",
+  "description": "Prebuilt skardi CLI binary for Linux arm64 (glibc)",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/SkardiLabs/skardi"
+  },
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "files": [
+    "bin"
+  ]
+}
