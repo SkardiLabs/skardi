@@ -13,7 +13,7 @@
 //! | `recall <anchor> --version <n>` | `GET /memory/{anchor}/versions?version=n` |
 //! | `list [--anchor] [--text]` | `GET /memory` |
 //! | `copy <anchor> [--to] [--as] [--replace]` | recall, list at the target, then save there |
-//! | `share <anchor> [--confirm \| --off]` | `POST /memory/{anchor}/share` (phase 2) |
+//! | `share <anchor> [--confirm [--if-version <n>] \| --off]` | `POST /memory/{anchor}/share` (phase 2) |
 //! | `rm <anchor>` | `DELETE /memory/{anchor}` |
 //! | `history <anchor>` | `GET /memory/{anchor}/versions` |
 //! | `redact <anchor> --version <n>` | `POST /memory/{anchor}/versions/{n}/redact` |
@@ -1055,22 +1055,39 @@ pub async fn consent(
     Ok(Outcome::new(response, sentence))
 }
 
+/// How a share runs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ShareOptions {
+    /// Share it, after the person has seen the warning.
+    pub confirm: bool,
+    /// The version the warning was answered for. A confirmed share that
+    /// carries it is refused when the memory was saved since.
+    pub if_version: Option<i64>,
+}
+
 /// `POST /memory/{anchor}/share`, phase 2 on the server.
 ///
 /// Without `confirm`, a share changes nothing and returns the warning to
-/// show the person, with the confirming command as `next`. `shared: false`
-/// unshares, which needs no confirmation.
+/// show the person, with the confirming command as `next`. That command
+/// carries the version the warning was answered for, so the person's yes is
+/// for what they were shown: a save in between is refused with
+/// `version_conflict`, and nothing is shared. `shared: false` unshares, which
+/// needs no confirmation.
 pub async fn share(
     memory: &Memory,
     anchor: &str,
     shared: bool,
-    confirm: bool,
+    options: ShareOptions,
 ) -> Result<Outcome, AgentError> {
-    let body = if shared {
-        json!({ "shared": true, "confirm": confirm })
-    } else {
-        json!({ "shared": false })
-    };
+    let mut body = Map::new();
+    body.insert("shared".to_string(), json!(shared));
+    if shared {
+        body.insert("confirm".to_string(), json!(options.confirm));
+        if let Some(version) = options.if_version {
+            body.insert("if_version".to_string(), json!(version));
+        }
+    }
+    let body = Value::Object(body);
     let response = memory
         .send(
             Route::Share,
@@ -1080,7 +1097,29 @@ pub async fn share(
             Some(&body),
         )
         .await
-        .map_err(|err| with_hints(memory, anchor, err))?;
+        .map_err(|err| {
+            // A save's conflict is answered by recalling and merging. A
+            // share's is answered by looking at the warning again: the
+            // memory changed after the one the person said yes to. The
+            // server words every version conflict for a save, so its message
+            // would contradict that; the share's own replaces it.
+            let err = if err.code() == "version_conflict" && err.next.is_none() {
+                let now_at = match err.error.get("current_version").and_then(Value::as_i64) {
+                    Some(current) => format!(" and is now at version {current}"),
+                    None => String::new(),
+                };
+                err.with_field(
+                    "message",
+                    json!(format!(
+                        "the memory was saved after the warning you confirmed{now_at}: nothing was shared, so show its new warning and confirm that one"
+                    )),
+                )
+                .with_next(memory.hint(format!("skardi memory share {}", shell_quote(anchor))))
+            } else {
+                err
+            };
+            with_hints(memory, anchor, err)
+        })?;
     let stored = text(&response, "anchor").unwrap_or(anchor).to_string();
     if flag(&response, "needs_confirm") {
         let warning = response.get("warning").cloned().unwrap_or(Value::Null);
@@ -1097,6 +1136,19 @@ pub async fn share(
                 "\n{uncited} {} cite no source, so only this general warning covers them.",
                 plural(uncited as i64, "entry", "entries")
             ));
+        }
+        // What the memory draws on, for the person to judge: the server does
+        // not check who can read these, and its message says so.
+        let cited = list_of(&warning, "cited");
+        if !cited.is_empty() {
+            out.push_str(&format!(
+                "\nIt cites {} {}:",
+                cited.len(),
+                plural(cited.len() as i64, "source", "sources")
+            ));
+            for cite in cited {
+                out.push_str(&format!("\n  {}", render_cite(cite)));
+            }
         }
         for item in list_of(&warning, "unreadable") {
             let cite = item.get("cite").cloned().unwrap_or(Value::Null);
@@ -1115,10 +1167,18 @@ pub async fn share(
                 "share_needs_confirm",
                 "nothing was shared: show the warning to the person, and confirm only on their yes",
             )
-            .with_next(memory.hint(format!(
-                "skardi memory share {} --confirm",
-                shell_quote(&stored)
-            ))));
+            // The yes this asks for is for this version. A server from
+            // before versions were answered names none, and the command then
+            // confirms whatever the memory holds, as it always did.
+            .with_next(
+                memory.hint(match response.get("version").and_then(Value::as_i64) {
+                    Some(version) => format!(
+                        "skardi memory share {} --confirm --if-version {version}",
+                        shell_quote(&stored)
+                    ),
+                    None => format!("skardi memory share {} --confirm", shell_quote(&stored)),
+                }),
+            ));
     }
     let mut outcome = Outcome::new(
         response.clone(),
@@ -2279,7 +2339,9 @@ mod tests {
         .expect(1)
         .mount(&server)
         .await;
-        let outcome = share(&memory(&server), ANCHOR, true, false).await.unwrap();
+        let outcome = share(&memory(&server), ANCHOR, true, ShareOptions::default())
+            .await
+            .unwrap();
         let text = &outcome.sentence;
         assert!(
             text.starts_with(&format!("{ANCHOR} is still private. Sharing makes")),
@@ -2294,23 +2356,158 @@ mod tests {
             outcome.warning.as_ref().map(|w| w.code.as_str()),
             Some("share_needs_confirm")
         );
+        // The yes is for the version the warning was answered for.
+        assert_eq!(
+            outcome.next.as_deref(),
+            Some(format!("skardi memory share {ANCHOR} --confirm --if-version 4").as_str())
+        );
+    }
+
+    /// The warning lists what the memory cites, one source a line, for the
+    /// person to judge: the server does not check who can read them.
+    #[tokio::test]
+    async fn share_without_confirm_lists_the_sources_the_memory_cites() {
+        let server = MockServer::start().await;
+        authed(
+            Mock::given(method("POST")).and(path(format!("{ANCHOR_PATH}/share"))),
+            WS,
+        )
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(fixture("share_response_needs_confirm_cited.json")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+        let outcome = share(&memory(&server), ANCHOR, true, ShareOptions::default())
+            .await
+            .unwrap();
+        let text = &outcome.sentence;
+        assert!(text.contains("was not checked"), "{text}");
+        assert!(
+            text.ends_with(
+                "\nIt cites 2 sources:\n  drive/1AbC#drive/pricing/2026.md\n  github/acme/api#7"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("cannot be read by"), "{text}");
+        // The message points at the list ("listed with this warning") and
+        // names no source itself, so each is printed once.
+        for source in ["drive/1AbC", "github/acme/api#7"] {
+            assert_eq!(text.matches(source).count(), 1, "{text}");
+        }
+    }
+
+    /// A server from before a share answered its version names none, so the
+    /// confirming command carries none and confirms as it always did.
+    #[tokio::test]
+    async fn share_without_a_version_in_the_answer_confirms_without_one() {
+        let server = MockServer::start().await;
+        let mut answer = fixture("share_response_needs_confirm.json");
+        answer.as_object_mut().unwrap().remove("version");
+        authed(
+            Mock::given(method("POST")).and(path(format!("{ANCHOR_PATH}/share"))),
+            WS,
+        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(answer))
+        .mount(&server)
+        .await;
+        let outcome = share(&memory(&server), ANCHOR, true, ShareOptions::default())
+            .await
+            .unwrap();
         assert_eq!(
             outcome.next.as_deref(),
             Some(format!("skardi memory share {ANCHOR} --confirm").as_str())
         );
     }
 
+    /// The memory was saved after the warning the person said yes to: the
+    /// share is refused, nothing is shared, and the way on is the warning
+    /// again, not a recall and merge as for a save.
+    #[tokio::test]
+    async fn share_confirmed_for_a_version_since_saved_over_points_at_the_warning() {
+        let server = MockServer::start().await;
+        authed(
+            Mock::given(method("POST")).and(path(format!("{ANCHOR_PATH}/share"))),
+            WS,
+        )
+        .and(body_json(fixture(
+            "share_request_confirmed_at_version.json",
+        )))
+        .respond_with(
+            ResponseTemplate::new(409).set_body_json(fixture("error_version_conflict.json")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+        let options = ShareOptions {
+            confirm: true,
+            if_version: Some(4),
+        };
+        let err = share(&memory(&server), ANCHOR, true, options)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "version_conflict");
+        assert_eq!(err.exit, EXIT_REFUSED);
+        assert_eq!(
+            err.next.as_deref(),
+            Some(format!("skardi memory share {ANCHOR}").as_str())
+        );
+        // The server words every version conflict for a save. Under a share
+        // that would send the person to recall and merge, against `next`.
+        assert_eq!(
+            err.message(),
+            "the memory was saved after the warning you confirmed and is now at version 5: nothing was shared, so show its new warning and confirm that one"
+        );
+        assert_eq!(err.error["current_version"], 5);
+    }
+
+    /// An answer that names no current version still says what happened and
+    /// keeps nothing of the save's wording.
+    #[tokio::test]
+    async fn share_conflict_without_a_current_version_is_still_worded_for_a_share() {
+        let server = MockServer::start().await;
+        let mut refusal = fixture("error_version_conflict.json");
+        refusal.as_object_mut().unwrap().remove("current_version");
+        authed(
+            Mock::given(method("POST")).and(path(format!("{ANCHOR_PATH}/share"))),
+            WS,
+        )
+        .respond_with(ResponseTemplate::new(409).set_body_json(refusal))
+        .mount(&server)
+        .await;
+        let options = ShareOptions {
+            confirm: true,
+            if_version: Some(4),
+        };
+        let err = share(&memory(&server), ANCHOR, true, options)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.message(),
+            "the memory was saved after the warning you confirmed: nothing was shared, so show its new warning and confirm that one"
+        );
+    }
+
     #[rstest]
     #[case::confirmed(
         true,
-        true,
+        ShareOptions { confirm: true, if_version: None },
         "share_request_confirmed.json",
         "share_response_shared.json",
         "shared url:github.com/SkardiLabs/skardi-cloud/issues/1400: every member of acme-eng can now recall it"
     )]
+    #[case::confirmed_at_the_version_the_warning_showed(
+        true,
+        ShareOptions { confirm: true, if_version: Some(4) },
+        "share_request_confirmed_at_version.json",
+        "share_response_shared.json",
+        "shared url:github.com/SkardiLabs/skardi-cloud/issues/1400: every member of acme-eng can now recall it"
+    )]
+    // An unshare is not conditional: it sends neither `confirm` nor a version.
     #[case::unshare(
         false,
-        false,
+        ShareOptions { confirm: false, if_version: Some(4) },
         "share_request_unshare.json",
         "share_response_unshared.json",
         "url:github.com/SkardiLabs/skardi-cloud/issues/1400 is private again"
@@ -2318,7 +2515,7 @@ mod tests {
     #[tokio::test]
     async fn share_confirmed_and_unshare(
         #[case] shared: bool,
-        #[case] confirm: bool,
+        #[case] options: ShareOptions,
         #[case] request: &str,
         #[case] response: &str,
         #[case] sentence: &str,
@@ -2333,7 +2530,7 @@ mod tests {
         .expect(1)
         .mount(&server)
         .await;
-        let outcome = share(&memory(&server), ANCHOR, shared, confirm)
+        let outcome = share(&memory(&server), ANCHOR, shared, options)
             .await
             .unwrap();
         assert_eq!(outcome.sentence, sentence);
@@ -2365,9 +2562,17 @@ mod tests {
             body,
         )
         .await;
-        let err = share(&memory(&server), ANCHOR, true, true)
-            .await
-            .unwrap_err();
+        let err = share(
+            &memory(&server),
+            ANCHOR,
+            true,
+            ShareOptions {
+                confirm: true,
+                if_version: None,
+            },
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.exit, EXIT_UNAVAILABLE);
         assert_eq!(err.code(), "memory_share_unavailable");
         assert!(err.message().contains("phase 2"), "{}", err.message());
@@ -2384,9 +2589,17 @@ mod tests {
             json!({"success": false, "code": "share_personal_workspace", "error": "a personal workspace's memory cannot be shared; copy it to a team workspace first"}),
         )
         .await;
-        let err = share(&memory(&server), ANCHOR, true, true)
-            .await
-            .unwrap_err();
+        let err = share(
+            &memory(&server),
+            ANCHOR,
+            true,
+            ShareOptions {
+                confirm: true,
+                if_version: None,
+            },
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.exit, EXIT_REFUSED);
         assert_eq!(
             err.next.as_deref(),
