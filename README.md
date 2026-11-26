@@ -343,6 +343,9 @@ agents; deploy it next to your data, behind your usual auth.
 - **Retrieval built in** — KNN, FTS and hybrid RRF in SQL; `candle()` embeddings,
   `chunk()`, `onnx_predict()` and `llm_extract()` as UDFs, so content and vector
   land on the same row atomically. [docs/embeddings/](docs/embeddings/)
+  Optional contextual retrieval: `contextualize()` writes a short context for
+  each chunk at ingest and `rerank()` re-scores search candidates with a local
+  cross-encoder. [docs/contextual_retrieval.md](docs/contextual_retrieval.md)
 
 ### Supported data sources
 
@@ -434,6 +437,7 @@ ledger) · [CLI](docs/cli.md) · [pipelines](docs/pipelines.md) ·
 [federated queries](docs/federated-queries.md) ·
 [embeddings](docs/embeddings/) · [chunking](docs/chunk.md) ·
 [ONNX](docs/onnx_predict.md) · [LLM extraction](docs/llm_extract.md) ·
+[contextual retrieval](docs/contextual_retrieval.md) ·
 [JSON packing](docs/json_pack.md) · [auth](docs/auth/) ·
 [observability](docs/observability.md).
 

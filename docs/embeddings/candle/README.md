@@ -254,6 +254,14 @@ Re-run `setup.py` with `MODEL_ID = "BAAI/bge-base-en-v1.5"` and
 `MODEL_DIR = Path("models/generated/bge-base-en-v1.5")` to rebuild the Lance dataset
 with the new model's embeddings.
 
+## Reranking with a cross-encoder
+
+The same `candle` build also registers `rerank(model_dir, query, passage)`,
+which loads a cross-encoder reranker (`BAAI/bge-reranker-base`,
+`cross-encoder/ms-marco-MiniLM-L-6-v2`) and returns one relevance score per
+row — the second stage after a vector or hybrid search. It is a separate model
+from the embedding model; see [contextual retrieval](../../contextual_retrieval.md#rerank).
+
 ## Troubleshooting
 
 ### "Failed to load candle model"
