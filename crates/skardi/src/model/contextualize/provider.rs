@@ -61,6 +61,11 @@ pub struct ContextRequest<'a> {
 pub trait ContextProvider: Send + Sync {
     /// Provider name as written in SQL (`'anthropic'`, `'openai'`, `'ollama'`).
     fn name(&self) -> &str;
+    /// In-flight requests per document after the cache-warming first one,
+    /// when `CONTEXTUALIZE_CONCURRENCY` does not say otherwise.
+    fn default_concurrency(&self) -> usize {
+        4
+    }
     /// Generate the context for one chunk. Returns the model's raw text.
     async fn contextualize(&self, req: ContextRequest<'_>) -> anyhow::Result<String>;
 }
@@ -408,6 +413,15 @@ impl ContextProvider for OllamaProvider {
         "ollama"
     }
 
+    /// One at a time. A local Ollama serves requests from a queue, and
+    /// requests in flight together evict each other's cached document
+    /// prefix: measured 2026-11-27 on an M5 with qwen2.5:3b and ~8.4k-token
+    /// documents, 4 concurrent calls averaged ~7.5 s per chunk, sequential
+    /// calls ~4.5 s (document prefill served from cache in under a second).
+    fn default_concurrency(&self) -> usize {
+        1
+    }
+
     async fn contextualize(&self, req: ContextRequest<'_>) -> anyhow::Result<String> {
         let url = format!("{}/api/chat", self.base_url.trim_end_matches('/'));
         let value = post_json(&self.client, "ollama", &url, &[], &self.build_body(&req)).await?;
@@ -469,6 +483,14 @@ mod tests {
                 .unwrap()
                 .starts_with("<document>")
         );
+    }
+
+    #[test]
+    fn local_ollama_defaults_to_one_request_at_a_time() {
+        let ollama = OllamaProvider::with_base_url("http://x", 4096).unwrap();
+        let openai = OpenAiCompatProvider::with_base_url("http://x").unwrap();
+        assert_eq!(ollama.default_concurrency(), 1);
+        assert_eq!(openai.default_concurrency(), 4);
     }
 
     #[tokio::test]

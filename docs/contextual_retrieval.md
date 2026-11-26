@@ -59,7 +59,10 @@ would cut most of the document out of every call.
 
 - Within one call the UDF handles one document at a time: the first chunk is
   sent alone, then the remaining chunks go out `CONTEXTUALIZE_CONCURRENCY`
-  (default 4) at a time. The first call populates the provider's prompt cache
+  at a time — default 4 for `anthropic` / `openai`, 1 for `ollama`. A local
+  Ollama queues requests, and concurrent calls evict each other's cached
+  document prefix: measured with `qwen2.5:3b` on an M5 and ~8k-token
+  documents, 4 at a time averaged ~7.5 s per chunk, one at a time ~4.5 s. The first call populates the provider's prompt cache
   — `anthropic` marks the document block `cache_control: ephemeral`, hosted
   OpenAI caches long shared prefixes automatically, and the prompt is laid out
   document-first for both — and the rest read from it.

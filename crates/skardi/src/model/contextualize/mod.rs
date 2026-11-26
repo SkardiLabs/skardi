@@ -21,7 +21,9 @@
 //! **Cost shape.** The document travels with every chunk. Rows are processed
 //! one document at a time: the first chunk of a document is sent alone so it
 //! can populate the provider's prompt cache, then the rest go out
-//! concurrently (`CONTEXTUALIZE_CONCURRENCY`, default 4) and read from it.
+//! concurrently (`CONTEXTUALIZE_CONCURRENCY`; default 4 for hosted
+//! providers, 1 for a local Ollama, whose queue makes concurrent calls
+//! evict each other's cached prefix) and read from it.
 //! Documents longer than `CONTEXTUALIZE_MAX_DOCUMENT_CHARS` (default 32000)
 //! are cut to a window of that size centred on the chunk, so cost per chunk
 //! is bounded no matter how long the document is.
@@ -56,8 +58,6 @@ use self::provider::{
 
 /// Default cap on the document text sent with each chunk, in characters.
 pub const DEFAULT_MAX_DOCUMENT_CHARS: usize = 32_000;
-/// Default number of in-flight requests per document after the first.
-pub const DEFAULT_CONCURRENCY: usize = 4;
 const ELLIPSIS: &str = "\n[…]\n";
 
 // =============================================================================
@@ -80,7 +80,9 @@ const ELLIPSIS: &str = "\n[…]\n";
 pub struct ContextualizeRegistry {
     providers: HashMap<String, Arc<dyn ContextProvider>>,
     max_document_chars: usize,
-    concurrency: usize,
+    /// `CONTEXTUALIZE_CONCURRENCY`, when set; otherwise each provider's own
+    /// default applies.
+    concurrency: Option<usize>,
 }
 
 impl std::fmt::Debug for ContextualizeRegistry {
@@ -98,7 +100,7 @@ impl ContextualizeRegistry {
     pub fn new(
         providers: Vec<Arc<dyn ContextProvider>>,
         max_document_chars: usize,
-        concurrency: usize,
+        concurrency: Option<usize>,
     ) -> Self {
         Self {
             providers: providers
@@ -106,7 +108,7 @@ impl ContextualizeRegistry {
                 .map(|p| (p.name().to_string(), p))
                 .collect(),
             max_document_chars: max_document_chars.max(1),
-            concurrency: concurrency.max(1),
+            concurrency: concurrency.map(|c| c.max(1)),
         }
     }
 
@@ -133,8 +135,7 @@ impl ContextualizeRegistry {
             .unwrap_or(DEFAULT_MAX_DOCUMENT_CHARS);
         let concurrency = std::env::var("CONTEXTUALIZE_CONCURRENCY")
             .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(DEFAULT_CONCURRENCY);
+            .and_then(|v| v.trim().parse().ok());
         Self::new(providers, max_document_chars, concurrency)
     }
 
@@ -295,7 +296,10 @@ impl ContextualizeUDF {
             }
         }
 
-        let concurrency = self.registry.concurrency;
+        let concurrency = self
+            .registry
+            .concurrency
+            .unwrap_or_else(|| provider.default_concurrency());
         let mut out = Vec::new();
         for group in groups {
             let mut iter = group.into_iter();
@@ -467,7 +471,7 @@ mod tests {
         Arc::new(ContextualizeRegistry::new(
             vec![recorder as Arc<dyn ContextProvider>],
             50,
-            concurrency,
+            Some(concurrency),
         ))
         .register(&mut ctx);
         ctx
