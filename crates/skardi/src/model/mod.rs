@@ -2,6 +2,8 @@
 pub mod candle;
 #[cfg(feature = "chunking")]
 pub mod chunking;
+#[cfg(feature = "contextualize")]
+pub mod contextualize;
 #[cfg(feature = "onnx")]
 pub mod converter;
 #[cfg(feature = "gguf")]
@@ -17,8 +19,12 @@ pub mod remote_embed;
 // Re-export for convenience
 #[cfg(feature = "candle")]
 pub use candle::CandleModelRegistry;
+#[cfg(feature = "candle")]
+pub use candle::rerank::RerankModelRegistry;
 #[cfg(feature = "chunking")]
 pub use chunking::ChunkingRegistry;
+#[cfg(feature = "contextualize")]
+pub use contextualize::ContextualizeRegistry;
 #[cfg(feature = "gguf")]
 pub use gguf::GgufModelRegistry;
 #[cfg(feature = "llm-extract")]

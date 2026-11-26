@@ -556,6 +556,9 @@ pub async fn load_server_config(args: CliArgs) -> Result<ServerConfig> {
     // Register chunk UDF (text-splitter wrapper for inline ingestion)
     #[cfg(feature = "chunking")]
     register_chunk_udf(&mut session_ctx);
+    // Register contextualize UDF (LLM-written context per chunk at ingest)
+    #[cfg(feature = "contextualize")]
+    register_contextualize_udf(&mut session_ctx);
     // Register json_pack UDF (SQL-side JSON encoding; the etl generator's
     // metadata/frontmatter serialization boundary)
     register_json_pack_udf(&mut session_ctx);
@@ -870,6 +873,11 @@ pub fn register_gguf_udf(ctx: &mut SessionContext) {
 pub fn register_candle_udf(ctx: &mut SessionContext) {
     let registry = Arc::new(skardi::model::CandleModelRegistry::new());
     registry.register_candle_udf(ctx);
+    // The cross-encoder reranker shares candle's build feature and runtime,
+    // so a server that can embed with candle can also rerank:
+    //   rerank('path/to/reranker_dir', query, content) -> Float32
+    let rerankers = Arc::new(skardi::model::RerankModelRegistry::new());
+    rerankers.register_rerank_udf(ctx);
 }
 
 /// Register the `chunk` UDF for inline text chunking.
@@ -884,6 +892,20 @@ pub fn register_candle_udf(ctx: &mut SessionContext) {
 pub fn register_chunk_udf(ctx: &mut SessionContext) {
     let registry = Arc::new(skardi::model::ChunkingRegistry::new());
     registry.register_chunk_udf(ctx);
+}
+
+/// Register the `contextualize` UDF for Contextual Retrieval at ingest.
+///
+/// SQL:
+///   contextualize('ollama', 'qwen2.5:3b', document, chunk_text) -> Utf8
+///
+/// Providers: `anthropic` (ANTHROPIC_API_KEY), `openai` (OPENAI_API_KEY,
+/// CONTEXTUALIZE_OPENAI_BASE_URL for any compatible server) and `ollama`
+/// (local, CONTEXTUALIZE_OLLAMA_BASE_URL). Keys are read per request.
+#[cfg(feature = "contextualize")]
+pub fn register_contextualize_udf(ctx: &mut SessionContext) {
+    let registry = Arc::new(skardi::model::ContextualizeRegistry::from_env());
+    registry.register(ctx);
 }
 
 /// Load context configuration from YAML file

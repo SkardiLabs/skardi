@@ -25,8 +25,12 @@ llm-extract = ["dep:base64"]
 gguf = ["dep:llama-cpp-4"]
 candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers"]
 chunking = ["dep:text-splitter"]
-# RAG umbrella: chunk → embed → write loop in one feature.
-rag = ["embedding", "chunking"]
+# contextualize scalar UDF: an LLM writes a short context for each chunk from
+# its whole document before indexing (Contextual Retrieval). HTTP only —
+# reqwest is already a hard dependency — so it adds no crates.
+contextualize = []
+# RAG umbrella: chunk → (contextualize) → embed → write loop in one feature.
+rag = ["embedding", "chunking", "contextualize"]
 # documents source connector: parse a folder of files into queryable (file, page) rows.
 documents = ["dep:liteparse", "dep:glob", "dep:object_store"]
 # obsidian source connector: an Obsidian vault (local dir or s3:// prefix) as

@@ -24,6 +24,8 @@ use crate::config::ServerConfig;
 use crate::config::register_candle_udf;
 #[cfg(feature = "chunking")]
 use crate::config::register_chunk_udf;
+#[cfg(feature = "contextualize")]
+use crate::config::register_contextualize_udf;
 #[cfg(feature = "gguf")]
 use crate::config::register_gguf_udf;
 #[cfg(feature = "llm-extract")]
@@ -218,6 +220,9 @@ pub async fn setup_app_state(config: ServerConfig) -> Result<AppState> {
     // Register chunk UDF (text-splitter wrapper for inline ingestion)
     #[cfg(feature = "chunking")]
     register_chunk_udf(&mut session_ctx);
+    // Register contextualize UDF (LLM-written context per chunk at ingest)
+    #[cfg(feature = "contextualize")]
+    register_contextualize_udf(&mut session_ctx);
     // Register json_pack UDF (SQL-side JSON encoding; the etl generator's
     // metadata/frontmatter serialization boundary)
     register_json_pack_udf(&mut session_ctx);

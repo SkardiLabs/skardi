@@ -1,4 +1,5 @@
 pub mod embed;
+pub mod rerank;
 
 use anyhow::Result;
 use arrow::array::{Array, StringArray};
