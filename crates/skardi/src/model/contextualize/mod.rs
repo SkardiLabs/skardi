@@ -47,6 +47,7 @@ use std::sync::Arc;
 
 use arrow::array::{Array, StringArray, StringBuilder};
 use arrow::datatypes::DataType;
+use datafusion::common::Result;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
@@ -56,7 +57,7 @@ use datafusion::scalar::ScalarValue;
 use futures::stream;
 use futures::{StreamExt, TryStreamExt};
 
-use tokio::runtime::Handle;
+use tokio::runtime::{Handle, RuntimeFlavor};
 use tokio::task::block_in_place;
 
 use self::provider::{
@@ -105,6 +106,15 @@ impl std::fmt::Debug for ContextualizeRegistry {
 
 impl ContextualizeRegistry {
     /// Build from explicit providers and limits (tests, embedders).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use skardi::model::ContextualizeRegistry;
+    ///
+    /// // No providers: every call reports an unknown provider.
+    /// let registry = ContextualizeRegistry::new(Vec::new(), 32_000, Some(1));
+    /// ```
     pub fn new(
         providers: Vec<Arc<dyn ContextProvider>>,
         max_document_bytes: usize,
@@ -123,6 +133,14 @@ impl ContextualizeRegistry {
     /// Build all three providers from the environment. A provider whose HTTP
     /// client cannot be built is logged and left out, never a panic; keys are
     /// read per request, so nothing here needs a key to be set.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use skardi::model::ContextualizeRegistry;
+    ///
+    /// let registry = ContextualizeRegistry::from_env();
+    /// ```
     pub fn from_env() -> Self {
         let mut providers: Vec<Arc<dyn ContextProvider>> = Vec::new();
         match AnthropicProvider::from_env() {
@@ -150,6 +168,17 @@ impl ContextualizeRegistry {
     /// Register the `contextualize` UDF.
     ///
     /// Usage: `contextualize('provider', 'model', document, chunk) -> Utf8`
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use datafusion::prelude::SessionContext;
+    /// use skardi::model::ContextualizeRegistry;
+    ///
+    /// let mut ctx = SessionContext::new();
+    /// Arc::new(ContextualizeRegistry::from_env()).register(&mut ctx);
+    /// ```
     pub fn register(self: &Arc<Self>, ctx: &mut SessionContext) {
         ctx.register_udf(ScalarUDF::new_from_impl(ContextualizeUDF {
             registry: Arc::clone(self),
@@ -173,7 +202,7 @@ fn floor_char_boundary(s: &str, i: usize) -> usize {
     i
 }
 
-/// The part of `document` sent with `chunk`.
+/// Byte range `[start, end)` of `document` sent with `chunk`.
 ///
 /// A document of at most `max_bytes` (UTF-8 bytes) is sent whole. A longer
 /// one is cut into **fixed** segments of `max_bytes`, each overlapping the
@@ -187,12 +216,22 @@ fn floor_char_boundary(s: &str, i: usize) -> usize {
 /// The budget is bytes rather than characters so it tracks tokens across
 /// scripts: 32 KB is roughly 8k tokens of English and also of Chinese
 /// (about 10k characters), where 32k Chinese *characters* would overflow a
-/// 16k-token local context. Cuts land on character boundaries and are
-/// marked with `[…]`.
-pub fn document_segment(document: &str, chunk: &str, max_bytes: usize) -> String {
+/// 16k-token local context. Cuts land on character boundaries.
+///
+/// # Example
+///
+/// ```
+/// use skardi::model::contextualize::segment_bounds;
+///
+/// assert_eq!(segment_bounds("short doc", "doc", 100), (0, 9));
+/// let doc = "x".repeat(1000);
+/// let (start, end) = segment_bounds(&doc, "x", 100);
+/// assert!(end - start <= 100);
+/// ```
+pub fn segment_bounds(document: &str, chunk: &str, max_bytes: usize) -> (usize, usize) {
     let total = document.len();
     if total <= max_bytes {
-        return document.to_string();
+        return (0, total);
     }
     let max_bytes = max_bytes.max(8);
     let stride = max_bytes - max_bytes / 8;
@@ -205,19 +244,53 @@ pub fn document_segment(document: &str, chunk: &str, max_bytes: usize) -> String
     let last_start = total - max_bytes;
     let start = floor_char_boundary(document, ((chunk_at / stride) * stride).min(last_start));
     let end = floor_char_boundary(document, start + max_bytes);
+    (start, end)
+}
+
+/// `document[start..end]`, with `[…]` marking each side that was cut.
+fn render_segment(document: &str, start: usize, end: usize) -> String {
     let mut out = String::with_capacity(end - start + 2 * ELLIPSIS.len());
     if start > 0 {
         out.push_str(ELLIPSIS.trim_start());
     }
     out.push_str(&document[start..end]);
-    if end < total {
+    if end < document.len() {
         out.push_str(ELLIPSIS.trim_end());
     }
     out
 }
 
+/// The text of `document` sent with `chunk`: the [`segment_bounds`] range,
+/// marked with `[…]` where it was cut.
+///
+/// # Example
+///
+/// ```
+/// use skardi::model::contextualize::document_segment;
+///
+/// assert_eq!(document_segment("abc def", "def", 100), "abc def");
+/// let long = format!("{}NEEDLE{}", "a".repeat(500), "b".repeat(500));
+/// let seg = document_segment(&long, "NEEDLE", 100);
+/// assert!(seg.contains("NEEDLE") && seg.starts_with("[…]"));
+/// ```
+pub fn document_segment(document: &str, chunk: &str, max_bytes: usize) -> String {
+    let (start, end) = segment_bounds(document, chunk, max_bytes);
+    render_segment(document, start, end)
+}
+
 /// Trim the model's answer and drop a leading `<think>…</think>` block that
 /// reasoning models emit, so only the context itself lands in the index.
+/// An unterminated `<think>` (the model ran out of output budget while
+/// reasoning) leaves nothing; the UDF treats an empty result as an error.
+///
+/// # Example
+///
+/// ```
+/// use skardi::model::contextualize::clean_context;
+///
+/// assert_eq!(clean_context("<think>hmm</think> From the guide. "), "From the guide.");
+/// assert_eq!(clean_context("<think>never closed"), "");
+/// ```
 pub fn clean_context(raw: &str) -> String {
     let mut text = raw.trim();
     if let Some(rest) = text.strip_prefix("<think>") {
@@ -253,7 +326,7 @@ impl std::hash::Hash for ContextualizeUDF {
     }
 }
 
-fn string_literal(value: &ColumnarValue, label: &str) -> datafusion::common::Result<String> {
+fn string_literal(value: &ColumnarValue, label: &str) -> Result<String> {
     match value {
         ColumnarValue::Scalar(ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s))) => {
             Ok(s.trim().to_string())
@@ -264,55 +337,79 @@ fn string_literal(value: &ColumnarValue, label: &str) -> datafusion::common::Res
     }
 }
 
-fn utf8_rows(
-    value: &ColumnarValue,
-    num_rows: usize,
-    label: &str,
-) -> datafusion::common::Result<Vec<Option<String>>> {
-    match value {
-        ColumnarValue::Array(arr) => {
-            let strings = arr.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-                DataFusionError::Execution(format!("contextualize: {label} must be Utf8"))
-            })?;
-            Ok((0..strings.len())
-                .map(|i| (!strings.is_null(i)).then(|| strings.value(i).to_string()))
-                .collect())
+/// A text argument, borrowed from Arrow rather than copied per row. A
+/// literal (the ingest pipeline's `{content}`) is one value shared by every
+/// row: copying it per row is what made a 2 MB document cut into 3,400
+/// chunks cost gigabytes.
+enum TextArg<'a> {
+    Scalar(Option<&'a str>),
+    Column(&'a StringArray),
+}
+
+impl<'a> TextArg<'a> {
+    fn new(value: &'a ColumnarValue, label: &str) -> Result<Self> {
+        match value {
+            ColumnarValue::Array(arr) => arr
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .map(TextArg::Column)
+                .ok_or_else(|| {
+                    DataFusionError::Execution(format!("contextualize: {label} must be Utf8"))
+                }),
+            ColumnarValue::Scalar(ScalarValue::Utf8(v) | ScalarValue::LargeUtf8(v)) => {
+                Ok(TextArg::Scalar(v.as_deref()))
+            }
+            ColumnarValue::Scalar(ScalarValue::Null) => Ok(TextArg::Scalar(None)),
+            _ => Err(DataFusionError::Execution(format!(
+                "contextualize: {label} must be Utf8"
+            ))),
         }
-        ColumnarValue::Scalar(ScalarValue::Utf8(v) | ScalarValue::LargeUtf8(v)) => {
-            Ok(vec![v.clone(); num_rows])
+    }
+
+    fn get(&self, row: usize) -> Option<&'a str> {
+        match self {
+            TextArg::Scalar(v) => *v,
+            TextArg::Column(a) => (row < a.len() && !a.is_null(row)).then(|| a.value(row)),
         }
-        ColumnarValue::Scalar(ScalarValue::Null) => Ok(vec![None; num_rows]),
-        _ => Err(DataFusionError::Execution(format!(
-            "contextualize: {label} must be Utf8"
-        ))),
+    }
+
+    fn rows(&self) -> Option<usize> {
+        match self {
+            TextArg::Scalar(_) => None,
+            TextArg::Column(a) => Some(a.len()),
+        }
     }
 }
 
-/// One row that needs a model call.
-struct Job {
+/// One row that needs a model call. `document` is the segment sent with
+/// it, shared by every chunk of the same stretch of the same document.
+struct Job<'a> {
     row: usize,
-    document: String,
-    chunk: String,
+    document: Arc<str>,
+    chunk: &'a str,
 }
 
 impl ContextualizeUDF {
     /// Run every job, one document at a time: the first chunk alone (to warm
     /// the provider's prompt cache), the rest concurrently. Results come back
     /// keyed by row.
-    async fn run_jobs(
+    async fn run_jobs<'a>(
         &self,
         provider: Arc<dyn ContextProvider>,
         model: &str,
-        jobs: Vec<Job>,
+        jobs: Vec<Job<'a>>,
     ) -> anyhow::Result<Vec<(usize, String)>> {
-        // Group by document text, keeping first-seen order.
-        let mut groups: Vec<Vec<Job>> = Vec::new();
-        let mut index: HashMap<String, usize> = HashMap::new();
+        // Group by segment, keeping first-seen order. Segments are interned
+        // (one allocation per distinct text), so pointer equality is text
+        // equality.
+        let mut groups: Vec<Vec<Job<'a>>> = Vec::new();
+        let mut index: HashMap<*const u8, usize> = HashMap::new();
         for job in jobs {
-            match index.get(&job.document) {
+            let key = job.document.as_ptr();
+            match index.get(&key) {
                 Some(&g) => groups[g].push(job),
                 None => {
-                    index.insert(job.document.clone(), groups.len());
+                    index.insert(key, groups.len());
                     groups.push(vec![job]);
                 }
             }
@@ -326,17 +423,26 @@ impl ContextualizeUDF {
         for group in groups {
             let mut iter = group.into_iter();
             let Some(first) = iter.next() else { continue };
-            let call = |job: Job| {
+            let call = |job: Job<'a>| {
                 let provider = Arc::clone(&provider);
                 async move {
-                    let text = provider
+                    let raw = provider
                         .contextualize(ContextRequest {
                             model,
                             document: &job.document,
-                            chunk: &job.chunk,
+                            chunk: job.chunk,
                         })
                         .await?;
-                    anyhow::Ok((job.row, clean_context(&text)))
+                    let context = clean_context(&raw);
+                    if context.is_empty() {
+                        let shown: String = raw.trim().chars().take(200).collect();
+                        anyhow::bail!(
+                            "{} model '{model}' returned no context for a chunk (answer: {shown:?}); \
+                             a reasoning model may have spent its whole output budget thinking",
+                            provider.name()
+                        );
+                    }
+                    anyhow::Ok((job.row, context))
                 }
             };
             out.push(call(first).await?);
@@ -365,14 +471,11 @@ impl ScalarUDFImpl for ContextualizeUDF {
         &self.signature
     }
 
-    fn return_type(&self, _arg_types: &[DataType]) -> datafusion::common::Result<DataType> {
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
         Ok(DataType::Utf8)
     }
 
-    fn invoke_with_args(
-        &self,
-        args: ScalarFunctionArgs,
-    ) -> datafusion::common::Result<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         let num_rows = args.number_rows;
         let args = args.args;
         if args.len() != 4 {
@@ -387,9 +490,9 @@ impl ScalarUDFImpl for ContextualizeUDF {
                 "contextualize: model (second argument) must not be empty".to_string(),
             ));
         }
-        let documents = utf8_rows(&args[2], num_rows, "document (third argument)")?;
-        let chunks = utf8_rows(&args[3], num_rows, "chunk (fourth argument)")?;
-        let rows = documents.len().max(chunks.len());
+        let documents = TextArg::new(&args[2], "document (third argument)")?;
+        let chunks = TextArg::new(&args[3], "chunk (fourth argument)")?;
+        let rows = documents.rows().or(chunks.rows()).unwrap_or(num_rows);
 
         let provider = self
             .registry
@@ -404,31 +507,47 @@ impl ScalarUDFImpl for ContextualizeUDF {
                 ))
             })?;
 
+        let max_bytes = self.registry.max_document_bytes;
         let mut results: Vec<Option<String>> = vec![None; rows];
+        // One allocation per distinct segment, keyed by the borrowed slice
+        // and whether each side was cut.
+        let mut segments: HashMap<(&str, bool, bool), Arc<str>> = HashMap::new();
         let mut jobs = Vec::new();
         for (row, slot) in results.iter_mut().enumerate() {
-            let chunk = chunks.get(row).cloned().flatten();
-            let Some(chunk) = chunk else { continue };
+            let Some(chunk) = chunks.get(row) else {
+                continue;
+            };
             if chunk.trim().is_empty() {
                 *slot = Some(String::new());
                 continue;
             }
             // A NULL document still gets a context from the chunk alone
             // rather than silently skipping the call.
-            let document = documents
-                .get(row)
-                .cloned()
-                .flatten()
-                .unwrap_or_else(|| chunk.clone());
+            let document = documents.get(row).unwrap_or(chunk);
+            let (start, end) = segment_bounds(document, chunk, max_bytes);
+            let key = (&document[start..end], start > 0, end < document.len());
+            let segment = segments
+                .entry(key)
+                .or_insert_with(|| Arc::from(render_segment(document, start, end)));
             jobs.push(Job {
                 row,
-                document: document_segment(&document, &chunk, self.registry.max_document_bytes),
+                document: Arc::clone(segment),
                 chunk,
             });
         }
 
         if !jobs.is_empty() {
-            let handle = Handle::current();
+            // Provider calls are async; blocking on them needs a worker that
+            // can hand its other tasks off, which only the multi-threaded
+            // runtime (skardi-server's) has.
+            let handle = Handle::try_current()
+                .ok()
+                .filter(|h| h.runtime_flavor() == RuntimeFlavor::MultiThread)
+                .ok_or_else(|| {
+                    DataFusionError::Execution(
+                        "contextualize needs a multi-threaded Tokio runtime".to_string(),
+                    )
+                })?;
             let done = block_in_place(|| handle.block_on(self.run_jobs(provider, &model, jobs)))
                 .map_err(|e| {
                     tracing::error!("contextualize via '{}' failed: {}", provider_name, e);
@@ -451,6 +570,7 @@ impl ScalarUDFImpl for ContextualizeUDF {
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use std::collections::HashSet;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -464,6 +584,10 @@ mod tests {
         in_flight: AtomicUsize,
         peak: AtomicUsize,
         fail_on: Option<&'static str>,
+        /// Raw answer to return instead of the default one.
+        answer: Option<&'static str>,
+        /// Address of every document buffer the provider was handed.
+        doc_ptrs: Mutex<HashSet<usize>>,
     }
 
     #[async_trait]
@@ -476,6 +600,10 @@ mod tests {
             self.peak.fetch_max(now, Ordering::SeqCst);
             sleep(Duration::from_millis(5)).await;
             self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            self.doc_ptrs
+                .lock()
+                .unwrap()
+                .insert(req.document.as_ptr() as usize);
             self.seen.lock().unwrap().push((
                 req.model.to_string(),
                 req.document.to_string(),
@@ -484,15 +612,22 @@ mod tests {
             if self.fail_on == Some(req.chunk) {
                 anyhow::bail!("provider exploded");
             }
+            if let Some(answer) = self.answer {
+                return Ok(answer.to_string());
+            }
             Ok(format!("  <think>hmm</think> ctx[{}]  ", req.chunk))
         }
     }
 
     fn ctx_with(recorder: Arc<Recorder>, concurrency: usize) -> SessionContext {
+        ctx_with_cap(recorder, concurrency, 50)
+    }
+
+    fn ctx_with_cap(recorder: Arc<Recorder>, concurrency: usize, cap: usize) -> SessionContext {
         let mut ctx = SessionContext::new();
         Arc::new(ContextualizeRegistry::new(
             vec![recorder as Arc<dyn ContextProvider>],
-            50,
+            cap,
             Some(concurrency),
         ))
         .register(&mut ctx);
@@ -707,5 +842,58 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("provider"), "{err}");
+    }
+
+    /// Chunks of one long document share one buffer per segment: the
+    /// document is not copied per chunk (the reviewer's 2 MB / 3,400-chunk
+    /// ingest held one copy per chunk and peaked at 7 GB).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn chunks_share_one_buffer_per_segment_not_one_per_chunk() {
+        let rec = Arc::new(Recorder::default());
+        let ctx = ctx_with_cap(Arc::clone(&rec), 4, 1024);
+        let doc: String = (0..400).map(|i| format!("line {i:04} of text\n")).collect();
+        let rows: Vec<String> = (0..400)
+            .map(|i| format!("('line {i:04} of text')"))
+            .collect();
+        let sql = format!(
+            "SELECT contextualize('mock', 'm', '{doc}', c) FROM (VALUES {}) AS t(c)",
+            rows.join(",")
+        );
+        let out = column(&ctx, &sql).await;
+        assert_eq!(out.len(), 400);
+        assert_eq!(rec.seen.lock().unwrap().len(), 400);
+        let buffers = rec.doc_ptrs.lock().unwrap().len();
+        // 8 KB document, 1 KB segments with a 896-byte stride: 9 segments.
+        assert!(buffers <= 10, "{buffers} document buffers for 400 chunks");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_empty_context_fails_instead_of_storing_a_bare_chunk() {
+        let rec = Arc::new(Recorder {
+            answer: Some("<think>the model ran out of budget while thinking"),
+            ..Default::default()
+        });
+        let ctx = ctx_with(rec, 1);
+        let err = ctx
+            .sql("SELECT contextualize('mock', 'm', 'doc', 'chunk')")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("returned no context"), "{err}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_single_threaded_runtime_is_an_error_not_a_panic() {
+        let ctx = ctx_with(Arc::new(Recorder::default()), 1);
+        let err = ctx
+            .sql("SELECT contextualize('mock', 'm', 'doc', 'chunk')")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("multi-threaded"), "{err}");
     }
 }

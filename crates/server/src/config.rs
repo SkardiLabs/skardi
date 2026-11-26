@@ -899,9 +899,10 @@ pub fn register_chunk_udf(ctx: &mut SessionContext) {
 /// SQL:
 ///   contextualize('ollama', 'qwen2.5:3b', document, chunk_text) -> Utf8
 ///
-/// Providers: `anthropic` (ANTHROPIC_API_KEY), `openai` (OPENAI_API_KEY,
-/// CONTEXTUALIZE_OPENAI_BASE_URL for any compatible server) and `ollama`
-/// (local, CONTEXTUALIZE_OLLAMA_BASE_URL). Keys are read per request.
+/// Providers: `anthropic` (ANTHROPIC_API_KEY), `openai` (required
+/// CONTEXTUALIZE_OPENAI_BASE_URL; CONTEXTUALIZE_OPENAI_API_KEY, or
+/// OPENAI_API_KEY only for api.openai.com) and `ollama` (local,
+/// CONTEXTUALIZE_OLLAMA_BASE_URL). Keys are read per request.
 #[cfg(feature = "contextualize")]
 pub fn register_contextualize_udf(ctx: &mut SessionContext) {
     let registry = Arc::new(skardi::model::ContextualizeRegistry::from_env());

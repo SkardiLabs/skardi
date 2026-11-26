@@ -41,9 +41,12 @@ use std::sync::{Arc, RwLock};
 use anyhow::{Result, anyhow};
 use arrow::array::{Array, Float32Array, StringArray};
 use arrow::datatypes::DataType;
-use candle_core::{DType, Device, Module, Tensor, safetensors as candle_safetensors};
+use candle_core::{
+    DType, Device, Module, Result as CandleResult, Tensor, safetensors as candle_safetensors,
+};
 use candle_nn::{Linear, VarBuilder, linear};
 use candle_transformers::models::{bert, xlm_roberta};
+use datafusion::common::Result as DfResult;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
@@ -78,7 +81,7 @@ trait CrossEncoderBackend: Send + Sync {
         input_ids: &Tensor,
         attention_mask: &Tensor,
         token_type_ids: &Tensor,
-    ) -> candle_core::Result<Tensor>;
+    ) -> CandleResult<Tensor>;
 }
 
 struct XlmRobertaBackend(xlm_roberta::XLMRobertaForSequenceClassification);
@@ -89,7 +92,7 @@ impl CrossEncoderBackend for XlmRobertaBackend {
         input_ids: &Tensor,
         attention_mask: &Tensor,
         token_type_ids: &Tensor,
-    ) -> candle_core::Result<Tensor> {
+    ) -> CandleResult<Tensor> {
         self.0.forward(input_ids, attention_mask, token_type_ids)
     }
 }
@@ -109,7 +112,7 @@ impl CrossEncoderBackend for BertCrossEncoder {
         input_ids: &Tensor,
         attention_mask: &Tensor,
         token_type_ids: &Tensor,
-    ) -> candle_core::Result<Tensor> {
+    ) -> CandleResult<Tensor> {
         let hidden = self
             .bert
             .forward(input_ids, token_type_ids, Some(attention_mask))?;
@@ -193,6 +196,14 @@ pub struct RerankModel {
 impl RerankModel {
     /// Load a reranker from a directory holding one `.safetensors` file,
     /// `config.json` and `tokenizer.json`.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use skardi::model::candle::rerank::RerankModel;
+    ///
+    /// let model = RerankModel::from_dir("/models/bge-reranker-base").unwrap();
+    /// ```
     pub fn from_dir(model_dir: &str) -> Result<Self> {
         let dir = Path::new(model_dir);
         let weights_path = find_weights(dir, model_dir)?;
@@ -294,12 +305,32 @@ impl RerankModel {
     }
 
     /// Score each passage against `query`. Higher is more relevant.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use skardi::model::candle::rerank::RerankModel;
+    ///
+    /// let model = RerankModel::from_dir("/models/bge-reranker-base").unwrap();
+    /// let scores = model.score("retry limit", &["Retries stop after 5.", "Unrelated."]).unwrap();
+    /// assert_eq!(scores.len(), 2);
+    /// ```
     pub fn score(&self, query: &str, passages: &[&str]) -> Result<Vec<f32>> {
         let pairs: Vec<(&str, &str)> = passages.iter().map(|p| (query, *p)).collect();
         self.score_pairs(&pairs)
     }
 
     /// Score arbitrary (query, passage) pairs, in input order.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use skardi::model::candle::rerank::RerankModel;
+    ///
+    /// let model = RerankModel::from_dir("/models/bge-reranker-base").unwrap();
+    /// let scores = model.score_pairs(&[("retry limit", "Retries stop after 5.")]).unwrap();
+    /// assert_eq!(scores.len(), 1);
+    /// ```
     pub fn score_pairs(&self, pairs: &[(&str, &str)]) -> Result<Vec<f32>> {
         let mut scores = Vec::with_capacity(pairs.len());
         for batch in pairs.chunks(BATCH_SIZE) {
@@ -414,6 +445,14 @@ impl Default for RerankModelRegistry {
 
 impl RerankModelRegistry {
     /// An empty registry; models load on first use.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use skardi::model::RerankModelRegistry;
+    ///
+    /// let registry = RerankModelRegistry::new();
+    /// ```
     pub fn new() -> Self {
         Self {
             models: RwLock::new(HashMap::new()),
@@ -421,6 +460,15 @@ impl RerankModelRegistry {
     }
 
     /// Get or lazily load a reranker by directory path.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use skardi::model::RerankModelRegistry;
+    ///
+    /// let registry = RerankModelRegistry::new();
+    /// let model = registry.get_or_load("/models/bge-reranker-base").unwrap();
+    /// ```
     pub fn get_or_load(&self, model_dir: &str) -> Result<Arc<RerankModel>> {
         {
             let models = self.models.read().unwrap_or_else(|p| p.into_inner());
@@ -438,6 +486,17 @@ impl RerankModelRegistry {
     /// Register the `rerank` UDF.
     ///
     /// Usage: `rerank('path/to/reranker_dir', query, passage_col) -> Float32`
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use datafusion::prelude::SessionContext;
+    /// use skardi::model::RerankModelRegistry;
+    ///
+    /// let mut ctx = SessionContext::new();
+    /// Arc::new(RerankModelRegistry::new()).register_rerank_udf(&mut ctx);
+    /// ```
     pub fn register_rerank_udf(self: &Arc<Self>, ctx: &mut SessionContext) {
         ctx.register_udf(ScalarUDF::new_from_impl(RerankUDF::new(Arc::clone(self))));
         tracing::info!("Registered 'rerank' UDF");
@@ -479,11 +538,7 @@ impl RerankUDF {
 
 /// A Utf8 argument as one value per row: an array is read row by row, a
 /// scalar is broadcast. `None` marks SQL NULL.
-fn utf8_rows(
-    value: &ColumnarValue,
-    num_rows: usize,
-    label: &str,
-) -> datafusion::common::Result<Vec<Option<String>>> {
+fn utf8_rows(value: &ColumnarValue, num_rows: usize, label: &str) -> DfResult<Vec<Option<String>>> {
     match value {
         ColumnarValue::Array(arr) => {
             let strings = arr.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
@@ -516,14 +571,11 @@ impl ScalarUDFImpl for RerankUDF {
         &self.signature
     }
 
-    fn return_type(&self, _arg_types: &[DataType]) -> datafusion::common::Result<DataType> {
+    fn return_type(&self, _arg_types: &[DataType]) -> DfResult<DataType> {
         Ok(DataType::Float32)
     }
 
-    fn invoke_with_args(
-        &self,
-        args: ScalarFunctionArgs,
-    ) -> datafusion::common::Result<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DfResult<ColumnarValue> {
         let num_rows = args.number_rows;
         let args = args.args;
         if args.len() != 3 {

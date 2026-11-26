@@ -27,6 +27,7 @@ use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use serde_json::{from_value, json};
 use tokio::time::sleep;
+use url::Url;
 
 use crate::util::http::parse_retry_after;
 use crate::util::text::truncate_chars;
@@ -42,7 +43,8 @@ const ERROR_BODY_CHARS: usize = 400;
 
 const ANTHROPIC_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
-const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+/// The only host `OPENAI_API_KEY` is ever sent to.
+const OPENAI_HOST: &str = "api.openai.com";
 const OLLAMA_BASE_URL: &str = "http://localhost:11434";
 /// Ollama's context window for contextualize calls. Fixed rather than sized
 /// per document because changing `num_ctx` between requests makes Ollama
@@ -74,12 +76,28 @@ pub trait ContextProvider: Send + Sync {
 
 /// The document half of the prompt. Kept byte-identical across a document's
 /// chunks so providers can serve it from their prompt cache.
+///
+/// # Example
+///
+/// ```
+/// use skardi::model::contextualize::provider::document_block;
+///
+/// assert_eq!(document_block("text"), "<document>\ntext\n</document>");
+/// ```
 pub fn document_block(document: &str) -> String {
     format!("<document>\n{document}\n</document>")
 }
 
 /// The per-chunk half of the prompt — Anthropic's Contextual Retrieval
 /// prompt, which situates the chunk for search rather than summarising it.
+///
+/// # Example
+///
+/// ```
+/// use skardi::model::contextualize::provider::chunk_block;
+///
+/// assert!(chunk_block("a chunk").contains("a chunk"));
+/// ```
 pub fn chunk_block(chunk: &str) -> String {
     format!(
         "Here is the chunk we want to situate within the whole document\n\
@@ -167,6 +185,14 @@ impl AnthropicProvider {
     /// `ANTHROPIC_API_KEY` is read per request so a key exported after the
     /// server started is picked up; `CONTEXTUALIZE_ANTHROPIC_URL` overrides
     /// the endpoint (a gateway or a test server).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use skardi::model::contextualize::provider::AnthropicProvider;
+    ///
+    /// let provider = AnthropicProvider::from_env().unwrap();
+    /// ```
     pub fn from_env() -> anyhow::Result<Self> {
         Ok(Self {
             client: http_client()?,
@@ -177,6 +203,14 @@ impl AnthropicProvider {
     }
 
     /// Point at an explicit endpoint with an explicit key (tests, gateways).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use skardi::model::contextualize::provider::AnthropicProvider;
+    ///
+    /// let provider = AnthropicProvider::with_url("https://gateway.example/v1/messages", "key").unwrap();
+    /// ```
     pub fn with_url(url: &str, api_key: &str) -> anyhow::Result<Self> {
         Ok(Self {
             client: http_client()?,
@@ -186,6 +220,16 @@ impl AnthropicProvider {
     }
 
     /// Request body, separated out so it can be asserted on without sending.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use skardi::model::contextualize::provider::{AnthropicProvider, ContextRequest};
+    ///
+    /// let req = ContextRequest { model: "m", document: "doc", chunk: "chunk" };
+    /// let body = AnthropicProvider::build_body(&req);
+    /// assert_eq!(body["messages"][0]["content"][0]["cache_control"]["type"], "ephemeral");
+    /// ```
     pub fn build_body(req: &ContextRequest<'_>) -> serde_json::Value {
         json!({
             "model": req.model,
@@ -264,33 +308,141 @@ impl ContextProvider for AnthropicProvider {
 // =============================================================================
 
 /// Any `/chat/completions` endpoint.
+///
+/// There is no default endpoint: `CONTEXTUALIZE_OPENAI_BASE_URL` must name
+/// one, so documents never go to a hosted API by accident.
 pub struct OpenAiCompatProvider {
     client: Client,
-    base_url: String,
+    base_url: Option<String>,
+    /// `None` reads the keys from the environment per request.
+    keys: Option<OpenAiKeys>,
+}
+
+/// The two keys the OpenAI-compatible provider can send.
+#[derive(Debug, Clone, Default)]
+pub struct OpenAiKeys {
+    /// `CONTEXTUALIZE_OPENAI_API_KEY`: sent to whatever endpoint is
+    /// configured.
+    pub contextualize: Option<String>,
+    /// `OPENAI_API_KEY`: sent only to `api.openai.com`.
+    pub openai: Option<String>,
+}
+
+impl OpenAiKeys {
+    fn from_env() -> Self {
+        Self {
+            contextualize: env_nonempty("CONTEXTUALIZE_OPENAI_API_KEY"),
+            openai: env_nonempty("OPENAI_API_KEY"),
+        }
+    }
+}
+
+/// The bearer token for a request to `base_url`.
+///
+/// `CONTEXTUALIZE_OPENAI_API_KEY` wins when set. `OPENAI_API_KEY` is only
+/// sent when the endpoint is OpenAI itself: a shell that holds an OpenAI key
+/// must not leak it to a vLLM box, DeepSeek or any other server the endpoint
+/// happens to name.
+///
+/// # Example
+///
+/// ```
+/// use skardi::model::contextualize::provider::{OpenAiKeys, openai_bearer};
+///
+/// let keys = OpenAiKeys { contextualize: None, openai: Some("sk-openai".into()) };
+/// assert_eq!(openai_bearer("https://api.openai.com/v1", &keys), Some("sk-openai"));
+/// assert_eq!(openai_bearer("https://api.deepseek.com/v1", &keys), None);
+/// ```
+pub fn openai_bearer<'k>(base_url: &str, keys: &'k OpenAiKeys) -> Option<&'k str> {
+    if let Some(key) = keys.contextualize.as_deref() {
+        return Some(key);
+    }
+    let is_openai = Url::parse(base_url)
+        .ok()
+        .is_some_and(|u| u.scheme() == "https" && u.host_str() == Some(OPENAI_HOST));
+    keys.openai.as_deref().filter(|_| is_openai)
 }
 
 impl OpenAiCompatProvider {
-    /// `CONTEXTUALIZE_OPENAI_BASE_URL` points it at any compatible server;
-    /// `OPENAI_API_KEY` is sent when set and omitted otherwise (local
-    /// servers usually take none).
+    /// `CONTEXTUALIZE_OPENAI_BASE_URL` names the server (required; requests
+    /// fail without it). Keys are read per request, see [`openai_bearer`].
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use skardi::model::contextualize::provider::OpenAiCompatProvider;
+    ///
+    /// let provider = OpenAiCompatProvider::from_env().unwrap();
+    /// ```
     pub fn from_env() -> anyhow::Result<Self> {
         Ok(Self {
             client: http_client()?,
-            base_url: env_nonempty("CONTEXTUALIZE_OPENAI_BASE_URL")
-                .unwrap_or_else(|| OPENAI_BASE_URL.to_string()),
+            base_url: env_nonempty("CONTEXTUALIZE_OPENAI_BASE_URL"),
+            keys: None,
         })
     }
 
-    /// Point at an explicit base URL (tests).
+    /// Point at an explicit base URL with no keys (tests).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use skardi::model::contextualize::provider::OpenAiCompatProvider;
+    ///
+    /// let provider = OpenAiCompatProvider::with_base_url("http://localhost:8000/v1").unwrap();
+    /// ```
     pub fn with_base_url(base_url: &str) -> anyhow::Result<Self> {
+        Self::with_base_url_and_keys(base_url, OpenAiKeys::default())
+    }
+
+    /// Point at an explicit base URL with explicit keys (tests, embedders).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use skardi::model::contextualize::provider::{OpenAiCompatProvider, OpenAiKeys};
+    ///
+    /// let keys = OpenAiKeys { contextualize: Some("local-key".into()), openai: None };
+    /// let provider = OpenAiCompatProvider::with_base_url_and_keys("http://localhost:8000/v1", keys).unwrap();
+    /// ```
+    pub fn with_base_url_and_keys(base_url: &str, keys: OpenAiKeys) -> anyhow::Result<Self> {
         Ok(Self {
             client: http_client()?,
-            base_url: base_url.to_string(),
+            base_url: Some(base_url.to_string()),
+            keys: Some(keys),
+        })
+    }
+
+    /// Provider with no endpoint configured, as `from_env` builds it when
+    /// `CONTEXTUALIZE_OPENAI_BASE_URL` is unset (tests).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use skardi::model::contextualize::provider::OpenAiCompatProvider;
+    ///
+    /// let provider = OpenAiCompatProvider::unconfigured().unwrap();
+    /// ```
+    pub fn unconfigured() -> anyhow::Result<Self> {
+        Ok(Self {
+            client: http_client()?,
+            base_url: None,
+            keys: Some(OpenAiKeys::default()),
         })
     }
 
     /// Request body. Document first, chunk second, in one user message, so
     /// the shared prefix is as long as possible for automatic prefix caching.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use skardi::model::contextualize::provider::{ContextRequest, OpenAiCompatProvider};
+    ///
+    /// let req = ContextRequest { model: "m", document: "doc", chunk: "chunk" };
+    /// let body = OpenAiCompatProvider::build_body(&req);
+    /// assert!(body["messages"][0]["content"].as_str().unwrap().starts_with("<document>"));
+    /// ```
     pub fn build_body(req: &ContextRequest<'_>) -> serde_json::Value {
         json!({
             "model": req.model,
@@ -327,8 +479,15 @@ impl ContextProvider for OpenAiCompatProvider {
     }
 
     async fn contextualize(&self, req: ContextRequest<'_>) -> anyhow::Result<String> {
-        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let headers: Vec<(&str, String)> = env_nonempty("OPENAI_API_KEY")
+        let base_url = self.base_url.as_deref().ok_or_else(|| {
+            anyhow!(
+                "contextualize('openai', ...) has no endpoint: set CONTEXTUALIZE_OPENAI_BASE_URL \
+                 (https://api.openai.com/v1 for OpenAI itself)"
+            )
+        })?;
+        let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+        let keys = self.keys.clone().unwrap_or_else(OpenAiKeys::from_env);
+        let headers: Vec<(&str, String)> = openai_bearer(base_url, &keys)
             .map(|k| vec![("authorization", format!("Bearer {k}"))])
             .unwrap_or_default();
         let value = post_json(
@@ -365,6 +524,14 @@ pub struct OllamaProvider {
 impl OllamaProvider {
     /// `CONTEXTUALIZE_OLLAMA_BASE_URL` (default `http://localhost:11434`) and
     /// `CONTEXTUALIZE_OLLAMA_NUM_CTX` (default 16384 tokens).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use skardi::model::contextualize::provider::OllamaProvider;
+    ///
+    /// let provider = OllamaProvider::from_env().unwrap();
+    /// ```
     pub fn from_env() -> anyhow::Result<Self> {
         Ok(Self {
             client: http_client()?,
@@ -377,6 +544,14 @@ impl OllamaProvider {
     }
 
     /// Point at an explicit base URL (tests).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use skardi::model::contextualize::provider::OllamaProvider;
+    ///
+    /// let provider = OllamaProvider::with_base_url("http://localhost:11434", 16384).unwrap();
+    /// ```
     pub fn with_base_url(base_url: &str, num_ctx: u32) -> anyhow::Result<Self> {
         Ok(Self {
             client: http_client()?,
@@ -387,6 +562,16 @@ impl OllamaProvider {
 
     /// Request body. `temperature: 0` keeps re-ingests as repeatable as a
     /// local model allows.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use skardi::model::contextualize::provider::{ContextRequest, OllamaProvider};
+    ///
+    /// let provider = OllamaProvider::with_base_url("http://localhost:11434", 8192).unwrap();
+    /// let req = ContextRequest { model: "m", document: "doc", chunk: "chunk" };
+    /// assert_eq!(provider.build_body(&req)["options"]["num_ctx"], 8192);
+    /// ```
     pub fn build_body(&self, req: &ContextRequest<'_>) -> serde_json::Value {
         json!({
             "model": req.model,
@@ -565,6 +750,91 @@ mod tests {
         assert_eq!(
             seen[0].header("anthropic-version").as_deref(),
             Some(ANTHROPIC_VERSION)
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::openai_key_to_openai("https://api.openai.com/v1", None, Some("sk-o"), Some("sk-o"))]
+    #[case::openai_key_not_to_deepseek("https://api.deepseek.com/v1", None, Some("sk-o"), None)]
+    #[case::openai_key_not_to_vllm("http://10.0.0.5:8000/v1", None, Some("sk-o"), None)]
+    #[case::openai_key_not_to_lookalike(
+        "https://api.openai.com.evil.example/v1",
+        None,
+        Some("sk-o"),
+        None
+    )]
+    #[case::openai_key_not_over_http("http://api.openai.com/v1", None, Some("sk-o"), None)]
+    #[case::own_key_to_any_endpoint(
+        "https://api.deepseek.com/v1",
+        Some("sk-d"),
+        Some("sk-o"),
+        Some("sk-d")
+    )]
+    #[case::own_key_wins_at_openai(
+        "https://api.openai.com/v1",
+        Some("sk-c"),
+        Some("sk-o"),
+        Some("sk-c")
+    )]
+    fn bearer_choice(
+        #[case] base: &str,
+        #[case] own: Option<&str>,
+        #[case] openai: Option<&str>,
+        #[case] want: Option<&str>,
+    ) {
+        let keys = OpenAiKeys {
+            contextualize: own.map(String::from),
+            openai: openai.map(String::from),
+        };
+        assert_eq!(openai_bearer(base, &keys), want);
+    }
+
+    #[tokio::test]
+    async fn an_openai_key_is_not_sent_to_a_third_party_endpoint() {
+        let server = MockHttpServer::start(|_| {
+            MockResponse::new(200, r#"{"choices":[{"message":{"content":"ctx"}}]}"#)
+        })
+        .await;
+        let provider = OpenAiCompatProvider::with_base_url_and_keys(
+            &server.url(),
+            OpenAiKeys {
+                contextualize: None,
+                openai: Some("sk-real-openai".to_string()),
+            },
+        )
+        .unwrap();
+        provider.contextualize(req()).await.unwrap();
+        assert_eq!(server.requests()[0].header("authorization"), None);
+    }
+
+    #[tokio::test]
+    async fn the_contextualize_key_is_sent_to_the_configured_endpoint() {
+        let server = MockHttpServer::start(|_| {
+            MockResponse::new(200, r#"{"choices":[{"message":{"content":"ctx"}}]}"#)
+        })
+        .await;
+        let provider = OpenAiCompatProvider::with_base_url_and_keys(
+            &server.url(),
+            OpenAiKeys {
+                contextualize: Some("sk-vllm".to_string()),
+                openai: Some("sk-real-openai".to_string()),
+            },
+        )
+        .unwrap();
+        provider.contextualize(req()).await.unwrap();
+        assert_eq!(
+            server.requests()[0].header("authorization").as_deref(),
+            Some("Bearer sk-vllm")
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_without_an_endpoint_fails_instead_of_calling_openai() {
+        let provider = OpenAiCompatProvider::unconfigured().unwrap();
+        let err = provider.contextualize(req()).await.unwrap_err();
+        assert!(
+            err.to_string().contains("CONTEXTUALIZE_OPENAI_BASE_URL"),
+            "{err}"
         );
     }
 }

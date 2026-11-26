@@ -48,7 +48,7 @@ the chunk itself.
 |---|---|---|
 | `ollama` | Ollama's native `/api/chat` (local) | `CONTEXTUALIZE_OLLAMA_BASE_URL` (default `http://localhost:11434`), `CONTEXTUALIZE_OLLAMA_NUM_CTX` (default 16384) |
 | `anthropic` | Messages API | `ANTHROPIC_API_KEY`; `CONTEXTUALIZE_ANTHROPIC_URL` to override the endpoint |
-| `openai` | any `/chat/completions` | `OPENAI_API_KEY` (sent only when set); `CONTEXTUALIZE_OPENAI_BASE_URL` for DeepSeek, vLLM, LM Studio, llama.cpp server |
+| `openai` | any `/chat/completions` | `CONTEXTUALIZE_OPENAI_BASE_URL` (required: `https://api.openai.com/v1`, or DeepSeek, vLLM, LM Studio, a llama.cpp server); `CONTEXTUALIZE_OPENAI_API_KEY` is sent to that endpoint; `OPENAI_API_KEY` is sent only when the endpoint is `https://api.openai.com` |
 
 Ollama is called through its native API rather than its OpenAI-compatible one
 because only the native API accepts `num_ctx`; Ollama's default context is a
@@ -85,8 +85,20 @@ would cut most of the document out of every call.
 
 **Data leaves the machine** for `anthropic` and for `openai` (unless the base
 URL points at a local server): every chunk *and its document segment* is
-sent, once per chunk. `ollama` sends nothing off the host. With no
-`CONTEXTUALIZE_OPENAI_BASE_URL`, `openai` means `https://api.openai.com/v1`.
+sent, once per chunk. `ollama` sends nothing off the host. `openai` has no
+default endpoint: without `CONTEXTUALIZE_OPENAI_BASE_URL` every call fails,
+so documents never go to a hosted API by accident. An `OPENAI_API_KEY` in
+the environment is never sent anywhere but `api.openai.com`; a key for
+another server goes in `CONTEXTUALIZE_OPENAI_API_KEY`.
+
+**Every provider whose settings are present is callable.** The server
+registers all three providers, so anyone who can send SQL to it can call any
+provider its environment has a key for. Start the server with only the keys
+the workspace uses.
+
+**Runtime.** The UDF waits on HTTP calls, which needs Tokio's
+multi-threaded runtime (skardi-server's); on a single-threaded runtime it
+returns an error.
 
 **Failure is loud.** Retries cover 429 and 5xx (honouring `Retry-After`) and
 connection errors, up to four attempts. After that, or on any other HTTP
@@ -117,7 +129,9 @@ prose and less for code or CJK text.
   than the default, both of which this UDF sends; use a non-reasoning chat
   model, or a server that ignores them.
 - `<think>` blocks are stripped from the answer, but reasoning models still
-  spend output tokens and time on them.
+  spend output tokens and time on them. A model that is still thinking when
+  it hits the 200-token cap leaves no context; that fails the statement
+  rather than storing the chunk without one.
 
 **Determinism.** Requests use temperature 0, but model output can still vary
 between runs and model versions, so re-ingesting the same document can store
