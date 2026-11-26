@@ -30,7 +30,7 @@ cargo check --workspace --all-targets
 cargo build --release -p skardi-cli
 cargo build --release -p skardi-server
 
-# Full RAG kit: embedding UDFs (ONNX, GGUF, Candle, remote embed) + chunk UDF
+# Full RAG kit: embedding UDFs (ONNX, GGUF, Candle, remote embed) + chunk + contextualize UDFs
 cargo build --release -p skardi-server --features rag
 
 # Tests

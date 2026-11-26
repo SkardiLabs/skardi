@@ -18,13 +18,15 @@
 //!
 //! All outbound calls go through [`ContextProvider`] so tests can mock them.
 
+use std::env;
 use std::time::Duration;
 
 use anyhow::{Context, anyhow};
 use async_trait::async_trait;
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{from_value, json};
+use tokio::time::sleep;
 
 use crate::util::http::parse_retry_after;
 use crate::util::text::truncate_chars;
@@ -44,8 +46,8 @@ const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const OLLAMA_BASE_URL: &str = "http://localhost:11434";
 /// Ollama's context window for contextualize calls. Fixed rather than sized
 /// per document because changing `num_ctx` between requests makes Ollama
-/// reload the model. 16k tokens holds the default 32k-character document cap
-/// plus the chunk for Latin-script text.
+/// reload the model. 16k tokens holds the default 32 KB document segment
+/// (about 8k tokens in English or Chinese) plus the chunk and the answer.
 const DEFAULT_OLLAMA_NUM_CTX: u32 = 16384;
 
 /// One request: situate `chunk` inside `document`.
@@ -96,7 +98,7 @@ fn http_client() -> anyhow::Result<Client> {
 }
 
 fn env_nonempty(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+    env::var(name).ok().filter(|v| !v.trim().is_empty())
 }
 
 /// POST `body` with bounded retries on 429 and 5xx, honouring `Retry-After`.
@@ -117,7 +119,7 @@ async fn post_json(
             Ok(r) => r,
             Err(e) if e.is_timeout() || e.is_connect() => {
                 last_error = Some(anyhow!("{provider}: request to {url} failed: {e}"));
-                tokio::time::sleep(DEFAULT_RETRY_WAIT * (attempt as u32 + 1)).await;
+                sleep(DEFAULT_RETRY_WAIT * (attempt as u32 + 1)).await;
                 continue;
             }
             Err(e) => return Err(anyhow!("{provider}: request to {url} failed: {e}")),
@@ -131,7 +133,7 @@ async fn post_json(
                 "{provider}: HTTP {status}: {}",
                 truncate_chars(&text, ERROR_BODY_CHARS)
             ));
-            tokio::time::sleep(wait).await;
+            sleep(wait).await;
             continue;
         }
         if !status.is_success() {
@@ -246,7 +248,7 @@ impl ContextProvider for AnthropicProvider {
         )
         .await?;
         let parsed: AnthropicResponse =
-            serde_json::from_value(value).context("anthropic: unexpected response shape")?;
+            from_value(value).context("anthropic: unexpected response shape")?;
         Ok(parsed
             .content
             .into_iter()
@@ -338,7 +340,7 @@ impl ContextProvider for OpenAiCompatProvider {
         )
         .await?;
         let parsed: ChatCompletion =
-            serde_json::from_value(value).context("openai: unexpected response shape")?;
+            from_value(value).context("openai: unexpected response shape")?;
         parsed
             .choices
             .into_iter()
@@ -425,8 +427,7 @@ impl ContextProvider for OllamaProvider {
     async fn contextualize(&self, req: ContextRequest<'_>) -> anyhow::Result<String> {
         let url = format!("{}/api/chat", self.base_url.trim_end_matches('/'));
         let value = post_json(&self.client, "ollama", &url, &[], &self.build_body(&req)).await?;
-        let parsed: OllamaChat =
-            serde_json::from_value(value).context("ollama: unexpected response shape")?;
+        let parsed: OllamaChat = from_value(value).context("ollama: unexpected response shape")?;
         parsed
             .message
             .content

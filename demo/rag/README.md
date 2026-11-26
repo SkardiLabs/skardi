@@ -191,7 +191,7 @@ above becomes rows `100000, 100001, 100002 …`. Pick `doc_id`s that don't
 collide with the single-row `/ingest` path.
 
 Requires `--features rag` on `skardi-server` (the umbrella that bundles
-`embedding` + `chunking`).
+`embedding` + `chunking` + `contextualize`).
 
 ---
 
@@ -427,7 +427,9 @@ cargo run -p skardi-server --features rag -- \
 `--features rag` is the umbrella that bundles `embedding` (which pulls in
 the `candle` backend every pipeline below uses) and `chunking` (needed by
 `ingest-chunked`'s inline `chunk('markdown', ...)`), so this one server
-build covers the whole demo.
+build covers the whole demo. It also brings `contextualize` (see
+[docs/contextual_retrieval.md](../../docs/contextual_retrieval.md)), which
+this demo does not use.
 
 ### 7. `ingest` — write one document
 

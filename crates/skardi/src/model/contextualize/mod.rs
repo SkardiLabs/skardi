@@ -24,9 +24,10 @@
 //! concurrently (`CONTEXTUALIZE_CONCURRENCY`; default 4 for hosted
 //! providers, 1 for a local Ollama, whose queue makes concurrent calls
 //! evict each other's cached prefix) and read from it.
-//! Documents longer than `CONTEXTUALIZE_MAX_DOCUMENT_CHARS` (default 32000)
-//! are cut to a window of that size centred on the chunk, so cost per chunk
-//! is bounded no matter how long the document is.
+//! Documents longer than `CONTEXTUALIZE_MAX_DOCUMENT_BYTES` (default 32000)
+//! are cut into fixed, overlapping segments of that size and each chunk is
+//! sent with the segment it sits in, so cost per chunk is bounded no matter
+//! how long the document is and chunks of one segment still share a cache.
 //!
 //! **Data leaves the machine** for `anthropic` and `openai` (unless the
 //! OpenAI base URL points at a local server): every chunk plus its whole
@@ -34,11 +35,14 @@
 //!
 //! **Failure is loud.** A provider error fails the statement rather than
 //! writing a chunk without its context, so an ingest either lands a
-//! document with every chunk contextualised or not at all.
+//! document with every chunk contextualised or not at all. The first error
+//! stops the call: requests still in flight are dropped and no further
+//! chunk is sent, so a failing document is not paid for in full.
 
 pub mod provider;
 
 use std::collections::HashMap;
+use std::env;
 use std::sync::Arc;
 
 use arrow::array::{Array, StringArray, StringBuilder};
@@ -49,15 +53,19 @@ use datafusion::logical_expr::{
 };
 use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
-use futures::StreamExt;
 use futures::stream;
+use futures::{StreamExt, TryStreamExt};
+
+use tokio::runtime::Handle;
+use tokio::task::block_in_place;
 
 use self::provider::{
     AnthropicProvider, ContextProvider, ContextRequest, OllamaProvider, OpenAiCompatProvider,
 };
 
-/// Default cap on the document text sent with each chunk, in characters.
-pub const DEFAULT_MAX_DOCUMENT_CHARS: usize = 32_000;
+/// Default cap on the document text sent with each chunk, in UTF-8 bytes
+/// (see [`document_segment`]).
+pub const DEFAULT_MAX_DOCUMENT_BYTES: usize = 32_000;
 const ELLIPSIS: &str = "\n[…]\n";
 
 // =============================================================================
@@ -79,7 +87,7 @@ const ELLIPSIS: &str = "\n[…]\n";
 /// ```
 pub struct ContextualizeRegistry {
     providers: HashMap<String, Arc<dyn ContextProvider>>,
-    max_document_chars: usize,
+    max_document_bytes: usize,
     /// `CONTEXTUALIZE_CONCURRENCY`, when set; otherwise each provider's own
     /// default applies.
     concurrency: Option<usize>,
@@ -89,7 +97,7 @@ impl std::fmt::Debug for ContextualizeRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ContextualizeRegistry")
             .field("providers", &self.providers.keys().collect::<Vec<_>>())
-            .field("max_document_chars", &self.max_document_chars)
+            .field("max_document_bytes", &self.max_document_bytes)
             .field("concurrency", &self.concurrency)
             .finish()
     }
@@ -99,7 +107,7 @@ impl ContextualizeRegistry {
     /// Build from explicit providers and limits (tests, embedders).
     pub fn new(
         providers: Vec<Arc<dyn ContextProvider>>,
-        max_document_chars: usize,
+        max_document_bytes: usize,
         concurrency: Option<usize>,
     ) -> Self {
         Self {
@@ -107,7 +115,7 @@ impl ContextualizeRegistry {
                 .into_iter()
                 .map(|p| (p.name().to_string(), p))
                 .collect(),
-            max_document_chars: max_document_chars.max(1),
+            max_document_bytes: max_document_bytes.max(1),
             concurrency: concurrency.map(|c| c.max(1)),
         }
     }
@@ -129,14 +137,14 @@ impl ContextualizeRegistry {
             Ok(p) => providers.push(Arc::new(p)),
             Err(e) => tracing::warn!("contextualize: ollama provider unavailable: {e}"),
         }
-        let max_document_chars = std::env::var("CONTEXTUALIZE_MAX_DOCUMENT_CHARS")
+        let max_document_bytes = env::var("CONTEXTUALIZE_MAX_DOCUMENT_BYTES")
             .ok()
             .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(DEFAULT_MAX_DOCUMENT_CHARS);
-        let concurrency = std::env::var("CONTEXTUALIZE_CONCURRENCY")
+            .unwrap_or(DEFAULT_MAX_DOCUMENT_BYTES);
+        let concurrency = env::var("CONTEXTUALIZE_CONCURRENCY")
             .ok()
             .and_then(|v| v.trim().parse().ok());
-        Self::new(providers, max_document_chars, concurrency)
+        Self::new(providers, max_document_bytes, concurrency)
     }
 
     /// Register the `contextualize` UDF.
@@ -156,38 +164,52 @@ impl ContextualizeRegistry {
 // Document window and output cleanup
 // =============================================================================
 
-/// The part of `document` sent with `chunk`: the whole document when it fits
-/// in `max_chars`, otherwise a `max_chars` window centred on where the chunk
-/// sits (or the document's opening, if the chunk cannot be located), marked
-/// with `[…]` where text was cut. Always cut on character boundaries.
-pub fn document_window(document: &str, chunk: &str, max_chars: usize) -> String {
-    let total = document.chars().count();
-    if total <= max_chars {
+/// Round `i` down to the nearest char boundary of `s`.
+fn floor_char_boundary(s: &str, i: usize) -> usize {
+    let mut i = i.min(s.len());
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// The part of `document` sent with `chunk`.
+///
+/// A document of at most `max_bytes` (UTF-8 bytes) is sent whole. A longer
+/// one is cut into **fixed** segments of `max_bytes`, each overlapping the
+/// previous by an eighth, and the chunk gets the segment its start falls in
+/// (the opening segment if the chunk cannot be located). Because the grid
+/// does not move with the chunk, every chunk in the same stretch of the
+/// document gets byte-identical text, so the provider's prompt cache is
+/// shared by them and they are grouped and sent together. A chunk shorter
+/// than the overlap always lies wholly inside its segment.
+///
+/// The budget is bytes rather than characters so it tracks tokens across
+/// scripts: 32 KB is roughly 8k tokens of English and also of Chinese
+/// (about 10k characters), where 32k Chinese *characters* would overflow a
+/// 16k-token local context. Cuts land on character boundaries and are
+/// marked with `[…]`.
+pub fn document_segment(document: &str, chunk: &str, max_bytes: usize) -> String {
+    let total = document.len();
+    if total <= max_bytes {
         return document.to_string();
     }
+    let max_bytes = max_bytes.max(8);
+    let stride = max_bytes - max_bytes / 8;
     let probe: String = chunk.trim().chars().take(200).collect();
-    let chunk_start_char = if probe.is_empty() {
-        None
+    let chunk_at = if probe.is_empty() {
+        0
     } else {
-        document
-            .find(&probe)
-            .map(|byte_idx| document[..byte_idx].chars().count())
+        document.find(&probe).unwrap_or(0)
     };
-    let chunk_len = chunk.chars().count();
-    let start = match chunk_start_char {
-        Some(c) => {
-            let centre = c + chunk_len / 2;
-            centre.saturating_sub(max_chars / 2).min(total - max_chars)
-        }
-        None => 0,
-    };
-    let end = start + max_chars;
-    let body: String = document.chars().skip(start).take(max_chars).collect();
-    let mut out = String::with_capacity(body.len() + 2 * ELLIPSIS.len());
+    let last_start = total - max_bytes;
+    let start = floor_char_boundary(document, ((chunk_at / stride) * stride).min(last_start));
+    let end = floor_char_boundary(document, start + max_bytes);
+    let mut out = String::with_capacity(end - start + 2 * ELLIPSIS.len());
     if start > 0 {
         out.push_str(ELLIPSIS.trim_start());
     }
-    out.push_str(&body);
+    out.push_str(&document[start..end]);
     if end < total {
         out.push_str(ELLIPSIS.trim_end());
     }
@@ -318,13 +340,13 @@ impl ContextualizeUDF {
                 }
             };
             out.push(call(first).await?);
-            let rest: Vec<anyhow::Result<(usize, String)>> = stream::iter(iter.map(call))
+            // try_collect returns on the first error and drops the stream,
+            // which cancels the requests still in flight and sends no more.
+            let rest: Vec<(usize, String)> = stream::iter(iter.map(call))
                 .buffer_unordered(concurrency)
-                .collect()
-                .await;
-            for r in rest {
-                out.push(r?);
-            }
+                .try_collect()
+                .await?;
+            out.extend(rest);
         }
         Ok(out)
     }
@@ -400,20 +422,18 @@ impl ScalarUDFImpl for ContextualizeUDF {
                 .unwrap_or_else(|| chunk.clone());
             jobs.push(Job {
                 row,
-                document: document_window(&document, &chunk, self.registry.max_document_chars),
+                document: document_segment(&document, &chunk, self.registry.max_document_bytes),
                 chunk,
             });
         }
 
         if !jobs.is_empty() {
-            let handle = tokio::runtime::Handle::current();
-            let done = tokio::task::block_in_place(|| {
-                handle.block_on(self.run_jobs(provider, &model, jobs))
-            })
-            .map_err(|e| {
-                tracing::error!("contextualize via '{}' failed: {}", provider_name, e);
-                DataFusionError::Execution(format!("contextualize failed: {e}"))
-            })?;
+            let handle = Handle::current();
+            let done = block_in_place(|| handle.block_on(self.run_jobs(provider, &model, jobs)))
+                .map_err(|e| {
+                    tracing::error!("contextualize via '{}' failed: {}", provider_name, e);
+                    DataFusionError::Execution(format!("contextualize failed: {e}"))
+                })?;
             for (row, text) in done {
                 results[row] = Some(text);
             }
@@ -433,6 +453,8 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    use tokio::time::sleep;
 
     /// Records every request and answers with a context derived from the
     /// chunk, so tests can check row alignment.
@@ -452,7 +474,7 @@ mod tests {
         async fn contextualize(&self, req: ContextRequest<'_>) -> anyhow::Result<String> {
             let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             self.peak.fetch_max(now, Ordering::SeqCst);
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            sleep(Duration::from_millis(5)).await;
             self.in_flight.fetch_sub(1, Ordering::SeqCst);
             self.seen.lock().unwrap().push((
                 req.model.to_string(),
@@ -492,30 +514,68 @@ mod tests {
 
     #[test]
     fn short_document_is_sent_whole() {
-        assert_eq!(document_window("abc def", "def", 100), "abc def");
+        assert_eq!(document_segment("abc def", "def", 100), "abc def");
+    }
+
+    /// Strip the `[…]` markers to get the document bytes a segment carries.
+    fn body(segment: &str) -> String {
+        segment.replace("[…]\n", "").replace("\n[…]", "")
     }
 
     #[test]
-    fn long_document_is_windowed_around_the_chunk() {
-        let doc = format!("{}TARGET{}", "a".repeat(1000), "b".repeat(1000));
-        let w = document_window(&doc, "TARGET", 100);
-        assert!(w.contains("TARGET"), "{w}");
-        assert!(w.starts_with("[…]") && w.ends_with("[…]"), "{w}");
-        assert!(w.chars().filter(|c| *c == 'a' || *c == 'b').count() <= 100);
+    fn chunks_in_the_same_stretch_get_byte_identical_segments() {
+        // 8 KB of distinct lines; 1 KB budget → stride 896.
+        let doc: String = (0..400).map(|i| format!("line {i:04} of text\n")).collect();
+        let a = document_segment(&doc, "line 0101 of text", 1024);
+        let b = document_segment(&doc, "line 0110 of text", 1024);
+        assert_eq!(a, b, "neighbouring chunks must share one cacheable prefix");
+        assert!(a.contains("line 0101") && a.contains("line 0110"));
+        assert!(body(&a).len() <= 1024);
+        let far = document_segment(&doc, "line 0350 of text", 1024);
+        assert_ne!(a, far);
+        assert!(far.contains("line 0350"));
     }
 
     #[test]
-    fn window_at_the_end_does_not_overrun_and_respects_multibyte_text() {
+    fn a_chunk_shorter_than_the_overlap_is_always_inside_its_segment() {
+        let doc: String = (0..400).map(|i| format!("line {i:04} of text\n")).collect();
+        for i in (0..395).step_by(7) {
+            // Five lines ≈ 90 bytes, well under the 128-byte overlap.
+            let chunk: String = (i..i + 5)
+                .map(|j| format!("line {j:04} of text\n"))
+                .collect();
+            let seg = document_segment(&doc, &chunk, 1024);
+            assert!(
+                seg.contains(chunk.trim()),
+                "chunk at line {i} cut by its segment"
+            );
+        }
+    }
+
+    #[test]
+    fn the_last_segment_ends_at_the_document_end_on_a_char_boundary() {
         let doc = format!("{}结尾的段落", "中".repeat(500));
-        let w = document_window(&doc, "结尾的段落", 20);
-        assert!(w.ends_with("结尾的段落"), "{w}");
-        assert!(w.starts_with("[…]"));
+        let seg = document_segment(&doc, "结尾的段落", 60);
+        assert!(seg.ends_with("结尾的段落"), "{seg}");
+        assert!(seg.starts_with("[…]"));
+        assert!(body(&seg).len() <= 60);
+    }
+
+    #[test]
+    fn the_budget_is_bytes_so_cjk_gets_fewer_characters() {
+        let doc = "中".repeat(1000); // 3000 bytes
+        let seg = document_segment(&doc, "中中", 300);
+        assert!(
+            body(&seg).chars().count() <= 100,
+            "{}",
+            body(&seg).chars().count()
+        );
     }
 
     #[test]
     fn unlocatable_chunk_falls_back_to_the_opening() {
         let doc = "x".repeat(300);
-        let w = document_window(&doc, "not in there", 50);
+        let w = document_segment(&doc, "not in there", 50);
         assert!(w.starts_with('x') && w.ends_with("[…]"), "{w}");
     }
 
@@ -573,7 +633,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn long_documents_reach_the_provider_windowed() {
+    async fn long_documents_reach_the_provider_as_one_segment() {
         let rec = Arc::new(Recorder::default());
         let ctx = ctx_with(Arc::clone(&rec), 1);
         let doc = format!("{}NEEDLE{}", "a".repeat(500), "b".repeat(500));
@@ -581,7 +641,7 @@ mod tests {
         column(&ctx, &sql).await;
         let seen = rec.seen.lock().unwrap();
         assert!(seen[0].1.contains("NEEDLE"));
-        assert!(seen[0].1.chars().count() < 100, "registry cap is 50 chars");
+        assert!(body(&seen[0].1).len() <= 50, "registry cap is 50 bytes");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -602,6 +662,24 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("provider exploded"), "{err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_first_failure_stops_the_remaining_calls() {
+        let rec = Arc::new(Recorder {
+            fail_on: Some("c1"),
+            ..Default::default()
+        });
+        let ctx = ctx_with(Arc::clone(&rec), 1);
+        let rows: Vec<String> = (0..20).map(|i| format!("('c{i}')")).collect();
+        let sql = format!(
+            "SELECT contextualize('mock', 'm', 'doc', c) FROM (VALUES {}) AS t(c)",
+            rows.join(",")
+        );
+        let err = ctx.sql(&sql).await.unwrap().collect().await.unwrap_err();
+        assert!(err.to_string().contains("provider exploded"), "{err}");
+        let calls = rec.seen.lock().unwrap().len();
+        assert_eq!(calls, 2, "c0 then the failing c1; nothing after it is sent");
     }
 
     #[tokio::test(flavor = "multi_thread")]

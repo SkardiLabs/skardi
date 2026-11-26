@@ -14,7 +14,7 @@
 //! SELECT id, source, content,
 //!        rerank('/models/bge-reranker-base', {query}, content) AS rerank_score
 //! FROM candidates
-//! ORDER BY rerank_score DESC
+//! ORDER BY rerank_score DESC NULLS LAST
 //! LIMIT {limit}
 //! ```
 //!
@@ -33,7 +33,9 @@
 //! the machine.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::fs;
+use std::iter::repeat_n;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use anyhow::{Result, anyhow};
@@ -52,6 +54,8 @@ use tokenizers::{
     PaddingDirection, PaddingParams, PaddingStrategy, Tokenizer, TruncationDirection,
     TruncationParams, TruncationStrategy,
 };
+use tokio::runtime::{Handle, RuntimeFlavor};
+use tokio::task::block_in_place;
 
 /// Pairs scored per forward pass. Padding cost grows with the longest pair in
 /// a batch, so this stays small; 16 measured no slower than 32 on CPU for
@@ -192,7 +196,7 @@ impl RerankModel {
     pub fn from_dir(model_dir: &str) -> Result<Self> {
         let dir = Path::new(model_dir);
         let weights_path = find_weights(dir, model_dir)?;
-        let config_str = std::fs::read_to_string(dir.join("config.json"))
+        let config_str = fs::read_to_string(dir.join("config.json"))
             .map_err(|e| anyhow!("Failed to read config.json in '{model_dir}': {e}"))?;
         let raw: RawConfig = serde_json::from_str(&config_str)
             .map_err(|e| anyhow!("Failed to parse config.json: {e}"))?;
@@ -219,13 +223,14 @@ impl RerankModel {
         let pad_token = tokenizer
             .id_to_token(pad_id)
             .unwrap_or_else(|| "[PAD]".to_string());
-        // Cut the passage, never the query: the query is short and is the
-        // half of the pair that has to survive intact for the score to mean
-        // anything.
+        // Cut the longer side first. For the usual short query and long
+        // passage that trims only the passage; a query that alone fills the
+        // budget is trimmed too instead of failing the pair, which is what
+        // `OnlySecond` does once the query leaves no room for the passage.
         tokenizer
             .with_truncation(Some(TruncationParams {
                 max_length,
-                strategy: TruncationStrategy::OnlySecond,
+                strategy: TruncationStrategy::LongestFirst,
                 stride: 0,
                 direction: TruncationDirection::Right,
             }))
@@ -324,7 +329,7 @@ impl RerankModel {
             if self.uses_segment_ids {
                 types.extend_from_slice(enc.get_type_ids());
             } else {
-                types.extend(std::iter::repeat_n(0u32, enc.get_ids().len()));
+                types.extend(repeat_n(0u32, enc.get_ids().len()));
             }
         }
         let shape = (batch, seq_len);
@@ -345,22 +350,30 @@ impl RerankModel {
     }
 }
 
-fn find_weights(dir: &Path, model_dir: &str) -> Result<std::path::PathBuf> {
+/// The checkpoint's weights: `model.safetensors` if present, otherwise the
+/// directory's only `.safetensors` file. Several files without a
+/// `model.safetensors` is a sharded checkpoint, which this loader does not
+/// stitch together, so it is refused rather than half-loaded.
+fn find_weights(dir: &Path, model_dir: &str) -> Result<PathBuf> {
     let canonical = dir.join("model.safetensors");
     if canonical.exists() {
         return Ok(canonical);
     }
-    let mut files: Vec<_> = std::fs::read_dir(dir)
+    let mut files: Vec<_> = fs::read_dir(dir)
         .map_err(|e| anyhow!("Cannot read model directory '{model_dir}': {e}"))?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("safetensors"))
         .collect();
     files.sort();
-    files
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow!("No .safetensors file found in '{model_dir}'"))
+    match files.len() {
+        0 => Err(anyhow!("No .safetensors file found in '{model_dir}'")),
+        1 => Ok(files.remove(0)),
+        n => Err(anyhow!(
+            "'{model_dir}' holds {n} .safetensors files and no model.safetensors; \
+             sharded checkpoints are not supported"
+        )),
+    }
 }
 
 // =============================================================================
@@ -553,7 +566,14 @@ impl ScalarUDFImpl for RerankUDF {
             let model = self.registry.get_or_load(&model_dir).map_err(|e| {
                 DataFusionError::Execution(format!("Failed to load reranker '{model_dir}': {e}"))
             })?;
-            model.score_pairs(&pairs).map_err(|e| {
+            // Forward passes are seconds of CPU work; on a multi-threaded
+            // runtime tell Tokio so other tasks move off this worker.
+            let run = || model.score_pairs(&pairs);
+            let result = match Handle::try_current() {
+                Ok(h) if h.runtime_flavor() == RuntimeFlavor::MultiThread => block_in_place(run),
+                _ => run(),
+            };
+            result.map_err(|e| {
                 tracing::error!("rerank failed for model '{}': {}", model_dir, e);
                 DataFusionError::Execution(format!("Rerank failed: {e}"))
             })?
@@ -739,6 +759,40 @@ mod tests {
         assert!(scores[0].is_finite());
     }
 
+    #[rstest]
+    #[case::xlm_roberta(RerankArchitecture::XlmRoberta)]
+    #[case::bert(RerankArchitecture::Bert)]
+    fn query_that_fills_the_budget_is_trimmed_not_an_error(#[case] arch: RerankArchitecture) {
+        let dir = tiny_model(arch);
+        let model = RerankModel::from_dir(dir.path().to_str().unwrap()).unwrap();
+        // The query alone is longer than the 32-token pair budget.
+        let query = "how does retry backoff work ".repeat(20);
+        let scores = model
+            .score(&query, &["exponential backoff waits between attempts"])
+            .unwrap();
+        assert!(scores[0].is_finite());
+    }
+
+    #[test]
+    fn sharded_checkpoint_is_refused() {
+        let dir = tiny_model(RerankArchitecture::Bert);
+        let weights = dir.path().join("model.safetensors");
+        std::fs::copy(
+            &weights,
+            dir.path().join("model-00001-of-00002.safetensors"),
+        )
+        .unwrap();
+        std::fs::rename(
+            &weights,
+            dir.path().join("model-00002-of-00002.safetensors"),
+        )
+        .unwrap();
+        let err = RerankModel::from_dir(dir.path().to_str().unwrap())
+            .err()
+            .expect("two shards without model.safetensors must be refused");
+        assert!(err.to_string().contains("sharded"), "{err}");
+    }
+
     #[test]
     fn more_pairs_than_one_batch_keep_their_order() {
         let dir = tiny_model(RerankArchitecture::Bert);
@@ -802,7 +856,7 @@ mod tests {
         ctx
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn sql_orders_by_score_and_maps_null_passages_to_null() {
         let dir = tiny_model(RerankArchitecture::XlmRoberta);
         let ctx = ctx_with_passages(vec![

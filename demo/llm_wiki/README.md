@@ -643,7 +643,8 @@ Seeding a fresh corpus needs only `setup.py` + `wiki-bulk-create` calls —
 no Python embedding loop.
 
 `wiki-bulk-create` calls `chunk()` in addition to `candle()`, so start the
-server with the `rag` feature umbrella (bundles `embedding` + `chunking`)
+server with the `rag` feature umbrella (bundles `embedding` + `chunking` +
+`contextualize`)
 instead of just `candle` if you want to use it:
 
 ```bash

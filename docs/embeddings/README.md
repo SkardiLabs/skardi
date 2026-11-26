@@ -56,7 +56,7 @@ FROM (
 );
 ```
 
-Build with `--features rag` to get embedding UDFs plus the `chunk` UDF in one flag. See [docs/chunk.md](../chunk.md) for full `chunk()` semantics, supported modes, and overlap behaviour.
+Build with `--features rag` to get embedding UDFs plus the `chunk` and `contextualize` UDFs in one flag. See [docs/chunk.md](../chunk.md) for full `chunk()` semantics, supported modes, and overlap behaviour.
 
 ## Pipeline Shape
 

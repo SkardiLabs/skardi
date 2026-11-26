@@ -9,8 +9,9 @@
 > cargo build --release -p skardi-server --features rag   # + embedding UDFs
 > ```
 >
-> The `rag` umbrella feature bundles `embedding` and `chunking` so the
-> chunk → embed → write loop ships in one flag. The pre-built Docker image
+> The `rag` umbrella feature bundles `embedding`, `chunking` and
+> `contextualize` so the chunk → (contextualize →) embed → write loop ships in
+> one flag. The pre-built Docker image
 > `ghcr.io/skardilabs/skardi/skardi-server-full:<tag>` includes both (along
 > with every other stable feature); `skardi-server-lite:<tag>` is the
 > default build — chunking, no embedding.
