@@ -14,14 +14,17 @@
 //! `#[non_exhaustive]`, so tests drive the `do_*` methods directly.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Body;
 use axum::http::{HeaderMap, Method, Request, StatusCode, header};
 use rmcp::ServerHandler;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
-    Implementation, JsonObject, ListToolsResult, PaginatedRequestParams, ServerCapabilities,
+    CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock,
+    CustomRequest, CustomResult, ErrorCode, ErrorData, Implementation, JsonObject,
+    ListResourcesResult, ListToolsResult, PaginatedRequestParams, ReadResourceRequestMethod,
+    ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, ServerCapabilities,
     ServerInfo, Tool,
 };
 use rmcp::service::{RequestContext, RoleServer};
@@ -30,6 +33,7 @@ use skardi_mcp_core::{encode_component, projection};
 use tower::ServiceExt;
 use uuid::Uuid;
 
+use super::skills::{self, SkillCatalog};
 use crate::session_header::{SESSION_ID_HEADER, validate_session_id};
 
 /// Same wording as the stdio bridge (`crates/cli/src/mcp/bridge.rs`) — the
@@ -62,11 +66,75 @@ pub(crate) struct McpHandler {
     /// validation, audit recording). Arc-cheap to clone; the service factory
     /// clones it per request.
     rest: Router,
+    /// Skills served over the `io.modelcontextprotocol/skills` extension.
+    /// `None` (no `--mcp-skills-dir`) leaves the server exactly as it was
+    /// before the extension existed: no `resources` capability, no
+    /// extension declaration, `skills/*` and `resources/read` unknown.
+    skills: Option<Arc<SkillCatalog>>,
 }
 
 impl McpHandler {
     pub(crate) fn new(rest: Router) -> Self {
-        McpHandler { rest }
+        McpHandler { rest, skills: None }
+    }
+
+    pub(crate) fn with_skills(mut self, skills: Option<Arc<SkillCatalog>>) -> Self {
+        self.skills = skills;
+        self
+    }
+
+    /// `skills/list` and `skills/get`. Params are read from the raw JSON
+    /// rmcp hands custom methods; `_meta` validation for stateless requests
+    /// has already happened in rmcp before this runs.
+    pub(crate) fn do_skills_request(
+        &self,
+        method: &str,
+        params: Option<&Value>,
+    ) -> Result<Value, ErrorData> {
+        let Some(catalog) = self.skills.as_deref() else {
+            return Err(ErrorData::new(
+                ErrorCode::METHOD_NOT_FOUND,
+                method.to_string(),
+                None,
+            ));
+        };
+        let string_param = |key: &str| -> Result<Option<&str>, ErrorData> {
+            match params.and_then(|p| p.get(key)) {
+                None | Some(Value::Null) => Ok(None),
+                Some(Value::String(s)) => Ok(Some(s.as_str())),
+                Some(_) => Err(ErrorData::invalid_params(
+                    format!("`{key}` must be a string"),
+                    None,
+                )),
+            }
+        };
+        match method {
+            "skills/list" => catalog.list(string_param("cursor")?),
+            "skills/get" => {
+                let uri = string_param("uri")?
+                    .ok_or_else(|| ErrorData::invalid_params("missing `uri`", None))?;
+                catalog.get(uri)
+            }
+            _ => Err(ErrorData::new(
+                ErrorCode::METHOD_NOT_FOUND,
+                method.to_string(),
+                None,
+            )),
+        }
+    }
+
+    pub(crate) fn do_read_resource(&self, uri: &str) -> Result<ReadResourceResult, ErrorData> {
+        let Some(catalog) = self.skills.as_deref() else {
+            return Err(ErrorData::method_not_found::<ReadResourceRequestMethod>());
+        };
+        // -32602 for an unknown URI: the code the skills spec names for
+        // `resources/read` of a file the server does not serve.
+        let contents = catalog
+            .read(uri)
+            .ok_or_else(|| ErrorData::invalid_params(format!("No resource at {uri}"), None))?;
+        Ok(ReadResourceResult::new(vec![contents])
+            .with_ttl_ms(skills::TTL_MS)
+            .with_cache_scope(CacheScope::Private))
     }
 
     /// The audit id for this request, layered: a valid legacy
@@ -262,7 +330,25 @@ impl McpHandler {
 
 impl ServerHandler for McpHandler {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        let capabilities = match &self.skills {
+            None => ServerCapabilities::builder().enable_tools().build(),
+            // The extension requires the `resources` capability alongside
+            // it: skill files are served through `resources/read`. An empty
+            // settings object = no optional features (`directoryRead` is
+            // not implemented in this slice).
+            Some(_) => {
+                let mut capabilities = ServerCapabilities::builder()
+                    .enable_tools()
+                    .enable_resources()
+                    .build();
+                capabilities
+                    .extensions
+                    .get_or_insert_with(Default::default)
+                    .insert(skills::EXTENSION_ID.to_string(), JsonObject::new());
+                capabilities
+            }
+        };
+        ServerInfo::new(capabilities)
             .with_server_info(Implementation::new("skardi", env!("CARGO_PKG_VERSION")))
             .with_instructions(INSTRUCTIONS)
     }
@@ -287,6 +373,37 @@ impl ServerHandler for McpHandler {
         )
         .await
         .map(CallToolResponse::from)
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, ErrorData> {
+        let resources = self
+            .skills
+            .as_deref()
+            .map(SkillCatalog::skill_md_resources)
+            .unwrap_or_default();
+        Ok(ListResourcesResult::with_all_items(resources))
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, ErrorData> {
+        self.do_read_resource(&request.uri)
+            .map(ReadResourceResponse::from)
+    }
+
+    async fn on_custom_request(
+        &self,
+        request: CustomRequest,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<CustomResult, ErrorData> {
+        self.do_skills_request(&request.method, request.params.as_ref())
+            .map(CustomResult::new)
     }
 }
 

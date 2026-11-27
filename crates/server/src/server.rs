@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use tokio::net::TcpListener;
+use tokio::task::spawn_blocking;
 use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 
 use crate::auth::mode::AuthMode;
@@ -36,6 +37,7 @@ use crate::gui::serve_dashboard;
 use crate::handlers::health_check;
 use crate::jobs_handlers::{cancel_job_run, get_job_run, list_job_runs, list_jobs, submit_job_run};
 use crate::logging::QUERY_PLAN_TARGET;
+use crate::mcp::skills::SkillCatalog;
 use crate::metrics::{PipelineMetrics, WebhookMetrics};
 use crate::pipeline_handlers::{
     execute_pipeline_by_name, get_data_sources, get_pipelines_info, list_pipelines,
@@ -84,6 +86,10 @@ pub struct AppState {
     pub webhooks: Arc<WebhookRegistry>,
     /// OTel instruments for `/webhooks/:name`.
     pub webhook_metrics: WebhookMetrics,
+    /// Skills `/mcp` serves over the `io.modelcontextprotocol/skills`
+    /// extension. `None` unless [`AppState::with_mcp_skills`] loaded a
+    /// `--mcp-skills-dir`.
+    pub(crate) mcp_skills: Option<Arc<SkillCatalog>>,
 }
 
 impl AppState {
@@ -119,6 +125,7 @@ impl AppState {
             graph_sources,
             webhooks: Arc::new(WebhookRegistry::empty()),
             webhook_metrics: WebhookMetrics::new(),
+            mcp_skills: None,
         }
     }
 
@@ -128,6 +135,24 @@ impl AppState {
     pub fn with_webhooks(mut self, webhooks: Arc<WebhookRegistry>) -> Self {
         self.webhooks = webhooks;
         self
+    }
+
+    /// Snapshot the skills under `dir` (`--mcp-skills-dir`) for `/mcp` to
+    /// serve. `None` is a no-op, so the extension stays undeclared. A
+    /// missing or unreadable directory fails startup rather than serving no
+    /// skills silently.
+    pub async fn with_mcp_skills(mut self, dir: Option<PathBuf>) -> Result<Self> {
+        let Some(dir) = dir else {
+            return Ok(self);
+        };
+        let catalog = spawn_blocking(move || SkillCatalog::load(&dir))
+            .await
+            .map_err(|e| anyhow::anyhow!("loading MCP skills: {e}"))??;
+        if catalog.is_empty() {
+            tracing::warn!("--mcp-skills-dir has no valid skills; /mcp serves none");
+        }
+        self.mcp_skills = Some(Arc::new(catalog));
+        Ok(self)
     }
 }
 
@@ -372,6 +397,7 @@ pub async fn setup_app_state(config: ServerConfig) -> Result<AppState> {
         );
     }
 
+    let mcp_skills_dir = config.args.mcp_skills_dir.clone();
     // Create shared application state with RwLock for runtime updates
     let app_state = AppState::new(
         config,
@@ -384,7 +410,9 @@ pub async fn setup_app_state(config: ServerConfig) -> Result<AppState> {
         // sharing the Arc is what makes /data_source's health read live.
         optimizer_registry.graph_sources(),
     )
-    .with_webhooks(webhooks);
+    .with_webhooks(webhooks)
+    .with_mcp_skills(mcp_skills_dir)
+    .await?;
 
     tracing::info!("Application state setup completed successfully");
 
@@ -757,6 +785,7 @@ spec:
                 query_audit_db: None,
                 query_audit_retention_days: None,
                 mcp_allowed_hosts: vec![],
+                mcp_skills_dir: None,
             },
         };
 
@@ -785,6 +814,7 @@ spec:
                 query_audit_db: None,
                 query_audit_retention_days: None,
                 mcp_allowed_hosts: vec![],
+                mcp_skills_dir: None,
             },
         }
     }
@@ -830,6 +860,7 @@ spec:
             query_audit_db: None,
             query_audit_retention_days: None,
             mcp_allowed_hosts: vec![],
+            mcp_skills_dir: None,
         };
         let config = crate::config::load_server_config(args)
             .await
@@ -903,6 +934,7 @@ spec:
             query_audit_db: None,
             query_audit_retention_days: None,
             mcp_allowed_hosts: vec![],
+            mcp_skills_dir: None,
         };
         let config = crate::config::load_server_config(args)
             .await

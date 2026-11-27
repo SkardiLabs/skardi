@@ -4,6 +4,7 @@
 
 mod gate;
 pub(crate) mod handler;
+pub(crate) mod skills;
 
 use std::sync::Arc;
 
@@ -29,8 +30,9 @@ use handler::McpHandler;
 pub(crate) fn attach(rest: Router, state: AppState) -> Router {
     let allowed_hosts = allowed_hosts(&state);
     let handler_rest = rest.clone();
+    let skills = state.mcp_skills.clone();
     let service = StreamableHttpService::new(
-        move || Ok(McpHandler::new(handler_rest.clone())),
+        move || Ok(McpHandler::new(handler_rest.clone()).with_skills(skills.clone())),
         Arc::new(LocalSessionManager::default()),
         // The config is #[non_exhaustive], so it's built from the defaults
         // via the builder. Everything except allowed_hosts stays at rmcp's
@@ -113,6 +115,7 @@ mod tests {
                 query_audit_db: None,
                 query_audit_retention_days: None,
                 mcp_allowed_hosts,
+                mcp_skills_dir: None,
             },
         };
         let session_ctx = Arc::new(SessionContext::new());
