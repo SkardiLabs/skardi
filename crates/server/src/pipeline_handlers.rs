@@ -22,6 +22,7 @@ use serde_json::Value;
 use skardi::engine::Engine;
 use skardi::pipeline::pipeline::{Pipeline, StandardPipeline};
 use skardi::sources::providers::graph::udtf::GraphSourceHealth;
+use skardi::util::sql_template::{fill_placeholders, quote_sql_string};
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -671,27 +672,11 @@ pub async fn get_data_sources(
     })))
 }
 
-/// Render a JSON string as a single-quoted SQL string literal, doubling any
-/// embedded single quote.
-///
-/// Quote-doubling is the complete escape only while the SQL parser treats a
-/// backslash as an ordinary character. That holds for the engine's dialect:
-/// the server builds its session from DataFusion's defaults, whose
-/// `datafusion.sql_parser.dialect` is `Generic`, and sqlparser's
-/// `GenericDialect` keeps `supports_string_literal_backslash_escape` off.
-/// Nothing in the server changes that setting, and ad-hoc `/query` rejects
-/// `SET`. A dialect with backslash escapes (MySQL, BigQuery, ClickHouse,
-/// Snowflake, Redshift) would read `\'` as an escaped quote and this escape
-/// would no longer be sufficient; the test
-/// `test_string_literal_escape_matches_engine_dialect` pins the assumption.
-fn quote_sql_string(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
-}
-
 /// Render a single scalar JSON value as the SQL literal form used inside an
 /// array placeholder or a row tuple cell.
 ///
-/// Number/Bool/Null render verbatim; String is single-quoted and escaped.
+/// Number/Bool/Null render verbatim; String is single-quoted and escaped by
+/// `quote_sql_string` (see its note on the SQL dialect).
 /// `Array` and `Object` return `None` — neither has a safe scalar SQL
 /// literal form, and the previous fallback (`Value::to_string()`, emitting
 /// raw unquoted JSON text) let a nested object splice unescaped, attacker-
@@ -803,37 +788,6 @@ pub fn substitute_sql_params(
     *sql = fill_placeholders(sql, &rendered);
 
     (missing_params, unsupported_params)
-}
-
-/// Copy `template` into a new string, replacing each `{name}` whose `name`
-/// is a key of `values` with that value. Everything else, including any
-/// `{name}` not in `values`, is copied verbatim. The scan only ever moves
-/// forward through `template`; inserted values are never re-examined.
-fn fill_placeholders(template: &str, values: &HashMap<&str, String>) -> String {
-    let mut out = String::with_capacity(template.len());
-    let mut rest = template;
-    while let Some(open) = rest.find('{') {
-        out.push_str(&rest[..open]);
-        let after_open = &rest[open + 1..];
-        let Some(close) = after_open.find('}') else {
-            // No closing brace anywhere after this point: nothing left
-            // to substitute.
-            out.push('{');
-            rest = after_open;
-            break;
-        };
-        if let Some(value) = values.get(&after_open[..close]) {
-            out.push_str(value);
-            rest = &after_open[close + 1..];
-        } else {
-            // Not a placeholder we substitute. Emit only the `{` and resume
-            // just after it, so `{{name}}` still finds the inner `{name}`.
-            out.push('{');
-            rest = after_open;
-        }
-    }
-    out.push_str(rest);
-    out
 }
 
 /// Render one parameter value as SQL text, or return the
