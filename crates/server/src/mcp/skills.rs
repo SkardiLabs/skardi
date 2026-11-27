@@ -110,12 +110,14 @@ impl SkillCatalog {
 
         let mut catalog = SkillCatalog::default();
         for dir in skill_dirs {
-            // A skill with an unreadable path anywhere under it would be
-            // published with a manifest that silently misses files, while
-            // the spec requires `resources` to be complete: skip it.
-            if let Some(bad) = walk.unreadable.iter().find(|u| u.starts_with(&dir)) {
+            // A skill with a path anywhere under it that could not be put in
+            // the manifest — unreadable, unrepresentable in a URI, or a
+            // symlink we refuse to follow — would be published with a
+            // manifest that silently misses files, while the spec requires
+            // `resources` to be complete: skip the whole skill instead.
+            if let Some(bad) = walk.incomplete.iter().find(|u| u.starts_with(&dir)) {
                 tracing::warn!(
-                    "Skipping skill {}: {} is unreadable",
+                    "Skipping skill {}: {} could not be listed in full",
                     root.join(dir.join("/")).display(),
                     root.join(bad.join("/")).display()
                 );
@@ -246,12 +248,14 @@ impl SkillCatalog {
 }
 
 /// Recursively collect regular files under `dir` as path segments relative
-/// to the walk root. Dot-entries (`.git`, `.DS_Store`) are skipped, and so
-/// are symlinks: following one could serve a file outside the configured
-/// directory. Non-UTF-8 names are skipped because they cannot become a URI
-/// segment faithfully. An unreadable root is an error; an unreadable entry
-/// below it is recorded in `unreadable` rather than failing the walk, so one
-/// bad folder costs only the skill it sits in (see [`SkillCatalog::load`]).
+/// to the walk root. Dot-entries (`.git`, `.DS_Store`) are skipped as
+/// non-content. Every other entry the walk cannot put in the manifest — a
+/// symlink (following one could serve a file outside the configured
+/// directory), a non-UTF-8 name (no faithful URI segment), an entry whose
+/// type or directory listing cannot be read — is recorded in `incomplete`
+/// instead of being dropped, so the skill holding it is skipped rather than
+/// published with a manifest that claims to be complete. An unreadable root
+/// is an error.
 fn collect_files(dir: &Path, prefix: &mut Vec<String>, walk: &mut Walk) -> Result<()> {
     let entries = fs::read_dir(dir).and_then(|rd| rd.collect::<io::Result<Vec<_>>>());
     let mut entries = match entries {
@@ -261,14 +265,15 @@ fn collect_files(dir: &Path, prefix: &mut Vec<String>, walk: &mut Walk) -> Resul
         }
         Err(e) => {
             tracing::warn!("Unreadable {}: {e}", dir.display());
-            walk.unreadable.push(prefix.clone());
+            walk.incomplete.push(prefix.clone());
             return Ok(());
         }
     };
     entries.sort_by_key(|e| e.file_name());
     for entry in entries {
         let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-            tracing::warn!("Skipping non-UTF-8 path under {}", dir.display());
+            tracing::warn!("Non-UTF-8 path under {} cannot be served", dir.display());
+            walk.incomplete.push(prefix.clone());
             continue;
         };
         // shortcut: skips dot-entries and Python bytecode caches (what running
@@ -284,12 +289,15 @@ fn collect_files(dir: &Path, prefix: &mut Vec<String>, walk: &mut Walk) -> Resul
                 tracing::warn!("Unreadable {}: {e}", entry.path().display());
                 let mut path = prefix.clone();
                 path.push(name);
-                walk.unreadable.push(path);
+                walk.incomplete.push(path);
                 continue;
             }
         };
         if file_type.is_symlink() {
             tracing::warn!("Skipping symlink {}", entry.path().display());
+            let mut path = prefix.clone();
+            path.push(name);
+            walk.incomplete.push(path);
             continue;
         }
         prefix.push(name);
@@ -307,8 +315,11 @@ fn collect_files(dir: &Path, prefix: &mut Vec<String>, walk: &mut Walk) -> Resul
 #[derive(Default)]
 struct Walk {
     files: Vec<Vec<String>>,
-    /// Directories (or entries) that could not be read.
-    unreadable: Vec<Vec<String>>,
+    /// Paths the walk could not list in full: unreadable directories or
+    /// entries, non-UTF-8 names (recorded as the parent directory, since the
+    /// name itself cannot be stored), and skipped symlinks. A skill holding
+    /// any of them is skipped (see [`SkillCatalog::load`]).
+    incomplete: Vec<Vec<String>>,
 }
 
 type BuiltSkill = (SkillEntry, Vec<(String, SkillFile)>);
@@ -676,6 +687,65 @@ mod tests {
         let catalog = catalog.unwrap();
         assert!(catalog.get("skill://demo/SKILL.md").is_err());
         assert!(catalog.read("skill://demo/SKILL.md").is_none());
+        assert!(catalog.get("skill://good/SKILL.md").is_ok());
+    }
+
+    /// Codex review on #330 (round 2): a name that cannot become a URI
+    /// segment is dropped by the walk; like an unreadable path it must cost
+    /// the skill, not silently shorten its manifest.
+    #[cfg(unix)]
+    #[test]
+    fn skill_with_a_non_utf8_name_is_skipped() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let tmp = TempDir::new().unwrap();
+        write(tmp.path(), "demo/SKILL.md", DEMO_MD.as_bytes());
+        write(tmp.path(), "demo/references/guide.md", b"# Guide\n");
+        // APFS rejects non-UTF-8 names at creation, so this premise only holds
+        // on filesystems that accept arbitrary bytes (the Linux CI runner).
+        if fs::write(
+            tmp.path()
+                .join("demo")
+                .join(OsStr::from_bytes(b"caf\xe9.md")),
+            b"x",
+        )
+        .is_err()
+        {
+            return;
+        }
+        write(
+            tmp.path(),
+            "good/SKILL.md",
+            b"---\nname: good\ndescription: d\n---\n",
+        );
+        let catalog = SkillCatalog::load(tmp.path()).unwrap();
+        assert!(catalog.get("skill://demo/SKILL.md").is_err());
+        assert!(catalog.read("skill://demo/references/guide.md").is_none());
+        assert!(catalog.get("skill://good/SKILL.md").is_ok());
+    }
+
+    /// Same completeness rule: a symlink is never served, so a skill holding
+    /// one cannot be described by a manifest that lists everything.
+    #[cfg(unix)]
+    #[test]
+    fn skill_with_a_symlink_is_skipped() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        write(tmp.path(), "demo/SKILL.md", DEMO_MD.as_bytes());
+        symlink(
+            tmp.path().join("demo/SKILL.md"),
+            tmp.path().join("demo/link.md"),
+        )
+        .unwrap();
+        write(
+            tmp.path(),
+            "good/SKILL.md",
+            b"---\nname: good\ndescription: d\n---\n",
+        );
+        let catalog = SkillCatalog::load(tmp.path()).unwrap();
+        assert!(catalog.get("skill://demo/SKILL.md").is_err());
         assert!(catalog.get("skill://good/SKILL.md").is_ok());
     }
 

@@ -640,6 +640,26 @@ async fn skills_extension_serves_the_pinned_auto_context_skill() {
         "{listed}"
     );
     let skills = listed["skills"].as_array().expect("skills array");
+    // Every skill in the pinned checkout is served — nothing is dropped
+    // silently, and nothing else is added (one page: fewer than PAGE_SIZE).
+    let mut expected: Vec<String> = std::fs::read_dir(&skills_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.join("SKILL.md").is_file())
+        .map(|path| {
+            format!(
+                "skill://{}/SKILL.md",
+                path.file_name().unwrap().to_string_lossy()
+            )
+        })
+        .collect();
+    expected.sort();
+    let mut served_uris: Vec<String> = skills
+        .iter()
+        .map(|s| s["uri"].as_str().unwrap().to_string())
+        .collect();
+    served_uris.sort();
+    assert_eq!(served_uris, expected, "skills/list covers the checkout");
     let listed_entry = skills
         .iter()
         .find(|s| s["uri"] == json!(AUTO_CONTEXT_URI))
