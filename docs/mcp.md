@@ -198,8 +198,10 @@ skardi-server --mcp-skills-dir /path/to/skardi-skills/skills
 ```
 
 Every subdirectory holding a `SKILL.md` becomes a skill at
-`skill://<path>/SKILL.md`; its frontmatter `name` must equal the directory
-name, or the skill is skipped with a warning. The spec requires each entry's
+`skill://<path>/SKILL.md`; its frontmatter must satisfy the Agent Skills
+format (the `name` equals the directory name, `description` is 1-1024
+characters, `compatibility` is 1-500), or the skill is skipped with a
+warning. The spec requires each entry's
 `resources` to be complete, so a skill holding any path the server cannot put
 in its manifest is skipped as a whole with a warning, while other skills keep
 loading: an unreadable directory or file, a name that is not UTF-8, or a

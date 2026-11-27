@@ -51,6 +51,12 @@ const PAGE_SIZE: usize = 50;
 const MAX_FILES_PER_SKILL: usize = 512;
 const MAX_BYTES_PER_SKILL: usize = 16 * 1024 * 1024;
 
+/// Frontmatter limits from the Agent Skills format (spec § Frontmatter).
+/// Frontmatter goes out verbatim, so a skill over either limit is skipped
+/// rather than published with values a validating host would reject.
+const MAX_DESCRIPTION_CHARS: usize = 1024;
+const MAX_COMPATIBILITY_CHARS: usize = 500;
+
 /// One file of the snapshot, addressed by its `skill://` URI.
 #[derive(Debug)]
 struct SkillFile {
@@ -381,8 +387,23 @@ fn build_entry(root: &Path, dir: &[String], members: &[&Vec<String>]) -> Result<
         bail!("frontmatter name `{name}` does not match its directory `{skill_name}`");
     }
     match frontmatter.get("description").and_then(Value::as_str) {
-        Some(d) if !d.trim().is_empty() => {}
+        Some(d) if !d.trim().is_empty() => {
+            if d.chars().count() > MAX_DESCRIPTION_CHARS {
+                bail!(
+                    "description is {} characters, over the {MAX_DESCRIPTION_CHARS}-character limit",
+                    d.chars().count()
+                );
+            }
+        }
         _ => bail!("frontmatter has no non-empty string `description`"),
+    }
+    // Optional fields carry format limits too; a host that validates the
+    // frontmatter would refuse the skill, so serving it only moves the
+    // failure to the client.
+    if let Some(c) = frontmatter.get("compatibility").and_then(Value::as_str) {
+        if c.is_empty() || c.chars().count() > MAX_COMPATIBILITY_CHARS {
+            bail!("`compatibility` must be 1-{MAX_COMPATIBILITY_CHARS} characters");
+        }
     }
 
     let mut skill_md_path = dir.to_vec();
@@ -590,6 +611,37 @@ mod tests {
             .map(|s| s["uri"].as_str().unwrap())
             .collect();
         assert_eq!(uris, vec!["skill://good/SKILL.md"]);
+    }
+
+    /// Codex review on #330 (round 3): frontmatter is served verbatim, so a
+    /// value over the format's limit must cost the skill rather than reach a
+    /// host that validates it. The limit itself is accepted.
+    #[test]
+    fn frontmatter_over_the_format_limits_is_skipped() {
+        let tmp = TempDir::new().unwrap();
+        let long = "x".repeat(MAX_DESCRIPTION_CHARS + 1);
+        write(
+            tmp.path(),
+            "too-long/SKILL.md",
+            format!("---\nname: too-long\ndescription: {long}\n---\n").as_bytes(),
+        );
+        let fits = "y".repeat(MAX_DESCRIPTION_CHARS);
+        write(
+            tmp.path(),
+            "at-limit/SKILL.md",
+            format!("---\nname: at-limit\ndescription: {fits}\n---\n").as_bytes(),
+        );
+        let compatibility = "z".repeat(MAX_COMPATIBILITY_CHARS + 1);
+        write(
+            tmp.path(),
+            "bad-compat/SKILL.md",
+            format!("---\nname: bad-compat\ndescription: d\ncompatibility: {compatibility}\n---\n")
+                .as_bytes(),
+        );
+        let catalog = SkillCatalog::load(tmp.path()).unwrap();
+        assert!(catalog.get("skill://too-long/SKILL.md").is_err());
+        assert!(catalog.get("skill://bad-compat/SKILL.md").is_err());
+        assert!(catalog.get("skill://at-limit/SKILL.md").is_ok());
     }
 
     #[test]
