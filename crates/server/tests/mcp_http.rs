@@ -703,6 +703,25 @@ async fn skills_extension_serves_the_pinned_auto_context_skill() {
         json!(sha256_digest(text.as_bytes()))
     );
 
+    // resources/list shows each SKILL.md with the spec's recommended
+    // metadata, for hosts that do not implement the extension.
+    let resources = client.list_all_resources().await.unwrap();
+    let listed = resources
+        .iter()
+        .find(|r| r.uri == AUTO_CONTEXT_URI)
+        .unwrap_or_else(|| panic!("SKILL.md not in resources/list: {resources:?}"));
+    assert_eq!(listed.name, "auto-context");
+    assert_eq!(listed.mime_type.as_deref(), Some("text/markdown"));
+    assert_eq!(listed.size, Some(on_disk.len() as u64));
+    assert_eq!(
+        listed.description.as_deref(),
+        entry["frontmatter"]["description"].as_str()
+    );
+    assert!(
+        resources.iter().all(|r| r.uri.ends_with("/SKILL.md")),
+        "only SKILL.md entries are listed: {resources:?}"
+    );
+
     // A supporting file is readable at the URI the manifest gives it.
     let reference = "skill://auto-context/references/troubleshooting.md";
     let read = client
@@ -799,6 +818,57 @@ async fn legacy_initialize_also_declares_the_extension() {
     assert!(
         tools.iter().any(|t| t.name == "product-search"),
         "{tools:?}"
+    );
+    client.cancel().await.unwrap();
+}
+
+/// With auth on, skills sit behind the same Bearer gate as tools: an
+/// anonymous `skills/list` is a transport-level 401, and the same request
+/// with a token succeeds.
+#[tokio::test]
+async fn skills_requests_require_the_bearer_token_when_auth_is_on() {
+    let (state, _tmp) = make_app_state(better_auth_layer().await, None).await;
+    let token = bearer_token(&state).await;
+    let state = state
+        .with_mcp_skills(Some(pinned_skills_dir()))
+        .await
+        .unwrap();
+    let addr = serve(state).await;
+
+    let resp = reqwest::Client::new()
+        .post(mcp_uri(addr))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-protocol-version", "2026-07-28")
+        .header("mcp-method", "skills/list")
+        .body(
+            json!({"jsonrpc": "2.0", "id": 1, "method": "skills/list", "params": {"_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientInfo": {"name": "probe", "version": "0"},
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }}})
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let transport = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(mcp_uri(addr)).auth_header(token),
+    );
+    let client = ClientInfo::default()
+        .serve_with_lifecycle(transport, discover_2026_07_28())
+        .await
+        .expect("bearer discover");
+    let listed = skills_request(&client, "skills/list", json!({}))
+        .await
+        .unwrap();
+    assert!(
+        listed["skills"]
+            .as_array()
+            .is_some_and(|s| s.iter().any(|e| e["uri"] == json!(AUTO_CONTEXT_URI))),
+        "{listed}"
     );
     client.cancel().await.unwrap();
 }

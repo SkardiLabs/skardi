@@ -237,24 +237,41 @@ impl SkillCatalog {
 /// to the walk root. Dot-entries (`.git`, `.DS_Store`) are skipped, and so
 /// are symlinks: following one could serve a file outside the configured
 /// directory. Non-UTF-8 names are skipped because they cannot become a URI
-/// segment faithfully.
+/// segment faithfully. An unreadable root is an error; an unreadable entry
+/// below it is skipped with a warning, so one bad folder does not take the
+/// server down.
 fn collect_files(dir: &Path, prefix: &mut Vec<String>, out: &mut Vec<Vec<String>>) -> Result<()> {
-    let mut entries: Vec<_> = fs::read_dir(dir)
-        .with_context(|| format!("reading {}", dir.display()))?
-        .collect::<io::Result<_>>()
-        .with_context(|| format!("reading {}", dir.display()))?;
+    let entries = fs::read_dir(dir).and_then(|rd| rd.collect::<io::Result<Vec<_>>>());
+    let mut entries = match entries {
+        Ok(entries) => entries,
+        Err(e) if prefix.is_empty() => {
+            return Err(e).with_context(|| format!("reading {}", dir.display()));
+        }
+        Err(e) => {
+            tracing::warn!("Skipping unreadable {}: {e}", dir.display());
+            return Ok(());
+        }
+    };
     entries.sort_by_key(|e| e.file_name());
     for entry in entries {
         let Some(name) = entry.file_name().to_str().map(str::to_string) else {
             tracing::warn!("Skipping non-UTF-8 path under {}", dir.display());
             continue;
         };
-        if name.starts_with('.') {
+        // shortcut: skips dot-entries and Python bytecode caches (what running
+        // a skill's scripts in place leaves behind, and what skardi-skills
+        // gitignores) rather than honoring .gitignore; serve only git-tracked
+        // files if operators start keeping other untracked files in the dir.
+        if name.starts_with('.') || name == "__pycache__" || name.ends_with(".pyc") {
             continue;
         }
-        let file_type = entry
-            .file_type()
-            .with_context(|| format!("reading {}", entry.path().display()))?;
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(e) => {
+                tracing::warn!("Skipping unreadable {}: {e}", entry.path().display());
+                continue;
+            }
+        };
         if file_type.is_symlink() {
             tracing::warn!("Skipping symlink {}", entry.path().display());
             continue;
@@ -281,12 +298,27 @@ fn build_entry(root: &Path, dir: &[String], members: &[&Vec<String>]) -> Result<
         );
     }
 
+    let paths: Vec<_> = members
+        .iter()
+        .map(|segments| segments.iter().fold(root.to_path_buf(), |p, s| p.join(s)))
+        .collect();
+    // Sizes first, so an oversized file is rejected before it is read into
+    // memory. The byte count below is still what the limit is judged on.
+    let mut declared = 0u64;
+    for path in &paths {
+        declared += fs::metadata(path)
+            .with_context(|| format!("reading {}", path.display()))?
+            .len();
+    }
+    if declared > MAX_BYTES_PER_SKILL as u64 {
+        bail!("{declared} bytes exceeds the {MAX_BYTES_PER_SKILL}-byte limit");
+    }
+
     let mut files = Vec::with_capacity(members.len());
     let mut total = 0usize;
     let mut skill_md: Option<Vec<u8>> = None;
-    for segments in members {
-        let path = segments.iter().fold(root.to_path_buf(), |p, s| p.join(s));
-        let bytes = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+    for (segments, path) in members.iter().zip(&paths) {
+        let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
         total += bytes.len();
         if segments.len() == dir.len() + 1 && segments.last().is_some_and(|s| s == SKILL_MD) {
             skill_md = Some(bytes.clone());
@@ -417,6 +449,11 @@ mod tests {
         write(tmp.path(), "demo/references/guide.md", b"# Guide\n");
         write(tmp.path(), "demo/assets/logo.bin", &[0xff, 0x00, 0xfe]);
         write(tmp.path(), "demo/.DS_Store", b"junk");
+        write(
+            tmp.path(),
+            "demo/scripts/__pycache__/run.cpython-312.pyc",
+            b"bytecode",
+        );
         write(tmp.path(), "README.md", b"not part of any skill");
         tmp
     }
@@ -442,7 +479,7 @@ mod tests {
                 "skill://demo/assets/logo.bin",
                 "skill://demo/references/guide.md",
             ],
-            "dotfiles and files outside the skill are not part of it"
+            "dotfiles, bytecode caches and files outside the skill are not part of it"
         );
         let skill_md = &skill["resources"][0];
         assert_eq!(skill_md["size"], json!(DEMO_MD.len()));
@@ -570,6 +607,22 @@ mod tests {
         assert_eq!(second["resultType"], json!("complete"));
         assert!(catalog.list(Some("garbage")).is_err());
         assert!(catalog.list(Some("9999")).is_err());
+    }
+
+    #[test]
+    fn skill_over_the_size_limit_is_skipped() {
+        let tmp = TempDir::new().unwrap();
+        write(tmp.path(), "demo/SKILL.md", DEMO_MD.as_bytes());
+        let big = fs::File::create(tmp.path().join("demo/big.bin")).unwrap();
+        big.set_len(MAX_BYTES_PER_SKILL as u64 + 1).unwrap();
+        write(
+            tmp.path(),
+            "good/SKILL.md",
+            b"---\nname: good\ndescription: d\n---\n",
+        );
+        let catalog = SkillCatalog::load(tmp.path()).unwrap();
+        assert!(catalog.get("skill://demo/SKILL.md").is_err());
+        assert!(catalog.get("skill://good/SKILL.md").is_ok());
     }
 
     #[test]

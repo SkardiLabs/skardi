@@ -385,7 +385,9 @@ impl ServerHandler for McpHandler {
             .as_deref()
             .map(SkillCatalog::skill_md_resources)
             .unwrap_or_default();
-        Ok(ListResourcesResult::with_all_items(resources))
+        Ok(ListResourcesResult::with_all_items(resources)
+            .with_ttl_ms(skills::TTL_MS)
+            .with_cache_scope(CacheScope::Private))
     }
 
     async fn read_resource(

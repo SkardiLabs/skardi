@@ -146,8 +146,8 @@ pub struct CliArgs {
     /// `io.modelcontextprotocol/skills` extension: every subdirectory that
     /// holds a `SKILL.md` becomes a skill at `skill://<path>/SKILL.md`.
     /// Read once at startup. Unset, `/mcp` declares neither the extension
-    /// nor the `resources` capability. See docs/server.md for where the
-    /// skardi-skills checkout comes from.
+    /// nor the `resources` capability. See docs/mcp.md ("Skills over
+    /// `/mcp`") for where the skardi-skills checkout comes from.
     #[arg(
         long = "mcp-skills-dir",
         help = "Serve the Agent Skills under this directory over /mcp \
