@@ -20,6 +20,15 @@ use std::collections::HashMap;
 /// ClickHouse, Snowflake, Redshift) would read `\'` as an escaped quote and
 /// this escape would no longer be sufficient. Tests in this module and in the
 /// server's pipeline handlers pin the assumption.
+///
+/// # Example
+///
+/// ```rust
+/// use skardi::util::sql_template::quote_sql_string;
+///
+/// assert_eq!(quote_sql_string("plain"), "'plain'");
+/// assert_eq!(quote_sql_string("O'Brien"), "'O''Brien'");
+/// ```
 pub fn quote_sql_string(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
@@ -33,6 +42,23 @@ pub fn quote_sql_string(s: &str) -> String {
 /// substitutions. Everything else, including a `{name}` whose `name` is not a
 /// key of `values`, is copied as written. `{{name}}` still has its inner
 /// `{name}` replaced.
+///
+/// # Example
+///
+/// ```rust
+/// use std::collections::HashMap;
+///
+/// use skardi::util::sql_template::{fill_placeholders, quote_sql_string};
+///
+/// let mut values = HashMap::new();
+/// // This value contains `{b}`, but inserted text is never rescanned, so it
+/// // stays literal instead of picking up `b`'s value.
+/// values.insert("a", quote_sql_string("it's {b}"));
+/// values.insert("b", "42".to_string());
+///
+/// let sql = fill_placeholders("SELECT {a}, {b}, {missing}", &values);
+/// assert_eq!(sql, "SELECT 'it''s {b}', 42, {missing}");
+/// ```
 pub fn fill_placeholders(template: &str, values: &HashMap<&str, String>) -> String {
     let mut out = String::with_capacity(template.len());
     let mut rest = template;
