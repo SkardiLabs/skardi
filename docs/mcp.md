@@ -199,7 +199,13 @@ skardi-server --mcp-skills-dir /path/to/skardi-skills/skills
 
 Every subdirectory holding a `SKILL.md` becomes a skill at
 `skill://<path>/SKILL.md`; its frontmatter `name` must equal the directory
-name, or the skill is skipped with a warning. The directory is read once at
+name, or the skill is skipped with a warning. The spec requires each entry's
+`resources` to be complete, so a skill holding any path the server cannot put
+in its manifest is skipped as a whole with a warning, while other skills keep
+loading: an unreadable directory or file, a name that is not UTF-8, or a
+symlink (never followed, since it could point outside the directory).
+Dotfiles and Python bytecode caches are not skill content and are ignored.
+The directory is read once at
 startup and served from memory, so digests always match the bytes served;
 restart the server to pick up changes. A missing directory fails startup.
 
