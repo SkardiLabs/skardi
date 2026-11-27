@@ -36,7 +36,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::iter::repeat_n;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::{Result, anyhow};
 use arrow::array::{Array, Float32Array, StringArray};
@@ -426,6 +426,9 @@ fn find_weights(dir: &Path, model_dir: &str) -> Result<PathBuf> {
 /// ```
 pub struct RerankModelRegistry {
     models: RwLock<HashMap<String, Arc<RerankModel>>>,
+    /// Held while a checkpoint loads, so concurrent first uses of a
+    /// reranker load it once instead of each holding a full copy.
+    load_lock: Mutex<()>,
 }
 
 impl std::fmt::Debug for RerankModelRegistry {
@@ -456,6 +459,7 @@ impl RerankModelRegistry {
     pub fn new() -> Self {
         Self {
             models: RwLock::new(HashMap::new()),
+            load_lock: Mutex::new(()),
         }
     }
 
@@ -475,6 +479,16 @@ impl RerankModelRegistry {
             if let Some(model) = models.get(model_dir) {
                 return Ok(Arc::clone(model));
             }
+        }
+        let _loading = self.load_lock.lock().unwrap_or_else(|p| p.into_inner());
+        // Another caller may have finished loading while we waited.
+        if let Some(model) = self
+            .models
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(model_dir)
+        {
+            return Ok(Arc::clone(model));
         }
         let model = Arc::new(RerankModel::from_dir(model_dir)?);
         let mut models = self.models.write().unwrap_or_else(|p| p.into_inner());

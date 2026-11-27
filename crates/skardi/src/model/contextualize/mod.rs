@@ -229,11 +229,13 @@ fn floor_char_boundary(s: &str, i: usize) -> usize {
 /// assert!(end - start <= 100);
 /// ```
 pub fn segment_bounds(document: &str, chunk: &str, max_bytes: usize) -> (usize, usize) {
+    // Clamp before comparing: a cap below 8 bytes would otherwise make
+    // `total - max_bytes` underflow for a document between the cap and 8.
+    let max_bytes = max_bytes.max(8);
     let total = document.len();
     if total <= max_bytes {
         return (0, total);
     }
-    let max_bytes = max_bytes.max(8);
     let stride = max_bytes - max_bytes / 8;
     let probe: String = chunk.trim().chars().take(200).collect();
     let chunk_at = if probe.is_empty() {
@@ -895,5 +897,13 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("multi-threaded"), "{err}");
+    }
+
+    #[test]
+    fn segment_bounds_tiny_cap_does_not_underflow() {
+        // Caps below 8 are clamped to 8; a 6-byte document fits whole.
+        assert_eq!(segment_bounds("abcdef", "cd", 4), (0, 6));
+        let (start, end) = segment_bounds("abcdefghijkl", "ij", 1);
+        assert!(end - start <= 8 && end <= 12);
     }
 }
