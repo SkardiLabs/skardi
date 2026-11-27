@@ -1288,6 +1288,7 @@ spec:
             query_audit_db: None,
             query_audit_retention_days: None,
             mcp_allowed_hosts: vec![],
+            mcp_skills_dir: None,
         };
 
         let config = ServerConfig {
@@ -1381,6 +1382,7 @@ spec:
             query_audit_db: None,
             query_audit_retention_days: None,
             mcp_allowed_hosts: vec![],
+            mcp_skills_dir: None,
         };
 
         let config = ServerConfig {
@@ -2122,6 +2124,7 @@ spec:
             query_audit_db: None,
             query_audit_retention_days: None,
             mcp_allowed_hosts: vec![],
+            mcp_skills_dir: None,
         };
         let config = ServerConfig {
             pipelines: HashMap::new(),

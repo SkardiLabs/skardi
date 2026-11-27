@@ -22,6 +22,8 @@ Other top-level directories: [docs/](docs/) (per-source guides + `server.md`), [
 
 ## Build, Test, Lint
 
+`vendor/skardi-skills` is a git submodule (the skills `/mcp` serves, pinned to one skardi-skills commit). Clone with `--recurse-submodules` or run `git submodule update --init` once; without it the `/mcp` skills tests in `crates/server/tests/mcp_http.rs` fail on purpose.
+
 ```bash
 # Check the entire workspace (fast feedback)
 cargo check --workspace --all-targets

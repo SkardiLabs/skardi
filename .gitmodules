@@ -1,0 +1,3 @@
+[submodule "vendor/skardi-skills"]
+	path = vendor/skardi-skills
+	url = https://github.com/SkardiLabs/skardi-skills.git

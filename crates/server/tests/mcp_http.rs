@@ -11,19 +11,24 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow::array::{Float64Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use datafusion::prelude::SessionContext;
-use rmcp::model::{CallToolRequestParams, CallToolResult, ClientInfo, ProtocolVersion};
+use rmcp::model::{
+    CallToolRequestParams, CallToolResult, ClientInfo, ClientRequest, CustomRequest,
+    ProtocolVersion, ReadResourceRequestParams, ResourceContents,
+};
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::{
     ClientLifecycleMode, ClientServiceExt, RoleClient, ServiceExt, service::RunningService,
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use skardi::pipeline::pipeline::{Pipeline, StandardPipeline};
 use tempfile::TempDir;
 
@@ -142,6 +147,7 @@ spec:
             query_audit_db: None,
             query_audit_retention_days: None,
             mcp_allowed_hosts: vec![],
+            mcp_skills_dir: None,
         },
     };
     let state = AppState::new(
@@ -520,4 +526,369 @@ async fn stateless_pipeline_call_records_a_uuid_audit_session_id() {
         "{:?}",
         rows[0]
     );
+}
+
+// ── Skills over MCP (io.modelcontextprotocol/skills) ─────────────────────
+
+const SKILLS_EXTENSION: &str = "io.modelcontextprotocol/skills";
+const AUTO_CONTEXT_URI: &str = "skill://auto-context/SKILL.md";
+
+/// The skills the suite serves: the skardi-skills checkout pinned by the
+/// `vendor/skardi-skills` git submodule — the single copy of these files
+/// in this repository, and the commit the assertions below are run
+/// against. Fails loudly rather than skipping when the submodule is not
+/// checked out, so CI cannot pass without exercising it.
+fn pinned_skills_dir() -> PathBuf {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vendor/skardi-skills/skills");
+    assert!(
+        dir.join("auto-context/SKILL.md").is_file(),
+        "vendor/skardi-skills is not checked out at {}: run \
+         `git submodule update --init vendor/skardi-skills`",
+        dir.display()
+    );
+    dir
+}
+
+/// Every regular file under `dir` (dot-entries excluded, as the server
+/// excludes them), relative and `/`-joined.
+fn files_on_disk(dir: &Path) -> Vec<String> {
+    fn walk(base: &Path, dir: &Path, out: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().into_string().unwrap();
+            if name.starts_with('.') {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                walk(base, &path, out);
+            } else {
+                let rel = path.strip_prefix(base).unwrap();
+                let segments: Vec<String> = rel
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect();
+                out.push(segments.join("/"));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, dir, &mut out);
+    out.sort();
+    out
+}
+
+fn sha256_digest(bytes: &[u8]) -> String {
+    format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
+}
+
+async fn skills_request(
+    client: &RunningService<RoleClient, ClientInfo>,
+    method: &str,
+    params: Value,
+) -> Result<Value, rmcp::ServiceError> {
+    let result = client
+        .send_request(ClientRequest::CustomRequest(CustomRequest::new(
+            method,
+            Some(params),
+        )))
+        .await?;
+    Ok(serde_json::to_value(result).unwrap())
+}
+
+async fn discover_client(addr: SocketAddr) -> RunningService<RoleClient, ClientInfo> {
+    let transport = StreamableHttpClientTransport::from_uri(mcp_uri(addr));
+    ClientInfo::default()
+        .serve_with_lifecycle(transport, discover_2026_07_28())
+        .await
+        .expect("discover startup")
+}
+
+/// The acceptance path end to end, on the protocol revision the extension
+/// is specified against: discovery declares the extension (with the
+/// `resources` capability it depends on), `skills/list` carries
+/// auto-context, `skills/get` returns its complete manifest, and every
+/// digest and size matches the bytes in the pinned checkout — including
+/// the `SKILL.md` that `resources/read` returns verbatim.
+#[tokio::test]
+async fn skills_extension_serves_the_pinned_auto_context_skill() {
+    let skills_dir = pinned_skills_dir();
+    let (state, _tmp) = make_app_state(AuthLayer::None, None).await;
+    let state = state
+        .with_mcp_skills(Some(skills_dir.clone()))
+        .await
+        .unwrap();
+    let addr = serve(state).await;
+    let client = discover_client(addr).await;
+
+    let info = client.peer_info().expect("server info");
+    assert_eq!(info.protocol_version, ProtocolVersion::V_2026_07_28);
+    let extensions = info.capabilities.extensions.as_ref().expect("extensions");
+    assert!(extensions.contains_key(SKILLS_EXTENSION), "{extensions:?}");
+    assert!(
+        info.capabilities.resources.is_some(),
+        "the extension requires the resources capability"
+    );
+
+    // skills/list carries auto-context with its frontmatter verbatim.
+    let listed = skills_request(&client, "skills/list", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(listed["resultType"], json!("complete"), "{listed}");
+    assert!(
+        listed["ttlMs"].is_u64() && listed["cacheScope"].is_string(),
+        "{listed}"
+    );
+    let skills = listed["skills"].as_array().expect("skills array");
+    // Every skill in the pinned checkout is served — nothing is dropped
+    // silently, and nothing else is added (one page: fewer than PAGE_SIZE).
+    let mut expected: Vec<String> = std::fs::read_dir(&skills_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.join("SKILL.md").is_file())
+        .map(|path| {
+            format!(
+                "skill://{}/SKILL.md",
+                path.file_name().unwrap().to_string_lossy()
+            )
+        })
+        .collect();
+    expected.sort();
+    let mut served_uris: Vec<String> = skills
+        .iter()
+        .map(|s| s["uri"].as_str().unwrap().to_string())
+        .collect();
+    served_uris.sort();
+    assert_eq!(served_uris, expected, "skills/list covers the checkout");
+    let listed_entry = skills
+        .iter()
+        .find(|s| s["uri"] == json!(AUTO_CONTEXT_URI))
+        .unwrap_or_else(|| panic!("auto-context not listed: {listed}"));
+    assert_eq!(listed_entry["frontmatter"]["name"], json!("auto-context"));
+    assert!(listed_entry["frontmatter"]["description"].is_string());
+
+    // skills/get returns the same entry: a complete manifest of the
+    // directory, each digest and size computed from the bytes on disk.
+    let got = skills_request(&client, "skills/get", json!({"uri": AUTO_CONTEXT_URI}))
+        .await
+        .unwrap();
+    assert_eq!(got["resultType"], json!("complete"), "{got}");
+    let entry = &got["skill"];
+    assert_eq!(entry, listed_entry, "list and get describe one entry");
+    let skill_root = skills_dir.join("auto-context");
+    let mut served: Vec<String> = Vec::new();
+    for resource in entry["resources"].as_array().expect("resources array") {
+        let uri = resource["uri"].as_str().unwrap();
+        let rel = uri
+            .strip_prefix("skill://auto-context/")
+            .unwrap_or_else(|| panic!("{uri} is outside the skill"));
+        let bytes = std::fs::read(skill_root.join(rel)).unwrap();
+        assert_eq!(resource["digest"], json!(sha256_digest(&bytes)), "{uri}");
+        assert_eq!(resource["size"], json!(bytes.len()), "{uri}");
+        served.push(rel.to_string());
+    }
+    served.sort();
+    assert_eq!(
+        served,
+        files_on_disk(&skill_root),
+        "manifest must be complete"
+    );
+
+    // resources/read returns SKILL.md verbatim, matching its manifest entry.
+    let read = client
+        .read_resource(ReadResourceRequestParams::new(AUTO_CONTEXT_URI))
+        .await
+        .unwrap();
+    let on_disk = std::fs::read(skill_root.join("SKILL.md")).unwrap();
+    let text = match &read.contents[..] {
+        [
+            ResourceContents::TextResourceContents {
+                text, mime_type, ..
+            },
+        ] => {
+            assert_eq!(mime_type.as_deref(), Some("text/markdown"));
+            text.clone()
+        }
+        other => panic!("expected one text content: {other:?}"),
+    };
+    assert_eq!(text.as_bytes(), on_disk.as_slice());
+    let skill_md_entry = entry["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["uri"] == json!(AUTO_CONTEXT_URI))
+        .expect("manifest lists SKILL.md itself");
+    assert_eq!(
+        skill_md_entry["digest"],
+        json!(sha256_digest(text.as_bytes()))
+    );
+
+    // resources/list shows each SKILL.md with the spec's recommended
+    // metadata, for hosts that do not implement the extension.
+    let resources = client.list_all_resources().await.unwrap();
+    let listed = resources
+        .iter()
+        .find(|r| r.uri == AUTO_CONTEXT_URI)
+        .unwrap_or_else(|| panic!("SKILL.md not in resources/list: {resources:?}"));
+    assert_eq!(listed.name, "auto-context");
+    assert_eq!(listed.mime_type.as_deref(), Some("text/markdown"));
+    assert_eq!(listed.size, Some(on_disk.len() as u64));
+    assert_eq!(
+        listed.description.as_deref(),
+        entry["frontmatter"]["description"].as_str()
+    );
+    assert!(
+        resources.iter().all(|r| r.uri.ends_with("/SKILL.md")),
+        "only SKILL.md entries are listed: {resources:?}"
+    );
+
+    // A supporting file is readable at the URI the manifest gives it.
+    let reference = "skill://auto-context/references/troubleshooting.md";
+    let read = client
+        .read_resource(ReadResourceRequestParams::new(reference))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            &read.contents[..],
+            [ResourceContents::TextResourceContents { .. }]
+        ),
+        "{read:?}"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn skills_get_and_read_reject_unknown_uris_as_invalid_params() {
+    let (state, _tmp) = make_app_state(AuthLayer::None, None).await;
+    let state = state
+        .with_mcp_skills(Some(pinned_skills_dir()))
+        .await
+        .unwrap();
+    let addr = serve(state).await;
+    let client = discover_client(addr).await;
+
+    let err = skills_request(
+        &client,
+        "skills/get",
+        json!({"uri": "skill://nope/SKILL.md"}),
+    )
+    .await
+    .unwrap_err();
+    assert!(format!("{err:?}").contains("-32602"), "{err:?}");
+    let err = client
+        .read_resource(ReadResourceRequestParams::new("skill://nope/SKILL.md"))
+        .await
+        .unwrap_err();
+    assert!(format!("{err:?}").contains("-32602"), "{err:?}");
+
+    client.cancel().await.unwrap();
+}
+
+/// Without `--mcp-skills-dir` the capabilities are exactly what they were
+/// before the extension existed — on both protocol paths — so a client
+/// that does not implement it sees no change.
+#[tokio::test]
+async fn without_a_skills_dir_nothing_is_declared() {
+    let (state, _tmp) = make_app_state(AuthLayer::None, None).await;
+    let addr = serve(state).await;
+
+    let client = discover_client(addr).await;
+    let caps = &client.peer_info().expect("server info").capabilities;
+    assert!(caps.resources.is_none(), "{caps:?}");
+    assert!(
+        caps.extensions
+            .as_ref()
+            .is_none_or(|e| !e.contains_key(SKILLS_EXTENSION)),
+        "{caps:?}"
+    );
+    assert!(
+        skills_request(&client, "skills/list", json!({}))
+            .await
+            .is_err()
+    );
+    client.cancel().await.unwrap();
+
+    let legacy = connect(addr).await;
+    let caps = &legacy.peer_info().expect("server info").capabilities;
+    assert!(caps.resources.is_none(), "{caps:?}");
+    legacy.cancel().await.unwrap();
+}
+
+/// A legacy (`initialize`) client sees the declaration too; tools are
+/// unchanged alongside it.
+#[tokio::test]
+async fn legacy_initialize_also_declares_the_extension() {
+    let (state, _tmp) = make_app_state(AuthLayer::None, None).await;
+    let state = state
+        .with_mcp_skills(Some(pinned_skills_dir()))
+        .await
+        .unwrap();
+    let addr = serve(state).await;
+    let client = connect(addr).await;
+    let caps = &client.peer_info().expect("server info").capabilities;
+    assert!(
+        caps.extensions
+            .as_ref()
+            .is_some_and(|e| e.contains_key(SKILLS_EXTENSION)),
+        "{caps:?}"
+    );
+    let tools = client.list_all_tools().await.unwrap();
+    assert!(
+        tools.iter().any(|t| t.name == "product-search"),
+        "{tools:?}"
+    );
+    client.cancel().await.unwrap();
+}
+
+/// With auth on, skills sit behind the same Bearer gate as tools: an
+/// anonymous `skills/list` is a transport-level 401, and the same request
+/// with a token succeeds.
+#[tokio::test]
+async fn skills_requests_require_the_bearer_token_when_auth_is_on() {
+    let (state, _tmp) = make_app_state(better_auth_layer().await, None).await;
+    let token = bearer_token(&state).await;
+    let state = state
+        .with_mcp_skills(Some(pinned_skills_dir()))
+        .await
+        .unwrap();
+    let addr = serve(state).await;
+
+    let resp = reqwest::Client::new()
+        .post(mcp_uri(addr))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-protocol-version", "2026-07-28")
+        .header("mcp-method", "skills/list")
+        .body(
+            json!({"jsonrpc": "2.0", "id": 1, "method": "skills/list", "params": {"_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientInfo": {"name": "probe", "version": "0"},
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }}})
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let transport = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(mcp_uri(addr)).auth_header(token),
+    );
+    let client = ClientInfo::default()
+        .serve_with_lifecycle(transport, discover_2026_07_28())
+        .await
+        .expect("bearer discover");
+    let listed = skills_request(&client, "skills/list", json!({}))
+        .await
+        .unwrap();
+    assert!(
+        listed["skills"]
+            .as_array()
+            .is_some_and(|s| s.iter().any(|e| e["uri"] == json!(AUTO_CONTEXT_URI))),
+        "{listed}"
+    );
+    client.cancel().await.unwrap();
 }

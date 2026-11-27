@@ -242,6 +242,10 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          # vendor/skardi-skills pins the skills the /mcp skills-extension
+          # tests serve and check digests against (tests/mcp_http.rs).
+          submodules: true
 
       - name: Install system dependencies
         run: |

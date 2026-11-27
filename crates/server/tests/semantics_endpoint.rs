@@ -97,6 +97,7 @@ async fn make_state(data_sources: Vec<DataSource>, semantics: SemanticsRegistry)
             query_audit_db: None,
             query_audit_retention_days: None,
             mcp_allowed_hosts: vec![],
+            mcp_skills_dir: None,
         },
     };
     AppState::new(

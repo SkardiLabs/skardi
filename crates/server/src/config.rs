@@ -141,6 +141,19 @@ pub struct CliArgs {
                 (repeatable; host or host:port)"
     )]
     pub mcp_allowed_hosts: Vec<String>,
+
+    /// Directory of Agent Skills `/mcp` serves through the
+    /// `io.modelcontextprotocol/skills` extension: every subdirectory that
+    /// holds a `SKILL.md` becomes a skill at `skill://<path>/SKILL.md`.
+    /// Read once at startup. Unset, `/mcp` declares neither the extension
+    /// nor the `resources` capability. See docs/mcp.md ("Skills over
+    /// `/mcp`") for where the skardi-skills checkout comes from.
+    #[arg(
+        long = "mcp-skills-dir",
+        help = "Serve the Agent Skills under this directory over /mcp \
+                (io.modelcontextprotocol/skills extension)"
+    )]
+    pub mcp_skills_dir: Option<PathBuf>,
 }
 
 /// Main server configuration containing pipelines and data sources
@@ -2500,6 +2513,7 @@ spec:
             query_audit_db: None,
             query_audit_retention_days: None,
             mcp_allowed_hosts: vec![],
+            mcp_skills_dir: None,
         };
 
         let config = load_server_config(args).await.unwrap();
@@ -2529,6 +2543,7 @@ spec:
             query_audit_db: None,
             query_audit_retention_days: None,
             mcp_allowed_hosts: vec![],
+            mcp_skills_dir: None,
         };
 
         let config = load_server_config(args).await.unwrap();
@@ -2587,6 +2602,7 @@ spec:
             query_audit_db: None,
             query_audit_retention_days: None,
             mcp_allowed_hosts: vec![],
+            mcp_skills_dir: None,
         };
 
         let config = load_server_config(args).await.unwrap();
@@ -2619,6 +2635,7 @@ spec:
             query_audit_db: None,
             query_audit_retention_days: None,
             mcp_allowed_hosts: vec![],
+            mcp_skills_dir: None,
         };
 
         let result = load_server_config(args).await;
@@ -2666,6 +2683,7 @@ spec:
             query_audit_db: None,
             query_audit_retention_days: None,
             mcp_allowed_hosts: vec![],
+            mcp_skills_dir: None,
         };
 
         let error = load_server_config(args).await.unwrap_err();
@@ -2690,6 +2708,7 @@ spec:
             query_audit_db: None,
             query_audit_retention_days: None,
             mcp_allowed_hosts: vec![],
+            mcp_skills_dir: None,
         };
 
         let config = load_server_config(args).await.unwrap();

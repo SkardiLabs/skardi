@@ -133,7 +133,10 @@ skardi mcp
 
 Both MCP bindings — the local `skardi mcp` bridge and the server's `/mcp`
 endpoint — project the same tool surface; [docs/mcp.md](docs/mcp.md) covers
-host setup, auth, the host allowlist, and reverse proxies for both.
+host setup, auth, the host allowlist, and reverse proxies for both. `/mcp` can
+also serve Agent Skills to hosts that implement the MCP Skills extension
+(`--mcp-skills-dir`, main only; see
+[Skills over `/mcp`](docs/mcp.md#skills-over-mcp)).
 
 Promoting queries into pipelines is only the simplest form of **Act**. The same ledger supports
 acting on *intentions*: when every weekday morning ends with the same GitHub +

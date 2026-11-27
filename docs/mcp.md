@@ -181,6 +181,78 @@ there is nothing durable to group by. On either protocol the id reaches a
 is absent: a purpose-less query is recorded with no session id at all.
 Pipeline runs always carry the id, via `X-Skardi-Session-Id`.
 
+### Skills over `/mcp`
+
+`/mcp` can also serve Agent Skills through the MCP Skills extension
+(`io.modelcontextprotocol/skills`, SEP-2640; the extension is Beta). A host
+that implements the extension discovers and reads the skills from the server
+it is already connected to, with no separate skill install. skardi-server
+implements the
+[Beta specification at ext-skills `ff22433`](https://github.com/modelcontextprotocol/ext-skills/blob/ff224337b01f0c9b18b81dcf99eefe66e9a52b5c/specification/beta/skills.mdx)
+against base protocol `2026-07-28`.
+
+It is off unless the server is pointed at a directory of skills:
+
+```bash
+skardi-server --mcp-skills-dir /path/to/skardi-skills/skills
+```
+
+Every subdirectory holding a `SKILL.md` becomes a skill at
+`skill://<path>/SKILL.md`; its frontmatter must satisfy the Agent Skills
+format (the `name` equals the directory name, `description` is 1-1024
+characters, `compatibility` is 1-500), or the skill is skipped with a
+warning. The spec requires each entry's
+`resources` to be complete, so a skill holding any path the server cannot put
+in its manifest is skipped as a whole with a warning, while other skills keep
+loading: an unreadable directory or file, a name that is not UTF-8, or a
+symlink (never followed, since it could point outside the directory).
+Dotfiles and Python bytecode caches are not skill content and are ignored.
+The directory is read once at
+startup and served from memory, so digests always match the bytes served;
+restart the server to pick up changes. A missing directory fails startup.
+
+With the flag set, the server:
+
+- declares `io.modelcontextprotocol/skills` (with no optional settings)
+  under `capabilities.extensions`, together with the `resources`
+  capability the extension depends on;
+- answers `skills/list` (paginated) and `skills/get`, each entry carrying
+  the frontmatter verbatim and every file of the skill with its `sha256:`
+  digest and byte size;
+- serves each file through `resources/read`, and lists each skill's
+  `SKILL.md` in `resources/list` so hosts without the extension still see
+  them as ordinary resources.
+
+`resources/directory/read` (optional in the spec) is not implemented, so
+`directoryRead` is not declared. Without the flag nothing above is declared
+and the capabilities are unchanged. Skills are served on `/mcp` only; the
+stdio bridge (`skardi mcp`) does not serve them, and hosts without the
+extension keep installing the standalone skill package. With auth enabled,
+skills sit behind the same Bearer token as tools.
+
+**Where the skills come from.** The source is the
+[skardi-skills](https://github.com/SkardiLabs/skardi-skills) repository;
+this repository does not keep a copy. The commit the server is tested
+against is the one the `vendor/skardi-skills` git submodule points at:
+
+```bash
+git submodule update --init vendor/skardi-skills   # in a skardi checkout
+git submodule status vendor/skardi-skills          # prints the pinned commit
+skardi-server --mcp-skills-dir vendor/skardi-skills/skills
+```
+
+Outside a skardi checkout, clone skardi-skills and check out that commit:
+
+```bash
+git clone https://github.com/SkardiLabs/skardi-skills.git
+git -C skardi-skills checkout <commit from `git submodule status` above>
+skardi-server --mcp-skills-dir skardi-skills/skills
+```
+
+To serve newer skills, move the submodule to a newer skardi-skills commit
+and run `cargo test -p skardi-server --test mcp_http skills`; the test
+checks every served digest and size against that checkout.
+
 ---
 
 ## Tool surface
