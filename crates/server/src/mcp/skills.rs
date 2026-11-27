@@ -96,8 +96,9 @@ impl SkillCatalog {
             bail!("--mcp-skills-dir {}: not a directory", root.display());
         }
 
-        let mut paths = Vec::new();
-        collect_files(root, &mut Vec::new(), &mut paths)?;
+        let mut walk = Walk::default();
+        collect_files(root, &mut Vec::new(), &mut walk)?;
+        let paths = walk.files;
 
         let skill_dirs: Vec<Vec<String>> = paths
             .iter()
@@ -109,6 +110,17 @@ impl SkillCatalog {
 
         let mut catalog = SkillCatalog::default();
         for dir in skill_dirs {
+            // A skill with an unreadable path anywhere under it would be
+            // published with a manifest that silently misses files, while
+            // the spec requires `resources` to be complete: skip it.
+            if let Some(bad) = walk.unreadable.iter().find(|u| u.starts_with(&dir)) {
+                tracing::warn!(
+                    "Skipping skill {}: {} is unreadable",
+                    root.join(dir.join("/")).display(),
+                    root.join(bad.join("/")).display()
+                );
+                continue;
+            }
             let members: Vec<&Vec<String>> = paths.iter().filter(|p| p.starts_with(&dir)).collect();
             match build_entry(root, &dir, &members) {
                 Ok((entry, files)) => {
@@ -238,9 +250,9 @@ impl SkillCatalog {
 /// are symlinks: following one could serve a file outside the configured
 /// directory. Non-UTF-8 names are skipped because they cannot become a URI
 /// segment faithfully. An unreadable root is an error; an unreadable entry
-/// below it is skipped with a warning, so one bad folder does not take the
-/// server down.
-fn collect_files(dir: &Path, prefix: &mut Vec<String>, out: &mut Vec<Vec<String>>) -> Result<()> {
+/// below it is recorded in `unreadable` rather than failing the walk, so one
+/// bad folder costs only the skill it sits in (see [`SkillCatalog::load`]).
+fn collect_files(dir: &Path, prefix: &mut Vec<String>, walk: &mut Walk) -> Result<()> {
     let entries = fs::read_dir(dir).and_then(|rd| rd.collect::<io::Result<Vec<_>>>());
     let mut entries = match entries {
         Ok(entries) => entries,
@@ -248,7 +260,8 @@ fn collect_files(dir: &Path, prefix: &mut Vec<String>, out: &mut Vec<Vec<String>
             return Err(e).with_context(|| format!("reading {}", dir.display()));
         }
         Err(e) => {
-            tracing::warn!("Skipping unreadable {}: {e}", dir.display());
+            tracing::warn!("Unreadable {}: {e}", dir.display());
+            walk.unreadable.push(prefix.clone());
             return Ok(());
         }
     };
@@ -268,7 +281,10 @@ fn collect_files(dir: &Path, prefix: &mut Vec<String>, out: &mut Vec<Vec<String>
         let file_type = match entry.file_type() {
             Ok(file_type) => file_type,
             Err(e) => {
-                tracing::warn!("Skipping unreadable {}: {e}", entry.path().display());
+                tracing::warn!("Unreadable {}: {e}", entry.path().display());
+                let mut path = prefix.clone();
+                path.push(name);
+                walk.unreadable.push(path);
                 continue;
             }
         };
@@ -278,13 +294,21 @@ fn collect_files(dir: &Path, prefix: &mut Vec<String>, out: &mut Vec<Vec<String>
         }
         prefix.push(name);
         if file_type.is_dir() {
-            collect_files(&entry.path(), prefix, out)?;
+            collect_files(&entry.path(), prefix, walk)?;
         } else if file_type.is_file() {
-            out.push(prefix.clone());
+            walk.files.push(prefix.clone());
         }
         prefix.pop();
     }
     Ok(())
+}
+
+/// What a directory walk found, as path segments relative to the root.
+#[derive(Default)]
+struct Walk {
+    files: Vec<Vec<String>>,
+    /// Directories (or entries) that could not be read.
+    unreadable: Vec<Vec<String>>,
 }
 
 type BuiltSkill = (SkillEntry, Vec<(String, SkillFile)>);
@@ -622,6 +646,36 @@ mod tests {
         );
         let catalog = SkillCatalog::load(tmp.path()).unwrap();
         assert!(catalog.get("skill://demo/SKILL.md").is_err());
+        assert!(catalog.get("skill://good/SKILL.md").is_ok());
+    }
+
+    /// Codex review on #330: a skill whose subtree is partly unreadable
+    /// must not be published with a manifest that claims to be complete.
+    #[cfg(unix)]
+    #[test]
+    fn skill_with_an_unreadable_subdirectory_is_skipped() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        write(tmp.path(), "demo/SKILL.md", DEMO_MD.as_bytes());
+        write(tmp.path(), "demo/secret/notes.md", b"x");
+        write(
+            tmp.path(),
+            "good/SKILL.md",
+            b"---\nname: good\ndescription: d\n---\n",
+        );
+        let locked = tmp.path().join("demo/secret");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        // Root ignores directory permissions; the premise does not hold.
+        let enforced = fs::read_dir(&locked).is_err();
+        let catalog = SkillCatalog::load(tmp.path());
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        if !enforced {
+            return;
+        }
+        let catalog = catalog.unwrap();
+        assert!(catalog.get("skill://demo/SKILL.md").is_err());
+        assert!(catalog.read("skill://demo/SKILL.md").is_none());
         assert!(catalog.get("skill://good/SKILL.md").is_ok());
     }
 
