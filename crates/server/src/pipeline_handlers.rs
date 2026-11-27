@@ -22,6 +22,7 @@ use serde_json::Value;
 use skardi::engine::Engine;
 use skardi::pipeline::pipeline::{Pipeline, StandardPipeline};
 use skardi::sources::providers::graph::udtf::GraphSourceHealth;
+use skardi::util::sql_template::{fill_placeholders, quote_sql_string};
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -674,7 +675,8 @@ pub async fn get_data_sources(
 /// Render a single scalar JSON value as the SQL literal form used inside an
 /// array placeholder or a row tuple cell.
 ///
-/// Number/Bool/Null render verbatim; String is single-quoted and escaped.
+/// Number/Bool/Null render verbatim; String is single-quoted and escaped by
+/// `quote_sql_string` (see its note on the SQL dialect).
 /// `Array` and `Object` return `None` — neither has a safe scalar SQL
 /// literal form, and the previous fallback (`Value::to_string()`, emitting
 /// raw unquoted JSON text) let a nested object splice unescaped, attacker-
@@ -682,7 +684,7 @@ pub async fn get_data_sources(
 fn scalar_to_sql(v: &Value) -> Option<String> {
     match v {
         Value::Number(n) => Some(n.to_string()),
-        Value::String(s) => Some(format!("'{}'", s.replace("'", "''"))),
+        Value::String(s) => Some(quote_sql_string(s)),
         Value::Bool(b) => Some(b.to_string()),
         Value::Null => Some("NULL".to_string()),
         Value::Array(_) | Value::Object(_) => None,
@@ -714,8 +716,20 @@ use skardi::util::json::json_kind;
 
 /// Substitute `{param}` placeholders in `sql` with their SQL-safe values.
 ///
-/// `expected_params` must be sorted longest-first so that a shorter name (e.g. `user`) cannot
-/// corrupt a longer one that shares it as a prefix (e.g. `user_id`).
+/// Substitution is a single pass over the template: every parameter value
+/// is rendered first, then the original template is scanned once and each
+/// `{name}` whose `name` is a successfully rendered parameter is replaced by
+/// its value. Text that came from a value is copied into the output and
+/// never scanned again, so a value that itself contains `{other_param}` is
+/// kept verbatim instead of being rewritten by a later substitution (which
+/// could also split an already-quoted literal and splice SQL into it).
+/// The result therefore does not depend on the order of `expected_params`.
+///
+/// A `{name}` in the template is left exactly as written when `name` is not
+/// in `expected_params`, or when its parameter is missing or rejected (the
+/// caller reports those and does not execute the SQL). Placeholders are
+/// matched anywhere in the template, including inside string literals, as
+/// before.
 ///
 /// Supported JSON parameter shapes:
 /// - String / Number / Bool / Null → the obvious literal.
@@ -739,7 +753,8 @@ use skardi::util::json::json_kind;
 /// generic "Unsupported parameter type" so CDC consumers that may emit
 /// empty batches see a clear instruction to filter client-side.
 ///
-/// Returns `(missing_params, unsupported_params)` — both empty on full success.
+/// Returns `(missing_params, unsupported_params)` — both empty on full success,
+/// each listed in `expected_params` order.
 /// `pub` for the integration suites: the graph `{params}` contract test
 /// (tests/graph_views.rs) must run THIS function — a hand-rolled
 /// `str::replace` in the test would keep passing after a substitution
@@ -753,154 +768,158 @@ pub fn substitute_sql_params(
 ) -> (Vec<String>, Vec<String>) {
     let mut missing_params = Vec::new();
     let mut unsupported_params = Vec::new();
+    let mut rendered: HashMap<&str, String> = HashMap::new();
 
     for param_name in expected_params {
-        let placeholder = format!("{{{}}}", param_name);
-
-        if let Some(param_value) = parameters.get(param_name) {
-            let sql_value = match param_value {
-                Value::String(s) => format!("'{}'", s.replace("'", "''")),
-                Value::Number(n) => n.to_string(),
-                Value::Bool(b) => b.to_string(),
-                Value::Null => "NULL".to_string(),
-                Value::Array(arr) if arr.is_empty() => {
-                    // CDC consumers commonly produce empty batches; surface a
-                    // specific, actionable error (rather than the generic
-                    // "Unsupported parameter type") so the caller knows to
-                    // filter zero-row batches client-side. There is no SQL
-                    // expansion that makes `VALUES` with zero rows valid.
-                    tracing::error!(
-                        "Empty array for {}: cannot expand into a VALUES tuple \
-                         list with zero rows, or into a vector literal of zero \
-                         elements. Filter empty batches client-side.",
-                        param_name
-                    );
-                    unsupported_params.push(format!(
-                        "{}: empty array — provide at least one row/element, \
-                         or filter empty batches client-side",
-                        param_name
-                    ));
-                    continue;
+        match parameters.get(param_name) {
+            Some(param_value) => match render_param_value(param_name, param_value) {
+                Ok(sql_value) => {
+                    rendered.insert(param_name.as_str(), sql_value);
                 }
-                Value::Array(arr) => {
-                    if arr.iter().all(|v| v.is_array()) {
-                        // Multi-row tuple list — `(c1, c2, …), (c1, c2, …)`.
-                        let row_arrays: Vec<&Vec<Value>> = arr
-                            .iter()
-                            .map(|row| row.as_array().expect("checked above"))
-                            .collect();
-                        let width = row_arrays[0].len();
-                        if width == 0 || row_arrays.iter().any(|r| r.len() != width) {
-                            tracing::error!(
-                                "Inconsistent or empty row widths for {}: every \
-                                 row in a VALUES tuple list must have the same \
-                                 non-zero number of cells.",
-                                param_name
-                            );
-                            unsupported_params.push(format!(
-                                "{}: inconsistent or empty row widths in a tuple list",
-                                param_name
-                            ));
-                            continue;
-                        }
-                        let rendered_rows: Option<Vec<String>> = row_arrays
-                            .iter()
-                            .map(|cells| {
-                                let rendered_cells: Option<Vec<String>> =
-                                    cells.iter().map(row_cell_to_sql).collect();
-                                rendered_cells.map(|cells| format!("({})", cells.join(", ")))
-                            })
-                            .collect();
-                        match rendered_rows {
-                            Some(rows) => rows.join(", "),
-                            None => {
-                                // A cell is a nested object (or an array
-                                // containing one) — no safe SQL literal form
-                                // exists, and the previous fallback spliced
-                                // its raw JSON text, unquoted, into the SQL
-                                // string. Reject the whole parameter, same
-                                // shape as every other unsupported-shape
-                                // reject in this function; value-free per
-                                // the ERROR-log policy above.
-                                tracing::error!(
-                                    "Unsupported cell type inside VALUES tuple list for {}: \
-                                     every cell must be a scalar or an array of scalars.",
-                                    param_name
-                                );
-                                unsupported_params
-                                    .push(format!("{}: {:?}", param_name, param_value));
-                                continue;
-                            }
-                        }
-                    } else if arr.iter().any(|v| v.is_array()) {
-                        tracing::error!(
-                            "Mixed-shape array for {} (some elements are arrays, \
-                             some are scalars). Pass either an all-scalar array \
-                             (vector literal) or an all-array array (VALUES tuple \
-                             list).",
-                            param_name
-                        );
-                        unsupported_params.push(format!(
-                            "{}: mixed-shape array (all scalars or all arrays)",
-                            param_name
-                        ));
-                        continue;
-                    } else {
-                        // Flat scalar array — the original vector-literal form.
-                        // Every element must actually be a scalar: a nested
-                        // object here (`{"p": [{"a": 1}]}`) is neither an
-                        // array (so it never reaches the tuple-list/mixed-
-                        // shape branches above) nor a scalar `scalar_to_sql`
-                        // can render — reject rather than let the previous
-                        // `Value::to_string()` fallback splice raw JSON text
-                        // into the vector literal.
-                        match arr
-                            .iter()
-                            .map(scalar_to_sql)
-                            .collect::<Option<Vec<String>>>()
-                        {
-                            Some(elements) => format!("[{}]", elements.join(", ")),
-                            None => {
-                                tracing::error!(
-                                    "Unsupported element type inside array parameter {}: \
-                                     every element must be a scalar.",
-                                    param_name
-                                );
-                                unsupported_params
-                                    .push(format!("{}: {:?}", param_name, param_value));
-                                continue;
-                            }
-                        }
-                    }
-                }
-                _ => {
-                    // Value-free by design: this log is ERROR-level (on by
-                    // default) and fans out to any configured OTLP
-                    // collector, unlike `unsupported_params` below, which
-                    // only ever reaches the caller who already supplied the
-                    // value in their own request body. Only the parameter
-                    // name and the JSON type name are logged.
-                    tracing::error!(
-                        "Unsupported parameter type for {}: {}",
-                        param_name,
-                        json_kind(param_value)
-                    );
-                    unsupported_params.push(format!(
-                        "{}: unsupported JSON value ({})",
-                        param_name,
-                        json_kind(param_value)
-                    ));
-                    continue;
-                }
-            };
-            *sql = sql.replace(&placeholder, &sql_value);
-        } else {
-            tracing::error!("Missing required parameter: {}", param_name);
-            missing_params.push(param_name.clone());
+                Err(reason) => unsupported_params.push(reason),
+            },
+            None => {
+                tracing::error!("Missing required parameter: {}", param_name);
+                missing_params.push(param_name.clone());
+            }
         }
     }
 
+    *sql = fill_placeholders(sql, &rendered);
+
     (missing_params, unsupported_params)
+}
+
+/// Render one parameter value as SQL text, or return the
+/// `unsupported_params` entry explaining why it cannot be rendered.
+fn render_param_value(param_name: &str, param_value: &Value) -> Result<String, String> {
+    match param_value {
+        Value::String(s) => Ok(quote_sql_string(s)),
+        Value::Number(n) => Ok(n.to_string()),
+        Value::Bool(b) => Ok(b.to_string()),
+        Value::Null => Ok("NULL".to_string()),
+        Value::Array(arr) if arr.is_empty() => {
+            // CDC consumers commonly produce empty batches; surface a
+            // specific, actionable error (rather than the generic
+            // "Unsupported parameter type") so the caller knows to
+            // filter zero-row batches client-side. There is no SQL
+            // expansion that makes `VALUES` with zero rows valid.
+            tracing::error!(
+                "Empty array for {}: cannot expand into a VALUES tuple \
+                 list with zero rows, or into a vector literal of zero \
+                 elements. Filter empty batches client-side.",
+                param_name
+            );
+            Err(format!(
+                "{}: empty array — provide at least one row/element, \
+                 or filter empty batches client-side",
+                param_name
+            ))
+        }
+        Value::Array(arr) => {
+            if arr.iter().all(|v| v.is_array()) {
+                // Multi-row tuple list — `(c1, c2, …), (c1, c2, …)`.
+                let row_arrays: Vec<&Vec<Value>> = arr
+                    .iter()
+                    .map(|row| row.as_array().expect("checked above"))
+                    .collect();
+                let width = row_arrays[0].len();
+                if width == 0 || row_arrays.iter().any(|r| r.len() != width) {
+                    tracing::error!(
+                        "Inconsistent or empty row widths for {}: every \
+                         row in a VALUES tuple list must have the same \
+                         non-zero number of cells.",
+                        param_name
+                    );
+                    return Err(format!(
+                        "{}: inconsistent or empty row widths in a tuple list",
+                        param_name
+                    ));
+                }
+                let rendered_rows: Option<Vec<String>> = row_arrays
+                    .iter()
+                    .map(|cells| {
+                        let rendered_cells: Option<Vec<String>> =
+                            cells.iter().map(row_cell_to_sql).collect();
+                        rendered_cells.map(|cells| format!("({})", cells.join(", ")))
+                    })
+                    .collect();
+                match rendered_rows {
+                    Some(rows) => Ok(rows.join(", ")),
+                    None => {
+                        // A cell is a nested object (or an array
+                        // containing one) — no safe SQL literal form
+                        // exists, and the previous fallback spliced
+                        // its raw JSON text, unquoted, into the SQL
+                        // string. Reject the whole parameter, same
+                        // shape as every other unsupported-shape
+                        // reject in this function; value-free per
+                        // the ERROR-log policy above.
+                        tracing::error!(
+                            "Unsupported cell type inside VALUES tuple list for {}: \
+                             every cell must be a scalar or an array of scalars.",
+                            param_name
+                        );
+                        Err(format!("{}: {:?}", param_name, param_value))
+                    }
+                }
+            } else if arr.iter().any(|v| v.is_array()) {
+                tracing::error!(
+                    "Mixed-shape array for {} (some elements are arrays, \
+                     some are scalars). Pass either an all-scalar array \
+                     (vector literal) or an all-array array (VALUES tuple \
+                     list).",
+                    param_name
+                );
+                Err(format!(
+                    "{}: mixed-shape array (all scalars or all arrays)",
+                    param_name
+                ))
+            } else {
+                // Flat scalar array — the original vector-literal form.
+                // Every element must actually be a scalar: a nested
+                // object here (`{"p": [{"a": 1}]}`) is neither an
+                // array (so it never reaches the tuple-list/mixed-
+                // shape branches above) nor a scalar `scalar_to_sql`
+                // can render — reject rather than let the previous
+                // `Value::to_string()` fallback splice raw JSON text
+                // into the vector literal.
+                match arr
+                    .iter()
+                    .map(scalar_to_sql)
+                    .collect::<Option<Vec<String>>>()
+                {
+                    Some(elements) => Ok(format!("[{}]", elements.join(", "))),
+                    None => {
+                        tracing::error!(
+                            "Unsupported element type inside array parameter {}: \
+                             every element must be a scalar.",
+                            param_name
+                        );
+                        Err(format!("{}: {:?}", param_name, param_value))
+                    }
+                }
+            }
+        }
+        _ => {
+            // Value-free by design: this log is ERROR-level (on by
+            // default) and fans out to any configured OTLP
+            // collector, unlike `unsupported_params`, which
+            // only ever reaches the caller who already supplied the
+            // value in their own request body. Only the parameter
+            // name and the JSON type name are logged.
+            tracing::error!(
+                "Unsupported parameter type for {}: {}",
+                param_name,
+                json_kind(param_value)
+            );
+            Err(format!(
+                "{}: unsupported JSON value ({})",
+                param_name,
+                json_kind(param_value)
+            ))
+        }
+    }
 }
 
 /// Execute pipeline endpoint - POST /:name/execute
@@ -957,8 +976,8 @@ pub async fn execute_pipeline_by_name(
         let query_def = pipeline.query_definition();
         let request_schema = pipeline.request_schema();
         let mut expected_params: Vec<String> = request_schema.fields.keys().cloned().collect();
-        // Sort longest-first so a shorter name (e.g. `{user}`) cannot corrupt a longer one
-        // (`{user_id}`) during str::replace when both appear in the same SQL template.
+        // Substitution is a single pass and does not depend on this order; the
+        // sort only keeps the parameter order reported in error responses.
         expected_params.sort_by_key(|b| std::cmp::Reverse(b.len()));
         (
             query_def.sql.clone(),
@@ -1217,7 +1236,10 @@ mod tests {
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use arrow::util::display::array_value_to_string;
+    use datafusion::common::config::Dialect;
     use datafusion::prelude::SessionContext;
+    use datafusion_federation::default_session_state;
     use skardi::engine::datafusion::DataFusionEngine;
     use skardi::pipeline::pipeline::{Pipeline, StandardPipeline};
     use skardi::sources::AccessMode;
@@ -1988,6 +2010,243 @@ spec:
         assert_eq!(unsupported.len(), 1);
         assert!(unsupported[0].starts_with("rows: "));
         assert_eq!(sql, "INSERT INTO t (a) VALUES {rows}");
+    }
+
+    // -------------------------------------------------------------------------
+    // Single-pass substitution: text that came from a value is never scanned
+    // again, so one value cannot rewrite another or break out of its literal.
+    // -------------------------------------------------------------------------
+
+    fn permutations(items: &[String]) -> Vec<Vec<String>> {
+        if items.len() <= 1 {
+            return vec![items.to_vec()];
+        }
+        let mut out = Vec::new();
+        for i in 0..items.len() {
+            let mut rest = items.to_vec();
+            let head = rest.remove(i);
+            for mut tail in permutations(&rest) {
+                tail.insert(0, head.clone());
+                out.push(tail);
+            }
+        }
+        out
+    }
+
+    /// Substitute `template` once per ordering of the parameter names
+    /// (the server's longest-first order first), assert every ordering
+    /// succeeds and produces the same SQL, and return that SQL.
+    fn substitute_in_every_order(template: &str, params_map: &HashMap<String, Value>) -> String {
+        let mut orders = vec![sorted_keys(params_map)];
+        let mut names: Vec<String> = params_map.keys().cloned().collect();
+        names.sort();
+        orders.extend(permutations(&names));
+
+        let mut first: Option<String> = None;
+        for order in orders {
+            let mut sql = template.to_string();
+            let (missing, unsupported) = substitute_sql_params(&mut sql, &order, params_map);
+            assert!(missing.is_empty(), "order {order:?}: {missing:?}");
+            assert!(unsupported.is_empty(), "order {order:?}: {unsupported:?}");
+            match &first {
+                None => first = Some(sql),
+                Some(expected) => assert_eq!(&sql, expected, "order {order:?} changed the SQL"),
+            }
+        }
+        first.expect("at least one ordering")
+    }
+
+    /// Run `sql` on a session built the way the server builds its own
+    /// (`setup_app_state` starts from DataFusion Federation's default
+    /// session state) and return its single row as display strings.
+    async fn engine_single_row(sql: &str) -> Vec<String> {
+        let ctx = SessionContext::new_with_state(default_session_state());
+        let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 1, "expected one row from: {sql}");
+        let batch = batches.iter().find(|b| b.num_rows() == 1).unwrap();
+        (0..batch.num_columns())
+            .map(|i| array_value_to_string(batch.column(i).as_ref(), 0).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn test_substitute_value_containing_other_placeholder_is_kept_verbatim() {
+        // A document body that mentions `{doc_id}` / `{source}` must be
+        // stored as written, not rewritten by the later substitution of
+        // those parameters.
+        let template =
+            "INSERT INTO docs (doc_id, source, body) VALUES ({doc_id}, {source}, {body_text})";
+        let params_map = params(&[
+            ("doc_id", Value::String("d1".to_string())),
+            ("source", Value::String("web".to_string())),
+            (
+                "body_text",
+                Value::String("see {doc_id} and {source}".to_string()),
+            ),
+        ]);
+
+        let sql = substitute_in_every_order(template, &params_map);
+        assert_eq!(
+            sql,
+            "INSERT INTO docs (doc_id, source, body) VALUES \
+             ('d1', 'web', 'see {doc_id} and {source}')"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_substitute_quoted_payload_cannot_escape_through_another_value() {
+        // The first value carries the second's placeholder; the second
+        // carries quotes and SQL. Re-substituting into the first value's
+        // literal would close it and splice `|| version() ||` in as SQL.
+        let template = "SELECT {title_text} AS title, {src} AS src";
+        let payload = "' || version() || '";
+        let params_map = params(&[
+            ("title_text", Value::String("a {src}".to_string())),
+            ("src", Value::String(payload.to_string())),
+        ]);
+
+        let sql = substitute_in_every_order(template, &params_map);
+        assert_eq!(
+            sql,
+            "SELECT 'a {src}' AS title, ''' || version() || ''' AS src"
+        );
+        // Exactly two literal columns, each holding its value verbatim: no
+        // function call was injected.
+        assert_eq!(
+            engine_single_row(&sql).await,
+            vec!["a {src}".to_string(), payload.to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_substitute_placeholder_of_quoted_value_does_not_break_literal() {
+        let template = "SELECT {display_name} AS display_name, {author} AS author";
+        let params_map = params(&[
+            ("display_name", Value::String("{author}".to_string())),
+            ("author", Value::String("O'Brien".to_string())),
+        ]);
+
+        let sql = substitute_in_every_order(template, &params_map);
+        assert_eq!(
+            sql,
+            "SELECT '{author}' AS display_name, 'O''Brien' AS author"
+        );
+        assert_eq!(
+            engine_single_row(&sql).await,
+            vec!["{author}".to_string(), "O'Brien".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_substitute_is_order_independent_with_cross_references() {
+        // Each value names another parameter, in a cycle, and two carry
+        // quotes: no ordering of the substitutions may change the result.
+        let template = "SELECT {a_param} AS a, {b_param} AS b, {c_param} AS c";
+        let params_map = params(&[
+            ("a_param", Value::String("{b_param}'".to_string())),
+            ("b_param", Value::String("{c_param}".to_string())),
+            ("c_param", Value::String("'{a_param}".to_string())),
+        ]);
+
+        let sql = substitute_in_every_order(template, &params_map);
+        assert_eq!(
+            sql,
+            "SELECT '{b_param}''' AS a, '{c_param}' AS b, '''{a_param}' AS c"
+        );
+    }
+
+    #[test]
+    fn test_substitute_every_value_kind_in_one_template() {
+        // All renderable kinds side by side, in every substitution order,
+        // render exactly as the per-kind tests above pin them.
+        let template = "SELECT {s}, {n}, {f}, {t}, {z}, {vec}, VALUES {rows}";
+        let params_map = params(&[
+            ("s", Value::String("o'brien".to_string())),
+            ("n", Value::Number(42.into())),
+            (
+                "f",
+                Value::Number(serde_json::Number::from_f64(0.5).unwrap()),
+            ),
+            ("t", Value::Bool(false)),
+            ("z", Value::Null),
+            (
+                "vec",
+                Value::Array(vec![Value::Number(1.into()), Value::Number(2.into())]),
+            ),
+            (
+                "rows",
+                Value::Array(vec![
+                    Value::Array(vec![
+                        Value::String("a".to_string()),
+                        Value::Array(vec![Value::Number(3.into())]),
+                        Value::Null,
+                    ]),
+                    Value::Array(vec![
+                        Value::String("{s}".to_string()),
+                        Value::Array(vec![Value::Number(4.into())]),
+                        Value::Bool(true),
+                    ]),
+                ]),
+            ),
+        ]);
+
+        let sql = substitute_in_every_order(template, &params_map);
+        assert_eq!(
+            sql,
+            "SELECT 'o''brien', 42, 0.5, false, NULL, [1, 2], \
+             VALUES ('a', [3], NULL), ('{s}', [4], true)"
+        );
+    }
+
+    #[test]
+    fn test_substitute_leaves_unknown_placeholders_as_written() {
+        // `{name}` where `name` is not a parameter is copied verbatim, as is
+        // any other brace text; `{{id}}` still has its inner `{id}` replaced,
+        // matching the previous `str::replace` behaviour.
+        let mut sql =
+            "SELECT {id} AS id, '{not_a_param}' AS raw, '{{id}}' AS nested, '{ open' AS o"
+                .to_string();
+        let params_map = params(&[("id", Value::Number(7.into()))]);
+        let (missing, unsupported) =
+            substitute_sql_params(&mut sql, &sorted_keys(&params_map), &params_map);
+
+        assert!(missing.is_empty());
+        assert!(unsupported.is_empty());
+        assert_eq!(
+            sql,
+            "SELECT 7 AS id, '{not_a_param}' AS raw, '{7}' AS nested, '{ open' AS o"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_string_literal_escape_matches_engine_dialect() {
+        // `quote_sql_string` only doubles single quotes. That is a complete
+        // escape only while the parser treats `\` as an ordinary character,
+        // which is true of DataFusion's default `Generic` dialect. Pin both
+        // the setting and the observable behaviour: a value with `\'` and a
+        // trailing `\` must come back verbatim as one literal each.
+        assert_eq!(
+            default_session_state()
+                .config()
+                .options()
+                .sql_parser
+                .dialect,
+            Dialect::Generic
+        );
+
+        let template = "SELECT {a} AS a, {b} AS b";
+        let a = r"x\' || version() || '";
+        let b = r"C:\dir\";
+        let params_map = params(&[
+            ("a", Value::String(a.to_string())),
+            ("b", Value::String(b.to_string())),
+        ]);
+        let sql = substitute_in_every_order(template, &params_map);
+        assert_eq!(
+            engine_single_row(&sql).await,
+            vec![a.to_string(), b.to_string()]
+        );
     }
 
     #[test]

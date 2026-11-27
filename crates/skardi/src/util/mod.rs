@@ -19,6 +19,7 @@ pub use skardi_source_pack::text;
 
 pub mod json_getters;
 pub mod json_pack;
+pub mod sql_template;
 
 /// The hand-rolled mock HTTP server, re-exported on the path it has always
 /// had. It now lives in `skardi-source-pack`: the pack's own client suite

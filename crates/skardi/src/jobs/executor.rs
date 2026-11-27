@@ -40,6 +40,7 @@ use super::destination::{
 use super::store::{JobProviderFailure, JobRun, JobRunStatus, JobStore};
 use crate::pipeline::pipeline::Pipeline;
 use crate::sources::DataSourceType;
+use crate::util::sql_template::{fill_placeholders, quote_sql_string};
 
 /// Submit-time errors — everything the executor rejects before creating a
 /// `JobRun` row. The server maps these to HTTP status codes.
@@ -233,10 +234,9 @@ impl JobExecutor {
             return Err(JobSubmitError::MissingParameters(missing.join(", ")));
         }
 
-        // Substitute parameters into the SQL template. Using the same
-        // sort-longest-first ordering as the pipeline handler so a shorter
-        // name cannot corrupt a longer shared-prefix name during
-        // `str::replace`.
+        // Substitute parameters into the SQL template. Substitution is a
+        // single pass and does not depend on this order; the sort only keeps
+        // which unsupported parameter is reported first unchanged.
         let mut expected_sorted = expected.clone();
         expected_sorted.sort_by_key(|s: &String| std::cmp::Reverse(s.len()));
         let (rendered_sql, bad_types) = substitute_sql_params(job.sql(), &expected_sorted, &params);
@@ -462,32 +462,38 @@ impl JobExecutor {
 }
 
 /// Substitute `{name}` placeholders in `sql` with JSON parameter values,
-/// mirroring the pipeline handler's scalar-literal substitution. Returns
-/// `(rendered_sql, Some(name))` on the first unsupported value; otherwise
-/// `(rendered_sql, None)`.
+/// using the same scalar literal forms as the pipeline handler. Returns
+/// `(rendered_sql, Some(name))` for the first parameter, in
+/// `expected_params` order, whose value is not a scalar (the SQL is then
+/// returned unsubstituted); otherwise `(rendered_sql, None)`.
+///
+/// Every value is rendered first and the template is then filled in one
+/// forward pass (`fill_placeholders`), so text inserted from one value is
+/// never rewritten by another substitution and the result does not depend
+/// on parameter order. A `{name}` that is not an expected parameter, or
+/// whose parameter is absent, is left as written.
 fn substitute_sql_params(
     sql: &str,
-    expected_params_longest_first: &[String],
+    expected_params: &[String],
     parameters: &HashMap<String, Value>,
 ) -> (String, Option<String>) {
-    let mut out = sql.to_string();
+    let mut rendered: HashMap<&str, String> = HashMap::new();
 
-    for param_name in expected_params_longest_first {
-        let placeholder = format!("{{{}}}", param_name);
+    for param_name in expected_params {
         let Some(value) = parameters.get(param_name) else {
             continue;
         };
         let literal = match value {
-            Value::String(s) => format!("'{}'", s.replace('\'', "''")),
+            Value::String(s) => quote_sql_string(s),
             Value::Number(n) => n.to_string(),
             Value::Bool(b) => b.to_string(),
             Value::Null => "NULL".to_string(),
-            _ => return (out, Some(param_name.clone())),
+            _ => return (sql.to_string(), Some(param_name.clone())),
         };
-        out = out.replace(&placeholder, &literal);
+        rendered.insert(param_name.as_str(), literal);
     }
 
-    (out, None)
+    (fill_placeholders(sql, &rendered), None)
 }
 
 fn sorted_json(params: &HashMap<String, Value>) -> String {
@@ -761,6 +767,7 @@ mod tests {
     use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use arrow::record_batch::RecordBatch;
+    use arrow::util::display::array_value_to_string;
     use rstest::rstest;
     use skardi_source_pack::testing::{MockGateway, MockResponse, discovery_ok};
 
@@ -996,6 +1003,116 @@ spec:
         params.insert("x".to_string(), serde_json::json!([1, 2, 3]));
         let (_, bad) = substitute_sql_params(sql, &["x".to_string()], &params);
         assert_eq!(bad.as_deref(), Some("x"));
+    }
+
+    /// Every ordering of `names` (they are few in these tests).
+    fn all_orders(names: &[&str]) -> Vec<Vec<String>> {
+        if names.len() <= 1 {
+            return vec![names.iter().map(|n| n.to_string()).collect()];
+        }
+        let mut out = Vec::new();
+        for i in 0..names.len() {
+            let mut rest = names.to_vec();
+            let head = rest.remove(i);
+            for mut tail in all_orders(&rest) {
+                tail.insert(0, head.to_string());
+                out.push(tail);
+            }
+        }
+        out
+    }
+
+    /// Substitute in every ordering of the parameter names, assert they all
+    /// succeed with the same SQL, and return it.
+    fn substitute_in_every_order(sql: &str, params: &HashMap<String, Value>) -> String {
+        let mut names: Vec<&str> = params.keys().map(String::as_str).collect();
+        names.sort();
+        let mut first: Option<String> = None;
+        for order in all_orders(&names) {
+            let (out, bad) = substitute_sql_params(sql, &order, params);
+            assert!(bad.is_none(), "order {order:?}: {bad:?}");
+            match &first {
+                None => first = Some(out),
+                Some(expected) => assert_eq!(&out, expected, "order {order:?} changed the SQL"),
+            }
+        }
+        first.expect("at least one ordering")
+    }
+
+    #[test]
+    fn substitute_sql_params_keeps_value_containing_other_placeholder() {
+        let sql = "SELECT {body_text} AS body, {doc_id} AS id";
+        let mut params = HashMap::new();
+        params.insert(
+            "body_text".to_string(),
+            Value::String("see {doc_id}".into()),
+        );
+        params.insert("doc_id".to_string(), Value::String("d1".into()));
+        assert_eq!(
+            substitute_in_every_order(sql, &params),
+            "SELECT 'see {doc_id}' AS body, 'd1' AS id"
+        );
+    }
+
+    #[tokio::test]
+    async fn substitute_sql_params_quote_payload_cannot_escape_through_another_value() {
+        // The first value carries the second's placeholder; the second
+        // carries quotes and SQL. Re-substitution would close the first
+        // literal and splice `|| version() ||` in as SQL.
+        let sql = "SELECT {title_text} AS title, {src} AS src";
+        let payload = "' || version() || '";
+        let mut params = HashMap::new();
+        params.insert("title_text".to_string(), Value::String("a {src}".into()));
+        params.insert("src".to_string(), Value::String(payload.into()));
+
+        let out = substitute_in_every_order(sql, &params);
+        assert_eq!(
+            out,
+            "SELECT 'a {src}' AS title, ''' || version() || ''' AS src"
+        );
+
+        // Planned and run on a default session: two literal columns, each
+        // holding its value verbatim, with nothing injected.
+        let batches = SessionContext::new()
+            .sql(&out)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 1);
+        let row: Vec<String> = (0..batch.num_columns())
+            .map(|i| array_value_to_string(batch.column(i).as_ref(), 0).unwrap())
+            .collect();
+        assert_eq!(row, vec!["a {src}".to_string(), payload.to_string()]);
+    }
+
+    #[test]
+    fn substitute_sql_params_is_order_independent_with_cross_references() {
+        let sql = "SELECT {a_param} AS a, {b_param} AS b, {c_param} AS c";
+        let mut params = HashMap::new();
+        params.insert("a_param".to_string(), Value::String("{b_param}'".into()));
+        params.insert("b_param".to_string(), Value::String("{c_param}".into()));
+        params.insert("c_param".to_string(), Value::String("'{a_param}".into()));
+        assert_eq!(
+            substitute_in_every_order(sql, &params),
+            "SELECT '{b_param}''' AS a, '{c_param}' AS b, '''{a_param}' AS c"
+        );
+    }
+
+    #[test]
+    fn substitute_sql_params_renders_every_scalar_kind() {
+        let sql = "SELECT {s}, {n}, {t}, {z}, {unknown}";
+        let mut params = HashMap::new();
+        params.insert("s".to_string(), Value::String("o'brien".into()));
+        params.insert("n".to_string(), serde_json::json!(1.5));
+        params.insert("t".to_string(), Value::Bool(true));
+        params.insert("z".to_string(), Value::Null);
+        assert_eq!(
+            substitute_in_every_order(sql, &params),
+            "SELECT 'o''brien', 1.5, true, NULL, {unknown}"
+        );
     }
 
     #[test]
